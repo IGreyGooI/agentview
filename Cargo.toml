@@ -1,0 +1,28 @@
+[package]
+name = "agentview"
+version = "0.1.0"
+edition = "2021"
+description = "AI/AX runtime: Agent Interface plus Agent Experience for language agents"
+license = "MIT"
+
+[features]
+default = ["openrouter"]
+openrouter = []
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+minijinja = "2"
+ecow = { version = "0.2", features = ["serde"] }
+async-trait = "0.1"
+futures = "0.3"
+thiserror = "2"
+nom = "8"
+
+[dev-dependencies]
+rig-core = "0.35"
+dotenvy = "0.15"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
