@@ -6,8 +6,8 @@
 //! Or with an OpenAI-compatible endpoint:
 //! `OHMYGPT_API_KEY=... OHMYGPT_BASE_URL=... cargo run -p agentview --example agent_streaming_tool_loop`
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use agentview::prelude::*;
 use futures::StreamExt;
@@ -67,7 +67,7 @@ impl LLMExecutor for RigExampleExecutor {
         request: AgentTurnRequest,
         sink: &mut S,
         side_sinks: &mut Vec<Box<dyn TurnSink<Output = ()>>>,
-    ) -> anyhow::Result<String>
+    ) -> anyhow::Result<ExecutorCommit>
     where
         S: TurnSink + Send,
     {
@@ -119,7 +119,7 @@ impl LLMExecutor for RigExampleExecutor {
                 .await;
         }
 
-        Ok(full_text)
+        Ok(ExecutorCommit::text(full_text))
     }
 }
 
@@ -326,27 +326,36 @@ impl PromptRenderable for ParserErrorArtifact {
     }
 }
 
-fn decide_demo_selection(ctx: DemoParseContext) -> AgentTurnControl {
-    if !ctx.intent_budget_verified {
-        return AgentTurnControl::continue_with(
-            "The intent budget verification failed because the budget changed during validation. In one response, call <verify_intent_budget scope=\"demo\"/> again and also return 1-3 <select local_id=\"...\"/> tags.",
-            vec![ParserErrorArtifact::turn_artifact(
-                "<verify_intent_budget scope=\"demo\"/> failed: intent budget changed during validation. Verify again before selecting intents.",
-            )],
-        );
-    }
+impl DefaultTurnOutput for DemoParseContext {
+    fn drain_default_turn_update(&mut self) -> DefaultTurnUpdate {
+        if !self.intent_budget_verified {
+            return DefaultTurnUpdate {
+                flow: TurnFlow::Continue,
+                artifacts: vec![ParserErrorArtifact::turn_artifact(
+                    "<verify_intent_budget scope=\"demo\"/> failed: intent budget changed during validation. Verify again before selecting intents.",
+                )],
+                task: Some("The intent budget verification failed because the budget changed during validation. In one response, call <verify_intent_budget scope=\"demo\"/> again and also return 1-3 <select local_id=\"...\"/> tags.".to_owned()),
+            };
+        }
 
-    if ctx.selected.is_empty() {
-        AgentTurnControl::continue_with(
-            "Return at least one <select local_id=\"...\"/> tag after verifying the intent budget.",
-            vec![ParserErrorArtifact::turn_artifact(
-                "Expected at least one <select> tag.",
-            )],
-        )
-    } else {
-        AgentTurnControl::sleep_with_feedback(AgentFeedback::with_task(
-            "Next awake: keep using <select local_id=\"...\"/> tags.",
-        ))
+        if self.selected.is_empty() {
+            DefaultTurnUpdate {
+                flow: TurnFlow::Continue,
+                artifacts: vec![ParserErrorArtifact::turn_artifact(
+                    "Expected at least one <select> tag.",
+                )],
+                task: Some(
+                    "Return at least one <select local_id=\"...\"/> tag after verifying the intent budget."
+                        .to_owned(),
+                ),
+            }
+        } else {
+            DefaultTurnUpdate {
+                flow: TurnFlow::Wait,
+                artifacts: Vec::new(),
+                task: Some("Next awake: keep using <select local_id=\"...\"/> tags.".to_owned()),
+            }
+        }
     }
 }
 
@@ -359,7 +368,7 @@ async fn main() -> anyhow::Result<()> {
     INTENT_BUDGET_ATTEMPTS.store(0, Ordering::SeqCst);
 
     let executor = RigExampleExecutor;
-    let agent: Agent<DemoContextBuilder, RigExampleExecutor, IdentityTransform> = Agent::new(
+    let agent: TextAgent<DemoContextBuilder, RigExampleExecutor, IdentityTransform> = Agent::new(
         DemoContextBuilder {
             agent_id: "demo_agent".to_string(),
         },
@@ -388,24 +397,21 @@ async fn main() -> anyhow::Result<()> {
             "Select 1-3 currently valid demo intents. First call <verify_intent_budget scope=\"demo\"/>, then return <select local_id=\"...\"/> tags.",
         )
         .with_max_loops(3)
-        .execute_loop(
-            &source,
-            &executor,
-            || {
-                StreamingToolRunner::new(DemoParseContext::default())
-                    .with_tool(VerifyIntentBudgetTool)
-                    .with_tool(SelectTool)
-            },
-            decide_demo_selection,
-        )
+        .execute_loop(&source, &executor, || {
+            StreamingToolRunner::new(DemoParseContext::default())
+                .with_tool(VerifyIntentBudgetTool)
+                .with_tool(SelectTool)
+        })
         .await?;
 
     println!(
         "\n--- PENDING NEXT-AWAKE FEEDBACK ---\n{}",
         agent
-            .pending_feedback
-            .lock()
+            .ctx
+            .read()
             .await
+            .context_state()
+            .feedback
             .task
             .as_deref()
             .unwrap_or("<none>")

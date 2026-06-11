@@ -47,12 +47,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 use nom::{
-    IResult, Parser,
     branch::alt,
     bytes::streaming::{tag, take_until, take_while1},
     character::streaming::{char, multispace0, space0},
     multi::separated_list0,
     sequence::delimited,
+    IResult, Parser,
 };
 
 // ── Error ─────────────────────────────────────────────────────────────────────

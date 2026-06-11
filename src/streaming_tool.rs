@@ -19,46 +19,6 @@ use crate::llm_call::{TextTurnEvent, TurnSink};
 use crate::stream_parser::{HermesParser, XmlElement};
 use crate::templates::{PromptRenderable, TemplateEngine, TurnArtifact};
 
-// ── Agent feedback/control ────────────────────────────────────────────────────
-
-/// Feedback that can be fed into either the next loop iteration or the next awake.
-///
-/// `Continue` feedback is consumed immediately by the current agent loop.
-/// `Sleep` feedback is stored on the agent and prepended to the next awake.
-#[derive(Default)]
-pub struct AgentFeedback {
-    pub artifacts: Vec<TurnArtifact>,
-    pub task: Option<String>,
-}
-
-impl AgentFeedback {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    pub fn new(artifacts: Vec<TurnArtifact>, task: Option<String>) -> Self {
-        Self { artifacts, task }
-    }
-
-    pub fn with_task(task: impl Into<String>) -> Self {
-        Self {
-            artifacts: Vec::new(),
-            task: Some(task.into()),
-        }
-    }
-
-    pub fn with_artifacts(artifacts: Vec<TurnArtifact>) -> Self {
-        Self {
-            artifacts,
-            task: None,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.artifacts.is_empty() && self.task.is_none()
-    }
-}
-
 // ── Errors / artifacts ────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -293,50 +253,6 @@ impl<C: ParseContext + Send + 'static> TurnSink for StreamingToolRunner<C> {
         self.finalize().await;
         let runner = *self;
         runner.into_context().await
-    }
-}
-
-// ── Decision result ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReturnPolicy {
-    Sleep,
-    Continue,
-}
-
-/// Result of an agent-specific decision function over a concrete parse context.
-pub struct AgentTurnControl {
-    pub return_policy: ReturnPolicy,
-    pub feedback: AgentFeedback,
-}
-
-impl AgentTurnControl {
-    pub fn sleep() -> Self {
-        Self {
-            return_policy: ReturnPolicy::Sleep,
-            feedback: AgentFeedback::empty(),
-        }
-    }
-
-    pub fn sleep_with_feedback(feedback: AgentFeedback) -> Self {
-        Self {
-            return_policy: ReturnPolicy::Sleep,
-            feedback,
-        }
-    }
-
-    pub fn continue_with(task: impl Into<String>, artifacts: Vec<TurnArtifact>) -> Self {
-        Self {
-            return_policy: ReturnPolicy::Continue,
-            feedback: AgentFeedback::new(artifacts, Some(task.into())),
-        }
-    }
-
-    pub fn continue_with_feedback(feedback: AgentFeedback) -> Self {
-        Self {
-            return_policy: ReturnPolicy::Continue,
-            feedback,
-        }
     }
 }
 

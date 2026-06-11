@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::{DefaultTurnOutput, DefaultTurnUpdate, TurnFlow};
 use crate::templates::TemplateEngine;
 
 #[derive(Debug, thiserror::Error)]
@@ -238,20 +239,30 @@ impl StreamingTool<NpcParseContext> for ThoughtTool {
     }
 }
 
-fn decide_npc_speak(ctx: &NpcParseContext) -> AgentTurnControl {
-    if ctx.speech_started() {
-        AgentTurnControl::sleep()
-    } else {
-        AgentTurnControl::continue_with(
-            "Your previous response did not start speech. Return valid Hermes XML with a <speak> tag.",
-            vec![
-                DecisionErrorArtifact::new(DecisionError::MissingRequiredTag {
-                    tag: "speak",
-                    purpose: "speech",
-                })
-                .into_turn_artifact(),
-            ],
-        )
+impl DefaultTurnOutput for NpcParseContext {
+    fn drain_default_turn_update(&mut self) -> DefaultTurnUpdate {
+        if self.speech_started() {
+            DefaultTurnUpdate {
+                flow: TurnFlow::Wait,
+                artifacts: Vec::new(),
+                task: None,
+            }
+        } else {
+            DefaultTurnUpdate {
+                flow: TurnFlow::Continue,
+                artifacts: vec![
+                    DecisionErrorArtifact::new(DecisionError::MissingRequiredTag {
+                        tag: "speak",
+                        purpose: "speech",
+                    })
+                    .into_turn_artifact(),
+                ],
+                task: Some(
+                    "Your previous response did not start speech. Return valid Hermes XML with a <speak> tag."
+                        .to_owned(),
+                ),
+            }
+        }
     }
 }
 
@@ -277,25 +288,22 @@ async fn streaming_tool_updates_concrete_parse_context_in_parser_order() {
 
 #[tokio::test]
 async fn decision_function_returns_retry_artifact_when_required_tool_missing() {
-    let ctx = NpcParseContext::new();
+    let mut ctx = NpcParseContext::new();
     let engine = TemplateEngine::new();
 
-    let control = decide_npc_speak(&ctx);
+    let update = ctx.drain_default_turn_update();
 
-    assert_eq!(control.return_policy, ReturnPolicy::Continue);
+    assert_eq!(update.flow, TurnFlow::Continue);
     assert_eq!(
-        control.feedback.task.as_deref(),
+        update.task.as_deref(),
         Some(
             "Your previous response did not start speech. Return valid Hermes XML with a <speak> tag."
         )
     );
-    assert_eq!(control.feedback.artifacts.len(), 1);
-    assert_eq!(control.feedback.artifacts[0].kind, "parser_error");
+    assert_eq!(update.artifacts.len(), 1);
+    assert_eq!(update.artifacts[0].kind, "parser_error");
     assert_eq!(
-        control.feedback.artifacts[0]
-            .render_full(&engine)
-            .await
-            .unwrap(),
+        update.artifacts[0].render_full(&engine).await.unwrap(),
         "<parser_error>Expected a <speak> tag to start speech.</parser_error>"
     );
 }
@@ -303,26 +311,24 @@ async fn decision_function_returns_retry_artifact_when_required_tool_missing() {
 #[tokio::test]
 async fn sleep_feedback_uses_behavior_feedback_kind_for_next_awake() {
     let engine = TemplateEngine::new();
-    let control = AgentTurnControl::sleep_with_feedback(AgentFeedback::new(
-        vec![
+    let update = DefaultTurnUpdate {
+        flow: TurnFlow::Wait,
+        artifacts: vec![
             BehaviorFeedbackArtifact::new("Use <thought> before <speak> next time.")
                 .into_turn_artifact(),
         ],
-        Some("Remember the previous format reminder.".into()),
-    ));
+        task: Some("Remember the previous format reminder.".into()),
+    };
 
-    assert_eq!(control.return_policy, ReturnPolicy::Sleep);
+    assert_eq!(update.flow, TurnFlow::Wait);
     assert_eq!(
-        control.feedback.task.as_deref(),
+        update.task.as_deref(),
         Some("Remember the previous format reminder.")
     );
-    assert_eq!(control.feedback.artifacts.len(), 1);
-    assert_eq!(control.feedback.artifacts[0].kind, "behavior_feedback");
+    assert_eq!(update.artifacts.len(), 1);
+    assert_eq!(update.artifacts[0].kind, "behavior_feedback");
     assert_eq!(
-        control.feedback.artifacts[0]
-            .render_full(&engine)
-            .await
-            .unwrap(),
+        update.artifacts[0].render_full(&engine).await.unwrap(),
         "<behavior_feedback>Use <thought> before <speak> next time.</behavior_feedback>"
     );
 }

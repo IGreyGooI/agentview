@@ -1,10 +1,9 @@
 //! Agent turn abstraction — [`AgentTurn`] builder and the [`TurnSink`] trait.
 //!
 //! `AgentTurn` owns one model-backed agent interaction. It is the transaction
-//! boundary around a single request/response: build request from
-//! [`PromptContext`], ask an application-provided [`LLMExecutor`] to execute it,
-//! route output into turn sinks, commit prompt history on success, and return an
-//! [`AgentTurnOutcome`].
+//! boundary around a single request/response: take an already-rendered
+//! [`AgentTurnRequest`], ask an application-provided [`LLMExecutor`] to execute
+//! it, route output into turn sinks, and return an [`AgentTurnOutcome`].
 //!
 //! It is deliberately **not** the agent loop, not application/world state, and
 //! not a provider adapter.
@@ -12,13 +11,13 @@
 //! Every model-backed agent turn goes through an application-provided
 //! [`LLMExecutor`], which owns provider streaming and observability details for
 //! this crate. The turn routes executor-defined events into one primary
-//! [`TurnSink`] plus optional side-effect sinks, commits prompt history on
-//! success, and returns an [`AgentTurnOutcome`].
+//! [`TurnSink`] plus optional side-effect sinks and returns an
+//! [`AgentTurnOutcome`].
 //!
 //! ## Responsibility split
 //!
-//! - [`AgentTurn`] owns the prompt-history transaction and calls
-//!   [`TurnTransform`] only after the model execution succeeds.
+//! - [`AgentTurn`] owns the executor/sink transaction for one model request.
+//!   It does not mutate prompt history.
 //! - [`LLMExecutor`] owns provider capabilities: streaming text, non-streaming
 //!   completion, native provider tools, provider hooks, retries, API shape, and
 //!   the concrete event type emitted to sinks.
@@ -34,36 +33,57 @@
 //! - [`finish`][TurnSink::finish] — called once the executor succeeds;
 //!   consumes the sink and returns its typed per-turn output
 //!
-//! Executors may emit zero events. They still return final assistant text so
-//! [`AgentTurn`] can commit prompt history.
+//! Executors may emit zero events. They still return an [`ExecutorCommit`] so
+//! the caller's view model can decide what becomes durable history.
 //!
 //! ## Ownership transfer
 //!
-//! `AgentTurn` takes **ownership** of the [`PromptContext`] passed to it.
-//! `execute()` returns `Result<AgentTurnOutcome<_>, AgentTurnError>` — the
-//! context is committed on success or returned uncommitted on failure. The
-//! caller can restore `e.ctx` from the error variant to retry or continue the
-//! session.
+//! `AgentTurn` does not own prompt history. The caller's
+//! [`AgentViewModel`](crate::agent::AgentViewModel) owns request construction
+//! and commit policy.
 
-use crate::StorageString;
-use crate::prompt_context::{
-    AgentTurnError, CommitTransformStatus, PromptContext, Turn, TurnTransform,
-};
+use crate::prompt_context::Turn;
 use crate::stream_parser::HermesParser;
+use crate::StorageString;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
-pub struct AgentTurnRequest {
+pub struct AgentTurnRequest<I = Turn> {
     pub call_id: StorageString,
     pub system: String,
-    pub history: Vec<Turn>,
+    pub history: Vec<I>,
     pub user: String,
     pub model: StorageString,
     pub max_tokens: u64,
 }
 
-pub struct AgentTurnOutcome<O> {
-    pub context: PromptContext,
+#[derive(Debug, Clone)]
+pub struct ExecutorCommit<I = Turn> {
+    pub append: Vec<I>,
+}
+
+impl<I> ExecutorCommit<I> {
+    pub fn new(append: impl IntoIterator<Item = I>) -> Self {
+        Self {
+            append: append.into_iter().collect(),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self { append: Vec::new() }
+    }
+}
+
+impl ExecutorCommit<Turn> {
+    pub fn text(text: impl Into<StorageString>) -> Self {
+        Self {
+            append: vec![Turn::assistant(text)],
+        }
+    }
+}
+
+pub struct AgentTurnOutcome<I, O> {
+    pub executor_commit: ExecutorCommit<I>,
     pub sink_output: O,
 }
 
@@ -87,11 +107,6 @@ pub enum AgentTurnEvent {
         call_id: StorageString,
         text: String,
     },
-    CommitTransformApplied {
-        call_id: StorageString,
-        user: CommitTransformStatus,
-        assistant: CommitTransformStatus,
-    },
     Failed {
         call_id: StorageString,
         error: String,
@@ -113,22 +128,23 @@ pub trait AgentTurnObserver: Send + Sync {
 pub type AgentTurnObserverHandle = Arc<dyn AgentTurnObserver>;
 
 #[async_trait::async_trait]
-pub trait LLMExecutor<E = TextTurnEvent>: Send + Sync {
-    /// Execute one model turn and return the final assistant text.
+pub trait LLMExecutor<I = Turn, E = TextTurnEvent>: Send + Sync {
+    /// Execute one model turn and return the transcript items to append.
     ///
     /// Implementors may emit any application/provider event type `E` into the
     /// primary sink and side sinks. Completion-style executors may emit no
-    /// events and simply return the final text. `AgentTurn` is responsible for
-    /// calling `finish(...)` and committing prompt history.
+    /// events and simply return an [`ExecutorCommit`]. `AgentTurn` is
+    /// responsible for calling `finish(...)`; context commit is owned by the
+    /// caller's view model.
     ///
     /// Native provider tools belong behind this boundary. If an adapter wants
     /// sinks to observe tool calls/results, it defines `E` accordingly.
     async fn execute_llm<S>(
         &self,
-        request: AgentTurnRequest,
+        request: AgentTurnRequest<I>,
         sink: &mut S,
         side_sinks: &mut Vec<Box<dyn TurnSink<E, Output = ()>>>,
-    ) -> anyhow::Result<String>
+    ) -> anyhow::Result<ExecutorCommit<I>>
     where
         S: TurnSink<E> + Send;
 }
@@ -230,45 +246,29 @@ impl TurnSink<TextTurnEvent> for HermesParser {
 ///
 /// `T: TurnTransform` controls how both sides of the exchange are committed to
 /// the [`PromptContext`]'s history after a successful call.
-pub struct AgentTurn<R, T, S = NoopTurnSink, E = TextTurnEvent>
+pub struct AgentTurn<R, S = NoopTurnSink, I = Turn, E = TextTurnEvent>
 where
-    R: LLMExecutor<E>,
-    T: TurnTransform,
+    R: LLMExecutor<I, E>,
     S: TurnSink<E>,
 {
     runtime: R,
-    call_id: StorageString,
-    context: PromptContext,
-    transform: T,
-    model: StorageString,
-    max_tokens: u64,
+    request: AgentTurnRequest<I>,
     sink: S,
     side_sinks: Vec<Box<dyn TurnSink<E, Output = ()>>>,
     observers: Vec<AgentTurnObserverHandle>,
     event: std::marker::PhantomData<E>,
 }
 
-impl<R, T, E> AgentTurn<R, T, NoopTurnSink, E>
+impl<R, I, E> AgentTurn<R, NoopTurnSink, I, E>
 where
-    R: LLMExecutor<E> + Clone + Send + Sync + 'static,
-    T: TurnTransform,
+    R: LLMExecutor<I, E> + Clone + Send + Sync + 'static,
+    I: Send + 'static,
     E: Send + 'static,
 {
-    pub fn new(
-        runtime: R,
-        call_id: impl Into<StorageString>,
-        context: PromptContext,
-        transform: T,
-        model: impl Into<StorageString>,
-        max_tokens: u64,
-    ) -> Self {
+    pub fn new(runtime: R, request: AgentTurnRequest<I>) -> Self {
         Self {
             runtime,
-            call_id: call_id.into(),
-            context,
-            transform,
-            model: model.into(),
-            max_tokens,
+            request,
             sink: NoopTurnSink,
             side_sinks: Vec::new(),
             observers: Vec::new(),
@@ -277,24 +277,20 @@ where
     }
 }
 
-impl<R, T, S, E> AgentTurn<R, T, S, E>
+impl<R, S, I, E> AgentTurn<R, S, I, E>
 where
-    R: LLMExecutor<E> + Clone + Send + Sync + 'static,
-    T: TurnTransform,
+    R: LLMExecutor<I, E> + Clone + Send + Sync + 'static,
     S: TurnSink<E> + Send + 'static,
+    I: Send + 'static,
     E: Send + 'static,
 {
-    pub fn with_sink<S2>(self, sink: S2) -> AgentTurn<R, T, S2, E>
+    pub fn with_sink<S2>(self, sink: S2) -> AgentTurn<R, S2, I, E>
     where
         S2: TurnSink<E> + Send + 'static,
     {
         AgentTurn {
             runtime: self.runtime,
-            call_id: self.call_id,
-            context: self.context,
-            transform: self.transform,
-            model: self.model,
-            max_tokens: self.max_tokens,
+            request: self.request,
             sink,
             side_sinks: self.side_sinks,
             observers: self.observers,
@@ -326,41 +322,28 @@ where
         self
     }
 
-    /// Execute the agent turn, drive the stream through sinks, commit the
-    /// exchange to history, and return the committed context plus sink output.
-    ///
-    /// On failure, returns [`AgentTurnError`] which carries the **uncommitted**
-    /// context so the caller can restore agent state and retry.
-    pub async fn execute(mut self) -> Result<AgentTurnOutcome<S::Output>, AgentTurnError> {
-        let call_id = self.call_id.clone();
+    /// Execute the agent turn, drive the stream through sinks, and return the
+    /// executor commit plus sink output.
+    pub async fn execute(mut self) -> anyhow::Result<AgentTurnOutcome<I, S::Output>> {
+        let call_id = self.request.call_id.clone();
         #[cfg(debug_assertions)]
         let mut drop_guard = AgentTurnDropGuard::new(call_id.clone(), self.observers.clone());
-
-        let (system, history_turns, user_msg) = self.context.build_request();
-        let request = AgentTurnRequest {
-            call_id: call_id.clone(),
-            system: system.to_owned(),
-            history: history_turns.to_vec(),
-            user: user_msg.to_owned(),
-            model: self.model.clone(),
-            max_tokens: self.max_tokens,
-        };
 
         notify_observers(
             &self.observers,
             AgentTurnEvent::UserPromptRendered {
                 call_id: call_id.clone(),
-                text: request.user.clone(),
+                text: self.request.user.clone(),
             },
         )
         .await;
 
-        let full_text = match self
+        let executor_commit = match self
             .runtime
-            .execute_llm(request, &mut self.sink, &mut self.side_sinks)
+            .execute_llm(self.request, &mut self.sink, &mut self.side_sinks)
             .await
         {
-            Ok(full_text) => full_text,
+            Ok(executor_commit) => executor_commit,
             Err(e) => {
                 let msg = format!("{e:#}");
                 tracing::warn!(call_id = %call_id, error = %msg, "agent turn failed");
@@ -372,10 +355,7 @@ where
                     },
                 )
                 .await;
-                return Err(AgentTurnError {
-                    ctx: self.context,
-                    source: e,
-                });
+                return Err(e);
             }
         };
 
@@ -384,36 +364,13 @@ where
         }
         let sink_output = Box::new(self.sink).finish().await;
 
-        let commit_report = self.context.commit(&full_text, &self.transform);
-
         #[cfg(debug_assertions)]
         {
             drop_guard.complete();
         }
-        notify_observers(
-            &self.observers,
-            AgentTurnEvent::AssistantCompleted {
-                call_id: call_id.clone(),
-                text: full_text,
-            },
-        )
-        .await;
-        if commit_report.user != CommitTransformStatus::Unchanged
-            || commit_report.assistant != CommitTransformStatus::Unchanged
-        {
-            notify_observers(
-                &self.observers,
-                AgentTurnEvent::CommitTransformApplied {
-                    call_id: call_id.clone(),
-                    user: commit_report.user,
-                    assistant: commit_report.assistant,
-                },
-            )
-            .await;
-        }
 
         Ok(AgentTurnOutcome {
-            context: self.context,
+            executor_commit,
             sink_output,
         })
     }
