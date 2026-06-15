@@ -148,7 +148,10 @@ struct DemoContextBuilder {
 
 #[async_trait::async_trait]
 impl PromptRenderable for DemoContextView {
-    async fn render_full<'a>(&'a self, engine: &'a TemplateEngine) -> anyhow::Result<String> {
+    async fn render_full<'a>(
+        &'a self,
+        engine: &'a TemplateEngine,
+    ) -> anyhow::Result<PromptFragment> {
         Ok(engine.render_template(
             "demo_context_full",
             r#"<demo_context><agent_id>{{ agent_id }}</agent_id><scene>{{ scene }}</scene></demo_context>"#,
@@ -156,7 +159,7 @@ impl PromptRenderable for DemoContextView {
                 agent_id => self.agent_id.as_str(),
                 scene => self.scene.as_str(),
             },
-        )?)
+        )?.into())
     }
 }
 
@@ -166,18 +169,22 @@ impl ContextView for DemoContextView {
         &'a self,
         prev: &'a Self,
         engine: &'a TemplateEngine,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<Option<PromptFragment>> {
         if self == prev {
             return Ok(None);
         }
 
-        Ok(Some(engine.render_template(
-            "demo_context_delta",
-            r#"<demo_delta><scene>{{ scene }}</scene></demo_delta>"#,
-            minijinja::context! {
-                scene => self.scene.as_str(),
-            },
-        )?))
+        Ok(Some(
+            engine
+                .render_template(
+                    "demo_context_delta",
+                    r#"<demo_delta><scene>{{ scene }}</scene></demo_delta>"#,
+                    minijinja::context! {
+                        scene => self.scene.as_str(),
+                    },
+                )?
+                .into(),
+        ))
     }
 }
 
@@ -315,46 +322,55 @@ impl ParserErrorArtifact {
 
 #[async_trait::async_trait]
 impl PromptRenderable for ParserErrorArtifact {
-    async fn render_full<'a>(&'a self, engine: &'a TemplateEngine) -> anyhow::Result<String> {
-        Ok(engine.render_template(
-            "parser_error_artifact",
-            r#"<parser_error>{{ message }}</parser_error>"#,
-            minijinja::context! {
-                message => self.message.as_str(),
-            },
-        )?)
+    async fn render_full<'a>(
+        &'a self,
+        engine: &'a TemplateEngine,
+    ) -> anyhow::Result<PromptFragment> {
+        Ok(engine
+            .render_template(
+                "parser_error_artifact",
+                r#"<parser_error>{{ message }}</parser_error>"#,
+                minijinja::context! {
+                    message => self.message.as_str(),
+                },
+            )?
+            .into())
     }
 }
 
-impl DefaultTurnOutput for DemoParseContext {
-    fn drain_default_turn_update(&mut self) -> DefaultTurnUpdate {
-        if !self.intent_budget_verified {
-            return DefaultTurnUpdate {
-                flow: TurnFlow::Continue,
-                artifacts: vec![ParserErrorArtifact::turn_artifact(
-                    "<verify_intent_budget scope=\"demo\"/> failed: intent budget changed during validation. Verify again before selecting intents.",
-                )],
-                task: Some("The intent budget verification failed because the budget changed during validation. In one response, call <verify_intent_budget scope=\"demo\"/> again and also return 1-3 <select local_id=\"...\"/> tags.".to_owned()),
-            };
-        }
+struct DemoLoopUpdate {
+    flow: TurnFlow,
+    artifacts: Vec<TurnArtifact>,
+    task: Option<String>,
+}
 
-        if self.selected.is_empty() {
-            DefaultTurnUpdate {
-                flow: TurnFlow::Continue,
-                artifacts: vec![ParserErrorArtifact::turn_artifact(
-                    "Expected at least one <select> tag.",
-                )],
-                task: Some(
-                    "Return at least one <select local_id=\"...\"/> tag after verifying the intent budget."
-                        .to_owned(),
-                ),
-            }
-        } else {
-            DefaultTurnUpdate {
-                flow: TurnFlow::Wait,
-                artifacts: Vec::new(),
-                task: Some("Next awake: keep using <select local_id=\"...\"/> tags.".to_owned()),
-            }
+fn drain_demo_loop_update(ctx: &mut DemoParseContext) -> DemoLoopUpdate {
+    if !ctx.intent_budget_verified {
+        return DemoLoopUpdate {
+            flow: TurnFlow::Continue,
+            artifacts: vec![ParserErrorArtifact::turn_artifact(
+                "<verify_intent_budget scope=\"demo\"/> failed: intent budget changed during validation. Verify again before selecting intents.",
+            )],
+            task: Some("The intent budget verification failed because the budget changed during validation. In one response, call <verify_intent_budget scope=\"demo\"/> again and also return 1-3 <select local_id=\"...\"/> tags.".to_owned()),
+        };
+    }
+
+    if ctx.selected.is_empty() {
+        DemoLoopUpdate {
+            flow: TurnFlow::Continue,
+            artifacts: vec![ParserErrorArtifact::turn_artifact(
+                "Expected at least one <select> tag.",
+            )],
+            task: Some(
+                "Return at least one <select local_id=\"...\"/> tag after verifying the intent budget."
+                    .to_owned(),
+            ),
+        }
+    } else {
+        DemoLoopUpdate {
+            flow: TurnFlow::Wait,
+            artifacts: Vec::new(),
+            task: Some("Next awake: keep using <select local_id=\"...\"/> tags.".to_owned()),
         }
     }
 }
@@ -368,7 +384,13 @@ async fn main() -> anyhow::Result<()> {
     INTENT_BUDGET_ATTEMPTS.store(0, Ordering::SeqCst);
 
     let executor = RigExampleExecutor;
-    let agent: TextAgent<DemoContextBuilder, RigExampleExecutor, IdentityTransform> = Agent::new(
+    let agent: TextAgent<
+        DemoContextBuilder,
+        RigExampleExecutor,
+        IdentityTransform,
+        TextTurnEvent,
+        DemoParseContext,
+    > = Agent::new(
         DemoContextBuilder {
             agent_id: "demo_agent".to_string(),
         },
@@ -391,18 +413,38 @@ async fn main() -> anyhow::Result<()> {
         scene: "demo scene captured from a tiny app source".to_string(),
     };
 
-    agent
-        .call("DemoSelect")
-        .with_user(
-            "Select 1-3 currently valid demo intents. First call <verify_intent_budget scope=\"demo\"/>, then return <select local_id=\"...\"/> tags.",
-        )
-        .with_max_loops(3)
-        .execute_loop(&source, &executor, || {
-            StreamingToolRunner::new(DemoParseContext::default())
-                .with_tool(VerifyIntentBudgetTool)
-                .with_tool(SelectTool)
-        })
-        .await?;
+    let mut task = "Select 1-3 currently valid demo intents. First call <verify_intent_budget scope=\"demo\"/>, then return <select local_id=\"...\"/> tags.".to_owned();
+    for _ in 0..3 {
+        let mut parse_ctx = agent
+            .call("DemoSelect")
+            .with_user(task)
+            .execute_with_sink(
+                &source,
+                &executor,
+                StreamingToolRunner::new(DemoParseContext::default())
+                    .with_tool(VerifyIntentBudgetTool)
+                    .with_tool(SelectTool),
+            )
+            .await?;
+
+        let update = drain_demo_loop_update(&mut parse_ctx);
+        let rendered_artifacts = agent
+            .config
+            .view
+            .render_turn_artifacts(update.artifacts)
+            .await?;
+        if !rendered_artifacts.is_empty() || update.task.is_some() {
+            agent.ctx.write().await.context_state_mut().feedback =
+                agentview::agent::DefaultAgentFeedback {
+                    artifacts: rendered_artifacts,
+                    task: update.task,
+                };
+        }
+        match update.flow {
+            TurnFlow::Wait => break,
+            TurnFlow::Continue => task = String::new(),
+        }
+    }
 
     println!(
         "\n--- PENDING NEXT-AWAKE FEEDBACK ---\n{}",

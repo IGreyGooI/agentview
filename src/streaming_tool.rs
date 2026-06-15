@@ -17,7 +17,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::llm_call::{TextTurnEvent, TurnSink};
 use crate::stream_parser::{HermesParser, XmlElement};
-use crate::templates::{PromptRenderable, TemplateEngine, TurnArtifact};
+use crate::templates::{PromptFragment, PromptRenderable, TemplateEngine, TurnArtifact};
 
 // ── Errors / artifacts ────────────────────────────────────────────────────────
 
@@ -63,8 +63,11 @@ impl ToolErrorArtifact {
 
 #[async_trait::async_trait]
 impl PromptRenderable for ToolErrorArtifact {
-    async fn render_full<'a>(&'a self, _engine: &'a TemplateEngine) -> anyhow::Result<String> {
-        Ok(format!("<parser_error>{}</parser_error>", self.error))
+    async fn render_full<'a>(
+        &'a self,
+        _engine: &'a TemplateEngine,
+    ) -> anyhow::Result<PromptFragment> {
+        Ok(format!("<parser_error>{}</parser_error>", self.error).into())
     }
 }
 

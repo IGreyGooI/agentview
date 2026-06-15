@@ -41,8 +41,7 @@ pub type StorageString = ecow::EcoString;
 /// Common imports for building an agent-facing ViewModel runtime.
 pub mod prelude {
     pub use crate::agent::{
-        Agent, AgentTurnBuilder, AgentViewModel, DefaultAgentViewModel, DefaultTurnOutput,
-        DefaultTurnUpdate, TextAgent, TurnFlow,
+        Agent, AgentTurnBuilder, AgentViewModel, DefaultAgentViewModel, TextAgent, TurnFlow,
     };
     pub use crate::llm_call::{
         AgentTurnEvent, AgentTurnObserver, AgentTurnObserverHandle, AgentTurnOutcome,
@@ -56,8 +55,8 @@ pub mod prelude {
         ParseContext, StreamingTool, StreamingToolError, StreamingToolRunner,
     };
     pub use crate::templates::{
-        ContextBlockKind, ContextView, ContextViewBuilder, PromptLayout, PromptRenderable,
-        PromptSystemVars, TemplateEngine, TurnArtifact,
+        ContextBlockKind, ContextView, ContextViewBuilder, PromptFragment, PromptLayout,
+        PromptRenderable, PromptSystemVars, TemplateEngine, TurnArtifact,
     };
     pub use crate::StorageString;
 }

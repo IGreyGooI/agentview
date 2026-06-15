@@ -1,6 +1,6 @@
 use super::*;
-use crate::agent::{DefaultTurnOutput, DefaultTurnUpdate, TurnFlow};
-use crate::templates::TemplateEngine;
+use crate::agent::TurnFlow;
+use crate::templates::{PromptFragment, TemplateEngine};
 
 #[derive(Debug, thiserror::Error)]
 enum DecisionError {
@@ -50,18 +50,21 @@ impl DecisionErrorArtifact {
 
 #[async_trait::async_trait]
 impl PromptRenderable for DecisionErrorArtifact {
-    async fn render_full<'a>(&'a self, _engine: &'a TemplateEngine) -> anyhow::Result<String> {
-        Ok(format!("<parser_error>{}</parser_error>", self.error))
+    async fn render_full<'a>(
+        &'a self,
+        _engine: &'a TemplateEngine,
+    ) -> anyhow::Result<PromptFragment> {
+        Ok(format!("<parser_error>{}</parser_error>", self.error).into())
     }
 }
 
 #[async_trait::async_trait]
 impl PromptRenderable for BehaviorFeedbackArtifact {
-    async fn render_full<'a>(&'a self, _engine: &'a TemplateEngine) -> anyhow::Result<String> {
-        Ok(format!(
-            "<behavior_feedback>{}</behavior_feedback>",
-            self.message
-        ))
+    async fn render_full<'a>(
+        &'a self,
+        _engine: &'a TemplateEngine,
+    ) -> anyhow::Result<PromptFragment> {
+        Ok(format!("<behavior_feedback>{}</behavior_feedback>", self.message).into())
     }
 }
 
@@ -239,29 +242,33 @@ impl StreamingTool<NpcParseContext> for ThoughtTool {
     }
 }
 
-impl DefaultTurnOutput for NpcParseContext {
-    fn drain_default_turn_update(&mut self) -> DefaultTurnUpdate {
-        if self.speech_started() {
-            DefaultTurnUpdate {
-                flow: TurnFlow::Wait,
-                artifacts: Vec::new(),
-                task: None,
-            }
-        } else {
-            DefaultTurnUpdate {
-                flow: TurnFlow::Continue,
-                artifacts: vec![
-                    DecisionErrorArtifact::new(DecisionError::MissingRequiredTag {
-                        tag: "speak",
-                        purpose: "speech",
-                    })
-                    .into_turn_artifact(),
-                ],
-                task: Some(
-                    "Your previous response did not start speech. Return valid Hermes XML with a <speak> tag."
-                        .to_owned(),
-                ),
-            }
+struct TestTurnUpdate {
+    flow: TurnFlow,
+    artifacts: Vec<TurnArtifact>,
+    task: Option<String>,
+}
+
+fn drain_npc_turn_update(ctx: &mut NpcParseContext) -> TestTurnUpdate {
+    if ctx.speech_started() {
+        TestTurnUpdate {
+            flow: TurnFlow::Wait,
+            artifacts: Vec::new(),
+            task: None,
+        }
+    } else {
+        TestTurnUpdate {
+            flow: TurnFlow::Continue,
+            artifacts: vec![
+                DecisionErrorArtifact::new(DecisionError::MissingRequiredTag {
+                    tag: "speak",
+                    purpose: "speech",
+                })
+                .into_turn_artifact(),
+            ],
+            task: Some(
+                "Your previous response did not start speech. Return valid Hermes XML with a <speak> tag."
+                    .to_owned(),
+            ),
         }
     }
 }
@@ -291,7 +298,7 @@ async fn decision_function_returns_retry_artifact_when_required_tool_missing() {
     let mut ctx = NpcParseContext::new();
     let engine = TemplateEngine::new();
 
-    let update = ctx.drain_default_turn_update();
+    let update = drain_npc_turn_update(&mut ctx);
 
     assert_eq!(update.flow, TurnFlow::Continue);
     assert_eq!(
@@ -303,7 +310,11 @@ async fn decision_function_returns_retry_artifact_when_required_tool_missing() {
     assert_eq!(update.artifacts.len(), 1);
     assert_eq!(update.artifacts[0].kind, "parser_error");
     assert_eq!(
-        update.artifacts[0].render_full(&engine).await.unwrap(),
+        update.artifacts[0]
+            .render_full(&engine)
+            .await
+            .unwrap()
+            .into_string(),
         "<parser_error>Expected a <speak> tag to start speech.</parser_error>"
     );
 }
@@ -311,7 +322,7 @@ async fn decision_function_returns_retry_artifact_when_required_tool_missing() {
 #[tokio::test]
 async fn sleep_feedback_uses_behavior_feedback_kind_for_next_awake() {
     let engine = TemplateEngine::new();
-    let update = DefaultTurnUpdate {
+    let update = TestTurnUpdate {
         flow: TurnFlow::Wait,
         artifacts: vec![
             BehaviorFeedbackArtifact::new("Use <thought> before <speak> next time.")
@@ -328,7 +339,11 @@ async fn sleep_feedback_uses_behavior_feedback_kind_for_next_awake() {
     assert_eq!(update.artifacts.len(), 1);
     assert_eq!(update.artifacts[0].kind, "behavior_feedback");
     assert_eq!(
-        update.artifacts[0].render_full(&engine).await.unwrap(),
+        update.artifacts[0]
+            .render_full(&engine)
+            .await
+            .unwrap()
+            .into_string(),
         "<behavior_feedback>Use <thought> before <speak> next time.</behavior_feedback>"
     );
 }
@@ -348,11 +363,19 @@ async fn tool_checks_parse_context_before_committing_side_effect() {
     assert_eq!(ctx.artifacts[0].kind, "parser_error");
     assert_eq!(ctx.artifacts[1].kind, "parser_error");
     assert_eq!(
-        ctx.artifacts[0].render_full(&engine).await.unwrap(),
+        ctx.artifacts[0]
+            .render_full(&engine)
+            .await
+            .unwrap()
+            .into_string(),
         "<parser_error><speak> invalid content: speech content cannot be empty</parser_error>"
     );
     assert_eq!(
-        ctx.artifacts[1].render_full(&engine).await.unwrap(),
+        ctx.artifacts[1]
+            .render_full(&engine)
+            .await
+            .unwrap()
+            .into_string(),
         "<parser_error><speak> rejected: duplicate speech tag</parser_error>"
     );
 }
@@ -371,7 +394,7 @@ async fn invalid_attribute_becomes_parser_error_artifact() {
     assert_eq!(ctx.artifacts.len(), 1);
     assert_eq!(ctx.artifacts[0].kind, "parser_error");
     assert_eq!(
-        ctx.artifacts[0].render_full(&engine).await.unwrap(),
+        ctx.artifacts[0].render_full(&engine).await.unwrap().into_string(),
         "<parser_error><update_relationship> invalid attribute `trust_delta`: expected integer</parser_error>"
     );
 }
@@ -392,7 +415,11 @@ async fn execution_error_becomes_parser_error_and_stream_continues() {
     assert_eq!(ctx.completed, vec!["still speaks"]);
     assert_eq!(ctx.artifacts.len(), 1);
     assert_eq!(
-        ctx.artifacts[0].render_full(&engine).await.unwrap(),
+        ctx.artifacts[0]
+            .render_full(&engine)
+            .await
+            .unwrap()
+            .into_string(),
         "<parser_error><emit_event> execution failed: event channel closed</parser_error>"
     );
 }
@@ -416,11 +443,15 @@ async fn multiple_tool_errors_accumulate_without_short_circuiting() {
     assert_eq!(ctx.completed, vec!["ok"]);
     assert_eq!(ctx.artifacts.len(), 2);
     assert_eq!(
-        ctx.artifacts[0].render_full(&engine).await.unwrap(),
+        ctx.artifacts[0].render_full(&engine).await.unwrap().into_string(),
         "<parser_error><update_relationship> invalid attribute `trust_delta`: missing trust delta</parser_error>"
     );
     assert_eq!(
-        ctx.artifacts[1].render_full(&engine).await.unwrap(),
+        ctx.artifacts[1]
+            .render_full(&engine)
+            .await
+            .unwrap()
+            .into_string(),
         "<parser_error><emit_event> execution failed: event channel closed</parser_error>"
     );
 }
@@ -442,7 +473,7 @@ async fn thought_after_speech_is_feedback_but_does_not_rollback_speech() {
     assert_eq!(ctx.artifacts.len(), 1);
     assert_eq!(ctx.artifacts[0].kind, "parser_error");
     assert_eq!(
-        ctx.artifacts[0].render_full(&engine).await.unwrap(),
+        ctx.artifacts[0].render_full(&engine).await.unwrap().into_string(),
         "<parser_error><thought> appeared after <speak>. Put private reasoning before visible speech next time.</parser_error>"
     );
 }

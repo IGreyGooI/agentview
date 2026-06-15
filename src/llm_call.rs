@@ -60,24 +60,36 @@ pub struct AgentTurnRequest<I = Turn> {
 #[derive(Debug, Clone)]
 pub struct ExecutorCommit<I = Turn> {
     pub append: Vec<I>,
+    pub observed_assistant_text: Option<StorageString>,
 }
 
 impl<I> ExecutorCommit<I> {
     pub fn new(append: impl IntoIterator<Item = I>) -> Self {
         Self {
             append: append.into_iter().collect(),
+            observed_assistant_text: None,
         }
     }
 
     pub fn empty() -> Self {
-        Self { append: Vec::new() }
+        Self {
+            append: Vec::new(),
+            observed_assistant_text: None,
+        }
+    }
+
+    pub fn with_observed_assistant_text(mut self, text: impl Into<StorageString>) -> Self {
+        self.observed_assistant_text = Some(text.into());
+        self
     }
 }
 
 impl ExecutorCommit<Turn> {
     pub fn text(text: impl Into<StorageString>) -> Self {
+        let text = text.into();
         Self {
-            append: vec![Turn::assistant(text)],
+            append: vec![Turn::assistant(text.clone())],
+            observed_assistant_text: Some(text),
         }
     }
 }
@@ -95,6 +107,9 @@ pub enum TextTurnEvent {
 
 #[derive(Debug, Clone)]
 pub enum AgentTurnEvent {
+    TurnStarted {
+        call_id: StorageString,
+    },
     SystemPromptRendered {
         call_id: StorageString,
         text: String,
@@ -107,6 +122,13 @@ pub enum AgentTurnEvent {
         call_id: StorageString,
         text: String,
     },
+    TurnCommitted {
+        call_id: StorageString,
+    },
+    TurnFlowDecided {
+        call_id: StorageString,
+        flow: AgentTurnFlow,
+    },
     Failed {
         call_id: StorageString,
         error: String,
@@ -118,6 +140,12 @@ pub enum AgentTurnEvent {
         call_id: StorageString,
         item: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTurnFlow {
+    Wait,
+    Continue,
 }
 
 #[async_trait::async_trait]
@@ -242,6 +270,84 @@ impl TurnSink<TextTurnEvent> for HermesParser {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::Mutex;
+
+    #[derive(Clone)]
+    struct StaticExecutor;
+
+    #[async_trait::async_trait]
+    impl LLMExecutor for StaticExecutor {
+        async fn execute_llm<S>(
+            &self,
+            _request: AgentTurnRequest,
+            _sink: &mut S,
+            _side_sinks: &mut Vec<Box<dyn TurnSink<Output = ()>>>,
+        ) -> anyhow::Result<ExecutorCommit>
+        where
+            S: TurnSink + Send,
+        {
+            Ok(ExecutorCommit::text("assistant response"))
+        }
+    }
+
+    struct RecordingObserver {
+        events: Mutex<Vec<AgentTurnEvent>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnObserver for RecordingObserver {
+        async fn on_agent_turn_event(&self, event: AgentTurnEvent) {
+            self.events.lock().await.push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn text_executor_commit_emits_assistant_completed() {
+        let observer = Arc::new(RecordingObserver {
+            events: Mutex::new(Vec::new()),
+        });
+        let request = AgentTurnRequest {
+            call_id: "call".into(),
+            system: "system".to_owned(),
+            history: Vec::new(),
+            user: "user".to_owned(),
+            model: "model".into(),
+            max_tokens: 16,
+        };
+
+        AgentTurn::new(StaticExecutor, request)
+            .with_observers([observer.clone() as AgentTurnObserverHandle])
+            .execute()
+            .await
+            .unwrap();
+
+        let events = observer.events.lock().await;
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentTurnEvent::TurnStarted { call_id } if call_id.as_ref() == "call"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentTurnEvent::UserPromptRendered { call_id, text }
+                    if call_id.as_ref() == "call" && text == "user"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentTurnEvent::AssistantCompleted { call_id, text }
+                    if call_id.as_ref() == "call" && text == "assistant response"
+            )
+        }));
+    }
+}
+
 /// A pending agent turn created by an application runtime.
 ///
 /// `T: TurnTransform` controls how both sides of the exchange are committed to
@@ -331,6 +437,14 @@ where
 
         notify_observers(
             &self.observers,
+            AgentTurnEvent::TurnStarted {
+                call_id: call_id.clone(),
+            },
+        )
+        .await;
+
+        notify_observers(
+            &self.observers,
             AgentTurnEvent::UserPromptRendered {
                 call_id: call_id.clone(),
                 text: self.request.user.clone(),
@@ -358,6 +472,17 @@ where
                 return Err(e);
             }
         };
+
+        if let Some(text) = executor_commit.observed_assistant_text.as_ref() {
+            notify_observers(
+                &self.observers,
+                AgentTurnEvent::AssistantCompleted {
+                    call_id: call_id.clone(),
+                    text: text.to_string(),
+                },
+            )
+            .await;
+        }
 
         for sink in self.side_sinks.drain(..) {
             sink.finish().await;

@@ -42,6 +42,76 @@ pub struct TemplateEngine {
     inner: Arc<RwLock<minijinja::Environment<'static>>>,
 }
 
+/// Rendered prompt text with room for non-provider metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptFragment {
+    text: String,
+    meta: PromptFragmentMeta,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptFragmentMeta {
+    pub memo: Option<String>,
+    pub indent_depth: usize,
+    pub attrs: Vec<(String, String)>,
+}
+
+impl PromptFragment {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            meta: PromptFragmentMeta::default(),
+        }
+    }
+
+    pub fn with_memo(mut self, memo: impl Into<String>) -> Self {
+        self.meta.memo = Some(memo.into());
+        self
+    }
+
+    pub fn with_indent_depth(mut self, indent_depth: usize) -> Self {
+        self.meta.indent_depth = indent_depth;
+        self
+    }
+
+    pub fn with_attr(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.meta.attrs.push((key.into(), value.into()));
+        self
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub fn memo(&self) -> Option<&str> {
+        self.meta.memo.as_deref()
+    }
+
+    pub fn indent_depth(&self) -> usize {
+        self.meta.indent_depth
+    }
+
+    pub fn meta(&self) -> &PromptFragmentMeta {
+        &self.meta
+    }
+
+    pub fn into_string(self) -> String {
+        self.text
+    }
+}
+
+impl From<String> for PromptFragment {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<&str> for PromptFragment {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
 // ── Prompt layout primitives ─────────────────────────────────────────────────
 
 /// Ephemeral information for one LLM turn that is not part of persistent context.
@@ -132,12 +202,12 @@ impl TemplateEngine {
 /// context views, leaf views, and future turn artifacts.
 #[async_trait::async_trait]
 pub trait PromptRenderable: Send + Sync {
-    async fn render_full<'a>(&'a self, templates: &'a TemplateEngine) -> Result<String>;
+    async fn render_full<'a>(&'a self, templates: &'a TemplateEngine) -> Result<PromptFragment>;
 }
 
 #[async_trait::async_trait]
 impl PromptRenderable for TurnArtifact {
-    async fn render_full<'a>(&'a self, templates: &'a TemplateEngine) -> Result<String> {
+    async fn render_full<'a>(&'a self, templates: &'a TemplateEngine) -> Result<PromptFragment> {
         self.payload.render_full(templates).await
     }
 }
@@ -152,7 +222,7 @@ pub trait ContextView: PromptRenderable + Sized {
         &'a self,
         prev: &'a Self,
         templates: &'a TemplateEngine,
-    ) -> Result<Option<String>>;
+    ) -> Result<Option<PromptFragment>>;
 }
 
 /// Builds a fresh root context view from an application-specific source/runtime.
