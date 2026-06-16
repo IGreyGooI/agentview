@@ -35,6 +35,7 @@ pub mod prompt_context;
 pub mod stream_parser;
 pub mod streaming_tool;
 pub mod templates;
+pub mod view_awake;
 
 pub type StorageString = ecow::EcoString;
 
@@ -58,5 +59,6 @@ pub mod prelude {
         ContextBlockKind, ContextView, ContextViewBuilder, PromptFragment, PromptLayout,
         PromptRenderable, PromptSystemVars, TemplateEngine, TurnArtifact,
     };
+    pub use crate::view_awake::{ViewAwake, ViewAwakeHandle, ViewAwakeSubscription, ViewEpoch};
     pub use crate::StorageString;
 }
