@@ -212,6 +212,13 @@ impl PromptRenderable for TurnArtifact {
     }
 }
 
+#[async_trait::async_trait]
+impl PromptRenderable for String {
+    async fn render_full<'a>(&'a self, _templates: &'a TemplateEngine) -> Result<PromptFragment> {
+        Ok(self.clone().into())
+    }
+}
+
 /// Renderable semantic context view.
 #[async_trait::async_trait]
 pub trait ContextView: PromptRenderable + Sized {
@@ -225,6 +232,21 @@ pub trait ContextView: PromptRenderable + Sized {
     ) -> Result<Option<PromptFragment>>;
 }
 
+#[async_trait::async_trait]
+impl ContextView for String {
+    async fn render_delta<'a>(
+        &'a self,
+        prev: &'a Self,
+        _templates: &'a TemplateEngine,
+    ) -> Result<Option<PromptFragment>> {
+        if self == prev {
+            Ok(None)
+        } else {
+            Ok(Some(self.clone().into()))
+        }
+    }
+}
+
 /// Builds a fresh root context view from an application-specific source/runtime.
 ///
 /// Scope/identity belongs on the builder, not on generic [`crate::agent::Agent`].
@@ -234,4 +256,47 @@ pub trait ContextViewBuilder: Send + Sync {
     type View: ContextView;
 
     async fn capture(&self, source: &Self::Source) -> Self::View;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContextView, PromptRenderable, TemplateEngine};
+
+    #[tokio::test]
+    async fn string_prompt_renders_as_plain_text() {
+        let fragment = "hello world"
+            .to_owned()
+            .render_full(&TemplateEngine::new())
+            .await
+            .unwrap();
+
+        assert_eq!(fragment.as_str(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn string_context_delta_is_empty_when_unchanged() {
+        let current = "hello".to_owned();
+        let previous = "hello".to_owned();
+
+        let delta = current
+            .render_delta(&previous, &TemplateEngine::new())
+            .await
+            .unwrap();
+
+        assert!(delta.is_none());
+    }
+
+    #[tokio::test]
+    async fn string_context_delta_renders_new_text_when_changed() {
+        let current = "hello world".to_owned();
+        let previous = "hello".to_owned();
+
+        let delta = current
+            .render_delta(&previous, &TemplateEngine::new())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(delta.as_str(), "hello world");
+    }
 }

@@ -21,6 +21,7 @@ async-trait = "0.1"
 futures = "0.3"
 thiserror = "2"
 nom = "8"
+chess = "3.2"
 
 [dev-dependencies]
 rig-core = "0.35"

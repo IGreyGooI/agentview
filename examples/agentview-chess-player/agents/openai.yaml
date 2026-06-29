@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentView Chess Player"
+  short_description: "Play AgentView chess via CLI loop"
+  default_prompt: "Use $agentview-chess-player to play the AgentView chess example through the CLI loop."
