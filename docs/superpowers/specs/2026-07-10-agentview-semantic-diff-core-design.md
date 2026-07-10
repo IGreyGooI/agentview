@@ -6,6 +6,7 @@ Make diffing a property of the rendered semantic view tree rather than custom
 behavior implemented by each Rust value type. The user-facing model remains:
 
 - `AgentView` renders a complete semantic view.
+- every `AgentView` root is the implicit first diff slot.
 - `#[view(diff)]` marks a field boundary that may be expanded in a delta.
 - collection diff arguments select the comparison algorithm for that field.
 
@@ -51,6 +52,9 @@ independently addressable node:
 `diff(replace)` and collection modes also imply node rendering and follow the
 same validation. Conflicting rendering modes remain compile errors rather than
 depending on attribute order.
+
+`#[agent_view(diff)]` remains unsupported because it would only repeat the
+default: an `AgentView` root always participates in diffing.
 
 ## Full Semantic Tree
 
@@ -107,7 +111,18 @@ not methods on the Rust value type.
 ## Generic Diff
 
 `render_agent_view_diff_xml` renders current and previous values completely,
-then compares their semantic fragments.
+then compares their semantic fragments. It treats the root as an implicit
+recursive diff slot even though the root is not stored inside a parent
+`SemanticNode`.
+
+Root behavior is therefore always enabled:
+
+- equal roots produce no patch;
+- a change to unmarked root content replaces the complete current root;
+- if unmarked root content is equal, changes may expand through the root's
+  marked diff slots and produce a root delta;
+- scalar and other non-node roots compare as complete values and are replaced
+  when changed.
 
 For a node:
 
@@ -189,6 +204,9 @@ extension mechanisms.
 
 The implementation is accepted when tests cover:
 
+- root diffing without any type-level annotation;
+- an unmarked root field change replacing the complete root;
+- a marked child-only change producing a root delta;
 - compile failures for every incompatible `diff` field mode;
 - `#[view(diff)]` and `#[view(element, diff)]` producing identical nodes;
 - scalar, structured, and optional recursive field diffs;
