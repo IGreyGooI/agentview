@@ -33,6 +33,7 @@ pub mod agent;
 pub mod control;
 pub mod llm_call;
 pub mod prompt_context;
+mod semantic_diff;
 pub mod stream_parser;
 pub mod streaming_tool;
 pub mod templates;

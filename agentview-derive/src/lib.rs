@@ -74,9 +74,6 @@ fn expand_agent_view(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
     };
 
     let mut field_renderers = Vec::new();
-    let mut non_diff_root_checks = Vec::new();
-    let mut non_diff_field_checks = Vec::new();
-    let mut diff_field_renderers = Vec::new();
     for field in fields.named {
         let field_ident = field.ident.expect("named field");
         let field_name = field_ident.to_string();
@@ -138,131 +135,46 @@ fn expand_agent_view(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
                 "collection diff modes are only supported on Vec fields",
             ));
         }
-        let current_field = if options.diff && matches!(options.mode, FieldMode::Default) {
-            render_diff_field_expr(quote! { self }, &field_ident, rendered_field_name)
-        } else {
-            render_field_expr(
-                quote! { self },
-                &field_ident,
-                rendered_field_name,
-                options.mode,
-            )
-        };
-        field_renderers.push(quote! {
-            node.push_field(#current_field);
-        });
-
+        let current_field = render_field_expr(
+            quote! { self },
+            &field_ident,
+            rendered_field_name,
+            options.mode,
+        );
         if options.diff {
-            let field_diff = if options.replace {
-                quote! {
-                    ::agentview::semantic_view::render_replace_field_diff(
-                        &self.#field_ident,
-                        #rendered_field_name,
-                        &previous.#field_ident,
-                    )
-                }
+            let strategy = if options.replace {
+                quote! { ::agentview::semantic_view::SemanticDiffStrategy::Replace }
             } else {
                 match &options.collection_diff_mode {
                     Some(CollectionDiffMode::Append) => {
-                        quote! {
-                            ::agentview::semantic_view::render_vec_append_field_diff(
-                                &self.#field_ident,
-                                #rendered_field_name,
-                                &previous.#field_ident,
-                            )
-                        }
+                        quote! { ::agentview::semantic_view::SemanticDiffStrategy::Append }
                     }
                     Some(CollectionDiffMode::Set) => {
-                        quote! {
-                            ::agentview::semantic_view::render_vec_set_field_diff(
-                                &self.#field_ident,
-                                #rendered_field_name,
-                                &previous.#field_ident,
-                            )
-                        }
+                        quote! { ::agentview::semantic_view::SemanticDiffStrategy::Set }
                     }
                     Some(CollectionDiffMode::Seq) => {
-                        quote! {
-                            ::agentview::semantic_view::render_vec_seq_field_diff(
-                                &self.#field_ident,
-                                #rendered_field_name,
-                                &previous.#field_ident,
-                            )
-                        }
+                        quote! { ::agentview::semantic_view::SemanticDiffStrategy::Sequence }
                     }
                     Some(CollectionDiffMode::Keyed(key_attr)) => {
                         quote! {
-                            ::agentview::semantic_view::render_vec_keyed_field_diff(
-                                &self.#field_ident,
-                                #rendered_field_name,
-                                &previous.#field_ident,
-                                #key_attr,
-                            )
+                            ::agentview::semantic_view::SemanticDiffStrategy::Keyed(#key_attr)
                         }
                     }
                     None => {
-                        quote! {
-                            ::agentview::semantic_view::AgentView::render_field_diff(
-                                &self.#field_ident,
-                                #rendered_field_name,
-                                &previous.#field_ident,
-                            )
-                        }
+                        quote! { ::agentview::semantic_view::SemanticDiffStrategy::Recursive }
                     }
                 }
             };
-            diff_field_renderers.push(quote! {
-                if let Some(field) = #field_diff {
-                    node.push_field(field);
-                    changed = true;
-                }
+            field_renderers.push(quote! {
+                node.push_diff_field(
+                    #rendered_field_name,
+                    #strategy,
+                    #current_field,
+                );
             });
         } else {
-            let current_field = render_field_expr(
-                quote! { self },
-                &field_ident,
-                rendered_field_name,
-                options.mode,
-            );
-            let previous_field = render_field_expr(
-                quote! { previous },
-                &field_ident,
-                rendered_field_name,
-                options.mode,
-            );
-            non_diff_root_checks.push(quote! {
-                {
-                    let current_field = #current_field;
-                    let previous_field = #previous_field;
-                    if current_field != previous_field {
-                        return Some(::agentview::semantic_view::AgentView::render_root(self));
-                    }
-                }
-            });
-
-            let current_field = render_field_expr(
-                quote! { self },
-                &field_ident,
-                rendered_field_name,
-                options.mode,
-            );
-            let previous_field = render_field_expr(
-                quote! { previous },
-                &field_ident,
-                rendered_field_name,
-                options.mode,
-            );
-            non_diff_field_checks.push(quote! {
-                {
-                    let current_field = #current_field;
-                    let previous_field = #previous_field;
-                    if current_field != previous_field {
-                        return Some(::agentview::semantic_view::AgentView::render_field(
-                            self,
-                            field_name,
-                        ));
-                    }
-                }
+            field_renderers.push(quote! {
+                node.push_field(#current_field);
             });
         }
     }
@@ -289,42 +201,6 @@ fn expand_agent_view(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
                 )
             }
 
-            fn render_diff(&self, previous: &Self) -> ::std::option::Option<::agentview::semantic_view::SemanticFragment> {
-                #(#non_diff_root_checks)*
-
-                let mut node = ::agentview::semantic_view::SemanticNode::new(#kind);
-                node.push_attr("rendering_mode", "delta");
-                let mut changed = false;
-                #(#diff_field_renderers)*
-
-                if changed {
-                    Some(::agentview::semantic_view::SemanticFragment::Node(node))
-                } else {
-                    None
-                }
-            }
-
-            fn render_field_diff(
-                &self,
-                field_name: &'static str,
-                previous: &Self,
-            ) -> ::std::option::Option<::agentview::semantic_view::SemanticField> {
-                #(#non_diff_field_checks)*
-
-                let mut node = ::agentview::semantic_view::SemanticNode::new(field_name);
-                node.push_attr("rendering_mode", "delta");
-                node.push_attr("kind", #kind);
-                let mut changed = false;
-                #(#diff_field_renderers)*
-
-                if changed {
-                    Some(::agentview::semantic_view::SemanticField::Fragment(
-                        ::agentview::semantic_view::SemanticFragment::Node(node)
-                    ))
-                } else {
-                    None
-                }
-            }
         }
 
         impl #impl_generics ::agentview::semantic_view::AgentViewRoot for #ident #ty_generics #where_clause {}
@@ -564,19 +440,6 @@ fn render_field_expr(
                 ::agentview::semantic_view::render_children_field(&#receiver.#field_ident)
             }
         }
-    }
-}
-
-fn render_diff_field_expr(
-    receiver: proc_macro2::TokenStream,
-    field_ident: &syn::Ident,
-    field_name: &str,
-) -> proc_macro2::TokenStream {
-    quote! {
-        ::agentview::semantic_view::AgentView::render_diff_field(
-            &#receiver.#field_ident,
-            #field_name,
-        )
     }
 }
 

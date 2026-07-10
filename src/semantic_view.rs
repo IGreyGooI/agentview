@@ -61,32 +61,6 @@ pub trait AgentView {
     fn render_children(&self) -> Vec<SemanticFragment> {
         vec![self.render_root()]
     }
-
-    fn render_diff_field(&self, field_name: &'static str) -> SemanticField {
-        changed_field_patch(field_name, self.render_field(field_name))
-    }
-
-    fn render_diff(&self, previous: &Self) -> Option<SemanticFragment> {
-        let current = self.render_root();
-        if current == previous.render_root() {
-            None
-        } else {
-            Some(current)
-        }
-    }
-
-    fn render_field_diff(
-        &self,
-        field_name: &'static str,
-        previous: &Self,
-    ) -> Option<SemanticField> {
-        let current = self.render_field(field_name);
-        if current == previous.render_field(field_name) {
-            None
-        } else {
-            Some(changed_field_patch(field_name, current))
-        }
-    }
 }
 
 pub trait AgentViewRoot: AgentView {}
@@ -168,22 +142,6 @@ where
             None => Vec::new(),
         }
     }
-
-    fn render_field_diff(
-        &self,
-        field_name: &'static str,
-        previous: &Self,
-    ) -> Option<SemanticField> {
-        match (self, previous) {
-            (Some(current), Some(previous)) => current.render_field_diff(field_name, previous),
-            (Some(_), None) => Some(changed_field_patch(
-                field_name,
-                self.render_field(field_name),
-            )),
-            (None, Some(_)) => Some(none_field_patch(field_name)),
-            (None, None) => None,
-        }
-    }
 }
 
 impl<T> AgentView for Vec<T>
@@ -216,43 +174,6 @@ where
 
     fn render_field(&self, field_name: &'static str) -> SemanticField {
         SemanticField::Fragment(SemanticFragment::Node(render_map_node(field_name, self)))
-    }
-
-    fn render_field_diff(
-        &self,
-        field_name: &'static str,
-        previous: &Self,
-    ) -> Option<SemanticField> {
-        let mut node = SemanticNode::new(field_name);
-        node.push_attr("rendering_mode", "delta");
-
-        for (key, value) in self {
-            if !previous.contains_key(key) {
-                node.push_child(operation_node("insert", render_map_entry(key, value)));
-            }
-        }
-
-        for (key, value) in previous {
-            if !self.contains_key(key) {
-                node.push_child(operation_node("remove", render_map_entry(key, value)));
-            }
-        }
-
-        for (key, value) in self {
-            if let Some(previous_value) = previous.get(key) {
-                let current_entry = render_map_entry(key, value);
-                let previous_entry = render_map_entry(key, previous_value);
-                if current_entry != previous_entry {
-                    node.push_child(operation_node("update", current_entry));
-                }
-            }
-        }
-
-        if !node.has_rendered_children() {
-            None
-        } else {
-            Some(SemanticField::Fragment(SemanticFragment::Node(node)))
-        }
     }
 }
 
@@ -304,10 +225,7 @@ impl SemanticNode {
         strategy: SemanticDiffStrategy,
         field: SemanticField,
     ) {
-        let value = match field {
-            SemanticField::Empty => None,
-            field => Some(SemanticFragment::Node(field_as_node(field_name, field))),
-        };
+        let value = field_as_optional_fragment(field_name, field);
         self.children
             .push(SemanticChild::DiffSlot(SemanticDiffSlot {
                 field_name,
@@ -370,6 +288,10 @@ impl SemanticNode {
     pub(crate) fn identity(&self) -> Option<&SemanticFragment> {
         self.identity.as_deref()
     }
+
+    fn set_identity(&mut self, identity: Option<SemanticFragment>) {
+        self.identity = identity.map(Box::new);
+    }
 }
 
 pub fn render_agent_view_xml(view: &impl AgentView) -> String {
@@ -380,7 +302,8 @@ pub fn render_agent_view_diff_xml<T>(view: &T, previous: &T) -> Option<String>
 where
     T: AgentView,
 {
-    AgentView::render_diff(view, previous).map(|fragment| render_fragment(&fragment, 0))
+    crate::semantic_diff::diff_agent_views(view, previous)
+        .map(|fragment| render_semantic_fragment_xml(&fragment))
 }
 
 pub fn render_semantic_fragment_xml(fragment: &SemanticFragment) -> String {
@@ -399,187 +322,9 @@ pub fn render_children_field(value: &impl AgentView) -> SemanticField {
     SemanticField::Fragments(value.render_children())
 }
 
-pub fn render_vec_append_field_diff<T>(
-    current: &[T],
-    field_name: &'static str,
-    previous: &[T],
-) -> Option<SemanticField>
-where
-    T: AgentView,
-{
-    if current.len() < previous.len() {
-        return Some(SemanticField::Fragment(SemanticFragment::Node(
-            render_list_node(field_name, current),
-        )));
-    }
-
-    for (current_item, previous_item) in current.iter().zip(previous.iter()) {
-        if current_item.render_root() != previous_item.render_root() {
-            return Some(SemanticField::Fragment(SemanticFragment::Node(
-                render_list_node(field_name, current),
-            )));
-        }
-    }
-
-    if current.len() == previous.len() {
-        return None;
-    }
-
-    let mut node = SemanticNode::new(field_name);
-    node.push_attr("rendering_mode", "delta");
-    for item in &current[previous.len()..] {
-        node.push_child(operation_node(
-            "insert",
-            fragment_as_node(item.render_root()),
-        ));
-    }
-    Some(SemanticField::Fragment(SemanticFragment::Node(node)))
-}
-
-pub fn render_vec_set_field_diff<T>(
-    current: &[T],
-    field_name: &'static str,
-    previous: &[T],
-) -> Option<SemanticField>
-where
-    T: AgentView,
-{
-    let current_nodes = render_vec_nodes(current);
-    let previous_nodes = render_vec_nodes(previous);
-    let mut node = SemanticNode::new(field_name);
-    node.push_attr("rendering_mode", "delta");
-
-    for current_node in &current_nodes {
-        if !previous_nodes.contains(current_node) {
-            node.push_child(operation_node("insert", current_node.clone()));
-        }
-    }
-
-    for previous_node in &previous_nodes {
-        if !current_nodes.contains(previous_node) {
-            node.push_child(operation_node("remove", previous_node.clone()));
-        }
-    }
-
-    delta_or_none(node)
-}
-
-pub fn render_vec_seq_field_diff<T>(
-    current: &[T],
-    field_name: &'static str,
-    previous: &[T],
-) -> Option<SemanticField>
-where
-    T: AgentView,
-{
-    let current_nodes = render_vec_nodes(current);
-    let previous_nodes = render_vec_nodes(previous);
-    let common_prefix_len = current_nodes
-        .iter()
-        .zip(previous_nodes.iter())
-        .take_while(|(current_node, previous_node)| current_node == previous_node)
-        .count();
-    let min_len = current_nodes.len().min(previous_nodes.len());
-    if common_prefix_len < min_len {
-        return full_list_field_diff(current, field_name, previous);
-    }
-
-    let mut node = SemanticNode::new(field_name);
-    node.push_attr("rendering_mode", "delta");
-
-    for current_node in &current_nodes[common_prefix_len..] {
-        node.push_child(operation_node("insert", current_node.clone()));
-    }
-    for previous_node in &previous_nodes[common_prefix_len..] {
-        node.push_child(operation_node("remove", previous_node.clone()));
-    }
-
-    delta_or_none(node)
-}
-
-pub fn render_vec_keyed_field_diff<T>(
-    current: &[T],
-    field_name: &'static str,
-    previous: &[T],
-    key_attr: &'static str,
-) -> Option<SemanticField>
-where
-    T: AgentView,
-{
-    let Some(current_nodes) = keyed_vec_nodes(current, key_attr) else {
-        return full_list_field_diff(current, field_name, previous);
-    };
-    let Some(previous_nodes) = keyed_vec_nodes(previous, key_attr) else {
-        return full_list_field_diff(current, field_name, previous);
-    };
-
-    let mut node = SemanticNode::new(field_name);
-    node.push_attr("rendering_mode", "delta");
-
-    for (key, current_node) in &current_nodes {
-        if !previous_nodes.contains_key(key) {
-            node.push_child(operation_node("insert", current_node.clone()));
-        }
-    }
-
-    for (key, previous_node) in &previous_nodes {
-        if !current_nodes.contains_key(key) {
-            node.push_child(operation_node("remove", previous_node.clone()));
-        }
-    }
-
-    for (key, current_node) in &current_nodes {
-        if let Some(previous_node) = previous_nodes.get(key) {
-            if current_node != previous_node {
-                node.push_child(operation_node("update", current_node.clone()));
-            }
-        }
-    }
-
-    delta_or_none(node)
-}
-
-pub fn render_replace_field_diff<T>(
-    current: &T,
-    field_name: &'static str,
-    previous: &T,
-) -> Option<SemanticField>
-where
-    T: AgentView,
-{
-    let current_field = current.render_field(field_name);
-    if current_field == previous.render_field(field_name) {
-        return None;
-    }
-
-    let replacement = field_as_node(field_name, changed_field_patch(field_name, current_field));
-    let mut node = SemanticNode::new(field_name);
-    node.push_attr("rendering_mode", "delta");
-    node.push_child(operation_node("replace", replacement));
-    Some(SemanticField::Fragment(SemanticFragment::Node(node)))
-}
-
-fn full_list_field_diff<T>(
-    current: &[T],
-    field_name: &'static str,
-    previous: &[T],
-) -> Option<SemanticField>
-where
-    T: AgentView,
-{
-    let current_node = render_list_node(field_name, current);
-    if current_node == render_list_node(field_name, previous) {
-        None
-    } else {
-        Some(SemanticField::Fragment(SemanticFragment::Node(
-            current_node,
-        )))
-    }
-}
-
 fn field_as_node(field_name: &'static str, field: SemanticField) -> SemanticNode {
     match field {
-        SemanticField::Empty => none_field_node(field_name),
+        SemanticField::Empty => unreachable!("empty fields do not have a semantic fragment"),
         SemanticField::Attr { name, value } => SemanticNode::element(name, value),
         SemanticField::Fragment(SemanticFragment::Node(node)) => node,
         SemanticField::Fragment(SemanticFragment::Text(text)) => {
@@ -600,36 +345,13 @@ fn field_as_node(field_name: &'static str, field: SemanticField) -> SemanticNode
     }
 }
 
-fn render_vec_nodes<T>(items: &[T]) -> Vec<SemanticNode>
-where
-    T: AgentView,
-{
-    items
-        .iter()
-        .map(|item| fragment_as_node(item.render_root()))
-        .collect()
-}
-
-fn keyed_vec_nodes<T>(items: &[T], key_attr: &str) -> Option<BTreeMap<String, SemanticNode>>
-where
-    T: AgentView,
-{
-    let mut nodes = BTreeMap::new();
-    for item in items {
-        let node = fragment_as_node(item.render_root());
-        let key = node.attr(key_attr)?.to_owned();
-        if nodes.insert(key, node).is_some() {
-            return None;
-        }
-    }
-    Some(nodes)
-}
-
-fn delta_or_none(node: SemanticNode) -> Option<SemanticField> {
-    if !node.has_rendered_children() {
-        None
-    } else {
-        Some(SemanticField::Fragment(SemanticFragment::Node(node)))
+fn field_as_optional_fragment(
+    field_name: &'static str,
+    field: SemanticField,
+) -> Option<SemanticFragment> {
+    match field {
+        SemanticField::Empty => None,
+        field => Some(SemanticFragment::Node(field_as_node(field_name, field))),
     }
 }
 
@@ -662,6 +384,7 @@ where
     V: AgentView,
 {
     let mut node = SemanticNode::new(tag);
+    node.intrinsic_diff_strategy = Some(IntrinsicDiffStrategy::Map);
     for (key, value) in entries {
         node.push_child(render_map_entry(key, value));
     }
@@ -674,15 +397,11 @@ where
     V: AgentView,
 {
     let mut entry = SemanticNode::new("entry");
-    entry.push_field(key.render_field("key"));
+    let key_field = key.render_field("key");
+    entry.set_identity(field_as_optional_fragment("key", key_field.clone()));
+    entry.push_field(key_field);
     entry.push_field(value.render_field("value"));
     entry
-}
-
-fn operation_node(tag: &'static str, child: SemanticNode) -> SemanticNode {
-    let mut node = SemanticNode::new(tag);
-    node.push_child(child);
-    node
 }
 
 fn fragment_as_node(fragment: SemanticFragment) -> SemanticNode {
@@ -695,43 +414,6 @@ fn fragment_as_node(fragment: SemanticFragment) -> SemanticNode {
             node
         }
     }
-}
-
-fn changed_field_patch(field_name: &'static str, field: SemanticField) -> SemanticField {
-    match field {
-        SemanticField::Empty => SemanticField::Empty,
-        SemanticField::Attr { name, value } => {
-            SemanticField::Fragment(SemanticFragment::Node(SemanticNode::element(name, value)))
-        }
-        SemanticField::Fragment(SemanticFragment::Node(node)) => {
-            SemanticField::Fragment(SemanticFragment::Node(node))
-        }
-        SemanticField::Fragment(SemanticFragment::Text(text)) => SemanticField::Fragment(
-            SemanticFragment::Node(SemanticNode::element(field_name, text)),
-        ),
-        SemanticField::Fragment(SemanticFragment::Comment(comment)) => {
-            let mut node = SemanticNode::new(field_name);
-            node.push_comment(comment);
-            SemanticField::Fragment(SemanticFragment::Node(node))
-        }
-        SemanticField::Fragments(fragments) => {
-            let mut node = SemanticNode::new(field_name);
-            for fragment in fragments {
-                node.push_fragment(fragment);
-            }
-            SemanticField::Fragment(SemanticFragment::Node(node))
-        }
-    }
-}
-
-fn none_field_patch(field_name: &'static str) -> SemanticField {
-    SemanticField::Fragment(SemanticFragment::Node(none_field_node(field_name)))
-}
-
-fn none_field_node(field_name: &'static str) -> SemanticNode {
-    let mut node = SemanticNode::new(field_name);
-    node.push_child(SemanticNode::new("none"));
-    node
 }
 
 fn render_node(node: &SemanticNode, depth: usize) -> String {

@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use agentview::prelude::{render_agent_view_diff_xml, AgentView};
+use agentview::prelude::{
+    render_agent_view_diff_xml, AgentView, SemanticField, SemanticFragment, SemanticNode,
+};
 use serde_json::json;
 
 #[derive(AgentView)]
@@ -103,6 +105,34 @@ struct MaybeAliasView {
     alias: Option<String>,
 }
 
+struct DynamicField(Option<String>);
+
+impl AgentView for DynamicField {
+    fn render_root(&self) -> SemanticFragment {
+        self.0
+            .as_ref()
+            .map(|value| SemanticFragment::Text(value.clone()))
+            .unwrap_or_else(|| SemanticFragment::Node(SemanticNode::new("none")))
+    }
+
+    fn render_field(&self, field_name: &'static str) -> SemanticField {
+        self.0
+            .as_ref()
+            .map(|value| SemanticField::Attr {
+                name: field_name.to_owned(),
+                value: value.clone(),
+            })
+            .unwrap_or(SemanticField::Empty)
+    }
+}
+
+#[derive(AgentView)]
+#[agent_view(kind = "dynamic")]
+struct DynamicView {
+    #[view(diff)]
+    value: DynamicField,
+}
+
 #[derive(AgentView)]
 #[agent_view(kind = "prompt_state")]
 struct PromptStateView {
@@ -180,6 +210,69 @@ fn cast(actors: Vec<ActorView>) -> CastView {
         id: "cast.1".to_owned(),
         actors,
     }
+}
+
+#[test]
+fn scalar_root_is_an_implicit_diff_slot() {
+    assert_eq!(
+        render_agent_view_diff_xml(&"new".to_owned(), &"old".to_owned()),
+        Some("new".to_owned())
+    );
+    assert_eq!(
+        render_agent_view_diff_xml(&"same".to_owned(), &"same".to_owned()),
+        None
+    );
+}
+
+#[test]
+fn dynamic_diff_slots_handle_empty_complete_fields() {
+    assert_eq!(
+        render_agent_view_diff_xml(
+            &DynamicView {
+                value: DynamicField(None),
+            },
+            &DynamicView {
+                value: DynamicField(Some("present".to_owned())),
+            },
+        ),
+        Some(
+            r#"<dynamic rendering_mode="delta">
+  <value>
+    <none />
+  </value>
+</dynamic>"#
+                .to_owned()
+        )
+    );
+
+    assert_eq!(
+        render_agent_view_diff_xml(
+            &DynamicView {
+                value: DynamicField(None),
+            },
+            &DynamicView {
+                value: DynamicField(None),
+            },
+        ),
+        None
+    );
+
+    assert_eq!(
+        render_agent_view_diff_xml(
+            &DynamicView {
+                value: DynamicField(Some("present".to_owned())),
+            },
+            &DynamicView {
+                value: DynamicField(None),
+            },
+        ),
+        Some(
+            r#"<dynamic rendering_mode="delta">
+  <value>present</value>
+</dynamic>"#
+                .to_owned()
+        )
+    );
 }
 
 fn status_panel(status: &str, summary: &str) -> StatusPanelView {
