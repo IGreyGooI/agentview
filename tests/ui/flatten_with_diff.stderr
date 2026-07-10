@@ -1,0 +1,5 @@
+error: `diff` implies node rendering and cannot be combined with this field mode
+ --> tests/ui/flatten_with_diff.rs:6:5
+  |
+6 |     value: String,
+  |     ^^^^^

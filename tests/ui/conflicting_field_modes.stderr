@@ -1,0 +1,5 @@
+error: a field can have only one rendering mode
+ --> tests/ui/conflicting_field_modes.rs:5:18
+  |
+5 |     #[view(attr, element)]
+  |                  ^^^^^^^
