@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use agentview::prelude::{
     render_agent_view_diff_xml, AgentView, SemanticField, SemanticFragment, SemanticNode,
 };
+use agentview::semantic_view::SemanticDiffStrategy;
 use serde_json::json;
 
 #[derive(AgentView)]
@@ -133,6 +134,48 @@ struct DynamicView {
     value: DynamicField,
 }
 
+struct InterleavedChildrenView {
+    slot_first: bool,
+}
+
+impl InterleavedChildrenView {
+    fn render_node(&self, tag: &'static str) -> SemanticNode {
+        let mut node = SemanticNode::new(tag);
+        let push_slot = |node: &mut SemanticNode| {
+            node.push_diff_field(
+                "marked",
+                SemanticDiffStrategy::Recursive,
+                SemanticField::Attr {
+                    name: "marked".to_owned(),
+                    value: "same".to_owned(),
+                },
+            );
+        };
+        let push_fragment = |node: &mut SemanticNode| {
+            node.push_child(SemanticNode::element("ordinary", "same"));
+        };
+
+        if self.slot_first {
+            push_slot(&mut node);
+            push_fragment(&mut node);
+        } else {
+            push_fragment(&mut node);
+            push_slot(&mut node);
+        }
+        node
+    }
+}
+
+impl AgentView for InterleavedChildrenView {
+    fn render_root(&self) -> SemanticFragment {
+        SemanticFragment::Node(self.render_node("interleaved"))
+    }
+
+    fn render_field(&self, field_name: &'static str) -> SemanticField {
+        SemanticField::Fragment(SemanticFragment::Node(self.render_node(field_name)))
+    }
+}
+
 #[derive(AgentView)]
 #[agent_view(kind = "prompt_state")]
 struct PromptStateView {
@@ -221,6 +264,23 @@ fn scalar_root_is_an_implicit_diff_slot() {
     assert_eq!(
         render_agent_view_diff_xml(&"same".to_owned(), &"same".to_owned()),
         None
+    );
+}
+
+#[test]
+fn reordered_diff_slots_and_fragments_replace_complete_root() {
+    let previous = InterleavedChildrenView { slot_first: false };
+    let current = InterleavedChildrenView { slot_first: true };
+
+    assert_eq!(
+        render_agent_view_diff_xml(&current, &previous),
+        Some(
+            r#"<interleaved>
+  <marked>same</marked>
+  <ordinary>same</ordinary>
+</interleaved>"#
+                .to_owned()
+        )
     );
 }
 

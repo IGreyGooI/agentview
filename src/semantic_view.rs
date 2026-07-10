@@ -260,13 +260,6 @@ impl SemanticNode {
         &self.children
     }
 
-    pub(crate) fn ordinary_fragments(&self) -> impl Iterator<Item = &SemanticFragment> {
-        self.children.iter().filter_map(|child| match child {
-            SemanticChild::Fragment(fragment) => Some(fragment),
-            SemanticChild::DiffSlot(_) => None,
-        })
-    }
-
     pub(crate) fn diff_slots(&self) -> impl Iterator<Item = &SemanticDiffSlot> {
         self.children.iter().filter_map(|child| match child {
             SemanticChild::Fragment(_) => None,

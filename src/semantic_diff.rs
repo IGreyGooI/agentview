@@ -72,24 +72,23 @@ fn diff_node(current: &SemanticNode, previous: &SemanticNode) -> SemanticPatch {
 }
 
 fn same_unmarked_shape(current: &SemanticNode, previous: &SemanticNode) -> bool {
-    if current.tag() != previous.tag()
-        || current.attrs() != previous.attrs()
-        || current.intrinsic_diff_strategy() != previous.intrinsic_diff_strategy()
-        || !current
-            .ordinary_fragments()
-            .eq(previous.ordinary_fragments())
-    {
-        return false;
-    }
-
-    let current_slots = current.diff_slots().collect::<Vec<_>>();
-    let previous_slots = previous.diff_slots().collect::<Vec<_>>();
-    current_slots.len() == previous_slots.len()
-        && current_slots
+    current.tag() == previous.tag()
+        && current.attrs() == previous.attrs()
+        && current.intrinsic_diff_strategy() == previous.intrinsic_diff_strategy()
+        && current.children().len() == previous.children().len()
+        && current
+            .children()
             .iter()
-            .zip(previous_slots)
-            .all(|(current, previous)| {
-                current.field_name == previous.field_name && current.strategy == previous.strategy
+            .zip(previous.children())
+            .all(|(current, previous)| match (current, previous) {
+                (SemanticChild::Fragment(current), SemanticChild::Fragment(previous)) => {
+                    current == previous
+                }
+                (SemanticChild::DiffSlot(current), SemanticChild::DiffSlot(previous)) => {
+                    current.field_name == previous.field_name
+                        && current.strategy == previous.strategy
+                }
+                _ => false,
             })
 }
 
