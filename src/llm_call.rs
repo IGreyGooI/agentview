@@ -57,6 +57,50 @@ pub struct AgentTurnRequest<I = Turn> {
     pub max_tokens: u64,
 }
 
+/// Result of provider-specific context preparation before a model turn.
+#[derive(Debug, Clone)]
+pub enum ContextPreparation<I = Turn> {
+    /// Execute the prepared request as-is.
+    Ready(AgentTurnRequest<I>),
+    /// Replace committed history, optionally invalidate the rendered view baseline,
+    /// and prepare the same logical turn again.
+    ReplaceHistory { history: Vec<I>, reset_view: bool },
+}
+
+/// Replacement budget for preparing one logical model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextPreparationBudget {
+    replacements: usize,
+    max_replacements: usize,
+    committed_history_len: usize,
+}
+
+impl ContextPreparationBudget {
+    pub fn new(replacements: usize, max_replacements: usize, committed_history_len: usize) -> Self {
+        Self {
+            replacements,
+            max_replacements,
+            committed_history_len,
+        }
+    }
+
+    pub fn can_replace(self) -> bool {
+        self.replacements < self.max_replacements
+    }
+
+    pub fn max_replacements(self) -> usize {
+        self.max_replacements
+    }
+
+    /// Number of leading request-history items owned by durable history.
+    ///
+    /// Remaining items are the prompt context's working set and must not be
+    /// persisted by a context-history replacement.
+    pub fn committed_history_len(self) -> usize {
+        self.committed_history_len
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutorCommit<I = Turn> {
     pub append: Vec<I>,
@@ -157,6 +201,21 @@ pub type AgentTurnObserverHandle = Arc<dyn AgentTurnObserver>;
 
 #[async_trait::async_trait]
 pub trait LLMExecutor<I = Turn, E = TextTurnEvent>: Send + Sync {
+    /// Prepare provider context before executing a model turn.
+    ///
+    /// The default preserves existing executor behavior. Provider adapters may
+    /// request a history replacement for context compaction.
+    async fn prepare_context(
+        &self,
+        request: AgentTurnRequest<I>,
+        _budget: ContextPreparationBudget,
+    ) -> anyhow::Result<ContextPreparation<I>>
+    where
+        I: Send + 'static,
+    {
+        Ok(ContextPreparation::Ready(request))
+    }
+
     /// Execute one model turn and return the transcript items to append.
     ///
     /// Implementors may emit any application/provider event type `E` into the
@@ -345,6 +404,33 @@ mod tests {
                     if call_id.as_ref() == "call" && text == "assistant response"
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn executor_context_preparation_defaults_to_ready() {
+        let request = AgentTurnRequest {
+            call_id: "call".into(),
+            system: "system".to_owned(),
+            history: Vec::new(),
+            user: "user".to_owned(),
+            model: "model".into(),
+            max_tokens: 16,
+        };
+
+        let prepared = StaticExecutor
+            .prepare_context(request, ContextPreparationBudget::new(0, 3, 0))
+            .await
+            .unwrap();
+
+        match prepared {
+            ContextPreparation::Ready(request) => {
+                assert_eq!(request.call_id.as_ref(), "call");
+                assert_eq!(request.user, "user");
+            }
+            ContextPreparation::ReplaceHistory { .. } => {
+                panic!("default context preparation replaced history")
+            }
+        }
     }
 }
 

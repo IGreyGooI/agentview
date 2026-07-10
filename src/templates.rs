@@ -10,6 +10,8 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::semantic_view::{render_agent_view_diff_xml, render_agent_view_xml, AgentViewRoot};
+
 pub const AGENT_SYSTEM_LAYOUT_TEMPLATE: &str = "agent_system_layout";
 pub const AGENT_USER_LAYOUT_TEMPLATE: &str = "agent_user_layout";
 
@@ -220,6 +222,11 @@ impl PromptRenderable for String {
 }
 
 /// Renderable semantic context view.
+///
+/// Self-contained context is a root prompt-context invariant. Nested views may
+/// render stable handles to content introduced by sibling root sections or by
+/// earlier committed prompt context; they do not need to locally hydrate every
+/// reference they print.
 #[async_trait::async_trait]
 pub trait ContextView: PromptRenderable + Sized {
     /// Render only what changed since `prev` (warm path / subsequent calls).
@@ -230,6 +237,30 @@ pub trait ContextView: PromptRenderable + Sized {
         prev: &'a Self,
         templates: &'a TemplateEngine,
     ) -> Result<Option<PromptFragment>>;
+}
+
+#[async_trait::async_trait]
+impl<T> PromptRenderable for T
+where
+    T: AgentViewRoot + Send + Sync,
+{
+    async fn render_full<'a>(&'a self, _templates: &'a TemplateEngine) -> Result<PromptFragment> {
+        Ok(render_agent_view_xml(self).into())
+    }
+}
+
+#[async_trait::async_trait]
+impl<T> ContextView for T
+where
+    T: AgentViewRoot + Send + Sync,
+{
+    async fn render_delta<'a>(
+        &'a self,
+        prev: &'a Self,
+        _templates: &'a TemplateEngine,
+    ) -> Result<Option<PromptFragment>> {
+        Ok(render_agent_view_diff_xml(self, prev).map(Into::into))
+    }
 }
 
 #[async_trait::async_trait]
@@ -264,13 +295,13 @@ mod tests {
 
     #[tokio::test]
     async fn string_prompt_renders_as_plain_text() {
-        let fragment = "hello world"
+        let fragment = "hello <world>"
             .to_owned()
             .render_full(&TemplateEngine::new())
             .await
             .unwrap();
 
-        assert_eq!(fragment.as_str(), "hello world");
+        assert_eq!(fragment.as_str(), "hello <world>");
     }
 
     #[tokio::test]

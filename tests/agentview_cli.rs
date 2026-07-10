@@ -85,8 +85,24 @@ fn help_hides_internal_daemon_mode() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("observe"), "{stdout}");
     assert!(stdout.contains("act"), "{stdout}");
+    assert!(stdout.contains("AGENTVIEW_ADDR"), "{stdout}");
     assert!(!stdout.to_ascii_lowercase().contains("daemon"), "{stdout}");
     assert!(!stdout.contains("__agentview"), "{stdout}");
+}
+
+#[test]
+fn chess_act_help_describes_uci_and_context_flags() {
+    let addr = unused_loopback_addr();
+
+    let output = run_cli(&addr, &["chess", "act", "--help"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("agentview chess act"), "{stdout}");
+    assert!(stdout.contains("--uci <uci>"), "{stdout}");
+    assert!(stdout.contains("--piece <piece>"), "{stdout}");
+    assert!(stdout.contains("context flags"), "{stdout}");
+    assert!(stdout.contains("positional <uci>"), "{stdout}");
 }
 
 #[test]
@@ -98,7 +114,7 @@ fn observe_then_act_share_an_implicit_server_session() {
     assert!(observe.status.success(), "{observe:?}");
     let observe_stdout = String::from_utf8_lossy(&observe.stdout);
     assert!(observe_stdout.contains("observe epoch=0 turn=turn-1"));
-    assert!(observe_stdout.contains("view: Hello, stranger."));
+    assert!(observe_stdout.contains(r#"view: <hello greeting="Hello" />"#));
     assert!(observe_stdout.contains("prompt: Ask the caller for their name."));
 
     let act = run_cli(&addr, &["act", "world"]);
@@ -108,7 +124,9 @@ fn observe_then_act_share_an_implicit_server_session() {
     assert!(act.status.success(), "{act:?}");
     let act_stdout = String::from_utf8_lossy(&act.stdout);
     assert!(act_stdout.contains("update epoch=1 turn=turn-2"));
-    assert!(act_stdout.contains("view: Hello, world!"));
+    assert!(act_stdout.contains("view:\n<hello greeting=\"Hello\">"));
+    assert!(act_stdout.contains("  <name>world</name>"));
+    assert!(act_stdout.contains("</hello>"));
     assert!(act_stdout.contains("prompt: Say hello to the named caller."));
 }
 
@@ -122,8 +140,12 @@ fn chess_commands_share_an_implicit_server_session() {
     assert!(observe.status.success(), "{observe:?}");
     let observe_stdout = String::from_utf8_lossy(&observe.stdout);
     assert!(observe_stdout.contains("observe epoch=0 turn=turn-1"));
-    assert!(observe_stdout.contains("<prompt_board render_mode=\"full\">"));
+    assert!(observe_stdout.contains("<prompt_board>"));
+    assert!(!observe_stdout.contains("render_mode=\"full\""));
     assert!(!observe_stdout.contains("<rendering_mode"));
+    assert!(observe_stdout.contains("<board_state kind=\"board_state\">"));
+    assert!(observe_stdout.contains("<board_squares>"));
+    assert!(!observe_stdout.contains("<board_squares kind="));
     assert!(observe_stdout.contains(
         "<command>agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; --to &lt;to&gt; [--promotion &lt;promotion&gt;] --uci &lt;uci&gt;</command>"
     ));
@@ -140,32 +162,28 @@ fn chess_commands_share_an_implicit_server_session() {
     assert!(act.status.success(), "{act:?}");
     let act_stdout = String::from_utf8_lossy(&act.stdout);
     assert!(act_stdout.contains("act epoch=1 turn=turn-2"));
-    assert!(act_stdout.contains("<prompt_board render_mode=\"update\">"));
+    assert!(act_stdout.contains("<prompt_board rendering_mode=\"delta\">"));
     assert!(!act_stdout.contains("<prompt_board_update>"));
-    assert!(!act_stdout.contains("<rendering_mode"));
-    assert!(act_stdout.contains("<board_state>"));
-    assert!(act_stdout.contains("<board_state>\n    <replace>"));
-    assert!(!act_stdout.contains("<board_state>\n    <board_ascii>"));
-    assert!(act_stdout.contains("<board_squares>"));
-    assert!(act_stdout.contains("<board_squares>\n    <replace>"));
+    assert!(act_stdout.contains("<board_state rendering_mode=\"delta\">"));
+    assert!(act_stdout.contains("<board_squares rendering_mode=\"delta\">"));
+    assert!(act_stdout.contains("<update>"));
     assert!(act_stdout.contains("<square id=\"e2\" file=\"e\" rank=\"2\">.</square>"));
     assert!(act_stdout.contains("<square id=\"e4\" file=\"e\" rank=\"4\">P</square>"));
     assert!(!act_stdout.contains("<square id=\"a8\""));
     assert!(!act_stdout.contains("<rank n="));
     assert!(!act_stdout.contains("<changed_sections>"));
-    assert!(act_stdout.contains("<legal_moves>"));
-    assert!(act_stdout.contains("<added>"));
-    assert!(act_stdout.contains("<removed>"));
-    assert!(!act_stdout.contains("<legal_moves op="));
-    assert!(act_stdout.contains("<move_history>"));
-    assert!(!act_stdout.contains("<move_history op="));
+    assert!(act_stdout.contains("<legal_moves rendering_mode=\"delta\">"));
+    assert!(act_stdout.contains("<insert>"));
+    assert!(act_stdout.contains("<remove>"));
+    assert!(act_stdout.contains("<move_history rendering_mode=\"delta\">"));
     assert!(act_stdout.contains("<move>e2e4</move>"));
     assert!(act_stdout.contains("<move>e7e5</move>"));
-    assert!(act_stdout.contains("<engine>"));
+    assert!(act_stdout.contains("<engine rendering_mode=\"delta\">"));
     assert!(act_stdout.contains("<replace>"));
-    assert!(!act_stdout.contains("<engine op="));
-    assert!(!act_stdout.contains("op=\""));
     assert!(act_stdout.contains("<pending>true</pending>"));
+    assert!(!act_stdout.contains("render_mode="));
+    assert!(!act_stdout.contains("<added>"));
+    assert!(!act_stdout.contains("<removed>"));
 
     let hook = run_cli_with_env(&addr, &["chess", "hook", "1"], &envs);
 
@@ -174,31 +192,27 @@ fn chess_commands_share_an_implicit_server_session() {
     assert!(hook.status.success(), "{hook:?}");
     let hook_stdout = String::from_utf8_lossy(&hook.stdout);
     assert!(hook_stdout.contains("hook epoch=2 turn=turn-3"));
-    assert!(hook_stdout.contains("<prompt_board render_mode=\"update\">"));
+    assert!(hook_stdout.contains("<prompt_board rendering_mode=\"delta\">"));
     assert!(!hook_stdout.contains("<prompt_board_update>"));
-    assert!(!hook_stdout.contains("<rendering_mode"));
-    assert!(hook_stdout.contains("<board_state>"));
-    assert!(hook_stdout.contains("<board_state>\n    <replace>"));
-    assert!(!hook_stdout.contains("<board_state>\n    <board_ascii>"));
-    assert!(hook_stdout.contains("<board_squares>"));
-    assert!(hook_stdout.contains("<board_squares>\n    <replace>"));
+    assert!(hook_stdout.contains("<board_state rendering_mode=\"delta\">"));
+    assert!(hook_stdout.contains("<board_squares rendering_mode=\"delta\">"));
+    assert!(hook_stdout.contains("<update>"));
     assert!(hook_stdout.contains("<square id=\"e7\" file=\"e\" rank=\"7\">.</square>"));
     assert!(hook_stdout.contains("<square id=\"e5\" file=\"e\" rank=\"5\">p</square>"));
     assert!(!hook_stdout.contains("<square id=\"a8\""));
     assert!(!hook_stdout.contains("<rank n="));
     assert!(!hook_stdout.contains("<changed_sections>"));
-    assert!(hook_stdout.contains("<legal_moves>"));
-    assert!(hook_stdout.contains("<added>"));
-    assert!(hook_stdout.contains("<removed>"));
-    assert!(!hook_stdout.contains("<legal_moves op="));
-    assert!(hook_stdout.contains("<move_history>"));
-    assert!(!hook_stdout.contains("<move_history op="));
+    assert!(hook_stdout.contains("<legal_moves rendering_mode=\"delta\">"));
+    assert!(hook_stdout.contains("<insert>"));
+    assert!(hook_stdout.contains("<remove>"));
+    assert!(hook_stdout.contains("<move_history rendering_mode=\"delta\">"));
     assert!(hook_stdout.contains("<move>e7e5</move>"));
-    assert!(hook_stdout.contains("<engine>"));
+    assert!(hook_stdout.contains("<engine rendering_mode=\"delta\">"));
     assert!(hook_stdout.contains("<replace>"));
-    assert!(!hook_stdout.contains("<engine op="));
-    assert!(!hook_stdout.contains("op=\""));
     assert!(hook_stdout.contains("<pending>false</pending>"));
+    assert!(!hook_stdout.contains("render_mode="));
+    assert!(!hook_stdout.contains("<added>"));
+    assert!(!hook_stdout.contains("<removed>"));
 
     let _ = fs::remove_dir_all(dir);
 }

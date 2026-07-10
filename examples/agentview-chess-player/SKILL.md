@@ -30,7 +30,7 @@ Use a fresh `AGENTVIEW_ADDR` port per game/test so hidden daemon state does not 
 target/debug/agentview chess observe
 ```
 
-2. Read `<prompt_board render_mode="full">`, `<legal_moves>`, and `<chess_task>`. Choose exactly one legal UCI move from `<legal_moves>`.
+2. Read the full `<prompt_board>`, `<legal_moves>`, and `<chess_task>`. Choose exactly one legal UCI move from `<legal_moves>`.
 
 3. Act with context flags plus the canonical UCI move:
 
@@ -44,7 +44,7 @@ For promotion, include the promotion flag before `--uci`:
 target/debug/agentview chess act --piece P --from e7 --to e8 --promotion q --uci e7e8q
 ```
 
-4. Read the `act epoch=N` response. If `<engine><pending>true</pending>` appears, wait for the engine reply:
+4. Read the `act epoch=N` response. If the engine field contains `<pending>true</pending>`, wait for the engine reply:
 
 ```bash
 target/debug/agentview chess hook N
@@ -60,11 +60,12 @@ target/debug/agentview --__agentview-shutdown
 
 ## Reading Updates
 
-The first observe is a full render. Later `act` and `hook` responses usually contain `<prompt_board render_mode="update">` with only changed sections.
+The first observe is a full `<prompt_board>` render. Later `act` and `hook` responses usually contain `<prompt_board rendering_mode="delta">` with only the fields that changed.
 
 - Maintain the current position from the last full snapshot plus updates.
-- For `<board_squares>`, changed squares are inside `<replace>`; unchanged squares are omitted.
-- For list sections such as `<legal_moves>` or `<move_history>`, apply `<added>` and `<removed>` entries to the prior list.
+- Apply `<replace>` by replacing the named field with the value inside it.
+- Apply list `<insert>` and `<remove>` operations to the prior list.
+- Apply keyed `<update>` operations by replacing the item with the same stable attribute. Board squares use `id`; their text is the current piece symbol, and `.` means empty.
 - When `<pending>true</pending>`, do not make another White move. Call `hook` with the latest epoch.
 - When `<pending>false</pending>` and the prompt asks for White's next move, pick the next legal move.
 

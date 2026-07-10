@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use agentview::prelude::*;
 use chess_support::{
-    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessTurnPrompt,
-    ChessView, ChessViewModel, StockfishEngine,
+    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessTaskView, ChessView,
+    ChessViewModel, StockfishEngine,
 };
 use serde_json::json;
 
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn print_chess_full_snapshot(
     event: &str,
-    snapshot: &ViewSnapshot<ChessView, ChessTurnPrompt>,
+    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
     templates: &TemplateEngine,
 ) -> anyhow::Result<()> {
     println!(
@@ -86,7 +86,7 @@ async fn print_chess_full_snapshot(
 
 async fn print_chess_update(
     event: &str,
-    snapshot: &ViewSnapshot<ChessView, ChessTurnPrompt>,
+    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
     previous_view: &ChessView,
     templates: &TemplateEngine,
 ) -> anyhow::Result<()> {
@@ -94,14 +94,9 @@ async fn print_chess_update(
         "{event} epoch={} turn={}",
         snapshot.view_epoch, snapshot.turn_id
     );
-    println!(
-        "view:\n{}",
-        snapshot
-            .view
-            .render_update_since(previous_view, templates)
-            .await?
-            .as_str()
-    );
+    if let Some(view) = snapshot.view.render_delta(previous_view, templates).await? {
+        println!("view:\n{}", view.as_str());
+    }
     println!(
         "prompt:\n{}",
         snapshot.turn_prompt.render_full(templates).await?.as_str()

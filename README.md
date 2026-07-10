@@ -16,6 +16,12 @@ use agentview::prelude::*;
 
 Your app exposes state through a `ContextViewBuilder`. `agentview` renders that state into prompts, runs one model-backed turn through your executor, and commits successful results back into durable context.
 
+The important boundary is the root prompt context, not every nested view
+fragment. A root view should render enough information for the agent to
+understand the current turn, while nested fragments may use stable handles for
+things already rendered elsewhere in the root view or in earlier committed
+turns.
+
 The main pieces are:
 
 - `Agent`: long-lived session state
@@ -122,6 +128,7 @@ Read [examples/agent_streaming_tool_loop.rs](/home/greygoo/runtime/agentview/exa
 
 Useful source files:
 
+- [docs/semantic-agent-view.md](/home/greygoo/runtime/agentview/docs/semantic-agent-view.md)
 - [src/lib.rs](/home/greygoo/runtime/agentview/src/lib.rs)
 - [src/agent.rs](/home/greygoo/runtime/agentview/src/agent.rs)
 - [src/llm_call.rs](/home/greygoo/runtime/agentview/src/llm_call.rs)

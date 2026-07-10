@@ -34,6 +34,7 @@ pub mod control;
 pub mod llm_call;
 pub mod prompt_context;
 mod semantic_diff;
+pub mod semantic_view;
 pub mod stream_parser;
 pub mod streaming_tool;
 pub mod templates;
@@ -43,6 +44,8 @@ pub mod view_state;
 
 pub type StorageString = ecow::EcoString;
 
+pub use agentview_derive::AgentView;
+
 /// Common imports for building an agent-facing ViewModel runtime.
 pub mod prelude {
     pub use crate::agent::{
@@ -51,10 +54,16 @@ pub mod prelude {
     pub use crate::control::ControlReply;
     pub use crate::llm_call::{
         AgentTurnEvent, AgentTurnObserver, AgentTurnObserverHandle, AgentTurnOutcome,
-        AgentTurnRequest, ExecutorCommit, LLMExecutor, NoopTurnSink, TextTurnEvent, TurnSink,
+        AgentTurnRequest, ContextPreparation, ContextPreparationBudget, ExecutorCommit,
+        LLMExecutor, NoopTurnSink, TextTurnEvent, TurnSink,
     };
     pub use crate::prompt_context::{
         AgentTurnError, IdentityTransform, PromptContext, Role, Turn, TurnTransform,
+    };
+    pub use crate::semantic_view::{
+        render_agent_view_diff_xml, render_agent_view_xml, render_semantic_fragment_xml,
+        render_semantic_node_xml, AgentView, AgentViewCollect, AgentViewRoot, SemanticField,
+        SemanticFragment, SemanticNode,
     };
     pub use crate::stream_parser::{HermesParser, XmlElement};
     pub use crate::streaming_tool::{
@@ -68,4 +77,5 @@ pub mod prelude {
     pub use crate::view_session::{AgentViewSession, AgentViewSessionError};
     pub use crate::view_state::{ViewPatch, ViewSnapshot, ViewTurnId, ViewUpdate, ViewUpdateBody};
     pub use crate::StorageString;
+    pub use agentview_derive::AgentView;
 }

@@ -14,19 +14,28 @@ struct HelloState {
     name: Option<String>,
 }
 
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(kind = "hello")]
+struct HelloView {
+    greeting: String,
+
+    #[view(diff)]
+    name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct HelloViewBuilder;
 
 #[async_trait::async_trait]
 impl ContextViewBuilder for HelloViewBuilder {
     type Source = Arc<Mutex<HelloState>>;
-    type View = String;
+    type View = HelloView;
 
     async fn capture(&self, source: &Self::Source) -> Self::View {
         let state = source.lock().unwrap();
-        match &state.name {
-            Some(name) => format!("{}, {}!", state.greeting, name),
-            None => format!("{}, stranger.", state.greeting),
+        HelloView {
+            greeting: state.greeting.clone(),
+            name: state.name.clone(),
         }
     }
 }
@@ -93,7 +102,14 @@ async fn main() -> anyhow::Result<()> {
         "observe epoch={} turn={}",
         snapshot.view_epoch, snapshot.turn_id
     );
-    println!("view: {}", snapshot.view);
+    println!(
+        "view: {}",
+        snapshot
+            .view
+            .render_full(&TemplateEngine::new())
+            .await?
+            .as_str()
+    );
     println!("prompt: {}", snapshot.turn_prompt.task);
 
     let update = session
@@ -116,7 +132,13 @@ async fn main() -> anyhow::Result<()> {
         .snapshot()
         .ok_or_else(|| anyhow::anyhow!("hello world example expected a full update"))?;
     println!("update epoch={} turn={}", next.view_epoch, next.turn_id);
-    println!("view: {}", next.view);
+    println!(
+        "view: {}",
+        next.view
+            .render_full(&TemplateEngine::new())
+            .await?
+            .as_str()
+    );
     println!("prompt: {}", next.turn_prompt.task);
 
     Ok(())

@@ -124,6 +124,99 @@ pub struct ChessSquareView {
     pub piece: Option<ChessPieceView>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "square")]
+struct ChessSquarePromptView {
+    id: String,
+    file: char,
+    rank: u8,
+
+    #[view(text)]
+    piece: char,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "board_state")]
+struct ChessBoardStatePromptView {
+    #[view(element)]
+    board_ascii: String,
+
+    #[view(element)]
+    fen: String,
+
+    #[view(element)]
+    side_to_move: String,
+
+    #[view(element)]
+    status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "move")]
+struct ChessMovePromptView {
+    #[view(text)]
+    uci: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "engine")]
+struct ChessEnginePromptView {
+    #[view(element)]
+    pending: bool,
+
+    #[view(flatten)]
+    last_move: Option<ChessLastMovePromptView>,
+
+    #[view(flatten)]
+    last_error: Option<ChessLastErrorPromptView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "last_move")]
+struct ChessLastMovePromptView {
+    #[view(text)]
+    uci: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "last_error")]
+struct ChessLastErrorPromptView {
+    #[view(text)]
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "instruction")]
+struct ChessInstructionPromptView {
+    #[view(text)]
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "reasoning_policy")]
+struct ChessReasoningPolicyPromptView {
+    #[view(flatten)]
+    instructions: Vec<ChessInstructionPromptView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "reply_contract")]
+struct ChessReplyContractPromptView {
+    transport: String,
+
+    #[view(element)]
+    command: String,
+
+    #[view(element)]
+    example: String,
+
+    #[view(element)]
+    promotion_example: String,
+
+    #[view(element)]
+    instruction: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChessRankView {
     pub rank: u8,
@@ -157,295 +250,275 @@ impl ChessBoardView {
     }
 }
 
-/// Full chess VM snapshot for an outside chat/CLI/daemon/skill caller.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChessView {
-    pub board: ChessBoardView,
-    pub fen: String,
-    pub side_to_move: ChessSide,
-    pub legal_uci_moves: Vec<String>,
-    pub move_history: Vec<String>,
-    pub engine_pending: bool,
-    pub last_engine_move: Option<String>,
-    pub last_error: Option<String>,
-    pub status: String,
-}
-
-#[derive(Serialize)]
-struct ChessViewTemplateVars<'a> {
-    board: &'a ChessBoardView,
-    board_ascii_lines: Vec<String>,
-    fen: &'a str,
-    side_to_move: &'static str,
-    legal_uci_moves: &'a [String],
-    move_history: &'a [String],
-    engine_pending: bool,
-    last_engine_move: Option<&'a str>,
-    last_error: Option<&'a str>,
-    status: &'a str,
-}
-
-#[derive(Serialize)]
-struct ChessViewUpdateTemplateVars<'a> {
-    changed_squares: Vec<&'a ChessSquareView>,
-    board_state_changed: bool,
-    board_ascii_lines: Vec<String>,
-    fen: &'a str,
-    side_to_move: &'static str,
-    status: &'a str,
-    legal_moves_added: Vec<String>,
-    legal_moves_removed: Vec<String>,
-    move_history_added: Vec<String>,
-    move_history_removed: Vec<String>,
-    engine_changed: bool,
-    engine_pending: bool,
-    last_engine_move: Option<&'a str>,
-    last_error: Option<&'a str>,
-}
-
-const CHESS_VIEW_TEMPLATE: &str = r#"<prompt_board render_mode="full">
-  <board_state>
-    <board_ascii>
-{% for line in board_ascii_lines %}      {{ line }}
-{% endfor %}    </board_ascii>
-    <fen>{{ fen }}</fen>
-    <side_to_move>{{ side_to_move }}</side_to_move>
-    <status>{{ status }}</status>
-  </board_state>
-  <board_squares>
-{% for rank in board.ranks %}    <rank n="{{ rank.rank }}">
-{% for square in rank.squares %}      <square id="{{ square.square }}" file="{{ square.file }}" rank="{{ square.rank }}">{% if square.piece %}{{ square.piece.symbol }}{% else %}.{% endif %}</square>
-{% endfor %}    </rank>
-{% endfor %}  </board_squares>
-  <legal_moves>
-{% for uci in legal_uci_moves %}    <move>{{ uci }}</move>
-{% endfor %}  </legal_moves>
-  <move_history>
-{% for uci in move_history %}    <move>{{ uci }}</move>
-{% endfor %}  </move_history>
-  <engine>
-    <pending>{{ engine_pending }}</pending>
-{% if last_engine_move %}    <last_move>{{ last_engine_move }}</last_move>
-{% endif %}{% if last_error %}    <last_error>{{ last_error }}</last_error>
-{% endif %}  </engine>
-</prompt_board>"#;
-
-const CHESS_VIEW_UPDATE_TEMPLATE: &str = r#"<prompt_board render_mode="update">
-{% if board_state_changed %}  <board_state>
-    <replace>
-      <board_ascii>
-{% for line in board_ascii_lines %}        {{ line }}
-{% endfor %}      </board_ascii>
-      <fen>{{ fen }}</fen>
-      <side_to_move>{{ side_to_move }}</side_to_move>
-      <status>{{ status }}</status>
-    </replace>
-  </board_state>
-{% endif %}{% if changed_squares %}  <board_squares>
-    <replace>
-{% for square in changed_squares %}      <square id="{{ square.square }}" file="{{ square.file }}" rank="{{ square.rank }}">{% if square.piece %}{{ square.piece.symbol }}{% else %}.{% endif %}</square>
-{% endfor %}    </replace>
-  </board_squares>
-{% endif %}{% if legal_moves_added or legal_moves_removed %}  <legal_moves>
-{% if legal_moves_added %}    <added>
-{% for uci in legal_moves_added %}      <move>{{ uci }}</move>
-{% endfor %}    </added>
-{% endif %}{% if legal_moves_removed %}    <removed>
-{% for uci in legal_moves_removed %}      <move>{{ uci }}</move>
-{% endfor %}    </removed>
-{% endif %}  </legal_moves>
-{% endif %}{% if move_history_added or move_history_removed %}  <move_history>
-{% if move_history_added %}    <added>
-{% for uci in move_history_added %}      <move>{{ uci }}</move>
-{% endfor %}    </added>
-{% endif %}{% if move_history_removed %}    <removed>
-{% for uci in move_history_removed %}      <move>{{ uci }}</move>
-{% endfor %}    </removed>
-{% endif %}  </move_history>
-{% endif %}{% if engine_changed %}  <engine>
-    <replace>
-      <pending>{{ engine_pending }}</pending>
-{% if last_engine_move %}      <last_move>{{ last_engine_move }}</last_move>
-{% endif %}{% if last_error %}      <last_error>{{ last_error }}</last_error>
-{% endif %}    </replace>
-  </engine>
-{% endif %}
-</prompt_board>"#;
-
-impl ChessView {
-    pub async fn render_update_since<'a>(
-        &'a self,
-        prev: &'a Self,
-        templates: &'a TemplateEngine,
-    ) -> anyhow::Result<PromptFragment> {
-        let (move_history_added, move_history_removed) =
-            ordered_list_delta(&prev.move_history, &self.move_history);
-
-        let vars = ChessViewUpdateTemplateVars {
-            changed_squares: changed_squares(&prev.board, &self.board),
-            board_state_changed: self.board != prev.board
-                || self.fen != prev.fen
-                || self.side_to_move != prev.side_to_move
-                || self.status != prev.status,
-            board_ascii_lines: self
-                .board
-                .ascii_diagram()
-                .lines()
-                .map(str::to_owned)
-                .collect(),
-            fen: &self.fen,
-            side_to_move: self.side_to_move.as_str(),
-            status: &self.status,
-            legal_moves_added: list_added(&prev.legal_uci_moves, &self.legal_uci_moves),
-            legal_moves_removed: list_removed(&prev.legal_uci_moves, &self.legal_uci_moves),
-            move_history_added,
-            move_history_removed,
-            engine_changed: self.engine_pending != prev.engine_pending
-                || self.last_engine_move != prev.last_engine_move
-                || self.last_error != prev.last_error,
-            engine_pending: self.engine_pending,
-            last_engine_move: self.last_engine_move.as_deref(),
-            last_error: self.last_error.as_deref(),
-        };
-
-        Ok(templates
-            .render_template(
-                "chess_view_update",
-                CHESS_VIEW_UPDATE_TEMPLATE,
-                minijinja::Value::from_serialize(&vars),
-            )?
-            .into())
-    }
-}
-
-fn list_added(prev: &[String], next: &[String]) -> Vec<String> {
-    next.iter()
-        .filter(|item| !prev.contains(item))
-        .cloned()
-        .collect()
-}
-
-fn list_removed(prev: &[String], next: &[String]) -> Vec<String> {
-    prev.iter()
-        .filter(|item| !next.contains(item))
-        .cloned()
-        .collect()
-}
-
-fn ordered_list_delta(prev: &[String], next: &[String]) -> (Vec<String>, Vec<String>) {
-    if next.starts_with(prev) {
-        (next[prev.len()..].to_vec(), Vec::new())
-    } else if prev.starts_with(next) {
-        (Vec::new(), prev[next.len()..].to_vec())
-    } else {
-        (next.to_vec(), prev.to_vec())
-    }
-}
-
-fn changed_squares<'a>(
-    prev: &'a ChessBoardView,
-    next: &'a ChessBoardView,
-) -> Vec<&'a ChessSquareView> {
-    prev.ranks
-        .iter()
-        .flat_map(|rank| rank.squares.iter())
-        .zip(next.ranks.iter().flat_map(|rank| rank.squares.iter()))
-        .filter_map(|(prev_square, next_square)| {
-            (prev_square != next_square).then_some(next_square)
-        })
-        .collect()
-}
-
-#[async_trait::async_trait]
-impl PromptRenderable for ChessView {
-    async fn render_full<'a>(
-        &'a self,
-        templates: &'a TemplateEngine,
-    ) -> anyhow::Result<PromptFragment> {
-        let vars = ChessViewTemplateVars {
-            board: &self.board,
-            board_ascii_lines: self
-                .board
-                .ascii_diagram()
-                .lines()
-                .map(str::to_owned)
-                .collect(),
-            fen: &self.fen,
-            side_to_move: self.side_to_move.as_str(),
-            legal_uci_moves: &self.legal_uci_moves,
-            move_history: &self.move_history,
-            engine_pending: self.engine_pending,
-            last_engine_move: self.last_engine_move.as_deref(),
-            last_error: self.last_error.as_deref(),
-            status: &self.status,
-        };
-
-        Ok(templates
-            .render_template(
-                "chess_view_full",
-                CHESS_VIEW_TEMPLATE,
-                minijinja::Value::from_serialize(&vars),
-            )?
-            .into())
-    }
-}
-
-#[async_trait::async_trait]
-impl ContextView for ChessView {
-    async fn render_delta<'a>(
-        &'a self,
-        prev: &'a Self,
-        templates: &'a TemplateEngine,
-    ) -> anyhow::Result<Option<PromptFragment>> {
-        if self == prev {
-            Ok(None)
-        } else {
-            self.render_update_since(prev, templates).await.map(Some)
+impl AgentViewCollect<ChessSquareView> for ChessSquarePromptView {
+    fn collect(square: &ChessSquareView) -> Self {
+        Self {
+            id: square.square.clone(),
+            file: square.file,
+            rank: square.rank,
+            piece: square
+                .piece
+                .as_ref()
+                .map(|piece| piece.symbol)
+                .unwrap_or('.'),
         }
     }
 }
 
-/// Prompt/contract for the next chess move.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChessTurnPrompt {
+struct ChessBoardStateSource<'a> {
+    board: &'a ChessBoardView,
+    fen: &'a str,
+    side_to_move: ChessSide,
+    status: &'a str,
+}
+
+impl AgentViewCollect<ChessBoardStateSource<'_>> for ChessBoardStatePromptView {
+    fn collect(source: &ChessBoardStateSource<'_>) -> Self {
+        Self {
+            board_ascii: source.board.ascii_diagram(),
+            fen: source.fen.to_owned(),
+            side_to_move: source.side_to_move.as_str().to_owned(),
+            status: source.status.to_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
+fn render_chess_board_state_xml(view: &ChessView) -> String {
+    render_agent_view_xml(&view.board_state)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn render_board_state_xml_for_test(view: &ChessView) -> String {
+    render_chess_board_state_xml(view)
+}
+
+fn chess_move_prompt_view(uci: &str) -> ChessMovePromptView {
+    ChessMovePromptView {
+        uci: uci.to_owned(),
+    }
+}
+
+fn chess_move_prompt_views(moves: &[String]) -> Vec<ChessMovePromptView> {
+    moves
+        .iter()
+        .map(|uci| chess_move_prompt_view(uci))
+        .collect()
+}
+
+fn chess_last_move_prompt_view(uci: &str) -> ChessLastMovePromptView {
+    ChessLastMovePromptView {
+        uci: uci.to_owned(),
+    }
+}
+
+fn chess_last_error_prompt_view(message: &str) -> ChessLastErrorPromptView {
+    ChessLastErrorPromptView {
+        message: message.to_owned(),
+    }
+}
+
+impl AgentViewCollect<ChessGameState> for ChessView {
+    fn collect(state: &ChessGameState) -> Self {
+        let board = board_view(&state.board);
+        let fen = state.board.to_string();
+        let side_to_move = side_view(state.board.side_to_move());
+        let legal_uci_moves = state.legal_uci_moves();
+        let status = board_status_name(state.board.status()).to_owned();
+
+        Self {
+            board_state: ChessBoardStatePromptView::collect(&ChessBoardStateSource {
+                board: &board,
+                fen: &fen,
+                side_to_move,
+                status: &status,
+            }),
+            board_squares: board
+                .ranks
+                .iter()
+                .flat_map(|rank| rank.squares.iter())
+                .map(ChessSquarePromptView::collect)
+                .collect(),
+            legal_moves: chess_move_prompt_views(&legal_uci_moves),
+            move_history_view: chess_move_prompt_views(&state.move_history),
+            engine: ChessEnginePromptView {
+                pending: state.engine_pending,
+                last_move: state
+                    .last_engine_move
+                    .as_deref()
+                    .map(chess_last_move_prompt_view),
+                last_error: state
+                    .last_error
+                    .as_deref()
+                    .map(chess_last_error_prompt_view),
+            },
+        }
+    }
+}
+
+fn chess_instruction_prompt_view(text: &str) -> ChessInstructionPromptView {
+    ChessInstructionPromptView {
+        text: text.to_owned(),
+    }
+}
+
+fn chess_reasoning_policy_prompt_view() -> ChessReasoningPolicyPromptView {
+    ChessReasoningPolicyPromptView {
+        instructions: vec![
+            chess_instruction_prompt_view("Think privately about candidate moves before acting."),
+            chess_instruction_prompt_view(
+                "Do not print chain-of-thought; call the CLI only after deciding.",
+            ),
+        ],
+    }
+}
+
+fn chess_reply_contract_prompt_view() -> ChessReplyContractPromptView {
+    ChessReplyContractPromptView {
+        transport: "cli".to_owned(),
+        command: "agentview chess act --piece <piece> --from <from> --to <to> [--promotion <promotion>] --uci <uci>".to_owned(),
+        example: "agentview chess act --piece P --from e2 --to e4 --uci e2e4".to_owned(),
+        promotion_example: "agentview chess act --piece P --from e7 --to e8 --promotion q --uci e7e8q".to_owned(),
+        instruction:
+            "Choose one legal UCI move from the current view, include the move context flags first, then pass the canonical UCI move with --uci."
+                .to_owned(),
+    }
+}
+
+/// Full chess VM snapshot for an outside chat/CLI/daemon/skill caller.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "prompt_board")]
+pub struct ChessView {
+    #[view(diff(replace))]
+    board_state: ChessBoardStatePromptView,
+
+    #[view(diff(key = "id"))]
+    board_squares: Vec<ChessSquarePromptView>,
+
+    #[view(diff(set))]
+    legal_moves: Vec<ChessMovePromptView>,
+
+    #[view(name = "move_history", diff(seq))]
+    move_history_view: Vec<ChessMovePromptView>,
+
+    #[view(diff(replace))]
+    engine: ChessEnginePromptView,
+}
+
+impl ChessView {
+    #[allow(dead_code)]
+    pub fn side_to_move(&self) -> &str {
+        &self.board_state.side_to_move
+    }
+
+    #[allow(dead_code)]
+    pub fn legal_uci_moves(&self) -> Vec<&str> {
+        self.legal_moves
+            .iter()
+            .map(|move_view| move_view.uci.as_str())
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn move_history(&self) -> Vec<&str> {
+        self.move_history_view
+            .iter()
+            .map(|move_view| move_view.uci.as_str())
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn engine_pending(&self) -> bool {
+        self.engine.pending
+    }
+
+    #[allow(dead_code)]
+    pub fn last_engine_move(&self) -> Option<&str> {
+        self.engine
+            .last_move
+            .as_ref()
+            .map(|move_view| move_view.uci.as_str())
+    }
+
+    #[allow(dead_code)]
+    pub fn last_error(&self) -> Option<&str> {
+        self.engine
+            .last_error
+            .as_ref()
+            .map(|error| error.message.as_str())
+    }
+
+    #[cfg(test)]
+    fn square_for_test(
+        &self,
+        rank_index: usize,
+        square_index: usize,
+    ) -> Option<&ChessSquarePromptView> {
+        let index = rank_index
+            .checked_mul(ALL_FILES.len())?
+            .checked_add(square_index)?;
+        self.board_squares.get(index)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn rank_for_test(&self, rank_index: usize) -> Option<u8> {
+        self.square_for_test(rank_index, 0)
+            .map(|square| square.rank)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn square_id_for_test(&self, rank_index: usize, square_index: usize) -> Option<&str> {
+        self.square_for_test(rank_index, square_index)
+            .map(|square| square.id.as_str())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn piece_symbol_for_test(&self, rank_index: usize, square_index: usize) -> Option<char> {
+        self.square_for_test(rank_index, square_index)
+            .map(|square| square.piece)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn render_square_xml_for_test(
+        &self,
+        rank_index: usize,
+        square_index: usize,
+    ) -> Option<String> {
+        let square = self.square_for_test(rank_index, square_index)?;
+        Some(render_agent_view_xml(square))
+    }
+}
+
+/// Agent-facing task/contract for the next chess move.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, AgentView)]
+#[agent_view(kind = "chess_task")]
+pub struct ChessTaskView {
+    #[view(element)]
     pub task: String,
+
+    #[view(skip)]
     pub reply_schema: serde_json::Value,
+
+    #[view(flatten)]
+    reasoning_policy: ChessReasoningPolicyPromptView,
+
+    #[view(flatten)]
+    reply_contract: ChessReplyContractPromptView,
 }
 
-#[derive(Serialize)]
-struct ChessTurnPromptTemplateVars<'a> {
-    task: &'a str,
-}
-
-const CHESS_TURN_PROMPT_TEMPLATE: &str = r#"<chess_task>
-  <task>{{ task }}</task>
-  <reasoning_policy>
-    <instruction>Think privately about candidate moves before acting.</instruction>
-    <instruction>Do not print chain-of-thought; call the CLI only after deciding.</instruction>
-  </reasoning_policy>
-  <reply_contract transport="cli">
-    <command>agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; --to &lt;to&gt; [--promotion &lt;promotion&gt;] --uci &lt;uci&gt;</command>
-    <example>agentview chess act --piece P --from e2 --to e4 --uci e2e4</example>
-    <promotion_example>agentview chess act --piece P --from e7 --to e8 --promotion q --uci e7e8q</promotion_example>
-    <instruction>Choose one legal UCI move from the current view, include the move context flags first, then pass the canonical UCI move with --uci.</instruction>
-  </reply_contract>
-</chess_task>"#;
-
-#[async_trait::async_trait]
-impl PromptRenderable for ChessTurnPrompt {
-    async fn render_full<'a>(
-        &'a self,
-        templates: &'a TemplateEngine,
-    ) -> anyhow::Result<PromptFragment> {
-        let vars = ChessTurnPromptTemplateVars { task: &self.task };
-
-        Ok(templates
-            .render_template(
-                "chess_turn_prompt",
-                CHESS_TURN_PROMPT_TEMPLATE,
-                minijinja::Value::from_serialize(&vars),
-            )?
-            .into())
+impl ChessTaskView {
+    pub fn new(task: impl Into<String>, reply_schema: serde_json::Value) -> Self {
+        Self {
+            task: task.into(),
+            reply_schema,
+            reasoning_policy: chess_reasoning_policy_prompt_view(),
+            reply_contract: chess_reply_contract_prompt_view(),
+        }
     }
 }
 
@@ -456,8 +529,8 @@ pub struct ChessViewModel;
 impl AgentViewModel<Turn, ()> for ChessViewModel {
     type Source = ChessGameSource;
     type View = ChessView;
-    type SystemPrompt = ChessTurnPrompt;
-    type TurnPrompt = ChessTurnPrompt;
+    type SystemPrompt = ChessTaskView;
+    type TurnPrompt = ChessTaskView;
     type ContextState = ();
 
     async fn build_system_prompt(
@@ -465,25 +538,14 @@ impl AgentViewModel<Turn, ()> for ChessViewModel {
         _ctx: &PromptContext<Turn, Self::ContextState>,
         _source: &Self::Source,
     ) -> anyhow::Result<Self::SystemPrompt> {
-        Ok(ChessTurnPrompt {
-            task: "You are choosing legal chess moves from the rendered board.".to_owned(),
-            reply_schema: move_reply_schema(),
-        })
+        Ok(ChessTaskView::new(
+            "You are choosing legal chess moves from the rendered board.",
+            move_reply_schema(),
+        ))
     }
 
     async fn capture_view(&self, source: &Self::Source) -> Self::View {
-        let state = source.snapshot();
-        ChessView {
-            board: board_view(&state.board),
-            fen: state.board.to_string(),
-            side_to_move: side_view(state.board.side_to_move()),
-            legal_uci_moves: state.legal_uci_moves(),
-            move_history: state.move_history,
-            engine_pending: state.engine_pending,
-            last_engine_move: state.last_engine_move,
-            last_error: state.last_error,
-            status: board_status_name(state.board.status()).to_owned(),
-        }
+        ChessView::collect(&source.snapshot())
     }
 
     async fn build_turn_prompt(
@@ -492,10 +554,10 @@ impl AgentViewModel<Turn, ()> for ChessViewModel {
         call_id: &str,
         task: String,
     ) -> anyhow::Result<Self::TurnPrompt> {
-        Ok(ChessTurnPrompt {
-            task: format!("{task} Active turn id: {call_id}."),
-            reply_schema: move_reply_schema(),
-        })
+        Ok(ChessTaskView::new(
+            format!("{task} Active turn id: {call_id}."),
+            move_reply_schema(),
+        ))
     }
 
     async fn commit_turn(

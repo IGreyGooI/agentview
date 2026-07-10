@@ -51,12 +51,12 @@ use std::fmt;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::llm_call::{
     notify_observers, AgentTurn, AgentTurnEvent, AgentTurnFlow, AgentTurnObserverHandle,
-    AgentTurnOutcome, AgentTurnRequest, ExecutorCommit, LLMExecutor, NoopTurnSink, TextTurnEvent,
-    TurnSink,
+    AgentTurnOutcome, AgentTurnRequest, ContextPreparation, ContextPreparationBudget,
+    ExecutorCommit, LLMExecutor, NoopTurnSink, TextTurnEvent, TurnSink,
 };
 use crate::prompt_context::{IdentityTransform, PromptContext, Role, Turn, TurnTransform};
 use crate::templates::{
@@ -520,6 +520,7 @@ where
     /// Previous successfully-rendered view frame used for delta rendering.
     pub view_cursor: Arc<RwLock<Option<VM::View>>>,
 
+    turn_lock: Arc<Mutex<()>>,
     observers: Vec<AgentTurnObserverHandle>,
 }
 
@@ -571,6 +572,7 @@ where
             }),
             ctx: Arc::new(RwLock::new(PromptContext::without_system())),
             view_cursor: Arc::new(RwLock::new(None)),
+            turn_lock: Arc::new(Mutex::new(())),
             observers: Vec::new(),
         }
     }
@@ -587,6 +589,7 @@ where
             }),
             ctx: Arc::new(RwLock::new(self.ctx.read().await.clone())),
             view_cursor: Arc::new(RwLock::new(self.view_cursor.read().await.clone())),
+            turn_lock: Arc::new(Mutex::new(())),
             observers: self.observers.clone(),
         }
     }
@@ -616,6 +619,7 @@ where
             }),
             ctx: Arc::new(RwLock::new(ctx)),
             view_cursor: Arc::new(RwLock::new(None)),
+            turn_lock: Arc::new(Mutex::new(())),
             observers: Vec::new(),
         }
     }
@@ -642,6 +646,7 @@ where
             }),
             ctx: Arc::new(RwLock::new(self.ctx.read().await.clone())),
             view_cursor: Arc::new(RwLock::new(self.view_cursor.read().await.clone())),
+            turn_lock: Arc::new(Mutex::new(())),
             observers: self.observers.clone(),
         }
     }
@@ -676,6 +681,7 @@ where
             side_sinks: Vec::new(),
             observers: self.observers.clone(),
             max_loops: 4,
+            max_context_preparations: 3,
         }
     }
 }
@@ -697,6 +703,7 @@ where
     side_sinks: Vec<Box<dyn TurnSink<EV, Output = ()>>>,
     observers: Vec<AgentTurnObserverHandle>,
     max_loops: usize,
+    max_context_preparations: usize,
 }
 
 impl<'a, VM, E, I, EV, TurnOutput> AgentTurnBuilder<'a, VM, E, I, EV, TurnOutput>
@@ -734,6 +741,12 @@ where
         self
     }
 
+    /// Limit history replacements while preparing one logical model turn.
+    pub fn with_max_context_preparations(mut self, max_attempts: usize) -> Self {
+        self.max_context_preparations = max_attempts.clamp(1, 3);
+        self
+    }
+
     /// Add a per-call side-effect sink.
     pub fn with_side_sink(mut self, sink: impl TurnSink<EV, Output = ()> + 'static) -> Self {
         tracing::debug!(
@@ -761,10 +774,19 @@ where
             side_sinks,
             observers,
             max_loops: _,
+            max_context_preparations,
         } = self;
 
         execute_agent_turn_with_sink(
-            agent, call_id, source, executor, task, sink, side_sinks, observers,
+            agent,
+            call_id,
+            source,
+            executor,
+            task,
+            sink,
+            side_sinks,
+            observers,
+            max_context_preparations,
         )
         .await
         .map(|outcome| outcome.sink_output)
@@ -787,6 +809,7 @@ where
             mut side_sinks,
             observers,
             max_loops,
+            max_context_preparations,
         } = self;
 
         tracing::debug!(
@@ -815,6 +838,7 @@ where
                 build_sink(),
                 side_sinks,
                 observers.clone(),
+                max_context_preparations,
             )
             .await?;
 
@@ -874,6 +898,7 @@ where
             side_sinks,
             observers,
             max_loops: _,
+            max_context_preparations,
         } = self;
 
         execute_agent_turn_with_sink(
@@ -885,6 +910,7 @@ where
             NoopTurnSink,
             side_sinks,
             observers,
+            max_context_preparations,
         )
         .await
         .map(|_: CommittedAgentTurn<()>| ())
@@ -960,6 +986,7 @@ async fn execute_agent_turn_with_sink<VM, E, I, S, EV, TurnOutput>(
     sink: S,
     side_sinks: Vec<Box<dyn TurnSink<EV, Output = ()>>>,
     observers: Vec<AgentTurnObserverHandle>,
+    max_context_preparations: usize,
 ) -> anyhow::Result<CommittedAgentTurn<TurnOutput>>
 where
     VM: AgentViewModel<I, TurnOutput>,
@@ -969,6 +996,7 @@ where
     TurnOutput: Send + Sync + 'static,
     EV: Send + 'static,
 {
+    let _turn_guard = agent.turn_lock.lock().await;
     tracing::debug!(
         target: "agentview::agent",
         call_id,
@@ -976,35 +1004,78 @@ where
         "preparing agent turn"
     );
 
-    // ── Build request (brief read-lock on ctx) ─────────────────────────────
-    let ctx_for_request = { agent.ctx.read().await.clone() };
-    let had_system = ctx_for_request.has_system();
-    let previous_view = { agent.view_cursor.read().await.clone() };
-    let current_view = agent.config.view.capture_view(source).await;
-    let templates = TemplateEngine::new();
-    let system_prompt = agent
-        .config
-        .view
-        .build_system_prompt(&ctx_for_request, source)
-        .await?;
-    let system = system_prompt.render_full(&templates).await?.into_string();
-    let history = agent.config.view.history(&ctx_for_request);
-    let (context_kind, context_block) =
-        render_view_block(&current_view, previous_view.as_ref(), &templates, call_id).await?;
-    let turn_prompt = agent
-        .config
-        .view
-        .build_turn_prompt(&ctx_for_request, call_id, task)
-        .await?;
-    let turn_prompt = turn_prompt.render_full(&templates).await?;
-    let user = compose_user_message(context_block, turn_prompt);
-    let request = AgentTurnRequest {
-        call_id: call_id.into(),
-        system,
-        history,
-        user,
-        model: agent.config.model.clone(),
-        max_tokens: agent.config.max_tokens,
+    let mut preparation_replacements = 0;
+    let (request, current_view, context_kind, had_system) = loop {
+        // ── Build request (brief read-lock on ctx) ─────────────────────────
+        let ctx_for_request = { agent.ctx.read().await.clone() };
+        let committed_history_len = ctx_for_request.history().len();
+        let had_system = ctx_for_request.has_system();
+        let previous_view = { agent.view_cursor.read().await.clone() };
+        let current_view = agent.config.view.capture_view(source).await;
+        let templates = TemplateEngine::new();
+        let system_prompt = agent
+            .config
+            .view
+            .build_system_prompt(&ctx_for_request, source)
+            .await?;
+        let system = system_prompt.render_full(&templates).await?.into_string();
+        let history = agent.config.view.history(&ctx_for_request);
+        let (context_kind, context_block) =
+            render_view_block(&current_view, previous_view.as_ref(), &templates, call_id).await?;
+        let turn_prompt = agent
+            .config
+            .view
+            .build_turn_prompt(&ctx_for_request, call_id, task.clone())
+            .await?;
+        let turn_prompt = turn_prompt.render_full(&templates).await?;
+        let user = compose_user_message(context_block, turn_prompt);
+        let request = AgentTurnRequest {
+            call_id: call_id.into(),
+            system,
+            history,
+            user,
+            model: agent.config.model.clone(),
+            max_tokens: agent.config.max_tokens,
+        };
+
+        let preparation_budget = ContextPreparationBudget::new(
+            preparation_replacements,
+            max_context_preparations,
+            committed_history_len,
+        );
+        match executor
+            .prepare_context(request, preparation_budget)
+            .await?
+        {
+            ContextPreparation::Ready(request) => {
+                break (request, current_view, context_kind, had_system);
+            }
+            ContextPreparation::ReplaceHistory {
+                history,
+                reset_view,
+            } => {
+                if preparation_replacements >= max_context_preparations {
+                    anyhow::bail!(
+                        "agent turn `{call_id}` exceeded context preparation replacement limit {max_context_preparations}"
+                    );
+                }
+                preparation_replacements += 1;
+
+                let mut ctx = agent.ctx.write().await;
+                let mut view_cursor = agent.view_cursor.write().await;
+                ctx.replace_history(history);
+                if reset_view {
+                    *view_cursor = None;
+                }
+                tracing::debug!(
+                    target: "agentview::agent",
+                    call_id,
+                    preparation_replacements,
+                    reset_view,
+                    "replaced history during context preparation"
+                );
+            }
+        }
     };
     if !had_system {
         notify_observers(

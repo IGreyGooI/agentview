@@ -20,8 +20,8 @@ use std::os::unix::process::CommandExt;
 mod chess_support;
 
 use chess_support::{
-    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessTurnPrompt,
-    ChessView, ChessViewModel, StockfishEngine,
+    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessTaskView, ChessView,
+    ChessViewModel, StockfishEngine,
 };
 
 const INTERNAL_DAEMON_ARG: &str = "--__agentview-daemon";
@@ -38,19 +38,28 @@ struct HelloState {
     name: Option<String>,
 }
 
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(kind = "hello")]
+struct HelloView {
+    greeting: String,
+
+    #[view(diff)]
+    name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct HelloViewBuilder;
 
 #[async_trait::async_trait]
 impl ContextViewBuilder for HelloViewBuilder {
     type Source = Arc<Mutex<HelloState>>;
-    type View = String;
+    type View = HelloView;
 
     async fn capture(&self, source: &Self::Source) -> Self::View {
         let state = source.lock().unwrap();
-        match &state.name {
-            Some(name) => format!("{}, {}!", state.greeting, name),
-            None => format!("{}, stranger.", state.greeting),
+        HelloView {
+            greeting: state.greeting.clone(),
+            name: state.name.clone(),
         }
     }
 }
@@ -92,6 +101,9 @@ impl TurnSink<ControlReply> for NameSink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     Help,
+    ChessHelp,
+    ChessActHelp,
+    ChessHookHelp,
     Observe,
     Act { text: String },
     ChessObserve,
@@ -159,6 +171,18 @@ async fn run() -> anyhow::Result<()> {
             print!("{}", help_text());
             Ok(())
         }
+        CliCommand::ChessHelp => {
+            print!("{}", chess_help_text());
+            Ok(())
+        }
+        CliCommand::ChessActHelp => {
+            print!("{}", chess_act_help_text());
+            Ok(())
+        }
+        CliCommand::ChessHookHelp => {
+            print!("{}", chess_hook_help_text());
+            Ok(())
+        }
         CliCommand::Observe => {
             let response = request_with_autostart(&DaemonRequest::Observe).await?;
             print_response(response)
@@ -194,11 +218,18 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> anyhow::Result<CliComman
         [arg] if arg == "observe" => Ok(CliCommand::Observe),
         [cmd, text] if cmd == "act" => Ok(CliCommand::Act { text: text.clone() }),
         [cmd] if cmd == "act" => anyhow::bail!("usage: agentview act <text>\n\n{}", help_text()),
+        [scope, arg] if scope == "chess" && is_help_arg(arg) => Ok(CliCommand::ChessHelp),
         [scope, cmd] if scope == "chess" && cmd == "observe" => Ok(CliCommand::ChessObserve),
+        [scope, cmd, arg] if scope == "chess" && cmd == "act" && is_help_arg(arg) => {
+            Ok(CliCommand::ChessActHelp)
+        }
         [scope, cmd, rest @ ..] if scope == "chess" && cmd == "act" && !rest.is_empty() => {
             Ok(CliCommand::ChessAct {
                 uci: parse_chess_act_uci(rest)?,
             })
+        }
+        [scope, cmd, arg] if scope == "chess" && cmd == "hook" && is_help_arg(arg) => {
+            Ok(CliCommand::ChessHookHelp)
         }
         [scope, cmd, epoch] if scope == "chess" && cmd == "hook" => Ok(CliCommand::ChessHook {
             epoch: epoch
@@ -213,6 +244,10 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> anyhow::Result<CliComman
         }
         _ => anyhow::bail!("{}", help_text()),
     }
+}
+
+fn is_help_arg(arg: &str) -> bool {
+    arg == "--help" || arg == "-h" || arg == "help"
 }
 
 fn parse_chess_act_uci(args: &[String]) -> anyhow::Result<String> {
@@ -309,6 +344,59 @@ fn help_text() -> &'static str {
         "  act        Send a text reply for the latest turn\n",
         "  chess      Drive the chess AgentView example\n",
         "  help       Print this help\n",
+        "\n",
+        "ENVIRONMENT:\n",
+        "  AGENTVIEW_ADDR=127.0.0.1:<port>  Isolate concurrent CLI sessions\n",
+    )
+}
+
+fn chess_help_text() -> &'static str {
+    concat!(
+        "agentview chess\n",
+        "\n",
+        "USAGE:\n",
+        "  agentview chess observe\n",
+        "  agentview chess act [--piece <piece>] [--from <square>] [--to <square>] [--promotion <piece>] --uci <uci>\n",
+        "  agentview chess hook <epoch>\n",
+        "\n",
+        "COMMANDS:\n",
+        "  observe    Print the current chess AgentView snapshot\n",
+        "  act        Send a chess move for the latest turn\n",
+        "  hook       Wait for a later chess view epoch\n",
+        "  help       Print this help\n",
+    )
+}
+
+fn chess_act_help_text() -> &'static str {
+    concat!(
+        "agentview chess act\n",
+        "\n",
+        "USAGE:\n",
+        "  agentview chess act <uci>\n",
+        "  agentview chess act [--piece <piece>] [--from <square>] [--to <square>] [--promotion <piece>] --uci <uci>\n",
+        "\n",
+        "OPTIONS:\n",
+        "  --uci <uci>              UCI move, such as e2e4 or e7e8q\n",
+        "  --piece <piece>          Context flag for the moving piece\n",
+        "  --from <square>          Context flag for the source square\n",
+        "  --to <square>            Context flag for the target square\n",
+        "  --promotion <piece>      Context flag for promotion piece\n",
+        "\n",
+        "NOTES:\n",
+        "  Context flags are prompt context only; the submitted move is --uci <uci>.\n",
+        "  When passing context flags, include the move as --uci <uci>.\n",
+        "  Without context flags, positional <uci> is accepted.\n",
+    )
+}
+
+fn chess_hook_help_text() -> &'static str {
+    concat!(
+        "agentview chess hook\n",
+        "\n",
+        "USAGE:\n",
+        "  agentview chess hook <epoch>\n",
+        "\n",
+        "Wait for a chess view update after <epoch>.\n",
     )
 }
 
@@ -521,7 +609,7 @@ async fn observe_hello(session: &mut HelloSession) -> DaemonResponse {
             event: "observe".to_owned(),
             epoch: snapshot.view_epoch,
             turn_id: snapshot.turn_id.to_string(),
-            view: snapshot.view,
+            view: render_agent_view_xml(&snapshot.view),
             prompt: snapshot.turn_prompt.task,
         }) {
         Ok(response) => response,
@@ -559,7 +647,7 @@ async fn act_hello(session: &mut HelloSession, text: String) -> DaemonResponse {
                 event: "update".to_owned(),
                 epoch: snapshot.view_epoch,
                 turn_id: snapshot.turn_id.to_string(),
-                view: snapshot.view.clone(),
+                view: render_agent_view_xml(&snapshot.view),
                 prompt: snapshot.turn_prompt.task.clone(),
             },
             None => DaemonResponse::Error {
@@ -603,7 +691,7 @@ async fn act_chess(runtime: &mut ChessRuntime, uci: String) -> DaemonResponse {
     {
         Ok(update) => match update.snapshot() {
             Some(snapshot) => {
-                if snapshot.view.engine_pending {
+                if snapshot.view.engine_pending() {
                     schedule_chess_engine(runtime);
                 }
                 render_chess_update("act", runtime, snapshot, &templates).await
@@ -650,7 +738,7 @@ fn schedule_chess_engine(runtime: &ChessRuntime) {
 async fn render_chess_full_snapshot(
     event: &str,
     runtime: &mut ChessRuntime,
-    snapshot: &ViewSnapshot<ChessView, ChessTurnPrompt>,
+    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
     templates: &TemplateEngine,
 ) -> DaemonResponse {
     let view = match snapshot.view.render_full(templates).await {
@@ -661,19 +749,21 @@ async fn render_chess_full_snapshot(
             };
         }
     };
-    runtime.last_view = Some(snapshot.view.clone());
-    render_chess_response(event, snapshot, view, templates).await
+    let response = render_chess_response(event, snapshot, view, templates).await;
+    commit_chess_view_after_render(&mut runtime.last_view, &snapshot.view, &response);
+    response
 }
 
 async fn render_chess_update(
     event: &str,
     runtime: &mut ChessRuntime,
-    snapshot: &ViewSnapshot<ChessView, ChessTurnPrompt>,
+    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
     templates: &TemplateEngine,
 ) -> DaemonResponse {
     let view = match runtime.last_view.as_ref() {
-        Some(prev) => match snapshot.view.render_update_since(prev, templates).await {
-            Ok(view) => view.into_string(),
+        Some(prev) => match snapshot.view.render_delta(prev, templates).await {
+            Ok(Some(view)) => view.into_string(),
+            Ok(None) => String::new(),
             Err(err) => {
                 return DaemonResponse::Error {
                     message: err.to_string(),
@@ -690,13 +780,14 @@ async fn render_chess_update(
         },
     };
 
-    runtime.last_view = Some(snapshot.view.clone());
-    render_chess_response(event, snapshot, view, templates).await
+    let response = render_chess_response(event, snapshot, view, templates).await;
+    commit_chess_view_after_render(&mut runtime.last_view, &snapshot.view, &response);
+    response
 }
 
 async fn render_chess_response(
     event: &str,
-    snapshot: &ViewSnapshot<ChessView, ChessTurnPrompt>,
+    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
     view: String,
     templates: &TemplateEngine,
 ) -> DaemonResponse {
@@ -718,6 +809,16 @@ async fn render_chess_response(
     }
 }
 
+fn commit_chess_view_after_render(
+    last_view: &mut Option<ChessView>,
+    current: &ChessView,
+    response: &DaemonResponse,
+) {
+    if matches!(response, DaemonResponse::Snapshot { .. }) {
+        *last_view = Some(current.clone());
+    }
+}
+
 async fn write_response(mut stream: TcpStream, response: &DaemonResponse) -> anyhow::Result<()> {
     let line = serde_json::to_string(response)?;
     stream.write_all(line.as_bytes()).await?;
@@ -728,6 +829,31 @@ async fn write_response(mut stream: TcpStream, response: &DaemonResponse) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chess_diff_baseline_advances_only_after_snapshot_response() {
+        let current = ChessView::collect(&ChessGameSource::new().snapshot());
+        let mut last_view = None;
+        let error = DaemonResponse::Error {
+            message: "prompt rendering failed".to_owned(),
+        };
+
+        commit_chess_view_after_render(&mut last_view, &current, &error);
+
+        assert!(last_view.is_none());
+
+        let response = DaemonResponse::Snapshot {
+            event: "act".to_owned(),
+            epoch: 1,
+            turn_id: "turn-2".to_owned(),
+            view: "<prompt_board rendering_mode=\"delta\" />".to_owned(),
+            prompt: "next turn".to_owned(),
+        };
+
+        commit_chess_view_after_render(&mut last_view, &current, &response);
+
+        assert_eq!(last_view, Some(current));
+    }
 
     #[test]
     fn help_does_not_show_internal_mode() {

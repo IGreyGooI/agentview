@@ -155,6 +155,11 @@ impl<I, CS> PromptContext<I, CS> {
         self.history.extend(items);
     }
 
+    /// Replace committed history without changing stable or VM-owned context.
+    pub fn replace_history(&mut self, items: Vec<I>) {
+        self.history = items;
+    }
+
     pub fn push_working_set(&mut self, item: I) {
         self.working_set.push(item);
     }
@@ -248,6 +253,23 @@ mod tests {
         ctx.extend_history([Turn::user("turn 1"), Turn::assistant("reply 1")]);
         ctx.extend_history([Turn::user("turn 2"), Turn::assistant("reply 2")]);
         assert_eq!(ctx.history.len(), 4);
+    }
+
+    #[test]
+    fn replace_history_preserves_non_history_state() {
+        let mut ctx: PromptContext<Turn, usize> = PromptContext::new("system");
+        ctx.push_history(Turn::user("old history"));
+        ctx.push_working_set(Turn::user("working context"));
+        *ctx.context_state_mut() = 7;
+
+        ctx.replace_history(vec![Turn::user("context summary")]);
+
+        assert_eq!(ctx.system(), Some("system"));
+        assert_eq!(ctx.history().len(), 1);
+        assert_eq!(&*ctx.history()[0].text, "context summary");
+        assert_eq!(ctx.working_set().len(), 1);
+        assert_eq!(&*ctx.working_set()[0].text, "working context");
+        assert_eq!(*ctx.context_state(), 7);
     }
 
     #[test]

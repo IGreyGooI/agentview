@@ -164,6 +164,19 @@ A caller that only has the latest full snapshot must be able to understand the
 current view and the current turn prompt. It must not need older patches or
 private daemon state.
 
+This invariant is evaluated at the root rendered prompt-context boundary. It is
+not a rule that every nested view fragment must locally hydrate every reference
+it prints. A child fragment may render a stable handle when the handle's target
+is introduced by another root-level section in the same full snapshot, or by
+earlier prompt context that has already been committed to the agent's history.
+
+For example, a graph view may render `<source_chunk id="src_chunk.1"/>` as a
+provenance handle. The graph view does not need to inline the source text next to
+that handle. The source workspace or runtime root view is responsible for
+rendering newly read source chunks as their own prompt section. After that text
+has entered the prompt context, later graph facts can cite the stable
+`source_chunk` id without turning it into a dangling pointer.
+
 Current core shape:
 
 ```rust

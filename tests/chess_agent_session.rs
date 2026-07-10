@@ -9,8 +9,8 @@ mod chess_support;
 
 use agentview::prelude::*;
 use chess_support::{
-    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessViewModel,
-    StockfishEngine,
+    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessTaskView, ChessView,
+    ChessViewModel, StockfishEngine,
 };
 use serde_json::json;
 use tokio::time::timeout;
@@ -23,6 +23,128 @@ fn new_session(
         source,
         PromptContext::<Turn, ()>::without_system(),
     )
+}
+
+async fn apply_test_move(
+    session: &mut AgentViewSession<ChessViewModel, Turn, ()>,
+    source: &ChessGameSource,
+    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
+    uci: &str,
+) -> ViewSnapshot<ChessView, ChessTaskView> {
+    session
+        .act_with_sink(
+            &snapshot.turn_id,
+            ControlReply::structured(json!({ "uci": uci })),
+            ChessMoveSink::from_source(source),
+            apply_player_move,
+            "Continue the test game.",
+        )
+        .await
+        .unwrap()
+        .snapshot()
+        .unwrap()
+        .clone()
+}
+
+fn assert_agent_view<T: AgentView>() {}
+
+#[test]
+fn captured_chess_view_is_agent_facing_view() {
+    assert_agent_view::<ChessView>();
+}
+
+#[test]
+fn built_chess_task_view_is_agent_facing_view() {
+    assert_agent_view::<ChessTaskView>();
+}
+
+#[tokio::test]
+async fn chess_view_can_be_collected_from_game_state_snapshot() {
+    let source = ChessGameSource::new();
+    let collected = ChessView::collect(&source.snapshot());
+
+    assert_eq!(collected.side_to_move(), "white");
+    assert!(collected.legal_uci_moves().contains(&"e2e4"));
+    assert!(render_agent_view_xml(&collected).starts_with("<prompt_board>"));
+}
+
+#[tokio::test]
+async fn chess_square_leaf_uses_agent_view_derive() {
+    let source = ChessGameSource::new();
+    let (mut session, _awake) = new_session(source);
+    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+
+    assert_eq!(
+        snapshot.view.render_square_xml_for_test(0, 0).unwrap(),
+        r#"<square id="a8" file="a" rank="8">r</square>"#
+    );
+}
+
+#[tokio::test]
+async fn chess_board_state_uses_agent_view_derive() {
+    let source = ChessGameSource::new();
+    let (mut session, _awake) = new_session(source);
+    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+
+    let rendered = chess_support::render_board_state_xml_for_test(&snapshot.view);
+
+    assert!(rendered.starts_with("<board_state>"));
+    assert!(rendered.contains("<board_ascii>8 r n b q k b n r"));
+    assert!(rendered.contains("<fen>"));
+    assert!(rendered.contains("<side_to_move>white</side_to_move>"));
+    assert!(rendered.contains("<status>ongoing</status>"));
+    assert!(rendered.ends_with("</board_state>"));
+}
+
+#[tokio::test]
+async fn chess_board_squares_render_as_a_flat_agent_facing_list() {
+    let source = ChessGameSource::new();
+    let (mut session, _awake) = new_session(source);
+    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+
+    let rendered = snapshot
+        .view
+        .render_full(&TemplateEngine::new())
+        .await
+        .unwrap()
+        .into_string();
+
+    assert!(rendered
+        .contains("\n  <board_squares>\n    <square id=\"a8\" file=\"a\" rank=\"8\">r</square>"));
+    assert!(rendered.contains("<square id=\"a8\" file=\"a\" rank=\"8\">r</square>"));
+    assert!(rendered.contains("<square id=\"e1\" file=\"e\" rank=\"1\">K</square>"));
+    assert!(!rendered.contains("<rank "));
+    assert!(!rendered.contains("<ranks>"));
+    assert!(!rendered.contains("<squares>"));
+    assert_eq!(rendered.matches("<square id=").count(), 64);
+
+    let mut previous_offset = 0;
+    for rank in (1..=8).rev() {
+        for file in "abcdefgh".chars() {
+            let square = format!("<square id=\"{file}{rank}\"");
+            assert_eq!(rendered.matches(&square).count(), 1, "square {file}{rank}");
+            let offset = rendered.find(&square).unwrap();
+            assert!(
+                offset >= previous_offset,
+                "square {file}{rank} is out of order"
+            );
+            previous_offset = offset;
+        }
+    }
+}
+
+#[tokio::test]
+async fn chess_task_view_escapes_task_text() {
+    let prompt = ChessTaskView::new("Choose <e2e4> & verify.", json!({}));
+
+    let rendered = prompt
+        .render_full(&TemplateEngine::new())
+        .await
+        .unwrap()
+        .into_string();
+
+    assert!(rendered.contains("<task>Choose &lt;e2e4&gt; &amp; verify.</task>"));
+    assert!(!rendered.contains("<task>Choose <e2e4> & verify.</task>"));
 }
 
 #[cfg(unix)]
@@ -69,28 +191,14 @@ async fn observe_renders_starting_board_and_move_contract() {
 
     assert_eq!(snapshot.view_epoch, 0);
     assert_eq!(snapshot.turn_id, "turn-1");
-    assert_eq!(snapshot.view.side_to_move.as_str(), "white");
-    assert_eq!(snapshot.view.board.ranks[0].rank, 8);
-    assert_eq!(snapshot.view.board.ranks[0].squares[0].square, "a8");
-    assert_eq!(
-        snapshot.view.board.ranks[0].squares[0]
-            .piece
-            .as_ref()
-            .unwrap()
-            .symbol,
-        'r'
-    );
-    assert_eq!(snapshot.view.board.ranks[7].squares[4].square, "e1");
-    assert_eq!(
-        snapshot.view.board.ranks[7].squares[4]
-            .piece
-            .as_ref()
-            .unwrap()
-            .symbol,
-        'K'
-    );
-    assert!(snapshot.view.legal_uci_moves.contains(&"e2e4".to_owned()));
-    assert!(snapshot.view.legal_uci_moves.contains(&"g1f3".to_owned()));
+    assert_eq!(snapshot.view.side_to_move(), "white");
+    assert_eq!(snapshot.view.rank_for_test(0), Some(8));
+    assert_eq!(snapshot.view.square_id_for_test(0, 0), Some("a8"));
+    assert_eq!(snapshot.view.piece_symbol_for_test(0, 0), Some('r'));
+    assert_eq!(snapshot.view.square_id_for_test(7, 4), Some("e1"));
+    assert_eq!(snapshot.view.piece_symbol_for_test(7, 4), Some('K'));
+    assert!(snapshot.view.legal_uci_moves().contains(&"e2e4"));
+    assert!(snapshot.view.legal_uci_moves().contains(&"g1f3"));
     assert!(snapshot
         .turn_prompt
         .task
@@ -106,11 +214,14 @@ async fn observe_renders_starting_board_and_move_contract() {
         .await
         .unwrap()
         .into_string();
-    assert!(rendered_view.starts_with("<prompt_board render_mode=\"full\">"));
+    assert!(rendered_view.starts_with("<prompt_board>"));
+    assert!(!rendered_view.contains("render_mode=\"full\""));
     assert!(!rendered_view.contains("<rendering_mode"));
-    assert!(rendered_view.contains("\n  <board_state>\n    <board_ascii>"));
+    assert!(rendered_view.contains("\n  <board_state kind=\"board_state\">\n    <board_ascii>"));
+    assert!(rendered_view.contains("\n  <board_squares>\n    <square id=\"a8\""));
     assert!(rendered_view.contains("\n  <legal_moves>"));
     assert!(rendered_view.contains("\n    <move>e2e4</move>"));
+    assert!(rendered_view.contains("\n  <engine kind=\"engine\">\n    <pending>false</pending>"));
     assert!(!rendered_view.contains("<chess_view>"));
 
     let rendered_prompt = snapshot
@@ -157,9 +268,9 @@ async fn act_applies_player_move_and_hook_observes_stockfish_reply() {
 
     let after_player = update.snapshot().unwrap();
     assert_eq!(after_player.view_epoch, 1);
-    assert_eq!(after_player.view.move_history, vec!["e2e4"]);
-    assert_eq!(after_player.view.side_to_move.as_str(), "black");
-    assert!(after_player.view.engine_pending);
+    assert_eq!(after_player.view.move_history(), vec!["e2e4"]);
+    assert_eq!(after_player.view.side_to_move(), "black");
+    assert!(after_player.view.engine_pending());
 
     let (dir, script) = mock_stockfish_script("e7e5");
     let engine = StockfishEngine::new(script);
@@ -180,9 +291,9 @@ async fn act_applies_player_move_and_hook_observes_stockfish_reply() {
     .unwrap();
 
     assert_eq!(after_engine.view_epoch, 2);
-    assert_eq!(after_engine.view.move_history, vec!["e2e4", "e7e5"]);
-    assert_eq!(after_engine.view.side_to_move.as_str(), "white");
-    assert!(!after_engine.view.engine_pending);
+    assert_eq!(after_engine.view.move_history(), vec!["e2e4", "e7e5"]);
+    assert_eq!(after_engine.view.side_to_move(), "white");
+    assert!(!after_engine.view.engine_pending());
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -204,7 +315,7 @@ async fn stockfish_engine_applies_bestmove_from_uci_process() {
         )
         .await
         .unwrap();
-    assert!(update.snapshot().unwrap().view.engine_pending);
+    assert!(update.snapshot().unwrap().view.engine_pending());
 
     let (dir, script) = mock_stockfish_script("e7e5");
     let engine = StockfishEngine::new(script);
@@ -221,16 +332,16 @@ async fn stockfish_engine_applies_bestmove_from_uci_process() {
     .unwrap()
     .unwrap();
 
-    assert_eq!(after_engine.view.move_history, vec!["e2e4", "e7e5"]);
-    assert_eq!(after_engine.view.last_engine_move.as_deref(), Some("e7e5"));
-    assert!(!after_engine.view.engine_pending);
-    assert!(after_engine.view.last_error.is_none());
+    assert_eq!(after_engine.view.move_history(), vec!["e2e4", "e7e5"]);
+    assert_eq!(after_engine.view.last_engine_move(), Some("e7e5"));
+    assert!(!after_engine.view.engine_pending());
+    assert!(after_engine.view.last_error().is_none());
 
     let _ = fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
-async fn chess_view_partial_update_renders_changed_board_squares_and_sections() {
+async fn chess_view_uses_generic_field_diff_for_a_player_move() {
     let source = ChessGameSource::new();
     let (mut session, _awake) = new_session(source.clone());
     let snapshot = session.observe("Choose white's next move.").await.unwrap();
@@ -246,38 +357,65 @@ async fn chess_view_partial_update_renders_changed_board_squares_and_sections() 
         .await
         .unwrap();
 
-    let after_player = update.snapshot().unwrap();
-    let rendered_update = after_player
+    let rendered = update
+        .snapshot()
+        .unwrap()
         .view
-        .render_update_since(&snapshot.view, &TemplateEngine::new())
+        .render_delta(&snapshot.view, &TemplateEngine::new())
         .await
+        .unwrap()
         .unwrap()
         .into_string();
 
-    assert!(rendered_update.starts_with("<prompt_board render_mode=\"update\">"));
-    assert!(!rendered_update.contains("<rendering_mode"));
-    assert!(rendered_update.contains("\n  <board_state>\n    <replace>\n      <board_ascii>"));
-    assert!(!rendered_update.contains("\n  <board_state>\n    <board_ascii>"));
-    assert!(rendered_update.contains("\n  <board_squares>\n    <replace>"));
-    assert!(rendered_update.contains("<square id=\"e2\" file=\"e\" rank=\"2\">.</square>"));
-    assert!(rendered_update.contains("<square id=\"e4\" file=\"e\" rank=\"4\">P</square>"));
-    assert!(!rendered_update.contains("<square id=\"a8\""));
-    assert!(!rendered_update.contains("<rank n="));
-    assert!(!rendered_update.contains("<changed_sections>"));
-    assert!(rendered_update.contains("\n  <legal_moves>"));
-    assert!(rendered_update.contains("\n    <added>"));
-    assert!(rendered_update.contains("\n    <removed>"));
-    assert!(!rendered_update.contains("<legal_moves op="));
-    assert!(rendered_update.contains("\n  <move_history>"));
-    assert!(rendered_update.contains("\n    <added>"));
-    assert!(!rendered_update.contains("<move_history op="));
-    assert!(rendered_update.contains("<move>e2e4</move>"));
-    assert!(rendered_update.contains("<move>e7e5</move>"));
-    assert!(rendered_update.contains("\n  <engine>\n    <replace>"));
-    assert!(!rendered_update.contains("<engine op="));
-    assert!(!rendered_update.contains("op=\""));
-    assert!(rendered_update.contains("<pending>true</pending>"));
-    assert!(!rendered_update.contains("<prompt_board_update>"));
+    assert!(rendered.starts_with("<prompt_board rendering_mode=\"delta\">"));
+    assert!(rendered.contains(
+        "\n  <board_state rendering_mode=\"delta\">\n    <replace>\n      <board_state kind=\"board_state\">"
+    ));
+    assert!(rendered.contains(
+        "\n  <board_squares rendering_mode=\"delta\">\n    <update>\n      <square id=\"e2\" file=\"e\" rank=\"2\">.</square>"
+    ));
+    assert!(rendered
+        .contains("\n    <update>\n      <square id=\"e4\" file=\"e\" rank=\"4\">P</square>"));
+    assert_eq!(rendered.matches("\n    <update>").count(), 2);
+    assert_eq!(rendered.matches("<square id=").count(), 2);
+    assert!(!rendered.contains("<square id=\"a8\""));
+    assert!(rendered.contains("\n  <legal_moves rendering_mode=\"delta\">"));
+    assert!(rendered.contains("\n    <insert>"));
+    assert!(rendered.contains("\n    <remove>"));
+    assert!(rendered.contains("\n  <move_history rendering_mode=\"delta\">"));
+    assert!(rendered.contains("<move>e2e4</move>"));
+    assert!(rendered.contains("\n  <engine rendering_mode=\"delta\">\n    <replace>"));
+    assert!(rendered.contains("<pending>true</pending>"));
+    assert!(!rendered.contains("render_mode="));
+    assert!(!rendered.contains("<added>"));
+    assert!(!rendered.contains("<removed>"));
+}
+
+#[tokio::test]
+async fn chess_view_keyed_diff_emits_all_four_castling_square_updates() {
+    let source = ChessGameSource::new();
+    let (mut session, _awake) = new_session(source.clone());
+    let mut snapshot = session.observe("Set up castling.").await.unwrap();
+
+    for uci in ["e2e4", "e7e5", "g1f3", "b8c6", "f1e2", "g8f6"] {
+        snapshot = apply_test_move(&mut session, &source, &snapshot, uci).await;
+    }
+
+    let after_castling = apply_test_move(&mut session, &source, &snapshot, "e1g1").await;
+    let rendered = after_castling
+        .view
+        .render_delta(&snapshot.view, &TemplateEngine::new())
+        .await
+        .unwrap()
+        .unwrap()
+        .into_string();
+
+    assert_eq!(rendered.matches("\n    <update>").count(), 4);
+    assert_eq!(rendered.matches("<square id=").count(), 4);
+    assert!(rendered.contains("<square id=\"e1\" file=\"e\" rank=\"1\">.</square>"));
+    assert!(rendered.contains("<square id=\"f1\" file=\"f\" rank=\"1\">R</square>"));
+    assert!(rendered.contains("<square id=\"g1\" file=\"g\" rank=\"1\">K</square>"));
+    assert!(rendered.contains("<square id=\"h1\" file=\"h\" rank=\"1\">.</square>"));
 }
 
 #[tokio::test]
@@ -300,10 +438,9 @@ async fn act_rejects_illegal_chess_move() {
     let next = update.snapshot().unwrap();
     assert!(next
         .view
-        .last_error
-        .as_deref()
+        .last_error()
         .unwrap()
         .contains("illegal chess move"));
-    assert!(!next.view.engine_pending);
+    assert!(!next.view.engine_pending());
     assert!(source.snapshot().move_history().is_empty());
 }
