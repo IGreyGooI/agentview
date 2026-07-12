@@ -24,8 +24,10 @@ turns.
 
 The main pieces are:
 
-- `Agent`: long-lived session state
-- `PromptContext`: system prompt, history, and view-model state
+- `Agent`: provider-backed turn runner
+- `AgentSession`: committed prompt context plus its rendered view cursor
+- `AgentViewApp`: externally controlled `observe` / `hook` / `act` loop
+- `PromptContext`: system prompt, history, working set, and view-model state
 - `ContextView` / `ContextViewBuilder`: what the agent sees
 - `LLMExecutor`: your provider adapter
 - `TurnSink`: per-turn output handling
@@ -38,7 +40,12 @@ The main pieces are:
 3. Add the current task with `.with_user(...)`.
 4. Run the turn through your `LLMExecutor`.
 5. Parse or observe output with a `TurnSink`.
-6. Commit successful results back into `PromptContext`.
+6. Commit successful results and the new view cursor as one `AgentSession`.
+
+Each model turn works on a private session draft. Preparation, compaction,
+rendering, provider execution, and `commit_turn` may modify that draft, but the
+agent only publishes it after the whole turn succeeds. Errors and cancellation
+leave the previously committed session unchanged.
 
 ## Minimal Usage
 

@@ -21,7 +21,7 @@
 ## File Map
 
 - `examples/chess_engine_agent/support.rs`: Defines the chess domain snapshots, agent-facing view structs, collection, and test accessors. This file loses all update-only structs and helpers.
-- `tests/chess_agent_session.rs`: Proves full view shape and real `e2e4` generic delta behavior.
+- `tests/chess_agent_app.rs`: Proves full view shape and real `e2e4` generic delta behavior.
 - `examples/chess_engine_agent.rs`: Prints deltas through `ContextView::render_delta`.
 - `src/bin/agentview.rs`: Returns generic deltas from the chess daemon path and maps no-change to an empty view payload.
 - `tests/agentview_cli.rs`: Proves `observe`, `act`, and `hook` expose the new protocol end to end.
@@ -30,7 +30,7 @@
 ## Task 1: Flatten the Agent-Facing Board Squares
 
 **Files:**
-- Modify: `tests/chess_agent_session.rs:78-93, 170-181`
+- Modify: `tests/chess_agent_app.rs:78-93, 170-181`
 - Modify: `examples/chess_engine_agent/support.rs:127-152, 381-419, 475-505, 634-736, 780-792`
 
 **Interfaces:**
@@ -45,8 +45,8 @@ Replace the nested-rank assertion with the desired direct-child shape:
 #[tokio::test]
 async fn chess_board_squares_render_as_a_flat_agent_facing_list() {
     let source = ChessGameSource::new();
-    let (mut session, _awake) = new_session(source);
-    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+    let (mut app, _awake) = new_app(source);
+    let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
     let rendered = snapshot
         .view
@@ -76,7 +76,7 @@ assert!(rendered_view.contains("\n  <board_squares>\n    <square id=\"a8\""));
 Run:
 
 ```bash
-cargo test --test chess_agent_session chess_board_squares_render_as_a_flat_agent_facing_list -- --exact
+cargo test --test chess_agent_app chess_board_squares_render_as_a_flat_agent_facing_list -- --exact
 ```
 
 Expected: FAIL because current output contains `<board_squares kind="board_squares"><rank ...>` instead of direct square children.
@@ -142,9 +142,9 @@ fn changed_squares(
 Run:
 
 ```bash
-cargo test --test chess_agent_session chess_board_squares_render_as_a_flat_agent_facing_list -- --exact
-cargo test --test chess_agent_session observe_renders_starting_board_and_move_contract -- --exact
-cargo test --test chess_agent_session chess_square_leaf_uses_agent_view_derive -- --exact
+cargo test --test chess_agent_app chess_board_squares_render_as_a_flat_agent_facing_list -- --exact
+cargo test --test chess_agent_app observe_renders_starting_board_and_move_contract -- --exact
+cargo test --test chess_agent_app chess_square_leaf_uses_agent_view_derive -- --exact
 ```
 
 Expected: all three tests PASS; full XML has 64 direct square children and no rank wrapper.
@@ -152,7 +152,7 @@ Expected: all three tests PASS; full XML has 64 direct square children and no ra
 ## Task 2: Drive Chess Delta Through Generic Field Policies
 
 **Files:**
-- Modify: `tests/chess_agent_session.rs:302-352`
+- Modify: `tests/chess_agent_app.rs:302-352`
 - Modify: `examples/chess_engine_agent/support.rs:631-643`
 
 **Interfaces:**
@@ -167,10 +167,10 @@ Rename the existing partial-update test and render through `ContextView`:
 #[tokio::test]
 async fn chess_view_uses_generic_field_diff_for_a_player_move() {
     let source = ChessGameSource::new();
-    let (mut session, _awake) = new_session(source.clone());
-    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+    let (mut app, _awake) = new_app(source.clone());
+    let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
-    let update = session
+    let update = app
         .act_with_sink(
             &snapshot.turn_id,
             ControlReply::structured(json!({ "uci": "e2e4" })),
@@ -220,7 +220,7 @@ async fn chess_view_uses_generic_field_diff_for_a_player_move() {
 Run:
 
 ```bash
-cargo test --test chess_agent_session chess_view_uses_generic_field_diff_for_a_player_move -- --exact
+cargo test --test chess_agent_app chess_view_uses_generic_field_diff_for_a_player_move -- --exact
 ```
 
 Expected: FAIL because changed unmarked fields currently force a full `<prompt_board>` render.
@@ -255,8 +255,8 @@ pub struct ChessView {
 Run:
 
 ```bash
-cargo test --test chess_agent_session chess_view_uses_generic_field_diff_for_a_player_move -- --exact
-cargo test --test chess_agent_session
+cargo test --test chess_agent_app chess_view_uses_generic_field_diff_for_a_player_move -- --exact
+cargo test --test chess_agent_app
 ```
 
 Expected: the focused test and the entire chess session test target PASS.

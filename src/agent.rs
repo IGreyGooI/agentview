@@ -6,11 +6,11 @@
 //! Stable prompt/history parameters live on the agent. Per-call turn sinks are
 //! passed explicitly when starting a call.
 //!
-//! `Agent` is the long-lived session holder: prompt context, pending feedback,
-//! model config, transform, and an [`AgentViewModel`] that renders what the
-//! language agent sees.
+//! `Agent` is the provider-backed turn runner. Its mutable prompt state lives
+//! in an [`AgentSession`], while model config, transform, and the
+//! [`AgentViewModel`] describe how turns are rendered and committed.
 //! [`crate::llm_call::AgentTurn`] is the per-request transaction. The loop in
-//! [`AgentTurnBuilder::execute_loop`] is still an implementation shape: it repeats
+//! [`AgentTurnBuilder::execute_loop_with`] is still an implementation shape: it repeats
 //! `AgentTurn`s until a concrete parser context decides `Continue` or `Sleep`.
 //! We intentionally keep loop observability as tracing for now; a future
 //! `AgentApp`/runtime primitive can get its own observer once that concept
@@ -48,11 +48,13 @@
 
 use std::any::type_name;
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::agent_session::AgentSession;
 use crate::llm_call::{
     notify_observers, AgentTurn, AgentTurnEvent, AgentTurnFlow, AgentTurnObserverHandle,
     AgentTurnOutcome, AgentTurnRequest, ContextPreparation, ContextPreparationBudget,
@@ -127,16 +129,11 @@ pub struct DefaultAgentFeedback {
     pub task: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnFlow {
+    #[default]
     Wait,
     Continue,
-}
-
-impl Default for TurnFlow {
-    fn default() -> Self {
-        Self::Wait
-    }
 }
 
 impl From<TurnFlow> for AgentTurnFlow {
@@ -333,7 +330,7 @@ where
                     );
                     (ContextBlockKind::Empty, PromptFragment::new(String::new()))
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             },
         };
 
@@ -447,12 +444,11 @@ where
         for item in executor_commit.append {
             match item.role {
                 Role::User => ctx.push_history(item),
-                Role::Assistant => match self.transform.transform_assistant(&item.text) {
-                    Some(text) => {
+                Role::Assistant => {
+                    if let Some(text) = self.transform.transform_assistant(&item.text) {
                         ctx.push_history(Turn::assistant(text));
                     }
-                    None => {}
-                },
+                }
             }
         }
 
@@ -501,11 +497,13 @@ where
 
 // ── Agent ──────────────────────────────────────────────────────────────────────
 
+type SharedAgentSession<I, CS, V> = Arc<RwLock<AgentSession<I, CS, V>>>;
+
 /// Stateful LLM agent parameterized over view model, executor, and transcript.
 ///
-/// Read-only config lives in [`AgentConfig`] (behind `Arc`). Mutable session
-/// fields (`ctx`, view cursor) are behind locks so callers can fork without
-/// waiting for an in-flight LLM call to finish.
+/// Read-only config lives in [`AgentConfig`] (behind `Arc`). Mutable prompt
+/// state lives in one [`AgentSession`] so context and view cursor are always
+/// snapshotted and committed together.
 pub struct Agent<VM, E, I = Turn, EV = TextTurnEvent, TurnOutput = ()>
 where
     VM: AgentViewModel<I, TurnOutput>,
@@ -514,11 +512,7 @@ where
     /// Read-only configuration shared with forks.
     pub config: Arc<AgentConfig<VM, E, I, EV, TurnOutput>>,
 
-    /// Conversation history (system + committed turns).
-    pub ctx: Arc<RwLock<PromptContext<I, VM::ContextState>>>,
-
-    /// Previous successfully-rendered view frame used for delta rendering.
-    pub view_cursor: Arc<RwLock<Option<VM::View>>>,
+    session: SharedAgentSession<I, VM::ContextState, VM::View>,
 
     turn_lock: Arc<Mutex<()>>,
     observers: Vec<AgentTurnObserverHandle>,
@@ -532,10 +526,29 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Agent")
             .field("config", &self.config)
-            .field("ctx", &"<rwlock>")
-            .field("view_cursor", &"<rwlock>")
+            .field("session", &"<rwlock>")
             .field("observers", &self.observers.len())
             .finish()
+    }
+}
+
+/// Exclusive access to an agent session, serialized with model-backed turns.
+pub struct AgentSessionWriteGuard<'a, I, CS, V> {
+    session_guard: RwLockWriteGuard<'a, AgentSession<I, CS, V>>,
+    _turn_guard: MutexGuard<'a, ()>,
+}
+
+impl<I, CS, V> Deref for AgentSessionWriteGuard<'_, I, CS, V> {
+    type Target = AgentSession<I, CS, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session_guard
+    }
+}
+
+impl<I, CS, V> DerefMut for AgentSessionWriteGuard<'_, I, CS, V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session_guard
     }
 }
 
@@ -570,8 +583,9 @@ where
                 max_tokens,
                 executor: std::marker::PhantomData,
             }),
-            ctx: Arc::new(RwLock::new(PromptContext::without_system())),
-            view_cursor: Arc::new(RwLock::new(None)),
+            session: Arc::new(RwLock::new(AgentSession::new(
+                PromptContext::without_system(),
+            ))),
             turn_lock: Arc::new(Mutex::new(())),
             observers: Vec::new(),
         }
@@ -587,8 +601,7 @@ where
                 max_tokens: self.config.max_tokens,
                 executor: std::marker::PhantomData,
             }),
-            ctx: Arc::new(RwLock::new(self.ctx.read().await.clone())),
-            view_cursor: Arc::new(RwLock::new(self.view_cursor.read().await.clone())),
+            session: Arc::new(RwLock::new(self.session.read().await.clone())),
             turn_lock: Arc::new(Mutex::new(())),
             observers: self.observers.clone(),
         }
@@ -617,8 +630,7 @@ where
                 max_tokens,
                 executor: std::marker::PhantomData,
             }),
-            ctx: Arc::new(RwLock::new(ctx)),
-            view_cursor: Arc::new(RwLock::new(None)),
+            session: Arc::new(RwLock::new(AgentSession::new(ctx))),
             turn_lock: Arc::new(Mutex::new(())),
             observers: Vec::new(),
         }
@@ -629,10 +641,27 @@ where
         self
     }
 
+    /// Read the last successfully committed session.
+    pub async fn session(
+        &self,
+    ) -> RwLockReadGuard<'_, AgentSession<I, VM::ContextState, VM::View>> {
+        self.session.read().await
+    }
+
+    /// Mutate committed session state after any in-flight turn completes.
+    pub async fn session_mut(&self) -> AgentSessionWriteGuard<'_, I, VM::ContextState, VM::View> {
+        let turn_guard = self.turn_lock.lock().await;
+        let session_guard = self.session.write().await;
+        AgentSessionWriteGuard {
+            session_guard,
+            _turn_guard: turn_guard,
+        }
+    }
+
     /// Fork this agent for a parallel sub-call.
     ///
-    /// Clones prompt history and view-model snapshot state under brief locks;
-    /// keeps view-model context state with the cloned prompt context.
+    /// Clones the committed context and view cursor together under one brief
+    /// read lock.
     ///
     /// Safe to call while another call is in-flight — only needs short-lived
     /// read locks on the mutable fields.
@@ -644,8 +673,7 @@ where
                 max_tokens: self.config.max_tokens,
                 executor: std::marker::PhantomData,
             }),
-            ctx: Arc::new(RwLock::new(self.ctx.read().await.clone())),
-            view_cursor: Arc::new(RwLock::new(self.view_cursor.read().await.clone())),
+            session: Arc::new(RwLock::new(self.session.read().await.clone())),
             turn_lock: Arc::new(Mutex::new(())),
             observers: self.observers.clone(),
         }
@@ -664,8 +692,8 @@ where
     ///     .await?;
     /// ```
     ///
-    /// Takes `&self` (shared reference) — mutable fields are locked
-    /// individually during [`execute_agent_turn`].
+    /// Takes `&self` (shared reference); successful turns atomically replace
+    /// the committed session.
     pub fn call<'a>(&'a self, call_id: &'a str) -> AgentTurnBuilder<'a, VM, E, I, EV, TurnOutput> {
         tracing::debug!(
             target: "agentview::agent",
@@ -779,14 +807,16 @@ where
 
         execute_agent_turn_with_sink(
             agent,
-            call_id,
-            source,
-            executor,
-            task,
-            sink,
-            side_sinks,
-            observers,
-            max_context_preparations,
+            AgentTurnExecution {
+                call_id,
+                source,
+                executor,
+                task,
+                sink,
+                side_sinks,
+                observers,
+                max_context_preparations,
+            },
         )
         .await
         .map(|outcome| outcome.sink_output)
@@ -831,14 +861,16 @@ where
 
             let outcome = execute_agent_turn_with_sink(
                 agent,
-                call_id,
-                source,
-                executor,
-                task,
-                build_sink(),
-                side_sinks,
-                observers.clone(),
-                max_context_preparations,
+                AgentTurnExecution {
+                    call_id,
+                    source,
+                    executor,
+                    task,
+                    sink: build_sink(),
+                    side_sinks,
+                    observers: observers.clone(),
+                    max_context_preparations,
+                },
             )
             .await?;
 
@@ -903,14 +935,16 @@ where
 
         execute_agent_turn_with_sink(
             agent,
-            call_id,
-            source,
-            executor,
-            task,
-            NoopTurnSink,
-            side_sinks,
-            observers,
-            max_context_preparations,
+            AgentTurnExecution {
+                call_id,
+                source,
+                executor,
+                task,
+                sink: NoopTurnSink,
+                side_sinks,
+                observers,
+                max_context_preparations,
+            },
         )
         .await
         .map(|_: CommittedAgentTurn<()>| ())
@@ -961,7 +995,7 @@ where
                     PromptFragment::new(String::new()).with_memo("context:empty"),
                 ))
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         },
     }
 }
@@ -977,16 +1011,53 @@ fn compose_user_message(context_block: PromptFragment, turn_prompt: PromptFragme
     }
 }
 
-async fn execute_agent_turn_with_sink<VM, E, I, S, EV, TurnOutput>(
-    agent: &Agent<VM, E, I, EV, TurnOutput>,
-    call_id: &str,
-    source: &VM::Source,
-    executor: &E,
+struct AgentTurnExecution<'a, Source, E, S, EV> {
+    call_id: &'a str,
+    source: &'a Source,
+    executor: &'a E,
     task: String,
     sink: S,
     side_sinks: Vec<Box<dyn TurnSink<EV, Output = ()>>>,
     observers: Vec<AgentTurnObserverHandle>,
     max_context_preparations: usize,
+}
+
+fn notify_committed_turn_observers(
+    observers: Vec<AgentTurnObserverHandle>,
+    call_id: StorageString,
+    flow: AgentTurnFlow,
+) {
+    if observers.is_empty() {
+        return;
+    }
+
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            call_id = %call_id,
+            "dropping post-commit observer events without a Tokio runtime"
+        );
+        return;
+    };
+
+    std::mem::drop(runtime.spawn(async move {
+        notify_observers(
+            &observers,
+            AgentTurnEvent::TurnCommitted {
+                call_id: call_id.clone(),
+            },
+        )
+        .await;
+        notify_observers(
+            &observers,
+            AgentTurnEvent::TurnFlowDecided { call_id, flow },
+        )
+        .await;
+    }));
+}
+
+async fn execute_agent_turn_with_sink<VM, E, I, S, EV, TurnOutput>(
+    agent: &Agent<VM, E, I, EV, TurnOutput>,
+    execution: AgentTurnExecution<'_, VM::Source, E, S, EV>,
 ) -> anyhow::Result<CommittedAgentTurn<TurnOutput>>
 where
     VM: AgentViewModel<I, TurnOutput>,
@@ -996,6 +1067,16 @@ where
     TurnOutput: Send + Sync + 'static,
     EV: Send + 'static,
 {
+    let AgentTurnExecution {
+        call_id,
+        source,
+        executor,
+        task,
+        sink,
+        side_sinks,
+        observers,
+        max_context_preparations,
+    } = execution;
     let _turn_guard = agent.turn_lock.lock().await;
     tracing::debug!(
         target: "agentview::agent",
@@ -1004,28 +1085,29 @@ where
         "preparing agent turn"
     );
 
+    let mut draft_session = { agent.session.read().await.clone() };
     let mut preparation_replacements = 0;
     let (request, current_view, context_kind, had_system) = loop {
-        // ── Build request (brief read-lock on ctx) ─────────────────────────
-        let ctx_for_request = { agent.ctx.read().await.clone() };
+        // ── Build request against the private turn draft ──────────────────
+        let ctx_for_request = draft_session.context();
         let committed_history_len = ctx_for_request.history().len();
         let had_system = ctx_for_request.has_system();
-        let previous_view = { agent.view_cursor.read().await.clone() };
+        let previous_view = draft_session.view_cursor();
         let current_view = agent.config.view.capture_view(source).await;
         let templates = TemplateEngine::new();
         let system_prompt = agent
             .config
             .view
-            .build_system_prompt(&ctx_for_request, source)
+            .build_system_prompt(ctx_for_request, source)
             .await?;
         let system = system_prompt.render_full(&templates).await?.into_string();
-        let history = agent.config.view.history(&ctx_for_request);
+        let history = agent.config.view.history(ctx_for_request);
         let (context_kind, context_block) =
-            render_view_block(&current_view, previous_view.as_ref(), &templates, call_id).await?;
+            render_view_block(&current_view, previous_view, &templates, call_id).await?;
         let turn_prompt = agent
             .config
             .view
-            .build_turn_prompt(&ctx_for_request, call_id, task.clone())
+            .build_turn_prompt(ctx_for_request, call_id, task.clone())
             .await?;
         let turn_prompt = turn_prompt.render_full(&templates).await?;
         let user = compose_user_message(context_block, turn_prompt);
@@ -1050,10 +1132,7 @@ where
             ContextPreparation::Ready(request) => {
                 break (request, current_view, context_kind, had_system);
             }
-            ContextPreparation::ReplaceHistory {
-                history,
-                reset_view,
-            } => {
+            ContextPreparation::ReplaceHistory { history } => {
                 if preparation_replacements >= max_context_preparations {
                     anyhow::bail!(
                         "agent turn `{call_id}` exceeded context preparation replacement limit {max_context_preparations}"
@@ -1061,17 +1140,11 @@ where
                 }
                 preparation_replacements += 1;
 
-                let mut ctx = agent.ctx.write().await;
-                let mut view_cursor = agent.view_cursor.write().await;
-                ctx.replace_history(history);
-                if reset_view {
-                    *view_cursor = None;
-                }
+                draft_session.replace_history(history);
                 tracing::debug!(
                     target: "agentview::agent",
                     call_id,
                     preparation_replacements,
-                    reset_view,
                     "replaced history during context preparation"
                 );
             }
@@ -1096,7 +1169,7 @@ where
         "built agent turn request"
     );
 
-    // ── Execute agent turn (no locks held) ─────────────────────────────────
+    // ── Execute agent turn (no session lock held) ─────────────────────────
     let request_for_commit = request.clone();
     let mut call = AgentTurn::new(executor.clone(), request)
         .with_observers(observers.clone())
@@ -1117,48 +1190,31 @@ where
         "agent turn execute returned"
     );
 
-    // ── Commit (brief write-locks) ─────────────────────────────────────────
+    // ── Commit the completed session draft atomically ─────────────────────
     match result {
         Ok(outcome) => {
             let AgentTurnOutcome {
                 executor_commit,
                 mut sink_output,
             } = outcome;
-            let flow: TurnFlow;
-            {
-                let mut ctx = agent.ctx.write().await;
-                flow = agent
-                    .config
-                    .view
-                    .commit_turn(
-                        &mut ctx,
-                        &request_for_commit,
-                        executor_commit,
-                        &mut sink_output,
-                    )
-                    .await?
-            };
-            *agent.view_cursor.write().await = Some(current_view);
+            let flow = agent
+                .config
+                .view
+                .commit_turn(
+                    draft_session.context_mut(),
+                    &request_for_commit,
+                    executor_commit,
+                    &mut sink_output,
+                )
+                .await?;
+            draft_session.set_view_cursor(current_view);
+            *agent.session.write().await = draft_session;
             tracing::debug!(
                 target: "agentview::agent",
                 call_id,
                 "agent turn committed"
             );
-            notify_observers(
-                &observers,
-                AgentTurnEvent::TurnCommitted {
-                    call_id: call_id.into(),
-                },
-            )
-            .await;
-            notify_observers(
-                &observers,
-                AgentTurnEvent::TurnFlowDecided {
-                    call_id: call_id.into(),
-                    flow: flow.into(),
-                },
-            )
-            .await;
+            notify_committed_turn_observers(observers, call_id.into(), flow.into());
             Ok(CommittedAgentTurn { flow, sink_output })
         }
         Err(e) => {

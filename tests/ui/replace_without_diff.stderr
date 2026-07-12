@@ -1,0 +1,5 @@
+error: `replace` requires `#[view(diff(replace))]`
+ --> tests/ui/replace_without_diff.rs:7:5
+  |
+7 |     state: String,
+  |     ^^^^^

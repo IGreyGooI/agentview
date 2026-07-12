@@ -62,9 +62,9 @@ pub struct AgentTurnRequest<I = Turn> {
 pub enum ContextPreparation<I = Turn> {
     /// Execute the prepared request as-is.
     Ready(AgentTurnRequest<I>),
-    /// Replace committed history, optionally invalidate the rendered view baseline,
-    /// and prepare the same logical turn again.
-    ReplaceHistory { history: Vec<I>, reset_view: bool },
+    /// Replace committed history, invalidate the rendered view baseline, and
+    /// prepare the same logical turn again.
+    ReplaceHistory { history: Vec<I> },
 }
 
 /// Replacement budget for preparing one logical model turn.
@@ -194,6 +194,8 @@ pub enum AgentTurnFlow {
 
 #[async_trait::async_trait]
 pub trait AgentTurnObserver: Send + Sync {
+    /// Receive a passive lifecycle event. Post-commit events may be dispatched
+    /// asynchronously and must not be used as a turn-completion barrier.
     async fn on_agent_turn_event(&self, event: AgentTurnEvent);
 }
 
@@ -329,115 +331,10 @@ impl TurnSink<TextTurnEvent> for HermesParser {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::sync::Mutex;
-
-    #[derive(Clone)]
-    struct StaticExecutor;
-
-    #[async_trait::async_trait]
-    impl LLMExecutor for StaticExecutor {
-        async fn execute_llm<S>(
-            &self,
-            _request: AgentTurnRequest,
-            _sink: &mut S,
-            _side_sinks: &mut Vec<Box<dyn TurnSink<Output = ()>>>,
-        ) -> anyhow::Result<ExecutorCommit>
-        where
-            S: TurnSink + Send,
-        {
-            Ok(ExecutorCommit::text("assistant response"))
-        }
-    }
-
-    struct RecordingObserver {
-        events: Mutex<Vec<AgentTurnEvent>>,
-    }
-
-    #[async_trait::async_trait]
-    impl AgentTurnObserver for RecordingObserver {
-        async fn on_agent_turn_event(&self, event: AgentTurnEvent) {
-            self.events.lock().await.push(event);
-        }
-    }
-
-    #[tokio::test]
-    async fn text_executor_commit_emits_assistant_completed() {
-        let observer = Arc::new(RecordingObserver {
-            events: Mutex::new(Vec::new()),
-        });
-        let request = AgentTurnRequest {
-            call_id: "call".into(),
-            system: "system".to_owned(),
-            history: Vec::new(),
-            user: "user".to_owned(),
-            model: "model".into(),
-            max_tokens: 16,
-        };
-
-        AgentTurn::new(StaticExecutor, request)
-            .with_observers([observer.clone() as AgentTurnObserverHandle])
-            .execute()
-            .await
-            .unwrap();
-
-        let events = observer.events.lock().await;
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                AgentTurnEvent::TurnStarted { call_id } if call_id.as_ref() == "call"
-            )
-        }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                AgentTurnEvent::UserPromptRendered { call_id, text }
-                    if call_id.as_ref() == "call" && text == "user"
-            )
-        }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                AgentTurnEvent::AssistantCompleted { call_id, text }
-                    if call_id.as_ref() == "call" && text == "assistant response"
-            )
-        }));
-    }
-
-    #[tokio::test]
-    async fn executor_context_preparation_defaults_to_ready() {
-        let request = AgentTurnRequest {
-            call_id: "call".into(),
-            system: "system".to_owned(),
-            history: Vec::new(),
-            user: "user".to_owned(),
-            model: "model".into(),
-            max_tokens: 16,
-        };
-
-        let prepared = StaticExecutor
-            .prepare_context(request, ContextPreparationBudget::new(0, 3, 0))
-            .await
-            .unwrap();
-
-        match prepared {
-            ContextPreparation::Ready(request) => {
-                assert_eq!(request.call_id.as_ref(), "call");
-                assert_eq!(request.user, "user");
-            }
-            ContextPreparation::ReplaceHistory { .. } => {
-                panic!("default context preparation replaced history")
-            }
-        }
-    }
-}
-
 /// A pending agent turn created by an application runtime.
 ///
 /// `T: TurnTransform` controls how both sides of the exchange are committed to
-/// the [`PromptContext`]'s history after a successful call.
+/// the [`PromptContext`](crate::prompt_context::PromptContext)'s history after a successful call.
 pub struct AgentTurn<R, S = NoopTurnSink, I = Turn, E = TextTurnEvent>
 where
     R: LLMExecutor<I, E>,
@@ -584,5 +481,110 @@ where
             executor_commit,
             sink_output,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::Mutex;
+
+    #[derive(Clone)]
+    struct StaticExecutor;
+
+    #[async_trait::async_trait]
+    impl LLMExecutor for StaticExecutor {
+        async fn execute_llm<S>(
+            &self,
+            _request: AgentTurnRequest,
+            _sink: &mut S,
+            _side_sinks: &mut Vec<Box<dyn TurnSink<Output = ()>>>,
+        ) -> anyhow::Result<ExecutorCommit>
+        where
+            S: TurnSink + Send,
+        {
+            Ok(ExecutorCommit::text("assistant response"))
+        }
+    }
+
+    struct RecordingObserver {
+        events: Mutex<Vec<AgentTurnEvent>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnObserver for RecordingObserver {
+        async fn on_agent_turn_event(&self, event: AgentTurnEvent) {
+            self.events.lock().await.push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn text_executor_commit_emits_assistant_completed() {
+        let observer = Arc::new(RecordingObserver {
+            events: Mutex::new(Vec::new()),
+        });
+        let request = AgentTurnRequest {
+            call_id: "call".into(),
+            system: "system".to_owned(),
+            history: Vec::new(),
+            user: "user".to_owned(),
+            model: "model".into(),
+            max_tokens: 16,
+        };
+
+        AgentTurn::new(StaticExecutor, request)
+            .with_observers([observer.clone() as AgentTurnObserverHandle])
+            .execute()
+            .await
+            .unwrap();
+
+        let events = observer.events.lock().await;
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentTurnEvent::TurnStarted { call_id } if call_id.as_ref() == "call"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentTurnEvent::UserPromptRendered { call_id, text }
+                    if call_id.as_ref() == "call" && text == "user"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentTurnEvent::AssistantCompleted { call_id, text }
+                    if call_id.as_ref() == "call" && text == "assistant response"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn executor_context_preparation_defaults_to_ready() {
+        let request = AgentTurnRequest {
+            call_id: "call".into(),
+            system: "system".to_owned(),
+            history: Vec::new(),
+            user: "user".to_owned(),
+            model: "model".into(),
+            max_tokens: 16,
+        };
+
+        let prepared = StaticExecutor
+            .prepare_context(request, ContextPreparationBudget::new(0, 3, 0))
+            .await
+            .unwrap();
+
+        match prepared {
+            ContextPreparation::Ready(request) => {
+                assert_eq!(request.call_id.as_ref(), "call");
+                assert_eq!(request.user, "user");
+            }
+            ContextPreparation::ReplaceHistory { .. } => {
+                panic!("default context preparation replaced history")
+            }
+        }
     }
 }

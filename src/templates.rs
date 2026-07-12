@@ -196,6 +196,12 @@ impl TemplateEngine {
     }
 }
 
+impl Default for TemplateEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Prompt / context view traits ──────────────────────────────────────────────
 
 /// Anything that can render itself as a prompt block.

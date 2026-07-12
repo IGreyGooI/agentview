@@ -1,0 +1,5 @@
+error: collection diff modes are only supported on Vec fields
+ --> tests/ui/collection_mode_on_non_vec.rs:7:5
+  |
+7 |     item: String,
+  |     ^^^^

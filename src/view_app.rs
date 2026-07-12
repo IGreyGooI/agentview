@@ -1,4 +1,4 @@
-//! Session API for externally controlled AgentView loops.
+//! Application API for externally controlled AgentView loops.
 //!
 //! This is the chat/CLI/daemon/skill sibling of the provider-backed
 //! `AgentTurn` path. It does not call a model provider. It captures the
@@ -10,6 +10,7 @@ use std::marker::PhantomData;
 use thiserror::Error;
 
 use crate::agent::AgentViewModel;
+use crate::agent_session::AgentSession;
 use crate::control::ControlReply;
 use crate::llm_call::TurnSink;
 use crate::prompt_context::{PromptContext, Turn};
@@ -17,21 +18,21 @@ use crate::view_awake::{ViewAwake, ViewAwakeHandle, ViewEpoch};
 use crate::view_state::{ViewSnapshot, ViewTurnId, ViewUpdate};
 use crate::StorageString;
 
-/// Stateful AgentView session controlled by an external chat, CLI, daemon, or skill loop.
-pub struct AgentViewSession<VM, I = Turn, TurnOutput = ()>
+/// Stateful AgentView app controlled by an external chat, CLI, daemon, or skill loop.
+pub struct AgentViewApp<VM, I = Turn, TurnOutput = ()>
 where
     VM: AgentViewModel<I, TurnOutput>,
 {
     view_model: VM,
     source: VM::Source,
-    ctx: PromptContext<I, VM::ContextState>,
+    session: AgentSession<I, VM::ContextState, VM::View>,
     awake: ViewAwake,
     latest_turn_id: Option<ViewTurnId>,
     next_turn_index: u64,
     _turn_output: PhantomData<fn() -> TurnOutput>,
 }
 
-impl<VM, I, TurnOutput> AgentViewSession<VM, I, TurnOutput>
+impl<VM, I, TurnOutput> AgentViewApp<VM, I, TurnOutput>
 where
     VM: AgentViewModel<I, TurnOutput>,
 {
@@ -46,7 +47,7 @@ where
             Self {
                 view_model,
                 source,
-                ctx,
+                session: AgentSession::new(ctx),
                 awake,
                 latest_turn_id: None,
                 next_turn_index: 1,
@@ -66,14 +67,14 @@ where
         self.latest_turn_id.as_deref()
     }
 
-    /// Immutable access to durable prompt context.
-    pub fn context(&self) -> &PromptContext<I, VM::ContextState> {
-        &self.ctx
+    /// The durable prompt session owned by this app.
+    pub fn session(&self) -> &AgentSession<I, VM::ContextState, VM::View> {
+        &self.session
     }
 
-    /// Mutable access to durable prompt context.
-    pub fn context_mut(&mut self) -> &mut PromptContext<I, VM::ContextState> {
-        &mut self.ctx
+    /// Mutable access to the durable prompt session owned by this app.
+    pub fn session_mut(&mut self) -> &mut AgentSession<I, VM::ContextState, VM::View> {
+        &mut self.session
     }
 
     /// Capture a full view snapshot and current turn prompt.
@@ -106,7 +107,7 @@ where
     where
         S: TurnSink<ControlReply>,
         F: FnOnce(
-            &mut PromptContext<I, VM::ContextState>,
+            &mut AgentSession<I, VM::ContextState, VM::View>,
             &VM::Source,
             S::Output,
         ) -> anyhow::Result<()>,
@@ -118,22 +119,22 @@ where
         sink.on_event(reply).await;
         let sink_output = sink.finish().await;
 
-        apply(&mut self.ctx, &self.source, sink_output)?;
+        apply(&mut self.session, &self.source, sink_output)?;
         self.awake.handle().awake();
 
         let snapshot = self.capture_snapshot(next_task.into()).await?;
         Ok(ViewUpdate::full(base_epoch, snapshot))
     }
 
-    fn ensure_current_turn(&self, turn_id: &str) -> Result<(), AgentViewSessionError> {
+    fn ensure_current_turn(&self, turn_id: &str) -> Result<(), AgentViewAppError> {
         let Some(expected) = &self.latest_turn_id else {
-            return Err(AgentViewSessionError::NoActiveTurn);
+            return Err(AgentViewAppError::NoActiveTurn);
         };
 
         if expected == turn_id {
             Ok(())
         } else {
-            Err(AgentViewSessionError::StaleTurnId {
+            Err(AgentViewAppError::StaleTurnId {
                 expected: expected.clone(),
                 actual: turn_id.into(),
             })
@@ -150,10 +151,11 @@ where
             let view = self.view_model.capture_view(&self.source).await;
             let turn_prompt = self
                 .view_model
-                .build_turn_prompt(&self.ctx, &turn_id, task.clone())
+                .build_turn_prompt(self.session.context(), &turn_id, task.clone())
                 .await?;
 
             if self.awake.current_epoch() == view_epoch {
+                self.session.set_view_cursor(view.clone());
                 self.latest_turn_id = Some(turn_id.clone());
                 self.next_turn_index += 1;
                 return Ok(ViewSnapshot::new(view_epoch, turn_id, view, turn_prompt));
@@ -167,7 +169,7 @@ where
 }
 
 #[derive(Debug, Error)]
-pub enum AgentViewSessionError {
+pub enum AgentViewAppError {
     #[error("no active turn")]
     NoActiveTurn,
 

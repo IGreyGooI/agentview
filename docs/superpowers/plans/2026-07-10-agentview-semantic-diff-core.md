@@ -693,7 +693,7 @@ and map cases.
 Run:
 
 ```bash
-cargo test --test agent_view_session --test chess_agent_session --test agentview_cli
+cargo test --test agent_view_app --test chess_agent_app --test agentview_cli
 ```
 
 Expected: PASS with unchanged prompt XML.

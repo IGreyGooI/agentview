@@ -141,16 +141,16 @@ enum DaemonResponse {
 }
 
 type HelloViewModel = DefaultAgentViewModel<HelloViewBuilder, IdentityTransform>;
-type HelloSession = AgentViewSession<HelloViewModel, Turn, ()>;
-type ChessSession = AgentViewSession<ChessViewModel, Turn, ()>;
+type HelloApp = AgentViewApp<HelloViewModel, Turn, ()>;
+type ChessApp = AgentViewApp<ChessViewModel, Turn, ()>;
 
 struct DaemonState {
-    hello: HelloSession,
+    hello: HelloApp,
     chess: ChessRuntime,
 }
 
 struct ChessRuntime {
-    session: ChessSession,
+    app: ChessApp,
     source: ChessGameSource,
     awake: ViewAwakeHandle,
     engine: StockfishEngine,
@@ -527,12 +527,12 @@ async fn run_daemon(addr: SocketAddr) -> anyhow::Result<()> {
 
 fn new_daemon_state() -> DaemonState {
     DaemonState {
-        hello: new_hello_session(),
+        hello: new_hello_app(),
         chess: new_chess_runtime(),
     }
 }
 
-fn new_hello_session() -> HelloSession {
+fn new_hello_app() -> HelloApp {
     let source = Arc::new(Mutex::new(HelloState {
         greeting: "Hello".to_owned(),
         name: None,
@@ -548,24 +548,24 @@ fn new_hello_session() -> HelloSession {
         IdentityTransform,
     );
 
-    let (session, _awake): (HelloSession, _) = AgentViewSession::new(
+    let (app, _awake): (HelloApp, _) = AgentViewApp::new(
         view_model,
         source,
         PromptContext::<Turn, DefaultContextState>::without_system(),
     );
-    session
+    app
 }
 
 fn new_chess_runtime() -> ChessRuntime {
     let source = ChessGameSource::new();
-    let (session, awake) = AgentViewSession::new(
+    let (app, awake) = AgentViewApp::new(
         ChessViewModel,
         source.clone(),
         PromptContext::<Turn, ()>::without_system(),
     );
 
     ChessRuntime {
-        session,
+        app,
         source,
         awake,
         engine: StockfishEngine::new(stockfish_command()),
@@ -601,8 +601,8 @@ async fn handle_connection(state: &mut DaemonState, stream: TcpStream) -> anyhow
     Ok(false)
 }
 
-async fn observe_hello(session: &mut HelloSession) -> DaemonResponse {
-    match session
+async fn observe_hello(app: &mut HelloApp) -> DaemonResponse {
+    match app
         .observe("Ask the caller for their name.")
         .await
         .map(|snapshot| DaemonResponse::Snapshot {
@@ -619,22 +619,22 @@ async fn observe_hello(session: &mut HelloSession) -> DaemonResponse {
     }
 }
 
-async fn act_hello(session: &mut HelloSession, text: String) -> DaemonResponse {
-    let Some(turn_id) = session.latest_turn_id().map(ToOwned::to_owned) else {
+async fn act_hello(app: &mut HelloApp, text: String) -> DaemonResponse {
+    let Some(turn_id) = app.latest_turn_id().map(ToOwned::to_owned) else {
         return DaemonResponse::Error {
             message: "no active turn; run `agentview observe` first".to_owned(),
         };
     };
 
-    match session
+    match app
         .act_with_sink(
             &turn_id,
             ControlReply::text(text),
             NameSink::default(),
-            |ctx, source, name| {
+            |session, source, name| {
                 if let Some(name) = name {
                     source.lock().unwrap().name = Some(name.clone());
-                    ctx.push_history(Turn::user(format!("name = {name}")));
+                    session.push_history(Turn::user(format!("name = {name}")));
                 }
                 Ok(())
             },
@@ -662,7 +662,7 @@ async fn act_hello(session: &mut HelloSession, text: String) -> DaemonResponse {
 
 async fn observe_chess(runtime: &mut ChessRuntime) -> DaemonResponse {
     let templates = TemplateEngine::new();
-    match runtime.session.observe("Choose white's next move.").await {
+    match runtime.app.observe("Choose white's next move.").await {
         Ok(snapshot) => render_chess_full_snapshot("observe", runtime, &snapshot, &templates).await,
         Err(err) => DaemonResponse::Error {
             message: err.to_string(),
@@ -671,7 +671,7 @@ async fn observe_chess(runtime: &mut ChessRuntime) -> DaemonResponse {
 }
 
 async fn act_chess(runtime: &mut ChessRuntime, uci: String) -> DaemonResponse {
-    let Some(turn_id) = runtime.session.latest_turn_id().map(ToOwned::to_owned) else {
+    let Some(turn_id) = runtime.app.latest_turn_id().map(ToOwned::to_owned) else {
         return DaemonResponse::Error {
             message: "no active chess turn; run `agentview chess observe` first".to_owned(),
         };
@@ -679,7 +679,7 @@ async fn act_chess(runtime: &mut ChessRuntime, uci: String) -> DaemonResponse {
 
     let templates = TemplateEngine::new();
     match runtime
-        .session
+        .app
         .act_with_sink(
             &turn_id,
             ControlReply::structured(json!({ "uci": uci })),
@@ -710,7 +710,7 @@ async fn hook_chess(runtime: &mut ChessRuntime, epoch: ViewEpoch) -> DaemonRespo
     let templates = TemplateEngine::new();
     match timeout(
         Duration::from_secs(5),
-        runtime.session.hook(epoch, "Choose white's next move."),
+        runtime.app.hook(epoch, "Choose white's next move."),
     )
     .await
     {

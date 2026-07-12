@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-/// Shared chess game source used by `AgentViewSession`.
+/// Shared chess game source used by `AgentViewApp`.
 #[derive(Debug, Clone)]
 pub struct ChessGameSource {
     inner: Arc<Mutex<ChessGameState>>,
@@ -661,7 +661,7 @@ impl TurnSink<ControlReply> for ChessMoveSink {
 }
 
 pub fn apply_player_move(
-    ctx: &mut PromptContext<Turn, ()>,
+    session: &mut AgentSession<Turn, (), ChessView>,
     source: &ChessGameSource,
     output: ChessMoveOutput,
 ) -> anyhow::Result<()> {
@@ -673,14 +673,14 @@ pub fn apply_player_move(
                 state.engine_pending = state.board.status() == BoardStatus::Ongoing;
                 state.last_error = None;
             });
-            ctx.push_history(Turn::user(format!("player_move = {}", player_move.uci)));
+            session.push_history(Turn::user(format!("player_move = {}", player_move.uci)));
         }
         ChessMoveOutput::Rejected { message } => {
             source.with_state(|state| {
                 state.engine_pending = false;
                 state.last_error = Some(message.clone());
             });
-            ctx.push_history(Turn::user(format!("rejected_player_move = {message}")));
+            session.push_history(Turn::user(format!("rejected_player_move = {message}")));
         }
     }
     Ok(())

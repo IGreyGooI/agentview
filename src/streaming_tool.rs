@@ -6,10 +6,11 @@
 //! and write parse facts/artifacts into a concrete [`ParseContext`].
 //!
 //! These are "streaming tools" only because the model emits them as text/XML.
-//! They are part of the [`TurnSink`](crate::llm_call::TurnSink) layer: parse the
+//! They are part of the [`TurnSink`] layer: parse the
 //! assistant text, update per-turn state, and let the agent loop decide whether
 //! to continue or sleep. They are not provider-native tools like `rig::Tool`;
-//! native tool execution belongs in the application [`LLMExecutor`](crate::llm_call::LLMExecutor).
+//! native tool execution belongs in the application
+//! [`LLMExecutor`](crate::llm_call::LLMExecutor).
 
 use std::sync::Arc;
 

@@ -1,0 +1,10 @@
+error[E0624]: method `context_mut` is private
+ --> tests/ui/agent_session_context_mut_is_private.rs:7:42
+  |
+7 |     let _old = std::mem::replace(session.context_mut(), replacement);
+  |                                          ^^^^^^^^^^^ private method
+  |
+ ::: src/agent_session.rs
+  |
+  |     pub(crate) fn context_mut(&mut self) -> &mut PromptContext<I, CS> {
+  |     ----------------------------------------------------------------- private method defined here

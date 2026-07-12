@@ -1,4 +1,4 @@
-//! Minimal chess AgentViewSession with a Stockfish-compatible UCI engine.
+//! Minimal chess AgentViewApp with a Stockfish-compatible UCI engine.
 //!
 //! Run with:
 //! `cargo run --example chess_engine_agent`
@@ -18,18 +18,17 @@ mod chess_support;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let source = ChessGameSource::new();
-    let (mut session, awake): (AgentViewSession<ChessViewModel, Turn, ()>, _) =
-        AgentViewSession::new(
-            ChessViewModel,
-            source.clone(),
-            PromptContext::<Turn, ()>::without_system(),
-        );
+    let (mut app, awake): (AgentViewApp<ChessViewModel, Turn, ()>, _) = AgentViewApp::new(
+        ChessViewModel,
+        source.clone(),
+        PromptContext::<Turn, ()>::without_system(),
+    );
     let templates = TemplateEngine::new();
 
-    let snapshot = session.observe("Choose white's next move.").await?;
+    let snapshot = app.observe("Choose white's next move.").await?;
     print_chess_full_snapshot("observe", &snapshot, &templates).await?;
 
-    let update = session
+    let update = app
         .act_with_sink(
             &snapshot.turn_id,
             ControlReply::structured(json!({ "uci": "e2e4" })),
@@ -55,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let after_engine = session
+    let after_engine = app
         .hook(after_player.view_epoch, "Choose white's next move.")
         .await?;
     print_chess_update("hook", &after_engine, &after_player.view, &templates).await?;

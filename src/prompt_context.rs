@@ -156,7 +156,7 @@ impl<I, CS> PromptContext<I, CS> {
     }
 
     /// Replace committed history without changing stable or VM-owned context.
-    pub fn replace_history(&mut self, items: Vec<I>) {
+    pub(crate) fn replace_history(&mut self, items: Vec<I>) {
         self.history = items;
     }
 

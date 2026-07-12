@@ -1,0 +1,5 @@
+error: `skip` cannot be combined with rendering, naming, or diff attributes
+ --> tests/ui/skip_with_diff.rs:7:5
+  |
+7 |     runtime_state: String,
+  |     ^^^^^^^^^^^^^

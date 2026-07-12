@@ -128,17 +128,18 @@ impl TurnSink<ControlReply> for DeltaSink {
 #[tokio::test]
 async fn observe_returns_full_snapshot_with_turn_prompt() {
     let source = Arc::new(Mutex::new(0));
-    let (mut session, _awake) = AgentViewSession::new(
+    let (mut app, _awake) = AgentViewApp::new(
         CounterViewModel,
         source,
         PromptContext::<Turn, ()>::without_system(),
     );
 
-    let snapshot = session.observe("increment once").await.unwrap();
+    let snapshot = app.observe("increment once").await.unwrap();
 
     assert_eq!(snapshot.view_epoch, 0);
     assert_eq!(snapshot.turn_id, "turn-1");
     assert_eq!(snapshot.view, CounterView { value: 0 });
+    assert_eq!(app.session().view_cursor(), Some(&CounterView { value: 0 }));
     assert_eq!(
         snapshot.turn_prompt.text,
         "turn=turn-1; task=increment once; reply with {\"delta\": number}"
@@ -148,22 +149,25 @@ async fn observe_returns_full_snapshot_with_turn_prompt() {
 #[tokio::test]
 async fn act_applies_parsed_reply_and_returns_full_update() {
     let source = Arc::new(Mutex::new(0));
-    let (mut session, _awake) = AgentViewSession::new(
+    let (mut app, _awake) = AgentViewApp::new(
         CounterViewModel,
         Arc::clone(&source),
         PromptContext::<Turn, ()>::without_system(),
     );
-    let snapshot = session.observe("increment").await.unwrap();
+    let snapshot = app.observe("increment").await.unwrap();
 
-    let update = session
+    let update = app
         .act_with_sink(
             &snapshot.turn_id,
             ControlReply::structured(json!({ "delta": 3 })),
             DeltaSink::default(),
-            |_, source, delta| {
+            |session: &mut AgentSession<Turn, (), CounterView>,
+             source: &CounterSource,
+             delta: Option<i32>| {
                 if let Some(delta) = delta {
                     *source.lock().unwrap() += delta;
                 }
+                session.push_history(Turn::user("counter updated"));
                 Ok(())
             },
             "increment again",
@@ -177,19 +181,21 @@ async fn act_applies_parsed_reply_and_returns_full_update() {
     let next = update.snapshot().unwrap();
     assert_eq!(next.turn_id, "turn-2");
     assert_eq!(next.view, CounterView { value: 3 });
+    assert_eq!(app.session().view_cursor(), Some(&CounterView { value: 3 }));
+    assert_eq!(app.session().context().history().len(), 1);
 }
 
 #[tokio::test]
 async fn act_rejects_stale_turn_id() {
     let source = Arc::new(Mutex::new(0));
-    let (mut session, _awake) = AgentViewSession::new(
+    let (mut app, _awake) = AgentViewApp::new(
         CounterViewModel,
         source,
         PromptContext::<Turn, ()>::without_system(),
     );
-    let _snapshot = session.observe("increment").await.unwrap();
+    let _snapshot = app.observe("increment").await.unwrap();
 
-    let err = session
+    let err = app
         .act_with_sink(
             "turn-0",
             ControlReply::structured(json!({ "delta": 1 })),
@@ -211,12 +217,12 @@ async fn act_rejects_stale_turn_id() {
 #[tokio::test]
 async fn hook_waits_for_app_awake_then_returns_full_snapshot() {
     let source = Arc::new(Mutex::new(0));
-    let (mut session, awake) = AgentViewSession::new(
+    let (mut app, awake) = AgentViewApp::new(
         CounterViewModel,
         Arc::clone(&source),
         PromptContext::<Turn, ()>::without_system(),
     );
-    let snapshot = session.observe("watch").await.unwrap();
+    let snapshot = app.observe("watch").await.unwrap();
 
     tokio::spawn({
         let source = Arc::clone(&source);
@@ -229,7 +235,7 @@ async fn hook_waits_for_app_awake_then_returns_full_snapshot() {
 
     let next = timeout(
         Duration::from_secs(1),
-        session.hook(snapshot.view_epoch, "watch again"),
+        app.hook(snapshot.view_epoch, "watch again"),
     )
     .await
     .unwrap()
@@ -237,4 +243,5 @@ async fn hook_waits_for_app_awake_then_returns_full_snapshot() {
 
     assert_eq!(next.view_epoch, 1);
     assert_eq!(next.view, CounterView { value: 9 });
+    assert_eq!(app.session().view_cursor(), Some(&CounterView { value: 9 }));
 }

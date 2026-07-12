@@ -19,11 +19,11 @@ validation, rendering, and engine-opponent progress.
 
 The repo already has the right base pieces:
 
-- `AgentViewSession::observe` returns a full `ViewSnapshot`.
-- `AgentViewSession::act_with_sink` feeds an external `ControlReply` into
+- `AgentViewApp::observe` returns a full `ViewSnapshot`.
+- `AgentViewApp::act_with_sink` feeds an external `ControlReply` into
   `TurnSink<ControlReply>`, applies the sink output, and returns a full
   `ViewUpdate`.
-- `AgentViewSession::hook` waits for `ViewAwakeHandle::awake` and then returns a
+- `AgentViewApp::hook` waits for `ViewAwakeHandle::awake` and then returns a
   full `ViewSnapshot`.
 - `ViewUpdate` already has a `Partial(ViewPatch)` variant, but the session
   currently returns full updates only.
@@ -125,7 +125,7 @@ itself should not be only a rendered string.
 - [x] Create the chess planning and kanban doc.
 - [x] Pick the first implementation boundary for the chess example.
 - [x] Core `ViewSnapshot`, `ViewUpdate`, and `ViewAwake` types exist.
-- [x] `AgentViewSession` supports full `observe`, full-update `act`, and full
+- [x] `AgentViewApp` supports full `observe`, full-update `act`, and full
   `hook`.
 - [x] Hidden daemon plus thin CLI pattern exists for hello world.
 - [x] Loopback TCP transport exists for the local daemon prototype.
@@ -218,7 +218,7 @@ AgentView source can independently progress and wake the view.
 
 - If the chess example becomes useful beyond a demo, should it move into a
   separate crate or an explicitly gated module?
-- Do we want `AgentViewSession` to support async apply closures later, or is
+- Do we want `AgentViewApp` to support async apply closures later, or is
   async source progress through `hook` the intended style?
 - How much of the chess view should be rendered as structured JSON versus
   human-readable text?

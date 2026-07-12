@@ -1,0 +1,5 @@
+error: `replace` cannot be combined with collection diff modes
+ --> tests/ui/replace_with_collection_mode.rs:7:5
+  |
+7 |     items: Vec<String>,
+  |     ^^^^^

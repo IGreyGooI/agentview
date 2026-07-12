@@ -283,8 +283,9 @@ fn find_next_element(input: &str) -> Option<FindResult> {
 
 /// Streaming XML parser for Hermes-style LLM responses.
 ///
-/// Register per-tag callbacks with [`on_complete`], [`on_stream`], and [`on_open`],
-/// then feed LLM chunks with [`feed`]. Call [`finalize`] at stream end.
+/// Register per-tag callbacks with [`HermesParser::on_complete`],
+/// [`HermesParser::on_stream`], and [`HermesParser::on_open`], then feed LLM
+/// chunks with [`HermesParser::feed`]. Call [`HermesParser::finalize`] at stream end.
 ///
 /// Callback firing order per element:
 /// 1. `on_open`     — fires once as soon as `<tag attrs...>` is fully parsed

@@ -434,7 +434,7 @@ async fn main() -> anyhow::Result<()> {
             .render_turn_artifacts(update.artifacts)
             .await?;
         if !rendered_artifacts.is_empty() || update.task.is_some() {
-            agent.ctx.write().await.context_state_mut().feedback =
+            agent.session_mut().await.context_state_mut().feedback =
                 agentview::agent::DefaultAgentFeedback {
                     artifacts: rendered_artifacts,
                     task: update.task,
@@ -449,9 +449,9 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "\n--- PENDING NEXT-AWAKE FEEDBACK ---\n{}",
         agent
-            .ctx
-            .read()
+            .session()
             .await
+            .context()
             .context_state()
             .feedback
             .task

@@ -1,4 +1,4 @@
-//! Minimal AgentViewSession hello world.
+//! Minimal AgentViewApp hello world.
 //!
 //! Run with:
 //! `cargo run --example hello_world`
@@ -91,13 +91,13 @@ async fn main() -> anyhow::Result<()> {
         IdentityTransform,
     );
 
-    let (mut session, _awake): (AgentViewSession<_, Turn, ()>, _) = AgentViewSession::new(
+    let (mut app, _awake): (AgentViewApp<_, Turn, ()>, _) = AgentViewApp::new(
         view_model,
         Arc::clone(&source),
         PromptContext::<Turn, DefaultContextState>::without_system(),
     );
 
-    let snapshot = session.observe("Ask the caller for their name.").await?;
+    let snapshot = app.observe("Ask the caller for their name.").await?;
     println!(
         "observe epoch={} turn={}",
         snapshot.view_epoch, snapshot.turn_id
@@ -112,15 +112,15 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("prompt: {}", snapshot.turn_prompt.task);
 
-    let update = session
+    let update = app
         .act_with_sink(
             &snapshot.turn_id,
             ControlReply::text("world"),
             NameSink::default(),
-            |ctx, source, name| {
+            |session, source, name| {
                 if let Some(name) = name {
                     source.lock().unwrap().name = Some(name.clone());
-                    ctx.push_history(Turn::user(format!("name = {name}")));
+                    session.push_history(Turn::user(format!("name = {name}")));
                 }
                 Ok(())
             },

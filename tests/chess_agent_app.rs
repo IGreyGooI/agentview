@@ -15,10 +15,8 @@ use chess_support::{
 use serde_json::json;
 use tokio::time::timeout;
 
-fn new_session(
-    source: ChessGameSource,
-) -> (AgentViewSession<ChessViewModel, Turn, ()>, ViewAwakeHandle) {
-    AgentViewSession::new(
+fn new_app(source: ChessGameSource) -> (AgentViewApp<ChessViewModel, Turn, ()>, ViewAwakeHandle) {
+    AgentViewApp::new(
         ChessViewModel,
         source,
         PromptContext::<Turn, ()>::without_system(),
@@ -26,24 +24,23 @@ fn new_session(
 }
 
 async fn apply_test_move(
-    session: &mut AgentViewSession<ChessViewModel, Turn, ()>,
+    app: &mut AgentViewApp<ChessViewModel, Turn, ()>,
     source: &ChessGameSource,
     snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
     uci: &str,
 ) -> ViewSnapshot<ChessView, ChessTaskView> {
-    session
-        .act_with_sink(
-            &snapshot.turn_id,
-            ControlReply::structured(json!({ "uci": uci })),
-            ChessMoveSink::from_source(source),
-            apply_player_move,
-            "Continue the test game.",
-        )
-        .await
-        .unwrap()
-        .snapshot()
-        .unwrap()
-        .clone()
+    app.act_with_sink(
+        &snapshot.turn_id,
+        ControlReply::structured(json!({ "uci": uci })),
+        ChessMoveSink::from_source(source),
+        apply_player_move,
+        "Continue the test game.",
+    )
+    .await
+    .unwrap()
+    .snapshot()
+    .unwrap()
+    .clone()
 }
 
 fn assert_agent_view<T: AgentView>() {}
@@ -71,8 +68,8 @@ async fn chess_view_can_be_collected_from_game_state_snapshot() {
 #[tokio::test]
 async fn chess_square_leaf_uses_agent_view_derive() {
     let source = ChessGameSource::new();
-    let (mut session, _awake) = new_session(source);
-    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+    let (mut app, _awake) = new_app(source);
+    let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
     assert_eq!(
         snapshot.view.render_square_xml_for_test(0, 0).unwrap(),
@@ -83,8 +80,8 @@ async fn chess_square_leaf_uses_agent_view_derive() {
 #[tokio::test]
 async fn chess_board_state_uses_agent_view_derive() {
     let source = ChessGameSource::new();
-    let (mut session, _awake) = new_session(source);
-    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+    let (mut app, _awake) = new_app(source);
+    let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
     let rendered = chess_support::render_board_state_xml_for_test(&snapshot.view);
 
@@ -99,8 +96,8 @@ async fn chess_board_state_uses_agent_view_derive() {
 #[tokio::test]
 async fn chess_board_squares_render_as_a_flat_agent_facing_list() {
     let source = ChessGameSource::new();
-    let (mut session, _awake) = new_session(source);
-    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+    let (mut app, _awake) = new_app(source);
+    let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
     let rendered = snapshot
         .view
@@ -185,9 +182,9 @@ done
 #[tokio::test]
 async fn observe_renders_starting_board_and_move_contract() {
     let source = ChessGameSource::new();
-    let (mut session, _awake) = new_session(source);
+    let (mut app, _awake) = new_app(source);
 
-    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+    let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
     assert_eq!(snapshot.view_epoch, 0);
     assert_eq!(snapshot.turn_id, "turn-1");
@@ -252,10 +249,10 @@ async fn observe_renders_starting_board_and_move_contract() {
 #[cfg(unix)]
 async fn act_applies_player_move_and_hook_observes_stockfish_reply() {
     let source = ChessGameSource::new();
-    let (mut session, awake) = new_session(source.clone());
-    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+    let (mut app, awake) = new_app(source.clone());
+    let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
-    let update = session
+    let update = app
         .act_with_sink(
             &snapshot.turn_id,
             ControlReply::structured(json!({ "uci": "e2e4" })),
@@ -284,7 +281,7 @@ async fn act_applies_player_move_and_hook_observes_stockfish_reply() {
 
     let after_engine = timeout(
         Duration::from_secs(1),
-        session.hook(after_player.view_epoch, "Choose white's next move."),
+        app.hook(after_player.view_epoch, "Choose white's next move."),
     )
     .await
     .unwrap()
@@ -302,10 +299,10 @@ async fn act_applies_player_move_and_hook_observes_stockfish_reply() {
 #[tokio::test]
 async fn stockfish_engine_applies_bestmove_from_uci_process() {
     let source = ChessGameSource::new();
-    let (mut session, awake) = new_session(source.clone());
-    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+    let (mut app, awake) = new_app(source.clone());
+    let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
-    let update = session
+    let update = app
         .act_with_sink(
             &snapshot.turn_id,
             ControlReply::structured(json!({ "uci": "e2e4" })),
@@ -323,7 +320,7 @@ async fn stockfish_engine_applies_bestmove_from_uci_process() {
 
     let after_engine = timeout(
         Duration::from_secs(1),
-        session.hook(
+        app.hook(
             update.snapshot().unwrap().view_epoch,
             "Choose white's next move.",
         ),
@@ -343,10 +340,10 @@ async fn stockfish_engine_applies_bestmove_from_uci_process() {
 #[tokio::test]
 async fn chess_view_uses_generic_field_diff_for_a_player_move() {
     let source = ChessGameSource::new();
-    let (mut session, _awake) = new_session(source.clone());
-    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+    let (mut app, _awake) = new_app(source.clone());
+    let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
-    let update = session
+    let update = app
         .act_with_sink(
             &snapshot.turn_id,
             ControlReply::structured(json!({ "uci": "e2e4" })),
@@ -394,14 +391,14 @@ async fn chess_view_uses_generic_field_diff_for_a_player_move() {
 #[tokio::test]
 async fn chess_view_keyed_diff_emits_all_four_castling_square_updates() {
     let source = ChessGameSource::new();
-    let (mut session, _awake) = new_session(source.clone());
-    let mut snapshot = session.observe("Set up castling.").await.unwrap();
+    let (mut app, _awake) = new_app(source.clone());
+    let mut snapshot = app.observe("Set up castling.").await.unwrap();
 
     for uci in ["e2e4", "e7e5", "g1f3", "b8c6", "f1e2", "g8f6"] {
-        snapshot = apply_test_move(&mut session, &source, &snapshot, uci).await;
+        snapshot = apply_test_move(&mut app, &source, &snapshot, uci).await;
     }
 
-    let after_castling = apply_test_move(&mut session, &source, &snapshot, "e1g1").await;
+    let after_castling = apply_test_move(&mut app, &source, &snapshot, "e1g1").await;
     let rendered = after_castling
         .view
         .render_delta(&snapshot.view, &TemplateEngine::new())
@@ -421,10 +418,10 @@ async fn chess_view_keyed_diff_emits_all_four_castling_square_updates() {
 #[tokio::test]
 async fn act_rejects_illegal_chess_move() {
     let source = ChessGameSource::new();
-    let (mut session, _awake) = new_session(source.clone());
-    let snapshot = session.observe("Choose white's next move.").await.unwrap();
+    let (mut app, _awake) = new_app(source.clone());
+    let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
-    let update = session
+    let update = app
         .act_with_sink(
             &snapshot.turn_id,
             ControlReply::structured(json!({ "uci": "e2e5" })),

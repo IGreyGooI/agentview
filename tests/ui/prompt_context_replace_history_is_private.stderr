@@ -1,0 +1,10 @@
+error[E0624]: method `replace_history` is private
+ --> tests/ui/prompt_context_replace_history_is_private.rs:5:13
+  |
+5 |     context.replace_history(Vec::new());
+  |             ^^^^^^^^^^^^^^^ private method
+  |
+ ::: src/prompt_context.rs
+  |
+  |     pub(crate) fn replace_history(&mut self, items: Vec<I>) {
+  |     ------------------------------------------------------- private method defined here

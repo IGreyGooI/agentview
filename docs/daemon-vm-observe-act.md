@@ -13,7 +13,7 @@ session state, action validity, and control-loop progress.
 
 `agentview` currently defines the first reusable state envelopes and session:
 `ViewSnapshot`, `ViewUpdate`, `ViewPatch`, `ControlReply`, `ViewAwake`, and
-`AgentViewSession`. The session covers full `observe`, sync `hook`, and
+`AgentViewApp`. The app covers full `observe`, sync `hook`, and
 `act_with_sink` with a full-update response. External replies are parsed through
 `TurnSink<ControlReply>`, so the same sink concept handles provider streams and
 CLI/daemon replies. It does not yet define the patch decider or any daemon/CLI
@@ -195,7 +195,7 @@ turn identity, view, and turn prompt.
 ## Update Invariant
 
 Long term, `act` should be able to default to a partial update, but full
-snapshot fallback is always valid. The first `AgentViewSession::act_with_sink`
+snapshot fallback is always valid. The first `AgentViewApp::act_with_sink`
 implementation returns a full update while the patch decider is still separate.
 
 Suggested shape:
@@ -403,7 +403,7 @@ enum ControlReply {
 
 The sink should handle ordinary parsing and validation failures internally. Its
 `Output` can be accepted domain state, rejection feedback, tool requests, or
-other per-turn facts. The `AgentViewSession` caller should only see errors for
+other per-turn facts. The `AgentViewApp` caller should only see errors for
 session/infrastructure failures such as a stale `turn_id` or a failed apply
 step.
 
@@ -591,7 +591,7 @@ agents. The new loop is for stateful daemon sessions driven by an external
 caller through CLI or skill transport.
 
 The extraction point is around request/view preparation and commit semantics.
-The first `AgentViewSession` pulls out the external observe/hook/act path.
+The first `AgentViewApp` pulls out the external observe/hook/act path.
 Further implementation may need reusable helpers that can:
 
 - capture the current AgentView view;

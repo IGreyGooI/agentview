@@ -30,6 +30,7 @@
 #![deny(clippy::disallowed_types)]
 
 pub mod agent;
+pub mod agent_session;
 pub mod control;
 pub mod llm_call;
 pub mod prompt_context;
@@ -38,8 +39,8 @@ pub mod semantic_view;
 pub mod stream_parser;
 pub mod streaming_tool;
 pub mod templates;
+pub mod view_app;
 pub mod view_awake;
-pub mod view_session;
 pub mod view_state;
 
 pub type StorageString = ecow::EcoString;
@@ -51,6 +52,7 @@ pub mod prelude {
     pub use crate::agent::{
         Agent, AgentTurnBuilder, AgentViewModel, DefaultAgentViewModel, TextAgent, TurnFlow,
     };
+    pub use crate::agent_session::AgentSession;
     pub use crate::control::ControlReply;
     pub use crate::llm_call::{
         AgentTurnEvent, AgentTurnObserver, AgentTurnObserverHandle, AgentTurnOutcome,
@@ -73,8 +75,8 @@ pub mod prelude {
         ContextBlockKind, ContextView, ContextViewBuilder, PromptFragment, PromptLayout,
         PromptRenderable, PromptSystemVars, TemplateEngine, TurnArtifact,
     };
+    pub use crate::view_app::{AgentViewApp, AgentViewAppError};
     pub use crate::view_awake::{ViewAwake, ViewAwakeHandle, ViewAwakeSubscription, ViewEpoch};
-    pub use crate::view_session::{AgentViewSession, AgentViewSessionError};
     pub use crate::view_state::{ViewPatch, ViewSnapshot, ViewTurnId, ViewUpdate, ViewUpdateBody};
     pub use crate::StorageString;
     pub use agentview_derive::AgentView;
