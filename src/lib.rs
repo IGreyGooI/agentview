@@ -62,10 +62,10 @@ pub mod prelude {
     };
     pub use crate::pom::{
         BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentContext, ContentKind,
-        ContentNode, ContentRef, Document, HeadingLevel, HeadingNode, InlineChildren,
-        InlineContent, ListItem, ListKind, ListNode, MarkdownKind, MarkdownNode, MixedChildren,
-        MixedContent, ParagraphNode, PomError, StrongNode, TextNode, XmlAttribute, XmlAttributes,
-        XmlName, XmlNode,
+        ContentNode, ContentRef, DiffSlot, DiffStrategy, Document, HeadingLevel, HeadingNode,
+        InlineChildren, InlineContent, ListItem, ListKind, ListNode, MarkdownKind, MarkdownNode,
+        MixedChildren, MixedContent, ParagraphNode, PomError, StrongNode, TextNode, XmlAttribute,
+        XmlAttributes, XmlName, XmlNode,
     };
     pub use crate::prompt_context::{
         AgentTurnError, IdentityTransform, PromptContext, Role, Turn, TurnTransform,

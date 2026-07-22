@@ -1,8 +1,8 @@
 use agentview::pom::{
     BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentContext, ContentKind,
-    ContentNode, ContentRef, HeadingLevel, HeadingNode, InlineChildren, InlineContent, ListItem,
-    ListKind, ListNode, MarkdownKind, MarkdownNode, MixedChildren, MixedContent, ParagraphNode,
-    PomError, StrongNode, TextNode, XmlAttributes, XmlName, XmlNode,
+    ContentNode, ContentRef, DiffSlot, DiffStrategy, HeadingLevel, HeadingNode, InlineChildren,
+    InlineContent, ListItem, ListKind, ListNode, MarkdownKind, MarkdownNode, MixedChildren,
+    MixedContent, ParagraphNode, PomError, StrongNode, TextNode, XmlAttributes, XmlName, XmlNode,
 };
 
 #[test]
@@ -296,7 +296,115 @@ fn mixed_children_preserve_text_markdown_xml_text_order() {
             ContentRef::Node(ContentNode::Text(_)) => "text",
             ContentRef::Node(ContentNode::Markdown(_)) => "markdown",
             ContentRef::Node(ContentNode::Xml(_)) => "xml",
+            ContentRef::DiffSlot(_) => "diff",
         })
         .collect::<Vec<_>>();
     assert_eq!(kinds, vec!["text", "markdown", "xml", "text"]);
+}
+
+#[test]
+fn present_diff_slot_derives_role_from_value_name() {
+    let value = XmlNode::new(XmlName::try_from("agent_context").unwrap());
+    let slot = DiffSlot::present(DiffStrategy::Recursive, value.clone());
+
+    assert_eq!(slot.role().as_str(), "agent_context");
+    assert_eq!(slot.strategy(), &DiffStrategy::Recursive);
+    assert_eq!(slot.value(), Some(&value));
+    assert!(slot.is_present());
+}
+
+#[test]
+fn xml_wrapped_markdown_is_a_valid_slot_value() {
+    let mut inline = InlineChildren::new();
+    inline.push(InlineContent::try_text("explanation").unwrap());
+
+    let mut xml = XmlNode::new(XmlName::try_from("agent_context").unwrap());
+    xml.push(MixedContent::markdown(MarkdownNode::Paragraph(
+        ParagraphNode::new(inline),
+    )));
+
+    let slot = DiffSlot::present(DiffStrategy::Recursive, xml);
+    assert!(matches!(
+        slot.value().unwrap().children().iter().next(),
+        Some(ContentRef::Node(ContentNode::Markdown(
+            MarkdownNode::Paragraph(_)
+        )))
+    ));
+}
+
+#[test]
+fn all_diff_strategies_are_structurally_observable() {
+    let key = XmlName::try_from("id").unwrap();
+    let strategies = vec![
+        DiffStrategy::Recursive,
+        DiffStrategy::Replace,
+        DiffStrategy::Append,
+        DiffStrategy::Sequence,
+        DiffStrategy::Set,
+        DiffStrategy::Keyed(key),
+    ];
+    for strategy in strategies {
+        let slot = DiffSlot::present(
+            strategy.clone(),
+            XmlNode::new(XmlName::try_from("items").unwrap()),
+        );
+        assert_eq!(slot.strategy(), &strategy);
+    }
+}
+
+#[test]
+fn absent_diff_slot_retains_role_strategy_and_position() {
+    let role = XmlName::try_from("agent_context").unwrap();
+    let slot = DiffSlot::absent(role.clone(), DiffStrategy::Replace);
+    assert_eq!(slot.role(), &role);
+    assert_eq!(slot.strategy(), &DiffStrategy::Replace);
+    assert_eq!(slot.value(), None);
+
+    let mut children = MixedChildren::new();
+    children.push(MixedContent::text(TextNode::new("before")));
+    children.push(MixedContent::xml_slot(slot));
+    children.push(MixedContent::text(TextNode::new("after")));
+    assert!(matches!(
+        children.iter().nth(1),
+        Some(ContentRef::DiffSlot(slot)) if slot.role() == &role
+    ));
+}
+
+#[test]
+fn text_normalization_does_not_cross_diff_slot() {
+    let mut children = MixedChildren::new();
+    children.push(MixedContent::text(TextNode::new("left")));
+    children.push(MixedContent::xml_slot(DiffSlot::absent(
+        XmlName::try_from("agent_context").unwrap(),
+        DiffStrategy::Recursive,
+    )));
+    children.push(MixedContent::text(TextNode::new("right")));
+    assert_eq!(children.len(), 3);
+}
+
+#[test]
+fn diff_slots_are_valid_in_every_xml_context() {
+    let block = DiffSlot::absent(XmlName::try_from("block").unwrap(), DiffStrategy::Recursive);
+    let inline = DiffSlot::absent(XmlName::try_from("inline").unwrap(), DiffStrategy::Replace);
+    let mixed = DiffSlot::absent(XmlName::try_from("mixed").unwrap(), DiffStrategy::Append);
+
+    let mut block_children = BlockChildren::new();
+    block_children.push(BlockContent::xml_slot(block));
+    let mut inline_children = InlineChildren::new();
+    inline_children.push(InlineContent::xml_slot(inline));
+    let mut mixed_children = MixedChildren::new();
+    mixed_children.push(MixedContent::xml_slot(mixed));
+
+    assert!(matches!(
+        block_children.iter().next(),
+        Some(ContentRef::DiffSlot(slot)) if slot.role().as_str() == "block"
+    ));
+    assert!(matches!(
+        inline_children.iter().next(),
+        Some(ContentRef::DiffSlot(slot)) if slot.role().as_str() == "inline"
+    ));
+    assert!(matches!(
+        mixed_children.iter().next(),
+        Some(ContentRef::DiffSlot(slot)) if slot.role().as_str() == "mixed"
+    ));
 }

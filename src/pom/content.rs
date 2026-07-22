@@ -1,8 +1,8 @@
 use crate::StorageString;
 
 use super::{
-    CodeBlockNode, CodeSpanNode, ContentContext, ContentKind, HeadingNode, ListNode, MarkdownKind,
-    MarkdownNode, ParagraphNode, PomError, StrongNode, TextNode, XmlNode,
+    CodeBlockNode, CodeSpanNode, ContentContext, ContentKind, DiffSlot, HeadingNode, ListNode,
+    MarkdownKind, MarkdownNode, ParagraphNode, PomError, StrongNode, TextNode, XmlNode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,17 +39,20 @@ impl MarkdownNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ContentEdge {
     Node(ContentNode),
+    Diff(DiffSlot),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentRef<'a> {
     Node(&'a ContentNode),
+    DiffSlot(&'a DiffSlot),
 }
 
 impl ContentEdge {
     fn as_ref(&self) -> ContentRef<'_> {
         match self {
             Self::Node(node) => ContentRef::Node(node),
+            Self::Diff(slot) => ContentRef::DiffSlot(slot),
         }
     }
 }
@@ -85,6 +88,10 @@ impl BlockContent {
 
     pub fn xml(node: XmlNode) -> Self {
         Self(ContentEdge::Node(ContentNode::Xml(node)))
+    }
+
+    pub fn xml_slot(slot: DiffSlot) -> Self {
+        Self(ContentEdge::Diff(slot))
     }
 
     pub fn try_from_node(node: ContentNode) -> Result<Self, PomError> {
@@ -133,6 +140,10 @@ impl InlineContent {
 
     pub fn xml(node: XmlNode) -> Self {
         Self(ContentEdge::Node(ContentNode::Xml(node)))
+    }
+
+    pub fn xml_slot(slot: DiffSlot) -> Self {
+        Self(ContentEdge::Diff(slot))
     }
 
     pub fn try_from_node(node: ContentNode) -> Result<Self, PomError> {
@@ -186,6 +197,10 @@ impl MixedContent {
 
     pub fn xml(node: XmlNode) -> Self {
         Self::node(node.into())
+    }
+
+    pub fn xml_slot(slot: DiffSlot) -> Self {
+        Self(ContentEdge::Diff(slot))
     }
 
     pub(crate) fn as_ref(&self) -> ContentRef<'_> {

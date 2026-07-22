@@ -15,6 +15,7 @@ fn normalize_text_edge(
             }
             Some(ContentEdge::Node(ContentNode::Markdown(_)))
             | Some(ContentEdge::Node(ContentNode::Xml(_)))
+            | Some(ContentEdge::Diff(_))
             | None => Some(ContentEdge::Node(ContentNode::Text(text))),
         },
         ContentEdge::Node(ContentNode::Markdown(node)) => {
@@ -23,6 +24,7 @@ fn normalize_text_edge(
         ContentEdge::Node(ContentNode::Xml(node)) => {
             Some(ContentEdge::Node(ContentNode::Xml(node)))
         }
+        ContentEdge::Diff(slot) => Some(ContentEdge::Diff(slot)),
     }
 }
 
