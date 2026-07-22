@@ -96,6 +96,135 @@ fn closure_builders_cover_the_v1_authoring_surface() {
 }
 
 #[test]
+fn nested_try_paragraph_and_strong_failures_are_atomic_and_recoverable() {
+    let invalid_strong_text = "strong\nfailure";
+    let invalid_paragraph_text = "paragraph\nfailure";
+    let document = Document::try_build(|blocks| {
+        blocks.try_paragraph(|inline| {
+            inline.try_text("kept before ")?;
+            let result = inline.try_strong(|strong| {
+                strong.try_text("discarded strong child")?;
+                strong.try_text(invalid_strong_text)
+            });
+            assert_eq!(
+                result,
+                Err(PomError::InvalidInlineNewline {
+                    value: invalid_strong_text.into(),
+                })
+            );
+            inline.try_text("kept after")?;
+            Ok(())
+        })?;
+
+        let result = blocks.try_paragraph(|inline| {
+            inline.try_text("discarded paragraph child")?;
+            inline.try_text(invalid_paragraph_text)
+        });
+        assert_eq!(
+            result,
+            Err(PomError::InvalidInlineNewline {
+                value: invalid_paragraph_text.into(),
+            })
+        );
+
+        blocks.try_paragraph(|inline| {
+            inline.try_text("kept tail")?;
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(document.children().len(), 2);
+    match document.children().iter().next() {
+        Some(ContentRef::Node(ContentNode::Markdown(MarkdownNode::Paragraph(paragraph)))) => {
+            assert_eq!(paragraph.children().len(), 1);
+            assert!(matches!(
+                paragraph.children().iter().next(),
+                Some(ContentRef::Node(ContentNode::Text(text)))
+                    if text.value() == "kept before kept after"
+            ));
+        }
+        other => panic!("expected recovered paragraph, got {other:?}"),
+    }
+    assert!(matches!(
+        document.children().iter().nth(1),
+        Some(ContentRef::Node(ContentNode::Markdown(
+            MarkdownNode::Paragraph(paragraph),
+        ))) if matches!(
+            paragraph.children().iter().next(),
+            Some(ContentRef::Node(ContentNode::Text(text))) if text.value() == "kept tail"
+        )
+    ));
+}
+
+#[test]
+fn nested_try_list_and_item_failures_are_atomic_and_recoverable() {
+    let invalid_list_name = "invalid:list";
+    let invalid_item_name = "invalid:item";
+    let document = Document::try_build(|blocks| {
+        let result = blocks.try_list(ListKind::Unordered, |list| {
+            list.try_item(|item| {
+                item.try_paragraph(|inline| {
+                    inline.try_text("discarded with list")?;
+                    Ok(())
+                })?;
+                Ok(())
+            })?;
+            XmlName::try_from(invalid_list_name).map(|_| ())
+        });
+        assert_eq!(
+            result,
+            Err(PomError::InvalidXmlName {
+                value: invalid_list_name.into(),
+            })
+        );
+
+        blocks.try_list(ListKind::Unordered, |list| {
+            let result = list.try_item(|item| {
+                item.try_paragraph(|inline| {
+                    inline.try_text("discarded with item")?;
+                    Ok(())
+                })?;
+                XmlName::try_from(invalid_item_name).map(|_| ())
+            });
+            assert_eq!(
+                result,
+                Err(PomError::InvalidXmlName {
+                    value: invalid_item_name.into(),
+                })
+            );
+            list.try_item(|item| {
+                item.try_paragraph(|inline| {
+                    inline.try_text("kept item")?;
+                    Ok(())
+                })?;
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(document.children().len(), 1);
+    let list = match document.children().iter().next() {
+        Some(ContentRef::Node(ContentNode::Markdown(MarkdownNode::List(list)))) => list,
+        other => panic!("expected recovered list, got {other:?}"),
+    };
+    assert_eq!(list.items().len(), 1);
+    assert!(matches!(
+        list.items()[0].children().iter().next(),
+        Some(ContentRef::Node(ContentNode::Markdown(
+            MarkdownNode::Paragraph(paragraph),
+        ))) if matches!(
+            paragraph.children().iter().next(),
+            Some(ContentRef::Node(ContentNode::Text(text))) if text.value() == "kept item"
+        )
+    ));
+}
+
+#[test]
 fn typed_and_fallible_builder_entries_cover_remaining_surface() {
     let inline_slot = XmlName::try_from("inline_slot").unwrap();
     let document = Document::build(|blocks| {
@@ -552,6 +681,22 @@ fn diff_slots_are_valid_in_every_xml_context() {
 
 #[test]
 fn diagnostic_serialization_preserves_order_and_diff_metadata() {
+    fn find_keyed_payload(value: &serde_json::Value) -> Option<&serde_json::Value> {
+        match value {
+            serde_json::Value::Object(fields) => {
+                if let Some(payload) = fields.get("Keyed") {
+                    return match payload {
+                        serde_json::Value::Object(fields) => fields.get("value"),
+                        _ => Some(payload),
+                    };
+                }
+                fields.values().find_map(find_keyed_payload)
+            }
+            serde_json::Value::Array(values) => values.iter().find_map(find_keyed_payload),
+            _ => None,
+        }
+    }
+
     let document = Document::try_build(|blocks| {
         blocks.try_paragraph(|inline| {
             inline.try_text("before")?;
@@ -571,6 +716,9 @@ fn diagnostic_serialization_preserves_order_and_diff_metadata() {
     let role = json.find("agent_context").unwrap();
     let after = json.find("after").unwrap();
     assert!(before < role && role < after);
-    assert!(json.contains("Keyed"));
-    assert!(json.contains("id"));
+    let value = serde_json::to_value(&document).unwrap();
+    assert_eq!(
+        find_keyed_payload(&value),
+        Some(&serde_json::Value::String("id".into()))
+    );
 }
