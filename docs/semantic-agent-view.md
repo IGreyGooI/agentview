@@ -7,6 +7,37 @@ The semantic view is an agent-facing frontend tree. A struct's `kind` describes
 the concrete view model being rendered. A field name describes the role that a
 child value plays inside its parent.
 
+## Core Pipeline
+
+`AgentView` converts Rust values into a complete semantic tree before any prompt
+text is produced. Full rendering follows this pipeline:
+
+```text
+Rust struct instance -> complete semantic tree -> prompt renderer
+```
+
+Delta rendering builds the current and previous trees independently, compares
+those trees, and only then renders the resulting delta tree:
+
+```text
+current Rust instance  -> complete current semantic tree
+previous Rust instance -> complete previous semantic tree
+                                      |
+                                      v
+                              semantic tree diff
+                                      |
+                                      v
+                              delta semantic tree
+                                      |
+                                      v
+                                prompt renderer
+```
+
+The diff engine does not compare Rust structs directly and does not compare
+already-rendered prompt strings. `#[view(diff)]` retains a field boundary as a
+`SemanticDiffSlot` inside the complete semantic tree. Every root is the implicit
+first diff slot, so the root itself does not need a type-level marker.
+
 ## Derive Syntax
 
 Use `#[derive(AgentView)]` on named structs:
