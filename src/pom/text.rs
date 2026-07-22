@@ -1,0 +1,27 @@
+use crate::StorageString;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextNode {
+    value: StorageString,
+}
+
+impl TextNode {
+    pub fn new(value: impl Into<StorageString>) -> Self {
+        Self {
+            value: value.into(),
+        }
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.value.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn append(&mut self, value: &str) {
+        self.value.push_str(value);
+    }
+}

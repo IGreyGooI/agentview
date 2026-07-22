@@ -33,6 +33,7 @@ pub mod agent;
 pub mod agent_session;
 pub mod control;
 pub mod llm_call;
+pub mod pom;
 pub mod prompt_context;
 mod semantic_diff;
 pub mod semantic_view;
