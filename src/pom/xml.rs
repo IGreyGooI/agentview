@@ -1,5 +1,7 @@
 use crate::StorageString;
 
+use std::fmt;
+
 use super::PomError;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -28,6 +30,12 @@ impl XmlName {
     }
 }
 
+impl fmt::Display for XmlName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl TryFrom<&str> for XmlName {
     type Error = PomError;
 
@@ -35,3 +43,84 @@ impl TryFrom<&str> for XmlName {
         Self::new(value)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlAttribute {
+    name: XmlName,
+    value: StorageString,
+}
+
+impl XmlAttribute {
+    pub fn new(name: XmlName, value: impl Into<StorageString>) -> Self {
+        Self {
+            name,
+            value: value.into(),
+        }
+    }
+
+    pub fn name(&self) -> &XmlName {
+        &self.name
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct XmlAttributes(Vec<XmlAttribute>);
+
+impl XmlAttributes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(
+        &mut self,
+        name: XmlName,
+        value: impl Into<StorageString>,
+    ) -> Result<(), PomError> {
+        if self.0.iter().any(|attribute| attribute.name == name) {
+            return Err(PomError::DuplicateXmlAttribute { name });
+        }
+
+        self.0.push(XmlAttribute::new(name, value));
+        Ok(())
+    }
+
+    pub fn try_insert(
+        &mut self,
+        name: &str,
+        value: impl Into<StorageString>,
+    ) -> Result<(), PomError> {
+        self.insert(XmlName::try_from(name)?, value)
+    }
+
+    pub fn get(&self, name: &XmlName) -> Option<&XmlAttribute> {
+        self.0.iter().find(|attribute| attribute.name() == name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &XmlAttribute> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl PartialEq for XmlAttributes {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .0
+                .iter()
+                .all(|attribute| other.get(attribute.name()) == Some(attribute))
+    }
+}
+
+impl Eq for XmlAttributes {}

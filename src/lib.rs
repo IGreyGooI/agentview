@@ -60,6 +60,7 @@ pub mod prelude {
         AgentTurnRequest, ContextPreparation, ContextPreparationBudget, ExecutorCommit,
         LLMExecutor, NoopTurnSink, TextTurnEvent, TurnSink,
     };
+    pub use crate::pom::{XmlAttribute, XmlAttributes};
     pub use crate::prompt_context::{
         AgentTurnError, IdentityTransform, PromptContext, Role, Turn, TurnTransform,
     };

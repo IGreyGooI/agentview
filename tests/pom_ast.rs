@@ -1,4 +1,4 @@
-use agentview::pom::{HeadingLevel, PomError, TextNode, XmlName};
+use agentview::pom::{HeadingLevel, PomError, TextNode, XmlAttributes, XmlName};
 
 #[test]
 fn xml_name_accepts_prompt_safe_ascii_subset() {
@@ -54,4 +54,41 @@ fn text_node_preserves_author_text() {
     assert_eq!(text.value(), "  first\nsecond  ");
     assert!(!text.is_empty());
     assert!(TextNode::new("").is_empty());
+}
+
+#[test]
+fn xml_attributes_reject_duplicate_names() {
+    let id = XmlName::try_from("id").unwrap();
+    let mut attributes = XmlAttributes::new();
+    attributes.insert(id.clone(), "actor.1").unwrap();
+    assert_eq!(
+        attributes.insert(id.clone(), "actor.2"),
+        Err(PomError::DuplicateXmlAttribute { name: id })
+    );
+}
+
+#[test]
+fn xml_attribute_reordering_is_semantically_equal() {
+    let mut left = XmlAttributes::new();
+    left.try_insert("id", "actor.1").unwrap();
+    left.try_insert("name", "Rachel").unwrap();
+
+    let mut right = XmlAttributes::new();
+    right.try_insert("name", "Rachel").unwrap();
+    right.try_insert("id", "actor.1").unwrap();
+
+    assert_eq!(left, right);
+}
+
+#[test]
+fn attribute_iteration_preserves_insertion_order() {
+    let mut attributes = XmlAttributes::new();
+    attributes.try_insert("id", "actor.1").unwrap();
+    attributes.try_insert("name", "Rachel").unwrap();
+
+    let observed = attributes
+        .iter()
+        .map(|attribute| (attribute.name().as_str(), attribute.value()))
+        .collect::<Vec<_>>();
+    assert_eq!(observed, vec![("id", "actor.1"), ("name", "Rachel")]);
 }
