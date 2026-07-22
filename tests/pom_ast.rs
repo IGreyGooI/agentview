@@ -1,4 +1,8 @@
-use agentview::pom::{HeadingLevel, PomError, TextNode, XmlAttributes, XmlName};
+use agentview::pom::{
+    BlockChildren, CodeBlockNode, CodeSpanNode, ContentNode, ContentRef, HeadingLevel, HeadingNode,
+    InlineChildren, ListItem, ListKind, ListNode, MarkdownNode, MixedChildren, MixedContent,
+    PomError, TextNode, XmlAttributes, XmlName, XmlNode,
+};
 
 #[test]
 fn xml_name_accepts_prompt_safe_ascii_subset() {
@@ -91,4 +95,42 @@ fn attribute_iteration_preserves_insertion_order() {
         .map(|attribute| (attribute.name().as_str(), attribute.value()))
         .collect::<Vec<_>>();
     assert_eq!(observed, vec![("id", "actor.1"), ("name", "Rachel")]);
+}
+
+#[test]
+fn ordered_list_and_code_nodes_preserve_semantic_payload() {
+    let item = ListItem::new(BlockChildren::new());
+    let list = ListNode::new(ListKind::Ordered { start: 3 }, vec![item]);
+    assert_eq!(list.kind(), &ListKind::Ordered { start: 3 });
+    assert_eq!(list.items().len(), 1);
+
+    let block = CodeBlockNode::new(Some("rust".into()), TextNode::new("<tag>\n"));
+    assert_eq!(block.language(), Some("rust"));
+    assert_eq!(block.body().value(), "<tag>\n");
+
+    let span = CodeSpanNode::new(TextNode::new("<tag>"));
+    assert_eq!(span.body().value(), "<tag>");
+}
+
+#[test]
+fn mixed_children_preserve_text_markdown_xml_text_order() {
+    let mut children = MixedChildren::new();
+    children.push(MixedContent::text(TextNode::new("before")));
+    children.push(MixedContent::markdown(MarkdownNode::Heading(
+        HeadingNode::new(HeadingLevel::H2, InlineChildren::new()),
+    )));
+    children.push(MixedContent::xml(XmlNode::new(
+        XmlName::try_from("actor").unwrap(),
+    )));
+    children.push(MixedContent::text(TextNode::new("after")));
+
+    let kinds = children
+        .iter()
+        .map(|edge| match edge {
+            ContentRef::Node(ContentNode::Text(_)) => "text",
+            ContentRef::Node(ContentNode::Markdown(_)) => "markdown",
+            ContentRef::Node(ContentNode::Xml(_)) => "xml",
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, vec!["text", "markdown", "xml", "text"]);
 }

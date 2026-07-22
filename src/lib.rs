@@ -60,7 +60,12 @@ pub mod prelude {
         AgentTurnRequest, ContextPreparation, ContextPreparationBudget, ExecutorCommit,
         LLMExecutor, NoopTurnSink, TextTurnEvent, TurnSink,
     };
-    pub use crate::pom::{XmlAttribute, XmlAttributes};
+    pub use crate::pom::{
+        BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentNode, ContentRef,
+        Document, HeadingLevel, HeadingNode, InlineChildren, InlineContent, ListItem, ListKind,
+        ListNode, MarkdownNode, MixedChildren, MixedContent, ParagraphNode, PomError, StrongNode,
+        TextNode, XmlAttribute, XmlAttributes, XmlName, XmlNode,
+    };
     pub use crate::prompt_context::{
         AgentTurnError, IdentityTransform, PromptContext, Role, Turn, TurnTransform,
     };

@@ -2,7 +2,7 @@ use crate::StorageString;
 
 use std::fmt;
 
-use super::PomError;
+use super::{ContentNode, MixedChildren, PomError};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct XmlName {
@@ -124,3 +124,58 @@ impl PartialEq for XmlAttributes {
 }
 
 impl Eq for XmlAttributes {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct XmlMetadata {
+    collection_kind: Option<IntrinsicCollectionKind>,
+    identity: Option<Box<ContentNode>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum IntrinsicCollectionKind {
+    Map,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlNode {
+    name: XmlName,
+    attributes: XmlAttributes,
+    children: MixedChildren,
+    metadata: XmlMetadata,
+}
+
+impl XmlNode {
+    pub fn new(name: XmlName) -> Self {
+        Self {
+            name,
+            attributes: XmlAttributes::new(),
+            children: MixedChildren::new(),
+            metadata: XmlMetadata::default(),
+        }
+    }
+
+    pub fn name(&self) -> &XmlName {
+        &self.name
+    }
+
+    pub fn attributes(&self) -> &XmlAttributes {
+        &self.attributes
+    }
+
+    pub fn children(&self) -> &MixedChildren {
+        &self.children
+    }
+
+    pub fn push_attribute(
+        &mut self,
+        name: XmlName,
+        value: impl Into<StorageString>,
+    ) -> Result<(), PomError> {
+        self.attributes.insert(name, value)
+    }
+
+    pub fn push(&mut self, content: super::MixedContent) {
+        self.children.push(content);
+    }
+}
