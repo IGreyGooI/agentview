@@ -1,8 +1,8 @@
 use agentview::pom::{
     BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentContext, ContentKind,
     ContentNode, ContentRef, HeadingLevel, HeadingNode, InlineChildren, InlineContent, ListItem,
-    ListKind, ListNode, MarkdownKind, MarkdownNode, MixedChildren, MixedContent, PomError,
-    TextNode, XmlAttributes, XmlName, XmlNode,
+    ListKind, ListNode, MarkdownKind, MarkdownNode, MixedChildren, MixedContent, ParagraphNode,
+    PomError, StrongNode, TextNode, XmlAttributes, XmlName, XmlNode,
 };
 
 #[test]
@@ -27,6 +27,62 @@ fn block_and_inline_contexts_reject_invalid_direct_children() {
             actual: ContentKind::Markdown(MarkdownKind::Heading),
         })
     );
+}
+
+#[test]
+fn dynamic_context_conversion_accepts_every_valid_direct_child() {
+    let block_markdown = [
+        MarkdownNode::Heading(HeadingNode::new(HeadingLevel::H1, InlineChildren::new())),
+        MarkdownNode::Paragraph(ParagraphNode::new(InlineChildren::new())),
+        MarkdownNode::List(ListNode::new(ListKind::Unordered, Vec::new())),
+        MarkdownNode::CodeBlock(CodeBlockNode::new(None, TextNode::new(""))),
+        MarkdownNode::ThematicBreak,
+    ];
+    for node in block_markdown {
+        let kind = node.kind();
+        assert!(
+            BlockContent::try_from_node(ContentNode::Markdown(node)).is_ok(),
+            "{kind:?} should be valid block content"
+        );
+    }
+
+    let inline_markdown = [
+        MarkdownNode::Strong(StrongNode::new(InlineChildren::new())),
+        MarkdownNode::CodeSpan(CodeSpanNode::new(TextNode::new("code"))),
+    ];
+    for node in inline_markdown {
+        let kind = node.kind();
+        assert!(
+            InlineContent::try_from_node(ContentNode::Markdown(node)).is_ok(),
+            "{kind:?} should be valid inline content"
+        );
+    }
+
+    let xml = XmlNode::new(XmlName::try_from("island").unwrap());
+    assert_eq!(
+        BlockContent::try_from_node(ContentNode::Xml(xml.clone())),
+        Ok(BlockContent::xml(xml.clone()))
+    );
+    assert_eq!(
+        InlineContent::try_from_node(ContentNode::Xml(xml.clone())),
+        Ok(InlineContent::xml(xml))
+    );
+    assert_eq!(
+        InlineContent::try_from_node(ContentNode::Text(TextNode::new("plain"))),
+        InlineContent::try_text("plain")
+    );
+}
+
+#[test]
+fn dynamic_inline_text_conversion_rejects_newlines() {
+    for value in ["first\nsecond", "first\rsecond"] {
+        assert_eq!(
+            InlineContent::try_from_node(ContentNode::Text(TextNode::new(value))),
+            Err(PomError::InvalidInlineNewline {
+                value: value.into(),
+            })
+        );
+    }
 }
 
 #[test]
@@ -72,6 +128,39 @@ fn text_normalization_does_not_trim_or_cross_xml() {
 
     assert_eq!(children.len(), 3);
     let texts = children
+        .iter()
+        .filter_map(|edge| match edge {
+            ContentRef::Node(ContentNode::Text(text)) => Some(text.value()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts, vec![" left ", " right "]);
+}
+
+#[test]
+fn inline_text_sequence_normalization_is_canonical() {
+    let mut adjacent = InlineChildren::new();
+    adjacent.push(InlineContent::try_text("").unwrap());
+    adjacent.push(InlineContent::try_text("  first").unwrap());
+    adjacent.push(InlineContent::try_text(" second  ").unwrap());
+
+    assert_eq!(adjacent.len(), 1);
+    match adjacent.iter().next().unwrap() {
+        ContentRef::Node(ContentNode::Text(text)) => {
+            assert_eq!(text.value(), "  first second  ");
+        }
+        other => panic!("expected normalized inline text, got {other:?}"),
+    };
+
+    let mut separated = InlineChildren::new();
+    separated.push(InlineContent::try_text(" left ").unwrap());
+    separated.push(InlineContent::strong(
+        StrongNode::new(InlineChildren::new()),
+    ));
+    separated.push(InlineContent::try_text(" right ").unwrap());
+
+    assert_eq!(separated.len(), 3);
+    let texts = separated
         .iter()
         .filter_map(|edge| match edge {
             ContentRef::Node(ContentNode::Text(text)) => Some(text.value()),
