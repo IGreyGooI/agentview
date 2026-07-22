@@ -9,7 +9,7 @@ mod xml;
 pub use children::{BlockChildren, InlineChildren, MixedChildren};
 pub use content::{BlockContent, ContentNode, ContentRef, InlineContent, MixedContent};
 pub use document::Document;
-pub use error::PomError;
+pub use error::{ContentContext, ContentKind, MarkdownKind, PomError};
 pub use markdown::{
     CodeBlockNode, CodeSpanNode, HeadingLevel, HeadingNode, ListItem, ListKind, ListNode,
     MarkdownNode, ParagraphNode, StrongNode,

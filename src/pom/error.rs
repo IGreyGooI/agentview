@@ -2,6 +2,31 @@ use crate::StorageString;
 
 use super::XmlName;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentContext {
+    Block,
+    Inline,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentKind {
+    Markdown(MarkdownKind),
+    Xml,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownKind {
+    Heading,
+    Paragraph,
+    List,
+    CodeBlock,
+    ThematicBreak,
+    Strong,
+    CodeSpan,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PomError {
     #[error("invalid XML name: {value}")]
@@ -10,4 +35,11 @@ pub enum PomError {
     DuplicateXmlAttribute { name: XmlName },
     #[error("invalid Markdown heading level: {value}")]
     InvalidHeadingLevel { value: u8 },
+    #[error("inline text cannot contain a newline: {value:?}")]
+    InvalidInlineNewline { value: StorageString },
+    #[error("wrong content context: expected {expected:?}, got {actual:?}")]
+    WrongContentContext {
+        expected: ContentContext,
+        actual: ContentKind,
+    },
 }

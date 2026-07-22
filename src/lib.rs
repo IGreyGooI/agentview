@@ -61,10 +61,11 @@ pub mod prelude {
         LLMExecutor, NoopTurnSink, TextTurnEvent, TurnSink,
     };
     pub use crate::pom::{
-        BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentNode, ContentRef,
-        Document, HeadingLevel, HeadingNode, InlineChildren, InlineContent, ListItem, ListKind,
-        ListNode, MarkdownNode, MixedChildren, MixedContent, ParagraphNode, PomError, StrongNode,
-        TextNode, XmlAttribute, XmlAttributes, XmlName, XmlNode,
+        BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentContext, ContentKind,
+        ContentNode, ContentRef, Document, HeadingLevel, HeadingNode, InlineChildren,
+        InlineContent, ListItem, ListKind, ListNode, MarkdownKind, MarkdownNode, MixedChildren,
+        MixedContent, ParagraphNode, PomError, StrongNode, TextNode, XmlAttribute, XmlAttributes,
+        XmlName, XmlNode,
     };
     pub use crate::prompt_context::{
         AgentTurnError, IdentityTransform, PromptContext, Role, Turn, TurnTransform,

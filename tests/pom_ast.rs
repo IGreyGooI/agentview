@@ -1,8 +1,85 @@
 use agentview::pom::{
-    BlockChildren, CodeBlockNode, CodeSpanNode, ContentNode, ContentRef, HeadingLevel, HeadingNode,
-    InlineChildren, ListItem, ListKind, ListNode, MarkdownNode, MixedChildren, MixedContent,
-    PomError, TextNode, XmlAttributes, XmlName, XmlNode,
+    BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentContext, ContentKind,
+    ContentNode, ContentRef, HeadingLevel, HeadingNode, InlineChildren, InlineContent, ListItem,
+    ListKind, ListNode, MarkdownKind, MarkdownNode, MixedChildren, MixedContent, PomError,
+    TextNode, XmlAttributes, XmlName, XmlNode,
 };
+
+#[test]
+fn block_and_inline_contexts_reject_invalid_direct_children() {
+    let text = ContentNode::Text(TextNode::new("orphan"));
+    assert_eq!(
+        BlockContent::try_from_node(text),
+        Err(PomError::WrongContentContext {
+            expected: ContentContext::Block,
+            actual: ContentKind::Text,
+        })
+    );
+
+    let heading = ContentNode::Markdown(MarkdownNode::Heading(HeadingNode::new(
+        HeadingLevel::H2,
+        InlineChildren::new(),
+    )));
+    assert_eq!(
+        InlineContent::try_from_node(heading),
+        Err(PomError::WrongContentContext {
+            expected: ContentContext::Inline,
+            actual: ContentKind::Markdown(MarkdownKind::Heading),
+        })
+    );
+}
+
+#[test]
+fn markdown_inline_children_reject_newlines() {
+    assert_eq!(
+        InlineContent::try_text("first\nsecond"),
+        Err(PomError::InvalidInlineNewline {
+            value: "first\nsecond".into(),
+        })
+    );
+    assert_eq!(
+        InlineContent::try_text("first\rsecond"),
+        Err(PomError::InvalidInlineNewline {
+            value: "first\rsecond".into(),
+        })
+    );
+}
+
+#[test]
+fn text_sequences_drop_empty_and_merge_adjacent_text() {
+    let mut children = MixedChildren::new();
+    children.push(MixedContent::text(TextNode::new("")));
+    children.push(MixedContent::text(TextNode::new("  first")));
+    children.push(MixedContent::text(TextNode::new(" second  ")));
+
+    assert_eq!(children.len(), 1);
+    match children.iter().next().unwrap() {
+        ContentRef::Node(ContentNode::Text(text)) => {
+            assert_eq!(text.value(), "  first second  ");
+        }
+        other => panic!("expected normalized text, got {other:?}"),
+    };
+}
+
+#[test]
+fn text_normalization_does_not_trim_or_cross_xml() {
+    let mut children = MixedChildren::new();
+    children.push(MixedContent::text(TextNode::new(" left ")));
+    children.push(MixedContent::xml(XmlNode::new(
+        XmlName::try_from("break").unwrap(),
+    )));
+    children.push(MixedContent::text(TextNode::new(" right ")));
+
+    assert_eq!(children.len(), 3);
+    let texts = children
+        .iter()
+        .filter_map(|edge| match edge {
+            ContentRef::Node(ContentNode::Text(text)) => Some(text.value()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts, vec![" left ", " right "]);
+}
 
 #[test]
 fn xml_name_accepts_prompt_safe_ascii_subset() {
