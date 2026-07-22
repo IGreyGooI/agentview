@@ -1,9 +1,150 @@
 use agentview::pom::{
     BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentContext, ContentKind,
-    ContentNode, ContentRef, DiffSlot, DiffStrategy, HeadingLevel, HeadingNode, InlineChildren,
-    InlineContent, ListItem, ListKind, ListNode, MarkdownKind, MarkdownNode, MixedChildren,
-    MixedContent, ParagraphNode, PomError, StrongNode, TextNode, XmlAttributes, XmlName, XmlNode,
+    ContentNode, ContentRef, DiffSlot, DiffStrategy, Document, HeadingLevel, HeadingNode,
+    InlineChildren, InlineContent, ListItem, ListKind, ListNode, MarkdownKind, MarkdownNode,
+    MixedChildren, MixedContent, ParagraphNode, PomError, StrongNode, TextNode, XmlAttributes,
+    XmlName, XmlNode,
 };
+
+#[test]
+fn closure_and_compositional_builders_are_equivalent() {
+    let context = XmlNode::new(XmlName::try_from("agent_context").unwrap());
+    let closure = Document::try_build(|blocks| {
+        blocks.try_heading(2, |inline| {
+            inline.try_text("Known relationships")?;
+            Ok(())
+        })?;
+        blocks.xml_slot(DiffSlot::present(DiffStrategy::Recursive, context.clone()));
+        Ok(())
+    })
+    .unwrap();
+
+    let mut heading_children = InlineChildren::new();
+    heading_children.push(InlineContent::try_text("Known relationships").unwrap());
+    let mut blocks = BlockChildren::new();
+    blocks.push(BlockContent::heading(HeadingNode::new(
+        HeadingLevel::H2,
+        heading_children,
+    )));
+    blocks.push(BlockContent::xml_slot(DiffSlot::present(
+        DiffStrategy::Recursive,
+        context,
+    )));
+    let compositional = Document::new(blocks);
+
+    assert_eq!(closure, compositional);
+}
+
+#[test]
+fn closure_builders_cover_the_v1_authoring_surface() {
+    let document = Document::try_build(|blocks| {
+        blocks.try_heading(2, |inline| {
+            inline.try_text("Title")?;
+            Ok(())
+        })?;
+        blocks.try_paragraph(|inline| {
+            inline.try_text("plain ")?;
+            inline.try_strong(|strong| {
+                strong.try_text("strong")?;
+                Ok(())
+            })?;
+            inline.code_span(TextNode::new("code"));
+            inline.xml(XmlNode::new(XmlName::try_from("ref")?));
+            Ok(())
+        })?;
+        blocks.try_list(ListKind::Ordered { start: 3 }, |list| {
+            list.try_item(|item| {
+                item.try_paragraph(|inline| {
+                    inline.try_text("first item")?;
+                    Ok(())
+                })?;
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        blocks.code_block(Some("rust".into()), TextNode::new("<tag>\n"));
+        blocks.thematic_break();
+        blocks.xml(XmlNode::build(
+            XmlName::try_from("mixed").unwrap(),
+            |mixed| {
+                mixed.text(TextNode::new("before"));
+                mixed.markdown(MarkdownNode::Paragraph(ParagraphNode::new(
+                    InlineChildren::new(),
+                )));
+                mixed.xml(XmlNode::new(XmlName::try_from("inner").unwrap()));
+            },
+        ));
+        blocks.xml_slot(DiffSlot::present(
+            DiffStrategy::Recursive,
+            XmlNode::new(XmlName::try_from("agent_context")?),
+        ));
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(document.children().len(), 7);
+    assert!(matches!(
+        document.children().iter().next(),
+        Some(ContentRef::Node(ContentNode::Markdown(
+            MarkdownNode::Heading(_)
+        )))
+    ));
+    assert!(matches!(
+        document.children().iter().nth(6),
+        Some(ContentRef::DiffSlot(slot)) if slot.role().as_str() == "agent_context"
+    ));
+}
+
+#[test]
+fn typed_and_fallible_builder_entries_cover_remaining_surface() {
+    let inline_slot = XmlName::try_from("inline_slot").unwrap();
+    let document = Document::build(|blocks| {
+        blocks.push(BlockContent::thematic_break());
+        blocks.heading(HeadingLevel::H3, |inline| {
+            inline.push(InlineContent::try_text("left").unwrap());
+            inline.strong(|strong| {
+                strong.push(InlineContent::try_text(" strong").unwrap());
+            });
+            inline.xml_slot(DiffSlot::absent(inline_slot, DiffStrategy::Replace));
+        });
+        blocks.paragraph(|inline| {
+            inline.push(InlineContent::try_text("paragraph").unwrap());
+        });
+        blocks.list(ListKind::Unordered, |list| {
+            list.item(|item| {
+                item.paragraph(|inline| {
+                    inline.push(InlineContent::try_text("item").unwrap());
+                });
+            });
+        });
+    });
+    assert_eq!(document.children().len(), 4);
+
+    let mixed_slot = XmlName::try_from("mixed_slot").unwrap();
+    let xml = XmlNode::build(XmlName::try_from("mixed").unwrap(), |mixed| {
+        mixed.push(MixedContent::text(TextNode::new("left")));
+        mixed.text(TextNode::new(" right"));
+        mixed.xml_slot(DiffSlot::absent(mixed_slot, DiffStrategy::Append));
+    });
+    assert_eq!(xml.children().len(), 2);
+    assert!(matches!(
+        xml.children().iter().next(),
+        Some(ContentRef::Node(ContentNode::Text(text))) if text.value() == "left right"
+    ));
+
+    let parsed = XmlNode::try_build("valid", |mixed| {
+        mixed.text(TextNode::new("child"));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(parsed.name().as_str(), "valid");
+    assert_eq!(
+        XmlNode::try_build("invalid:name", |_| Ok(())),
+        Err(PomError::InvalidXmlName {
+            value: "invalid:name".into(),
+        })
+    );
+}
 
 #[test]
 fn block_and_inline_contexts_reject_invalid_direct_children() {

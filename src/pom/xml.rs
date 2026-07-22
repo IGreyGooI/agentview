@@ -2,7 +2,7 @@ use crate::StorageString;
 
 use std::fmt;
 
-use super::{ContentNode, MixedChildren, PomError};
+use super::{ContentNode, MixedBuilder, MixedChildren, PomError};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct XmlName {
@@ -153,6 +153,21 @@ impl XmlNode {
             children: MixedChildren::new(),
             metadata: XmlMetadata::default(),
         }
+    }
+
+    pub fn build(name: XmlName, build: impl FnOnce(&mut MixedBuilder<'_>)) -> Self {
+        let mut node = Self::new(name);
+        build(&mut MixedBuilder::new(&mut node.children));
+        node
+    }
+
+    pub fn try_build(
+        raw_name: &str,
+        build: impl FnOnce(&mut MixedBuilder<'_>) -> Result<(), PomError>,
+    ) -> Result<Self, PomError> {
+        let mut node = Self::new(XmlName::try_from(raw_name)?);
+        build(&mut MixedBuilder::new(&mut node.children))?;
+        Ok(node)
     }
 
     pub fn name(&self) -> &XmlName {

@@ -1,6 +1,6 @@
 use crate::StorageString;
 
-use super::{BlockChildren, InlineChildren, PomError, TextNode};
+use super::{BlockBuilder, BlockChildren, InlineChildren, PomError, TextNode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadingLevel {
@@ -164,6 +164,36 @@ impl ListItem {
 
     pub fn children(&self) -> &BlockChildren {
         &self.children
+    }
+}
+
+pub struct ListBuilder {
+    items: Vec<ListItem>,
+}
+
+impl ListBuilder {
+    pub(crate) fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    pub fn item(&mut self, build: impl FnOnce(&mut BlockBuilder<'_>)) {
+        let mut children = BlockChildren::new();
+        build(&mut BlockBuilder::new(&mut children));
+        self.items.push(ListItem::new(children));
+    }
+
+    pub fn try_item(
+        &mut self,
+        build: impl FnOnce(&mut BlockBuilder<'_>) -> Result<(), PomError>,
+    ) -> Result<(), PomError> {
+        let mut children = BlockChildren::new();
+        build(&mut BlockBuilder::new(&mut children))?;
+        self.items.push(ListItem::new(children));
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Vec<ListItem> {
+        self.items
     }
 }
 
