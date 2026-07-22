@@ -1,0 +1,16 @@
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+ --> tests/ui/pom/diff_slot_present_rejects_explicit_role.rs:6:5
+  |
+6 |     DiffSlot::present(role, DiffStrategy::Recursive, xml);
+  |     ^^^^^^^^^^^^^^^^^ ---- unexpected argument #1 of type `XmlName`
+  |
+note: associated function defined here
+ --> src/pom/diff_slot.rs
+  |
+  |     pub fn present(strategy: DiffStrategy, value: XmlNode) -> Self {
+  |            ^^^^^^^
+help: remove the extra argument
+  |
+6 -     DiffSlot::present(role, DiffStrategy::Recursive, xml);
+6 +     DiffSlot::present(DiffStrategy::Recursive, xml);
+  |

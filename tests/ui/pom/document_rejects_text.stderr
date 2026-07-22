@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/pom/document_rejects_text.rs:4:27
+  |
+4 |     let _ = Document::new(TextNode::new("orphan"));
+  |             ------------- ^^^^^^^^^^^^^^^^^^^^^^^ expected `BlockChildren`, found `TextNode`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> src/pom/document.rs
+  |
+  |     pub fn new(children: BlockChildren) -> Self {
+  |            ^^^

@@ -5,7 +5,7 @@ use super::{
     MarkdownKind, MarkdownNode, ParagraphNode, PomError, StrongNode, TextNode, XmlNode,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum ContentNode {
     Markdown(MarkdownNode),
     Xml(XmlNode),
@@ -36,13 +36,13 @@ impl MarkdownNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(super) enum ContentEdge {
     Node(ContentNode),
     Diff(DiffSlot),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ContentRef<'a> {
     Node(&'a ContentNode),
     DiffSlot(&'a DiffSlot),
@@ -57,7 +57,7 @@ impl ContentEdge {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct BlockContent(ContentEdge);
 
 impl BlockContent {
@@ -117,7 +117,7 @@ impl BlockContent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct InlineContent(pub(super) ContentEdge);
 
 impl InlineContent {
@@ -179,7 +179,7 @@ impl InlineContent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MixedContent(pub(super) ContentEdge);
 
 impl MixedContent {

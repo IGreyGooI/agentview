@@ -1,0 +1,9 @@
+error[E0451]: fields `level` and `children` of struct `HeadingNode` are private
+ --> tests/ui/pom/markdown_payload_fields_are_private.rs:5:9
+  |
+4 |     let _ = HeadingNode {
+  |             ----------- in this type
+5 |         level: HeadingLevel::H1,
+  |         ^^^^^ private field
+6 |         children: InlineChildren::new(),
+  |         ^^^^^^^^ private field

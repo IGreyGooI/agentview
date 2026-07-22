@@ -1,0 +1,11 @@
+#[test]
+fn invalid_pom_apis_fail_to_compile() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/pom/diff_slot_rejects_text_node.rs");
+    t.compile_fail("tests/ui/pom/diff_slot_present_rejects_explicit_role.rs");
+    t.compile_fail("tests/ui/pom/markdown_payload_fields_are_private.rs");
+    t.compile_fail("tests/ui/pom/inline_children_reject_heading.rs");
+    t.compile_fail("tests/ui/pom/document_rejects_text.rs");
+    t.compile_fail("tests/ui/pom/children_have_no_mutable_vector_access.rs");
+    t.compile_fail("tests/ui/pom/pom_types_do_not_deserialize.rs");
+}

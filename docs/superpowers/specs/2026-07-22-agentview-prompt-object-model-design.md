@@ -1,6 +1,8 @@
 # AgentView Prompt Object Model（POM）设计
 
-> 状态：设计已批准，Phase 2 additive POM AST 实施中。本文描述目标契约；“当前行为”只出现在已有脚手架和迁移说明中。
+> 状态：设计已批准，Phase 2 additive POM AST 已实现。本文描述目标契约；“当前行为”只出现在已有脚手架和迁移说明中。
+
+> 实现状态（2026-07-23）：新 `agentview::pom` AST 以 additive 方式存在；legacy runtime 仍使用 `SemanticNode`。
 
 ## 1. 文档目标
 

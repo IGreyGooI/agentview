@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/pom/diff_slot_rejects_text_node.rs:4:48
+  |
+4 |     DiffSlot::present(DiffStrategy::Recursive, TextNode::new("not XML"));
+  |     -----------------                          ^^^^^^^^^^^^^^^^^^^^^^^^ expected `XmlNode`, found `TextNode`
+  |     |
+  |     arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> src/pom/diff_slot.rs
+  |
+  |     pub fn present(strategy: DiffStrategy, value: XmlNode) -> Self {
+  |            ^^^^^^^

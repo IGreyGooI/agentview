@@ -1,0 +1,11 @@
+error[E0599]: no method named `children_mut` found for struct `Document` in the current scope
+ --> tests/ui/pom/children_have_no_mutable_vector_access.rs:4:41
+  |
+4 |     Document::new(BlockChildren::new()).children_mut().clear();
+  |                                         ^^^^^^^^^^^^
+  |
+help: there is a method `children` with a similar name
+  |
+4 -     Document::new(BlockChildren::new()).children_mut().clear();
+4 +     Document::new(BlockChildren::new()).children().clear();
+  |

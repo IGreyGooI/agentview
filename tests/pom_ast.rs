@@ -549,3 +549,28 @@ fn diff_slots_are_valid_in_every_xml_context() {
         Some(ContentRef::DiffSlot(slot)) if slot.role().as_str() == "mixed"
     ));
 }
+
+#[test]
+fn diagnostic_serialization_preserves_order_and_diff_metadata() {
+    let document = Document::try_build(|blocks| {
+        blocks.try_paragraph(|inline| {
+            inline.try_text("before")?;
+            inline.xml_slot(DiffSlot::present(
+                DiffStrategy::Keyed(XmlName::try_from("id")?),
+                XmlNode::new(XmlName::try_from("agent_context")?),
+            ));
+            inline.try_text("after")?;
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .unwrap();
+
+    let json = serde_json::to_string(&document).unwrap();
+    let before = json.find("before").unwrap();
+    let role = json.find("agent_context").unwrap();
+    let after = json.find("after").unwrap();
+    assert!(before < role && role < after);
+    assert!(json.contains("Keyed"));
+    assert!(json.contains("id"));
+}

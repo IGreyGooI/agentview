@@ -1,0 +1,17 @@
+error[E0308]: mismatched types
+ --> tests/ui/pom/inline_children_reject_heading.rs:5:19
+  |
+5 |       children.push(BlockContent::heading(HeadingNode::new(
+  |  ______________----_^
+  | |              |
+  | |              arguments to this method are incorrect
+6 | |         HeadingLevel::H1,
+7 | |         InlineChildren::new(),
+8 | |     )));
+  | |______^ expected `InlineContent`, found `BlockContent`
+  |
+note: method defined here
+ --> src/pom/children.rs
+  |
+  |     pub fn push(&mut self, content: InlineContent) {
+  |            ^^^^

@@ -4,7 +4,7 @@ use std::fmt;
 
 use super::{ContentNode, MixedBuilder, MixedChildren, PomError};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct XmlName {
     value: StorageString,
 }
@@ -44,7 +44,7 @@ impl TryFrom<&str> for XmlName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct XmlAttribute {
     name: XmlName,
     value: StorageString,
@@ -67,7 +67,7 @@ impl XmlAttribute {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct XmlAttributes(Vec<XmlAttribute>);
 
 impl XmlAttributes {
@@ -125,19 +125,19 @@ impl PartialEq for XmlAttributes {
 
 impl Eq for XmlAttributes {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct XmlMetadata {
     collection_kind: Option<IntrinsicCollectionKind>,
     identity: Option<Box<ContentNode>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[allow(dead_code)]
 pub(crate) enum IntrinsicCollectionKind {
     Map,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct XmlNode {
     name: XmlName,
     attributes: XmlAttributes,

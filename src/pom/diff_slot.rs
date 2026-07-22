@@ -1,6 +1,6 @@
 use super::{XmlName, XmlNode};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum DiffStrategy {
     Recursive,
     Replace,
@@ -10,7 +10,7 @@ pub enum DiffStrategy {
     Keyed(XmlName),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DiffSlot {
     role: XmlName,
     strategy: DiffStrategy,

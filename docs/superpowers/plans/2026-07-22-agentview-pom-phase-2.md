@@ -59,7 +59,7 @@
 - Produces: `PomError`, `TextNode::{new,value,is_empty}`, `XmlName::{new,as_str}`, `TryFrom<&str> for XmlName`, `HeadingLevel::{H1..H6,number}`, and `TryFrom<u8> for HeadingLevel`.
 - Consumes: `crate::StorageString` and `thiserror::Error` already in the workspace.
 
-- [ ] **Step 1: Write the bootstrap XML-name test**
+- [x] **Step 1: Write the bootstrap XML-name test**
 
 ```rust
 use agentview::pom::XmlName;
@@ -73,13 +73,13 @@ fn xml_name_accepts_prompt_safe_ascii_subset() {
 }
 ```
 
-- [ ] **Step 2: Run the exact test and observe RED**
+- [x] **Step 2: Run the exact test and observe RED**
 
 Run: `cargo test --test pom_ast xml_name_accepts_prompt_safe_ascii_subset -- --exact`
 
 Expected: compile failure `E0432` because `agentview::pom` does not exist. This unresolved import is accepted only for the bootstrap test and must not become a trybuild snapshot.
 
-- [ ] **Step 3: Add the minimal facade, error, and `XmlName` implementation**
+- [x] **Step 3: Add the minimal facade, error, and `XmlName` implementation**
 
 Add `pub mod pom;` to `src/lib.rs`. In `src/pom/mod.rs` declare private modules and re-export only types that exist in this task:
 
@@ -111,13 +111,13 @@ pub enum PomError {
 
 Implement `XmlName` in `xml.rs` with `Debug`, `Clone`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, and `Hash`. For this first GREEN, `XmlName::new` stores `impl Into<StorageString>` and returns `Ok`; `TryFrom<&str>` delegates to `new`, and `as_str` returns `&str`. This is the minimum implementation proven by the valid-name test. Exact rejection is added only after the next RED. Diagnostic serialization is deliberately deferred to Task 7 so it gets an observable RED.
 
-- [ ] **Step 4: Verify XML-name GREEN**
+- [x] **Step 4: Verify XML-name GREEN**
 
 Run: `cargo test --test pom_ast xml_name_accepts_prompt_safe_ascii_subset -- --exact`
 
 Expected: PASS.
 
-- [ ] **Step 5: Run three independent primitive RED/GREEN cycles**
+- [x] **Step 5: Run three independent primitive RED/GREEN cycles**
 
 Append these tests separately, running the exact command after each addition before implementing it:
 
@@ -172,7 +172,7 @@ Add and run each test separately, then make only its minimum implementation befo
 - heading RED: `HeadingLevel`/conversion is missing; GREEN adds `H1..H6`, `number`, and `TryFrom<u8>`;
 - text RED: `TextNode`/accessors are missing; GREEN adds context-neutral storage without trimming or newline rejection.
 
-- [ ] **Step 6: Keep the final primitive signatures exact**
+- [x] **Step 6: Keep the final primitive signatures exact**
 
 In `markdown.rs`, define `HeadingLevel::{H1..H6}`, derive `Debug, Clone, Copy, PartialEq, Eq`, implement `number`, and implement `TryFrom<u8>` returning `InvalidHeadingLevel` outside `1..=6`.
 
@@ -194,7 +194,7 @@ impl TextNode {
 
 Do not trim or reject newlines here.
 
-- [ ] **Step 7: Run task tests and format check**
+- [x] **Step 7: Run task tests and format check**
 
 Run:
 
@@ -205,7 +205,7 @@ cargo fmt --all --check
 
 Expected: all four POM tests PASS and formatting is clean.
 
-- [ ] **Step 8: Commit the primitive slice**
+- [x] **Step 8: Commit the primitive slice**
 
 ```bash
 git add src/lib.rs src/pom tests/pom_ast.rs
@@ -226,7 +226,7 @@ git commit -m "feat(pom): add validated primitive values"
 - Consumes: `XmlName` from Task 1.
 - Produces: `XmlAttribute::{new,name,value}`, `XmlAttributes::{new,insert,try_insert,get,iter,len,is_empty}` and order-independent `PartialEq/Eq`.
 
-- [ ] **Step 1: Write and run the duplicate-attribute RED test**
+- [x] **Step 1: Write and run the duplicate-attribute RED test**
 
 ```rust
 use agentview::pom::{PomError, XmlAttributes, XmlName};
@@ -247,7 +247,7 @@ Run: `cargo test --test pom_ast xml_attributes_reject_duplicate_names -- --exact
 
 Expected: compile failure because `XmlAttributes` and `DuplicateXmlAttribute` do not exist.
 
-- [ ] **Step 2: Implement duplicate-safe insertion**
+- [x] **Step 2: Implement duplicate-safe insertion**
 
 Add to `PomError`:
 
@@ -271,13 +271,13 @@ pub struct XmlAttributes(Vec<XmlAttribute>);
 
 `insert(XmlName, impl Into<StorageString>)` rejects an existing name before pushing. `try_insert(&str, value)` validates the raw name through `XmlName::try_from`. All getters expose borrowed data; no mutable vector accessor is added.
 
-- [ ] **Step 3: Verify duplicate GREEN**
+- [x] **Step 3: Verify duplicate GREEN**
 
 Run: `cargo test --test pom_ast xml_attributes_reject_duplicate_names -- --exact`
 
 Expected: PASS.
 
-- [ ] **Step 4: Write insertion-order and semantic-equality RED tests**
+- [x] **Step 4: Write insertion-order and semantic-equality RED tests**
 
 ```rust
 #[test]
@@ -309,11 +309,11 @@ fn attribute_iteration_preserves_insertion_order() {
 
 Run each exact test before implementation. Expected RED: derived/vector equality treats reorder as unequal, then missing or incorrect iteration order.
 
-- [ ] **Step 5: Implement custom equality and read-only traversal**
+- [x] **Step 5: Implement custom equality and read-only traversal**
 
 Implement `PartialEq` for `XmlAttributes` by checking equal length and matching each left attribute by name/value through `get`; implement `Eq`. Keep the backing `Vec` and its insertion order unchanged. Re-export `XmlAttribute` and `XmlAttributes` from `pom` and the crate prelude.
 
-- [ ] **Step 6: Run focused and broader GREEN checks**
+- [x] **Step 6: Run focused and broader GREEN checks**
 
 ```bash
 cargo test --test pom_ast
@@ -323,7 +323,7 @@ cargo fmt --all --check
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit XML attributes**
+- [x] **Step 7: Commit XML attributes**
 
 ```bash
 git add src/lib.rs src/pom tests/pom_ast.rs
@@ -349,7 +349,7 @@ git commit -m "feat(pom): add semantic XML attributes"
 - Produces: the complete non-diff recursive type graph: `Document`, `ContentNode`, `ContentRef`, block/inline/mixed wrappers and child sequences, all V1 Markdown payload types, and `XmlNode`.
 - Leaves for later tasks: dynamic context errors, canonical sequence normalization, diff edges, and convenience closure builders.
 
-- [ ] **Step 1: Write the Markdown-payload RED test**
+- [x] **Step 1: Write the Markdown-payload RED test**
 
 ```rust
 use agentview::pom::{
@@ -377,7 +377,7 @@ Run: `cargo test --test pom_ast ordered_list_and_code_nodes_preserve_semantic_pa
 
 Expected: compile failure because the Markdown payload types and child containers do not exist.
 
-- [ ] **Step 2: Add the V1 Markdown payload structs**
+- [x] **Step 2: Add the V1 Markdown payload structs**
 
 Define and derive `Debug, Clone, PartialEq, Eq` for:
 
@@ -404,7 +404,7 @@ pub struct CodeSpanNode { body: TextNode }
 
 Every struct gets an infallible constructor over already typed values and borrowed getters. `MarkdownNode` gets crate-visible exhaustive `is_block`/`is_inline` classification with no wildcard match.
 
-- [ ] **Step 3: Add the minimal recursive containers required to compile and verify GREEN**
+- [x] **Step 3: Add the minimal recursive containers required to compile and verify GREEN**
 
 Use this ownership graph across `content.rs`, `children.rs`, `xml.rs`, and `document.rs`:
 
@@ -460,7 +460,7 @@ Run: `cargo test --test pom_ast ordered_list_and_code_nodes_preserve_semantic_pa
 
 Expected: PASS.
 
-- [ ] **Step 4: Write the mixed-order RED test**
+- [x] **Step 4: Write the mixed-order RED test**
 
 ```rust
 use agentview::pom::{
@@ -494,7 +494,7 @@ fn mixed_children_preserve_text_markdown_xml_text_order() {
 
 Run the exact test. Expected RED: missing typed constructors/read-only iteration or wrong order.
 
-- [ ] **Step 5: Complete typed constructors and getters**
+- [x] **Step 5: Complete typed constructors and getters**
 
 Add:
 
@@ -506,7 +506,7 @@ Add:
 
 At this point `InlineContent::try_text` only establishes the fallible signature; Task 4 adds newline validation. Re-export every public value type from `pom/mod.rs`. Add an explicit prelude re-export list for `BlockBuilder`, `BlockChildren`, `BlockContent`, `CodeBlockNode`, `CodeSpanNode`, `ContentContext`, `ContentKind`, `ContentNode`, `ContentRef`, `DiffSlot`, `DiffStrategy`, `Document`, `HeadingLevel`, `HeadingNode`, `InlineBuilder`, `InlineChildren`, `InlineContent`, `ListBuilder`, `ListItem`, `ListKind`, `ListNode`, `MarkdownKind`, `MarkdownNode`, `MixedBuilder`, `MixedChildren`, `MixedContent`, `ParagraphNode`, `PomError`, `StrongNode`, `TextNode`, `XmlAttribute`, `XmlAttributes`, `XmlName`, and `XmlNode`; names introduced by later tasks are added when those tasks land.
 
-- [ ] **Step 6: Run focused and workspace tests**
+- [x] **Step 6: Run focused and workspace tests**
 
 ```bash
 cargo test --test pom_ast
@@ -516,7 +516,7 @@ cargo fmt --all --check
 
 Expected: PASS and legacy semantic tests unchanged.
 
-- [ ] **Step 7: Commit the recursive AST slice**
+- [x] **Step 7: Commit the recursive AST slice**
 
 ```bash
 git add src/lib.rs src/pom tests/pom_ast.rs
@@ -539,7 +539,7 @@ git commit -m "feat(pom): add mixed document AST"
 - Consumes: complete non-diff type graph from Task 3.
 - Produces: `ContentContext`, `ContentKind`, `MarkdownKind`, fallible dynamic conversion into block/inline wrappers, inline newline validation, and mandatory sequence normalization.
 
-- [ ] **Step 1: Write the direct-child validation RED test**
+- [x] **Step 1: Write the direct-child validation RED test**
 
 ```rust
 use agentview::pom::{
@@ -577,7 +577,7 @@ Run: `cargo test --test pom_ast block_and_inline_contexts_reject_invalid_direct_
 
 Expected: compile failure because context/kind diagnostics and dynamic conversion do not exist.
 
-- [ ] **Step 2: Implement exhaustive context classification and conversion**
+- [x] **Step 2: Implement exhaustive context classification and conversion**
 
 Add copyable public enums covering every current syntax variant:
 
@@ -598,13 +598,13 @@ WrongContentContext { expected: ContentContext, actual: ContentKind },
 
 Implement `ContentNode::kind` and exhaustive `MarkdownNode::kind`. `BlockContent::try_from_node` accepts only block Markdown and XML. For this GREEN, `InlineContent::try_from_node` accepts Text, inline Markdown, and XML without inspecting Text contents; the following RED adds CR/LF rejection through one shared private helper. `MixedContent::node` accepts any `ContentNode`.
 
-- [ ] **Step 3: Verify direct-child GREEN**
+- [x] **Step 3: Verify direct-child GREEN**
 
 Run: `cargo test --test pom_ast block_and_inline_contexts_reject_invalid_direct_children -- --exact`
 
 Expected: PASS.
 
-- [ ] **Step 4: Write and run inline-newline RED**
+- [x] **Step 4: Write and run inline-newline RED**
 
 ```rust
 #[test]
@@ -628,7 +628,7 @@ Run the exact test. Expected RED: newline text incorrectly returns `Ok`.
 
 Implement the check in the single private conversion used by both `try_text` and `try_from_node`, then re-run the exact test and the whole `pom_ast` suite.
 
-- [ ] **Step 5: Write canonical-normalization RED tests**
+- [x] **Step 5: Write canonical-normalization RED tests**
 
 ```rust
 #[test]
@@ -670,7 +670,7 @@ fn text_normalization_does_not_trim_or_cross_xml() {
 
 Run each exact test before changing production code. Expected RED: empty/adjacent text remains as multiple edges.
 
-- [ ] **Step 6: Centralize sequence normalization**
+- [x] **Step 6: Centralize sequence normalization**
 
 In `children.rs`, add one private helper over `ContentEdge` that:
 
@@ -680,7 +680,7 @@ In `children.rs`, add one private helper over `ContentEdge` that:
 
 Use it from `InlineChildren::push` and `MixedChildren::push`. `BlockChildren` cannot contain direct text and uses normal push. Do not normalize inside `CodeBlockNode` or `CodeSpanNode`.
 
-- [ ] **Step 7: Run regression GREEN**
+- [x] **Step 7: Run regression GREEN**
 
 ```bash
 cargo test --test pom_ast
@@ -690,7 +690,7 @@ cargo fmt --all --check
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit validation and normalization**
+- [x] **Step 8: Commit validation and normalization**
 
 ```bash
 git add src/lib.rs src/pom tests/pom_ast.rs
@@ -713,7 +713,7 @@ git commit -m "feat(pom): enforce child contexts"
 - Consumes: `XmlName`, `XmlNode`, and typed child wrappers.
 - Produces: `DiffStrategy::{Recursive,Replace,Append,Sequence,Set,Keyed}`, `DiffSlot::{present,absent,role,strategy,value,is_present}`, `ContentRef::DiffSlot`, and `xml_slot` construction in every context where XML is legal.
 
-- [ ] **Step 1: Write and run present-slot RED tests**
+- [x] **Step 1: Write and run present-slot RED tests**
 
 ```rust
 use agentview::pom::{DiffSlot, DiffStrategy, XmlName, XmlNode};
@@ -779,7 +779,7 @@ cargo test --test pom_ast all_diff_strategies_are_structurally_observable -- --e
 
 Expected: compile failure because `DiffSlot` and `DiffStrategy` do not exist.
 
-- [ ] **Step 2: Implement the XML-only slot type**
+- [x] **Step 2: Implement the XML-only slot type**
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -802,11 +802,11 @@ pub struct DiffSlot {
 
 `present` takes exactly `(DiffStrategy, XmlNode)` and clones the role from `value.name()`. `absent` takes `(XmlName, DiffStrategy)`. There is no generic `ContentNode` overload and no role argument on `present`.
 
-- [ ] **Step 3: Verify present-slot GREEN**
+- [x] **Step 3: Verify present-slot GREEN**
 
 Run all three exact commands from Step 1. Expected: PASS.
 
-- [ ] **Step 4: Write absent-slot, strategy, and ordered-edge RED tests**
+- [x] **Step 4: Write absent-slot, strategy, and ordered-edge RED tests**
 
 ```rust
 #[test]
@@ -842,7 +842,7 @@ fn text_normalization_does_not_cross_diff_slot() {
 
 Run each exact test before implementation. Expected RED: diff edge constructors/variant are absent or normalization incorrectly crosses the edge.
 
-- [ ] **Step 5: Integrate diff edges without making them syntax nodes**
+- [x] **Step 5: Integrate diff edges without making them syntax nodes**
 
 Extend private `ContentEdge` with `Diff(DiffSlot)` and public `ContentRef<'a>` with `DiffSlot(&'a DiffSlot)`. Add:
 
@@ -852,11 +852,11 @@ Extend private `ContentEdge` with `Diff(DiffSlot)` and public `ContentRef<'a>` w
 
 Keep `DiffSlot` out of `ContentNode`. Update read-only iteration and normalization exhaustively; a diff edge always blocks text merging, including an absent slot.
 
-- [ ] **Step 6: Keep earlier exhaustive traversal tests compiling**
+- [x] **Step 6: Keep earlier exhaustive traversal tests compiling**
 
 When adding `ContentRef::DiffSlot`, update the Task 3 mixed-order test's exhaustive match with `ContentRef::DiffSlot(_) => "diff"`. Re-run all three Step 1 exact tests to prove the complete nested XML value and strategy set remain intact after edge integration.
 
-- [ ] **Step 7: Run regression GREEN**
+- [x] **Step 7: Run regression GREEN**
 
 ```bash
 cargo test --test pom_ast
@@ -866,7 +866,7 @@ cargo fmt --all --check
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit explicit diff edges**
+- [x] **Step 8: Commit explicit diff edges**
 
 ```bash
 git add src/lib.rs src/pom tests/pom_ast.rs
@@ -890,7 +890,7 @@ git commit -m "feat(pom): add XML diff slots"
 - Consumes: typed content wrappers and validation from Tasks 3-5.
 - Produces: `BlockBuilder`, `InlineBuilder`, `MixedBuilder`, `ListBuilder`, `Document::{build,try_build}`, and `XmlNode::{build,try_build}`. Closure builders reuse the same typed constructors and `push` normalization as compositional construction.
 
-- [ ] **Step 1: Write closure/compositional parity RED**
+- [x] **Step 1: Write closure/compositional parity RED**
 
 ```rust
 use agentview::pom::{
@@ -935,7 +935,7 @@ Run: `cargo test --test pom_ast closure_and_compositional_builders_are_equivalen
 
 Expected: compile failure because document/child closure builders do not exist.
 
-- [ ] **Step 2: Implement builders as thin typed facades**
+- [x] **Step 2: Implement builders as thin typed facades**
 
 Use these entry signatures:
 
@@ -974,11 +974,11 @@ Final required surface:
 
 For the parity GREEN in this step, implement only `Document::try_build`, `BlockBuilder::{try_heading,xml_slot}`, and `InlineBuilder::try_text`. The builder-coverage RED below drives the remaining methods. The typed methods take validated values and infallible closures. The `try_*` methods take raw/fallible inputs and closures returning `Result<(), PomError>`. Do not store errors inside builders, panic on invalid input, infer a paragraph from raw block text, or duplicate validation logic.
 
-- [ ] **Step 3: Verify parity GREEN**
+- [x] **Step 3: Verify parity GREEN**
 
 Run the exact test. Expected: PASS.
 
-- [ ] **Step 4: Write a builder-coverage RED test**
+- [x] **Step 4: Write a builder-coverage RED test**
 
 ```rust
 #[test]
@@ -1046,11 +1046,11 @@ Run: `cargo test --test pom_ast closure_builders_cover_the_v1_authoring_surface 
 
 Expected RED: the first missing convenience method or wrong structural variant.
 
-- [ ] **Step 5: Complete only the missing builder methods and re-run GREEN**
+- [x] **Step 5: Complete only the missing builder methods and re-run GREEN**
 
 Implement the minimum methods required by the coverage test. Reuse `BlockChildren::push`, `InlineChildren::push`, and `MixedChildren::push` so closure and compositional paths cannot diverge on normalization.
 
-- [ ] **Step 6: Run regression GREEN**
+- [x] **Step 6: Run regression GREEN**
 
 ```bash
 cargo test --test pom_ast
@@ -1060,7 +1060,7 @@ cargo fmt --all --check
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit authoring builders**
+- [x] **Step 7: Commit authoring builders**
 
 ```bash
 git add src/lib.rs src/pom tests/pom_ast.rs
@@ -1089,7 +1089,7 @@ git commit -m "feat(pom): add typed document builders"
 - Consumes: the complete Phase 2 AST.
 - Produces: diagnostic-only `Serialize` coverage and compiler-checked negative API boundaries. It does not add `Deserialize`, renderer, parser, differ, resolver, cursor, or runtime integration.
 
-- [ ] **Step 1: Write diagnostic-serialization RED**
+- [x] **Step 1: Write diagnostic-serialization RED**
 
 ```rust
 #[test]
@@ -1122,13 +1122,13 @@ Run: `cargo test --test pom_ast diagnostic_serialization_preserves_order_and_dif
 
 Expected: compile failure `E0277` because `Document` does not yet implement `Serialize`.
 
-- [ ] **Step 2: Add `Serialize` transitively to the AST**
+- [x] **Step 2: Add `Serialize` transitively to the AST**
 
 Derive `serde::Serialize` on every public POM value and the private types reachable from them: document, syntax nodes, payload structs/enums, wrappers, child sequences, `ContentEdge`, XML attributes/metadata, `DiffSlot`, strategies, validated names/levels, and context/kind diagnostics. Do not derive or manually implement `Deserialize` anywhere under `src/pom`.
 
 Keep serialization structural and ordered. Do not add custom version tags or promise a stable wire representation.
 
-- [ ] **Step 3: Verify serialization GREEN**
+- [x] **Step 3: Verify serialization GREEN**
 
 Run:
 
@@ -1139,7 +1139,7 @@ cargo test --test pom_ast
 
 Expected: PASS.
 
-- [ ] **Step 4: Add the independent trybuild runner and invalid call sites**
+- [x] **Step 4: Add the independent trybuild runner and invalid call sites**
 
 Runner:
 
@@ -1187,7 +1187,7 @@ let _: Document = serde_json::from_str("{}").unwrap();
 
 Use normal `fn main()` fixtures and import only the required names.
 
-- [ ] **Step 5: Run trybuild, inspect RED, then accept exact diagnostics**
+- [x] **Step 5: Run trybuild, inspect RED, then accept exact diagnostics**
 
 First run without `.stderr` files:
 
@@ -1206,11 +1206,11 @@ cargo test --test pom_compile_fail
 
 Expected: PASS. These negative guards require no production broadening/narrowing when the already-tested positive API is correctly typed.
 
-- [ ] **Step 6: Update implementation status without rewriting the design**
+- [x] **Step 6: Update implementation status without rewriting the design**
 
 In the design spec, change only the status line and add a short implementation-status note stating that Phase 2 AST exists additively while legacy runtime still uses `SemanticNode`. Do not claim producer, diff, resolver, renderer, or session migration is implemented.
 
-- [ ] **Step 7: Run full verification**
+- [x] **Step 7: Run full verification**
 
 ```bash
 cargo fmt --all --check
@@ -1221,7 +1221,7 @@ git diff --check
 
 Expected: all commands exit 0 with no warnings or failures.
 
-- [ ] **Step 8: Commit Phase 2 contracts**
+- [x] **Step 8: Commit Phase 2 contracts**
 
 ```bash
 git add src/lib.rs src/pom tests/pom_ast.rs tests/pom_compile_fail.rs tests/ui/pom \

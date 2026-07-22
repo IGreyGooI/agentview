@@ -32,7 +32,7 @@ fn normalize_text_edge(
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct BlockChildren(Vec<BlockContent>);
 
 impl BlockChildren {
@@ -138,7 +138,7 @@ impl<'a> BlockBuilder<'a> {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct InlineChildren(Vec<InlineContent>);
 
 impl InlineChildren {
@@ -214,7 +214,7 @@ impl<'a> InlineBuilder<'a> {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct MixedChildren(Vec<MixedContent>);
 
 impl MixedChildren {

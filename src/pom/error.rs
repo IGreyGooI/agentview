@@ -2,21 +2,21 @@ use crate::StorageString;
 
 use super::XmlName;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ContentContext {
     Block,
     Inline,
     Mixed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ContentKind {
     Markdown(MarkdownKind),
     Xml,
     Text,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum MarkdownKind {
     Heading,
     Paragraph,
@@ -27,7 +27,7 @@ pub enum MarkdownKind {
     CodeSpan,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, thiserror::Error)]
 pub enum PomError {
     #[error("invalid XML name: {value}")]
     InvalidXmlName { value: StorageString },
