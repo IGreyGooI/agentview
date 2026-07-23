@@ -28,3 +28,23 @@ impl Document {
         Ok(Self::new(children))
     }
 }
+
+/// A complete prompt document with every diff slot resolved.
+///
+/// Resolved documents can only be produced by a role-specific resolver. This
+/// keeps callers from accidentally treating an unresolved [`Document`] as a
+/// complete prompt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ResolvedDocument {
+    children: BlockChildren,
+}
+
+impl ResolvedDocument {
+    pub(crate) fn new(children: BlockChildren) -> Self {
+        Self { children }
+    }
+
+    pub fn children(&self) -> &BlockChildren {
+        &self.children
+    }
+}

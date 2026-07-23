@@ -765,3 +765,63 @@ This bridge is intentionally marker-based. Built-in scalar `String` still
 renders as plain prompt text through the legacy `PromptRenderable for String`
 implementation, so ordinary prompts are not XML-escaped just because `String`
 also implements `AgentView`.
+
+## Additive POM System Prompt Path
+
+AgentView also has an additive Prompt Object Model path for authoring structured
+system prompts with Markdown and XML. This path does not replace the semantic
+context tree described above yet.
+
+The implemented system pipeline is:
+
+```text
+POM Document
+    -> resolve_system_document
+    -> ResolvedDocument
+    -> render_pom_document / PromptRenderable
+    -> AgentTurnRequest.system
+```
+
+`Document` is the authoring type and may contain `DiffSlot` edges.
+`resolve_system_document` applies system semantics recursively:
+
+- a present slot is expanded to its complete `XmlNode`;
+- an absent slot is omitted;
+- slot roles and strategies are ignored;
+- no previous state, cursor, delta, warning, or session mutation is involved.
+
+The result is the opaque, slot-free `ResolvedDocument`. Only that resolved type
+implements `PromptRenderable`; an unresolved `Document` cannot be sent directly
+through the prompt bridge. The renderer then emits canonical Markdown plus XML,
+including Markdown/XML context escaping, ordered and unordered lists, dynamic
+code fences, code spans, and XML mixed content. Structures with no canonical
+CommonMark representation, such as an empty paragraph, zero-item list, or empty
+code span, return `PomRenderError` instead of being silently dropped.
+
+The streaming tool-loop example authors its real provider system preamble this
+way:
+
+```rust
+let document = Document::try_build(|blocks| {
+    blocks.try_heading(1, |heading| {
+        heading.try_text("Demo intent selector")?;
+        Ok(())
+    })?;
+    blocks.try_paragraph(|paragraph| {
+        paragraph.try_text(
+            "Select 1-3 currently valid demo intents from the current context.",
+        )?;
+        Ok(())
+    })?;
+    blocks.xml(response_contract);
+    Ok(())
+})?;
+
+let system_prompt = resolve_system_document(document);
+```
+
+This is deliberately a system-only integration slice. The current user prompt,
+context capture, semantic diff, and fixed `## View` / `## Turn Prompt`
+composition still use the legacy `SemanticNode` pipeline. User-document
+resolution, a `UserDocumentCursor`, and the final producer/differ cutover remain
+separate work.

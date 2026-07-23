@@ -10,6 +10,8 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::pom::ResolvedDocument;
+use crate::pom_renderer::render_pom_document;
 use crate::semantic_view::{render_agent_view_diff_xml, render_agent_view_xml, AgentViewRoot};
 
 pub const AGENT_SYSTEM_LAYOUT_TEMPLATE: &str = "agent_system_layout";
@@ -224,6 +226,13 @@ impl PromptRenderable for TurnArtifact {
 impl PromptRenderable for String {
     async fn render_full<'a>(&'a self, _templates: &'a TemplateEngine) -> Result<PromptFragment> {
         Ok(self.clone().into())
+    }
+}
+
+#[async_trait::async_trait]
+impl PromptRenderable for ResolvedDocument {
+    async fn render_full<'a>(&'a self, _templates: &'a TemplateEngine) -> Result<PromptFragment> {
+        Ok(render_pom_document(self)?.into())
     }
 }
 

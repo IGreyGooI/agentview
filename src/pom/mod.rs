@@ -12,7 +12,7 @@ pub use children::{
 };
 pub use content::{BlockContent, ContentNode, ContentRef, InlineContent, MixedContent};
 pub use diff_slot::{DiffSlot, DiffStrategy};
-pub use document::Document;
+pub use document::{Document, ResolvedDocument};
 pub use error::{ContentContext, ContentKind, MarkdownKind, PomError};
 pub use markdown::{
     CodeBlockNode, CodeSpanNode, HeadingLevel, HeadingNode, ListBuilder, ListItem, ListKind,

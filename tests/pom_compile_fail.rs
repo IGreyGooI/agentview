@@ -8,4 +8,6 @@ fn invalid_pom_apis_fail_to_compile() {
     t.compile_fail("tests/ui/pom/document_rejects_text.rs");
     t.compile_fail("tests/ui/pom/children_have_no_mutable_vector_access.rs");
     t.compile_fail("tests/ui/pom/pom_types_do_not_deserialize.rs");
+    t.compile_fail("tests/ui/pom/document_is_not_prompt_renderable.rs");
+    t.compile_fail("tests/ui/pom/resolved_document_does_not_deserialize.rs");
 }

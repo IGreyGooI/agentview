@@ -1,8 +1,8 @@
 # AgentView Prompt Object Model（POM）设计
 
-> 状态：设计已批准，Phase 2 additive POM AST 已实现。本文描述目标契约；“当前行为”只出现在已有脚手架和迁移说明中。
+> 状态：设计已批准，Phase 2 additive POM AST 已实现，并已落地一个 system-only prompt integration slice。本文描述目标契约；“当前行为”只出现在已有脚手架和迁移说明中。
 
-> 实现状态（2026-07-23）：新 `agentview::pom` AST 以 additive 方式存在；legacy runtime 仍使用 `SemanticNode`。
+> 实现状态（2026-07-23）：新 `agentview::pom` AST 以 additive 方式存在；system `Document` 已可通过 full slot resolution、canonical renderer 和 `PromptRenderable` 进入真实 `AgentTurnRequest.system`。user document、cursor/differ、derive producer 和 context rendering 仍使用 legacy path。
 
 ## 1. 文档目标
 
@@ -54,7 +54,7 @@ POM 同时表达规范化 Markdown、XML、文本和 XML-only `DiffSlot`。它�
 - `AgentView` 使用 associated root type 和 `build_*` producer API；structured derive 的 root 静态为 `XmlNode`，不使用 runtime downcast 或 implicit document-root bridge。
 - `AgentViewModel` 构造完整 system/user `Document` 并拥有 section order；framework 不再注入固定 `## View` / `## Turn Prompt` envelope。
 - POM 类型实现 diagnostic `Serialize`，不实现 `Deserialize`；序列化格式不是 persistence 或 compatibility contract。
-- 当前阶段先完成 POM，并冻结本文已经确认的 cursor state contract；renderer、完整 diff traversal、具体 session integration API 和 Markdown derive syntax 后续分别设计。
+- 当前 additive 阶段已完成 POM AST、system full resolution 和 canonical renderer；完整 diff traversal、user cursor/session integration API 和 Markdown derive syntax 后续分别设计。
 
 ## 3. 已有脚手架
 
@@ -136,6 +136,18 @@ user `Document` 不再是 context 的同义词。`<agent_context>` 只是其中�
 
 system path 的 full slot resolution 不是 diff：它不访问 slot history，不产生 delta，也不改变 session state。它递归 materialize 所有 present slots、丢弃 absent slots，并返回不含 `DiffSlot` 的 `ResolvedDocument`。
 
+当前 additive integration slice 已实现这一条 system path：
+
+```text
+system Document
+    -> resolve_system_document
+    -> ResolvedDocument
+    -> render_pom_document / PromptRenderable
+    -> AgentTurnRequest.system
+```
+
+普通 `Document` 没有 `PromptRenderable` implementation，因而 unresolved slot 不能绕过 resolver 直接进入 request。这个 slice 没有实现 user resolution，也没有改变现有 `SemanticNode` context diff、固定 user envelope 或 session cursor。
+
 ## 5. 核心 AST
 
 `Document` 是不可嵌套的根容器；`ContentNode` 是唯一的 syntax union；`ContentEdge` 表示容器到 child 的有序关系。
@@ -164,7 +176,9 @@ pub struct BlockChildren(Vec<BlockContent>);
 pub struct InlineChildren(Vec<InlineContent>);
 pub struct MixedChildren(Vec<MixedContent>);
 
-pub struct ResolvedDocument(Document);
+pub struct ResolvedDocument {
+    children: BlockChildren,
+}
 ```
 
 这就是 `BlockChildren` 的完整位置和职责：它不是另一棵 AST，也不是 Markdown block enum；它是一个受约束、有顺序的 child sequence。
@@ -603,7 +617,7 @@ src/
 - `pom_resolution.rs`：按 system/user policy 解释 slots、lower patch；user path 返回 `ResolvedDocument` 与 next cursor；
 - `pom_renderer.rs`：`ResolvedDocument` -> `String`。
 
-本阶段只新增 `pom/*` 及其 tests。旧 `semantic_view.rs` 暂时保留，直到 producer、differ、renderer 都有新实现后再一次性切换 public API。
+当前 additive implementation 已新增 `pom/*`、`pom_resolution.rs` 和 `pom_renderer.rs`。`ResolvedDocument` 目前与 `Document` 一起定义在 `pom/document.rs`，尚未按目标目录草图拆出 `resolved.rs`。resolver 目前只实现无状态的 system full resolution；renderer 只接收 `ResolvedDocument`。旧 `semantic_view.rs` 以及 user/context diff path 暂时保留，直到 producer、differ、user resolver 和 session integration 完成后再一次性切换 public API。
 
 ## 14. 错误与规范化
 
@@ -773,6 +787,8 @@ producer/diff/renderer 迁移分别增加：
 
 ### Phase 4：Differ migration
 
+当前只提前落地了本阶段中独立的 system full resolution：present slot 递归展开、absent slot 省略，并产生 slot-free `ResolvedDocument`。typed `XmlPatch`、user cursor resolution 和 differ migration 尚未开始。
+
 - XML differ 改成显式接收 current/previous 完整 `XmlNode`；
 - differ 返回 typed `XmlPatch`，完整迁移 recursive/replace/append/sequence/set/keyed/map behavior；
 - 新增 `ResolvedDocument`、system full resolution 和 user cursor resolution；
@@ -782,7 +798,9 @@ producer/diff/renderer 迁移分别增加：
 
 ### Phase 5：Renderer 与 prompt integration
 
-- 设计 canonical Markdown/XML renderer；
+当前已落地 system-only vertical slice：canonical Markdown/XML renderer、`ResolvedDocument: PromptRenderable`，以及一个真实 streaming example 的 POM system prompt。完整 `AgentViewModel` system/user `Document` contract、user prompt cutover、artifact migration 和 session cursor integration 仍待实现。
+
+- 设计 canonical Markdown/XML renderer（system-only slice 已实现）；
 - renderer 只接受 slot-free `ResolvedDocument`；
 - `AgentViewModel` 改为构造完整 system `Document` 与 user `Document`；
 - 允许 user `Document` 组合 context、task、artifact、临时说明和其他 Markdown/XML content；
@@ -806,7 +824,7 @@ producer/diff/renderer 迁移分别增加：
 
 ## 17. 本阶段明确不做
 
-- 不设计最终 Markdown/XML whitespace、escaping 和 indentation；
+- 不在本文中冻结 Markdown/XML renderer 的全部 lexical 细节；当前 system renderer 的 canonical whitespace、escaping、indentation 和错误边界由 renderer tests 锁定；
 - 不决定 delta prompt 的最终 textual vocabulary；
 - 不改变现有 session draft、atomic commit 和 fork 生命周期；cursor 的持久化内容收窄为 slot baselines；
 - 不在本文中设计 history compaction 除“history replacement 清空 cursor”以外的策略；
@@ -837,4 +855,4 @@ producer/diff/renderer 迁移分别增加：
 - POM 实现 diagnostic `Serialize`，不实现 `Deserialize`；
 - 所有 implementation phases 强制执行可观察的 RED -> GREEN -> REFACTOR。
 
-renderer 的具体 whitespace/escaping、`XmlPatch` 的最终 XML vocabulary 和 Markdown derive syntax 属于后续独立设计，不改变本文冻结的 POM type/state boundaries。
+当前 system renderer 的 whitespace/escaping 已由实现与 renderer tests 锁定，但不属于本文冻结的 POM type/state boundary；`XmlPatch` 的最终 XML vocabulary、完整 user integration 和 Markdown derive syntax 仍属于后续独立设计。

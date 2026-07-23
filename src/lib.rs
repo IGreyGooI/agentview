@@ -34,6 +34,8 @@ pub mod agent_session;
 pub mod control;
 pub mod llm_call;
 pub mod pom;
+pub mod pom_renderer;
+pub mod pom_resolution;
 pub mod prompt_context;
 mod semantic_diff;
 pub mod semantic_view;
@@ -65,9 +67,11 @@ pub mod prelude {
         ContentKind, ContentNode, ContentRef, DiffSlot, DiffStrategy, Document, HeadingLevel,
         HeadingNode, InlineBuilder, InlineChildren, InlineContent, ListBuilder, ListItem, ListKind,
         ListNode, MarkdownKind, MarkdownNode, MixedBuilder, MixedChildren, MixedContent,
-        ParagraphNode, PomError, StrongNode, TextNode, XmlAttribute, XmlAttributes, XmlName,
-        XmlNode,
+        ParagraphNode, PomError, ResolvedDocument, StrongNode, TextNode, XmlAttribute,
+        XmlAttributes, XmlName, XmlNode,
     };
+    pub use crate::pom_renderer::{render_pom_document, PomRenderError};
+    pub use crate::pom_resolution::resolve_system_document;
     pub use crate::prompt_context::{
         AgentTurnError, IdentityTransform, PromptContext, Role, Turn, TurnTransform,
     };

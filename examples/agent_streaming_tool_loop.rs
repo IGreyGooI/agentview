@@ -201,19 +201,150 @@ impl ContextViewBuilder for DemoContextBuilder {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DemoPromptLayout;
+const DEMO_USER_TEMPLATE: &str = r#"{% if context_block %}{{ context_block }}
+{% endif %}{% for artifact in artifacts %}{{ artifact.rendered }}
+{% endfor %}<task>{{ task }}</task>"#;
 
-impl PromptLayout for DemoPromptLayout {
-    fn system_template(&self) -> &'static str {
-        r#"{{ instructions }}
-{% if output_schema %}{{ output_schema }}{% endif %}"#
+fn build_demo_system_document() -> Result<Document, PomError> {
+    let mut verify_tool = XmlNode::new(XmlName::try_from("tool")?);
+    verify_tool.push_attribute(XmlName::try_from("name")?, "verify_intent_budget")?;
+    verify_tool.push_attribute(XmlName::try_from("scope")?, "demo")?;
+    verify_tool.push_attribute(XmlName::try_from("required")?, "first")?;
+
+    let mut select_tool = XmlNode::new(XmlName::try_from("tool")?);
+    select_tool.push_attribute(XmlName::try_from("name")?, "select")?;
+    select_tool.push_attribute(XmlName::try_from("attribute")?, "local_id")?;
+    select_tool.push_attribute(XmlName::try_from("cardinality")?, "1-3")?;
+
+    let mut response_contract = XmlNode::try_build("response_contract", |children| {
+        children.xml(verify_tool);
+        children.xml(select_tool);
+        Ok(())
+    })?;
+    response_contract.push_attribute(XmlName::try_from("transport")?, "xml")?;
+
+    Document::try_build(|blocks| {
+        blocks.try_heading(1, |heading| {
+            heading.try_text("Demo intent selector")?;
+            Ok(())
+        })?;
+        blocks.try_paragraph(|paragraph| {
+            paragraph
+                .try_text("Select 1-3 currently valid demo intents from the current context.")?;
+            Ok(())
+        })?;
+        blocks.try_heading(2, |heading| {
+            heading.try_text("Required workflow")?;
+            Ok(())
+        })?;
+        blocks.try_list(ListKind::Ordered { start: 1 }, |list| {
+            list.try_item(|item| {
+                item.try_paragraph(|paragraph| {
+                    paragraph.try_text("Call ")?;
+                    paragraph.code_span(TextNode::new(r#"<verify_intent_budget scope="demo"/>"#));
+                    paragraph.try_text(".")?;
+                    Ok(())
+                })?;
+                Ok(())
+            })?;
+            list.try_item(|item| {
+                item.try_paragraph(|paragraph| {
+                    paragraph.try_text("After verification, return only ")?;
+                    paragraph.code_span(TextNode::new(r#"<select local_id="..."/>"#));
+                    paragraph.try_text(" elements.")?;
+                    Ok(())
+                })?;
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        blocks.xml(response_contract);
+        Ok(())
+    })
+}
+
+#[derive(Clone)]
+struct DemoViewModel {
+    context_builder: DemoContextBuilder,
+    templates: TemplateEngine,
+}
+
+impl DemoViewModel {
+    fn new(context_builder: DemoContextBuilder) -> Self {
+        Self {
+            context_builder,
+            templates: TemplateEngine::new(),
+        }
     }
 
-    fn user_template(&self) -> &'static str {
-        r#"{% if context_block %}{{ context_block }}
-{% endif %}{% for artifact in artifacts %}{{ artifact.rendered }}
-{% endfor %}<task>{{ task }}</task>"#
+    async fn render_turn_artifacts(
+        &self,
+        artifacts: Vec<TurnArtifact>,
+    ) -> anyhow::Result<Vec<agentview::templates::RenderedTurnArtifact>> {
+        let mut rendered = Vec::new();
+        for artifact in artifacts {
+            rendered.push(agentview::templates::RenderedTurnArtifact {
+                kind: artifact.kind.clone(),
+                rendered: artifact.render_full(&self.templates).await?.into_string(),
+            });
+        }
+        Ok(rendered)
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentViewModel<Turn, DemoParseContext> for DemoViewModel {
+    type Source = DemoSource;
+    type View = DemoContextView;
+    type SystemPrompt = ResolvedDocument;
+    type TurnPrompt = agentview::agent::DefaultTurnPrompt;
+    type ContextState = agentview::agent::DefaultContextState;
+
+    async fn build_system_prompt(
+        &self,
+        _ctx: &PromptContext<Turn, Self::ContextState>,
+        _source: &Self::Source,
+    ) -> anyhow::Result<Self::SystemPrompt> {
+        Ok(resolve_system_document(build_demo_system_document()?))
+    }
+
+    async fn capture_view(&self, source: &Self::Source) -> Self::View {
+        self.context_builder.capture(source).await
+    }
+
+    async fn build_turn_prompt(
+        &self,
+        ctx: &PromptContext<Turn, Self::ContextState>,
+        _call_id: &str,
+        task: String,
+    ) -> anyhow::Result<Self::TurnPrompt> {
+        let task = match ctx.context_state().feedback.task.as_deref() {
+            Some(feedback_task) if task.is_empty() => feedback_task.to_owned(),
+            Some(feedback_task) => format!("{feedback_task}\n\n{task}"),
+            None => task,
+        };
+        Ok(agentview::agent::DefaultTurnPrompt {
+            task,
+            rendered_artifacts: ctx.context_state().feedback.artifacts.clone(),
+            template: DEMO_USER_TEMPLATE.into(),
+        })
+    }
+
+    async fn commit_turn(
+        &self,
+        ctx: &mut PromptContext<Turn, Self::ContextState>,
+        request: &AgentTurnRequest<Turn>,
+        executor_commit: ExecutorCommit<Turn>,
+        _sink_output: &mut DemoParseContext,
+    ) -> anyhow::Result<TurnFlow> {
+        if !ctx.has_system() {
+            ctx.set_system_once(request.system.clone());
+        }
+
+        ctx.push_history(Turn::user(request.user.clone()));
+        ctx.extend_history(executor_commit.append);
+        ctx.context_state_mut().feedback = agentview::agent::DefaultAgentFeedback::default();
+        Ok(TurnFlow::Wait)
     }
 }
 
@@ -384,30 +515,17 @@ async fn main() -> anyhow::Result<()> {
     INTENT_BUDGET_ATTEMPTS.store(0, Ordering::SeqCst);
 
     let executor = RigExampleExecutor;
-    let agent: TextAgent<
-        DemoContextBuilder,
-        RigExampleExecutor,
-        IdentityTransform,
-        TextTurnEvent,
-        DemoParseContext,
-    > = Agent::new(
-        DemoContextBuilder {
-            agent_id: "demo_agent".to_string(),
-        },
-        DemoPromptLayout,
-        PromptSystemVars {
-            instructions: "You are a demo intent selector agent.".to_string(),
-            output_schema: Some(
-                "First call <verify_intent_budget scope=\"demo\"/>. After the budget is verified, return only <select local_id=\"...\"/> tags."
-                    .to_string(),
-            ),
-        },
-        std::env::var("AGENT_EXAMPLE_MODEL")
-            .unwrap_or_else(|_| "deepseek/deepseek-v3.2".to_string()),
-        128,
-        IdentityTransform,
-    )
-    .with_observer(Arc::new(executor.clone()));
+    let agent: Agent<DemoViewModel, RigExampleExecutor, Turn, TextTurnEvent, DemoParseContext> =
+        Agent::with_view(
+            DemoViewModel::new(DemoContextBuilder {
+                agent_id: "demo_agent".to_string(),
+            }),
+            std::env::var("AGENT_EXAMPLE_MODEL")
+                .unwrap_or_else(|_| "deepseek/deepseek-v3.2".to_string()),
+            128,
+            PromptContext::<Turn, agentview::agent::DefaultContextState>::without_system(),
+        )
+        .with_observer(Arc::new(executor.clone()));
 
     let source = DemoSource {
         scene: "demo scene captured from a tiny app source".to_string(),
@@ -460,4 +578,32 @@ async fn main() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn demo_system_prompt_is_authored_and_rendered_as_pom() {
+        let rendered = resolve_system_document(build_demo_system_document().unwrap())
+            .render_full(&TemplateEngine::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rendered.as_str(),
+            concat!(
+                "# Demo intent selector\n\n",
+                "Select 1-3 currently valid demo intents from the current context.\n\n",
+                "## Required workflow\n\n",
+                "1. Call `<verify_intent_budget scope=\"demo\"/>`.\n",
+                "2. After verification, return only `<select local_id=\"...\"/>` elements.\n\n",
+                "<response_contract transport=\"xml\">",
+                "<tool name=\"verify_intent_budget\" scope=\"demo\" required=\"first\" />",
+                "<tool name=\"select\" attribute=\"local_id\" cardinality=\"1-3\" />",
+                "</response_contract>"
+            )
+        );
+    }
 }

@@ -193,4 +193,9 @@ impl XmlNode {
     pub fn push(&mut self, content: super::MixedContent) {
         self.children.push(content);
     }
+
+    pub(crate) fn with_children(mut self, children: MixedChildren) -> Self {
+        self.children = children;
+        self
+    }
 }
