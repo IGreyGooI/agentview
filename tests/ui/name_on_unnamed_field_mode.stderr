@@ -1,0 +1,5 @@
+error: `name` is not valid for this field mode
+ --> tests/ui/name_on_unnamed_field_mode.rs:6:5
+  |
+6 |     value: String,
+  |     ^^^^^

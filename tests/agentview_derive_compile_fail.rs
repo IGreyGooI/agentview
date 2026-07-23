@@ -4,6 +4,13 @@ fn invalid_agent_view_apis_fail_to_compile() {
     t.compile_fail("tests/ui/vec_diff_without_mode.rs");
     t.compile_fail("tests/ui/collection_mode_without_diff.rs");
     t.compile_fail("tests/ui/collection_mode_on_non_vec.rs");
+    t.compile_fail("tests/ui/conflicting_nested_collection_modes.rs");
+    t.compile_fail("tests/ui/conflicting_top_level_collection_modes.rs");
+    t.compile_fail("tests/ui/invalid_static_xml_kind.rs");
+    t.compile_fail("tests/ui/invalid_static_xml_field_name.rs");
+    t.compile_fail("tests/ui/invalid_inferred_xml_kind.rs");
+    t.compile_fail("tests/ui/invalid_inferred_xml_field_name.rs");
+    t.compile_fail("tests/ui/name_on_unnamed_field_mode.rs");
     t.compile_fail("tests/ui/replace_without_diff.rs");
     t.compile_fail("tests/ui/replace_with_collection_mode.rs");
     t.compile_fail("tests/ui/skip_with_diff.rs");

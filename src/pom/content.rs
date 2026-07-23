@@ -203,6 +203,13 @@ impl MixedContent {
         Self(ContentEdge::Diff(slot))
     }
 
+    pub(crate) fn into_node_or_slot(self) -> Result<ContentNode, DiffSlot> {
+        match self.0 {
+            ContentEdge::Node(node) => Ok(node),
+            ContentEdge::Diff(slot) => Err(slot),
+        }
+    }
+
     pub(crate) fn as_ref(&self) -> ContentRef<'_> {
         self.0.as_ref()
     }

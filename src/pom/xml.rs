@@ -65,6 +65,10 @@ impl XmlAttribute {
     pub fn value(&self) -> &str {
         &self.value
     }
+
+    pub(crate) fn into_parts(self) -> (XmlName, StorageString) {
+        (self.name, self.value)
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -194,8 +198,26 @@ impl XmlNode {
         self.children.push(content);
     }
 
+    #[doc(hidden)]
+    pub fn extend_children(&mut self, children: MixedChildren) {
+        self.children.extend(children);
+    }
+
+    #[doc(hidden)]
+    pub fn into_children(self) -> MixedChildren {
+        self.children
+    }
+
     pub(crate) fn with_children(mut self, children: MixedChildren) -> Self {
         self.children = children;
         self
+    }
+
+    pub(crate) fn mark_as_map(&mut self) {
+        self.metadata.collection_kind = Some(IntrinsicCollectionKind::Map);
+    }
+
+    pub(crate) fn set_identity(&mut self, identity: Option<ContentNode>) {
+        self.metadata.identity = identity.map(Box::new);
     }
 }

@@ -1,0 +1,5 @@
+error: a collection diff field can have only one strategy
+ --> tests/ui/conflicting_top_level_collection_modes.rs:5:26
+  |
+5 |     #[view(diff, append, set)]
+  |                          ^^^

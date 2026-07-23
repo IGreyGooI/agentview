@@ -95,6 +95,23 @@ impl AgentView for str {
     }
 }
 
+impl<T> AgentView for &T
+where
+    T: AgentView + ?Sized,
+{
+    fn render_root(&self) -> SemanticFragment {
+        (*self).render_root()
+    }
+
+    fn render_field(&self, field_name: &'static str) -> SemanticField {
+        (*self).render_field(field_name)
+    }
+
+    fn render_children(&self) -> Vec<SemanticFragment> {
+        (*self).render_children()
+    }
+}
+
 macro_rules! impl_scalar_agent_view {
     ($($ty:ty),* $(,)?) => {
         $(

@@ -211,19 +211,95 @@ struct DemoStreamingTools {
     select: SelectTool,
 }
 
-#[derive(Debug, Clone)]
-struct DemoSystemPromptView {
-    title: String,
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(markdown = "paragraph")]
+struct DemoWorkflowStepView {
+    #[view(text)]
+    before: String,
+
+    #[view(code_span)]
+    call: String,
+
+    #[view(text)]
+    after: String,
+}
+
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(kind = "response_contract")]
+struct DemoResponseContractView {
+    #[view(attr)]
     transport: &'static str,
-    tools: DemoStreamingTools,
+
+    #[view(root)]
+    verify_intent_budget: VerifyIntentBudgetTool,
+
+    #[view(root)]
+    select: SelectTool,
+}
+
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(document)]
+struct DemoSystemPromptView {
+    #[view(heading = 1)]
+    title: String,
+
+    #[view(paragraph)]
+    task: String,
+
+    #[view(heading = 2)]
+    workflow_title: String,
+
+    #[view(ordered_list)]
+    workflow: Vec<DemoWorkflowStepView>,
+
+    #[view(xml)]
+    response_contract: DemoResponseContractView,
 }
 
 impl DemoSystemPromptView {
     fn new(tools: DemoStreamingTools) -> Self {
+        let verify_call = format!(
+            r#"<{} scope="{}"/>"#,
+            tools.verify_intent_budget.tag(),
+            tools.verify_intent_budget.scope
+        );
+        let select_call = format!(
+            r#"<{} {}="..."/>"#,
+            tools.select.tag(),
+            tools.select.attribute
+        );
+        let selection_range = format!(
+            "{}-{}",
+            tools.select.selection_range.min, tools.select.selection_range.max
+        );
+        let DemoStreamingTools {
+            verify_intent_budget,
+            select,
+        } = tools;
+
         Self {
             title: "Demo intent selector".to_owned(),
-            transport: "xml",
-            tools,
+            task: format!(
+                "Select {selection_range} currently valid demo intents from the current context."
+            ),
+            workflow_title: "Required workflow".to_owned(),
+            workflow: vec![
+                DemoWorkflowStepView {
+                    before: "Call ".to_owned(),
+                    call: verify_call,
+                    after: ".".to_owned(),
+                },
+                DemoWorkflowStepView {
+                    before: "After verification, return only ".to_owned(),
+                    call: select_call,
+                    after: " elements.".to_owned(),
+                },
+            ],
+            response_contract: DemoResponseContractView {
+                transport: "xml",
+                verify_intent_budget,
+                select,
+            },
         }
     }
 }
@@ -231,72 +307,6 @@ impl DemoSystemPromptView {
 impl Default for DemoSystemPromptView {
     fn default() -> Self {
         Self::new(DemoStreamingTools::default())
-    }
-}
-
-impl DocumentProducer for DemoSystemPromptView {
-    fn build_document(&self) -> Result<Document, PomError> {
-        let verify_call = format!(
-            r#"<{} scope="{}"/>"#,
-            self.tools.verify_intent_budget.tag(),
-            self.tools.verify_intent_budget.scope
-        );
-        let select_call = format!(
-            r#"<{} {}="..."/>"#,
-            self.tools.select.tag(),
-            self.tools.select.attribute
-        );
-        let selection_range = format!(
-            "{}-{}",
-            self.tools.select.min_selections, self.tools.select.max_selections
-        );
-
-        let mut response_contract = XmlNode::try_build("response_contract", |children| {
-            children.xml(self.tools.verify_intent_budget.build_prompt_node()?);
-            children.xml(self.tools.select.build_prompt_node()?);
-            Ok(())
-        })?;
-        response_contract.push_attribute(XmlName::try_from("transport")?, self.transport)?;
-
-        Document::try_build(|blocks| {
-            blocks.try_heading(1, |heading| {
-                heading.try_text(self.title.as_str())?;
-                Ok(())
-            })?;
-            blocks.try_paragraph(|paragraph| {
-                paragraph.try_text(format!(
-                    "Select {selection_range} currently valid demo intents from the current context."
-                ))?;
-                Ok(())
-            })?;
-            blocks.try_heading(2, |heading| {
-                heading.try_text("Required workflow")?;
-                Ok(())
-            })?;
-            blocks.try_list(ListKind::Ordered { start: 1 }, |list| {
-                list.try_item(|item| {
-                    item.try_paragraph(|paragraph| {
-                        paragraph.try_text("Call ")?;
-                        paragraph.code_span(TextNode::new(verify_call));
-                        paragraph.try_text(".")?;
-                        Ok(())
-                    })?;
-                    Ok(())
-                })?;
-                list.try_item(|item| {
-                    item.try_paragraph(|paragraph| {
-                        paragraph.try_text("After verification, return only ")?;
-                        paragraph.code_span(TextNode::new(select_call));
-                        paragraph.try_text(" elements.")?;
-                        Ok(())
-                    })?;
-                    Ok(())
-                })?;
-                Ok(())
-            })?;
-            blocks.xml(response_contract);
-            Ok(())
-        })
     }
 }
 
@@ -328,9 +338,7 @@ impl AgentViewModel<Turn, DemoParseContext> for DemoViewModel {
         _ctx: &PromptContext<Turn, Self::ContextState>,
         _source: &Self::Source,
     ) -> anyhow::Result<Self::SystemPrompt> {
-        Ok(resolve_system_document(
-            self.system_prompt.build_document()?,
-        ))
+        Ok(resolve_system_document(self.system_prompt.build_root()?))
     }
 
     async fn capture_view(&self, source: &Self::Source) -> Self::View {
@@ -401,15 +409,29 @@ impl ParseContext for DemoParseContext {
 
 static INTENT_BUDGET_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(kind = "tool")]
 struct VerifyIntentBudgetTool {
+    #[view(attr, name = "name")]
+    contract_name: &'static str,
+
+    #[view(attr)]
     scope: &'static str,
+
+    #[view(attr)]
     required: &'static str,
+}
+
+impl VerifyIntentBudgetTool {
+    fn tag(&self) -> &'static str {
+        self.contract_name
+    }
 }
 
 impl Default for VerifyIntentBudgetTool {
     fn default() -> Self {
         Self {
+            contract_name: "verify_intent_budget",
             scope: "demo",
             required: "first",
         }
@@ -418,18 +440,6 @@ impl Default for VerifyIntentBudgetTool {
 
 #[async_trait::async_trait]
 impl StreamingTool<DemoParseContext> for VerifyIntentBudgetTool {
-    fn tag(&self) -> &'static str {
-        "verify_intent_budget"
-    }
-
-    fn build_prompt_node(&self) -> Result<XmlNode, PomError> {
-        let mut node = XmlNode::new(XmlName::try_from("tool")?);
-        node.push_attribute(XmlName::try_from("name")?, self.tag())?;
-        node.push_attribute(XmlName::try_from("scope")?, self.scope)?;
-        node.push_attribute(XmlName::try_from("required")?, self.required)?;
-        Ok(node)
-    }
-
     async fn on_open(
         &mut self,
         elem: &XmlElement,
@@ -457,39 +467,48 @@ impl StreamingTool<DemoParseContext> for VerifyIntentBudgetTool {
 }
 
 #[derive(Debug, Clone)]
+struct SelectionRange {
+    min: usize,
+    max: usize,
+}
+
+impl std::fmt::Display for SelectionRange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}-{}", self.min, self.max)
+    }
+}
+
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(kind = "tool")]
 struct SelectTool {
+    #[view(attr, name = "name")]
+    contract_name: &'static str,
+
+    #[view(attr)]
     attribute: &'static str,
-    min_selections: usize,
-    max_selections: usize,
+
+    #[view(attr, name = "cardinality")]
+    selection_range: SelectionRange,
+}
+
+impl SelectTool {
+    fn tag(&self) -> &'static str {
+        self.contract_name
+    }
 }
 
 impl Default for SelectTool {
     fn default() -> Self {
         Self {
+            contract_name: "select",
             attribute: "local_id",
-            min_selections: 1,
-            max_selections: 3,
+            selection_range: SelectionRange { min: 1, max: 3 },
         }
     }
 }
 
 #[async_trait::async_trait]
 impl StreamingTool<DemoParseContext> for SelectTool {
-    fn tag(&self) -> &'static str {
-        "select"
-    }
-
-    fn build_prompt_node(&self) -> Result<XmlNode, PomError> {
-        let mut node = XmlNode::new(XmlName::try_from("tool")?);
-        node.push_attribute(XmlName::try_from("name")?, self.tag())?;
-        node.push_attribute(XmlName::try_from("attribute")?, self.attribute)?;
-        node.push_attribute(
-            XmlName::try_from("cardinality")?,
-            format!("{}-{}", self.min_selections, self.max_selections),
-        )?;
-        Ok(node)
-    }
-
     async fn on_open(
         &mut self,
         elem: &XmlElement,
@@ -503,10 +522,13 @@ impl StreamingTool<DemoParseContext> for SelectTool {
             });
         };
 
-        if ctx.selected.len() >= self.max_selections {
+        if ctx.selected.len() >= self.selection_range.max {
             return Err(StreamingToolError::Rejected {
                 tag: self.tag(),
-                reason: format!("expected at most {} selected intents", self.max_selections),
+                reason: format!(
+                    "expected at most {} selected intents",
+                    self.selection_range.max
+                ),
             });
         }
 
@@ -515,7 +537,10 @@ impl StreamingTool<DemoParseContext> for SelectTool {
     }
 }
 
+#[derive(AgentView)]
+#[agent_view(kind = "parser_error")]
 struct ParserErrorArtifact {
+    #[view(text)]
     message: String,
 }
 
@@ -524,23 +549,8 @@ impl ParserErrorArtifact {
         let artifact = Self {
             message: message.into(),
         };
-        let document = artifact
-            .build_document()
-            .expect("the demo parser-error POM uses a static valid XML name");
-        TurnArtifact::try_from_document("parser_error", document)
+        TurnArtifact::try_from_view(&artifact)
             .expect("the demo parser-error POM never contains a DiffSlot")
-    }
-}
-
-impl DocumentProducer for ParserErrorArtifact {
-    fn build_document(&self) -> Result<Document, PomError> {
-        Document::try_build(|blocks| {
-            blocks.xml(XmlNode::try_build("parser_error", |children| {
-                children.text(TextNode::new(self.message.as_str()));
-                Ok(())
-            })?);
-            Ok(())
-        })
     }
 }
 
@@ -568,25 +578,25 @@ fn drain_demo_loop_update(
                 "The intent budget verification failed because the budget changed during validation. In one response, call <{} scope=\"{}\"/> again and also return {}-{} <{} {}=\"...\"/> tags.",
                 tools.verify_intent_budget.tag(),
                 tools.verify_intent_budget.scope,
-                tools.select.min_selections,
-                tools.select.max_selections,
+                tools.select.selection_range.min,
+                tools.select.selection_range.max,
                 tools.select.tag(),
                 tools.select.attribute,
             )),
         };
     }
 
-    if ctx.selected.len() < tools.select.min_selections {
+    if ctx.selected.len() < tools.select.selection_range.min {
         DemoLoopUpdate {
             flow: TurnFlow::Continue,
             artifacts: vec![ParserErrorArtifact::turn_artifact(format!(
                 "Expected at least {} <{}> tag.",
-                tools.select.min_selections,
+                tools.select.selection_range.min,
                 tools.select.tag()
             ))],
             task: Some(format!(
                 "Return at least {} <{} {}=\"...\"/> tag after verifying the intent budget.",
-                tools.select.min_selections,
+                tools.select.selection_range.min,
                 tools.select.tag(),
                 tools.select.attribute,
             )),
@@ -636,8 +646,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut task = format!(
         "Select {}-{} currently valid demo intents. First call <{} scope=\"{}\"/>, then return <{} {}=\"...\"/> tags.",
-        tools.select.min_selections,
-        tools.select.max_selections,
+        tools.select.selection_range.min,
+        tools.select.selection_range.max,
         tools.verify_intent_budget.tag(),
         tools.verify_intent_budget.scope,
         tools.select.tag(),
@@ -691,10 +701,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn demo_system_prompt_is_a_typed_document_producer() {
+    fn demo_system_prompt_is_a_derived_document_view() {
         let prompt = DemoSystemPromptView::default();
-        let producer: &dyn DocumentProducer = &prompt;
-        let document = producer.build_document().unwrap();
+        let document = prompt.build_root().unwrap();
 
         assert!(!document.children().is_empty());
     }
@@ -703,8 +712,8 @@ mod tests {
     fn streaming_tools_contribute_their_own_pom_contract_nodes() {
         let tools = DemoStreamingTools::default();
 
-        let verify = tools.verify_intent_budget.build_prompt_node().unwrap();
-        let select = tools.select.build_prompt_node().unwrap();
+        let verify = tools.verify_intent_budget.build_root().unwrap();
+        let select = tools.select.build_root().unwrap();
         let name = XmlName::try_from("name").unwrap();
 
         assert_eq!(verify.name().as_str(), "tool");
@@ -740,7 +749,7 @@ mod tests {
                 .value(),
             format!(
                 "{}-{}",
-                tools.select.min_selections, tools.select.max_selections
+                tools.select.selection_range.min, tools.select.selection_range.max
             )
         );
     }
@@ -749,12 +758,11 @@ mod tests {
     fn system_document_reads_dynamic_tool_configuration() {
         let mut tools = DemoStreamingTools::default();
         tools.verify_intent_budget.scope = "sandbox";
-        tools.select.max_selections = 4;
+        tools.select.selection_range.max = 4;
         let prompt = DemoSystemPromptView::new(tools);
 
         let rendered =
-            render_pom_document(&resolve_system_document(prompt.build_document().unwrap()))
-                .unwrap();
+            render_pom_document(&resolve_system_document(prompt.build_root().unwrap())).unwrap();
 
         assert!(rendered.contains("Select 1-4 currently valid demo intents"));
         assert!(rendered.contains("scope=\"sandbox\""));
@@ -764,7 +772,7 @@ mod tests {
     #[tokio::test]
     async fn demo_system_prompt_is_authored_and_rendered_as_pom() {
         let rendered =
-            resolve_system_document(DemoSystemPromptView::default().build_document().unwrap())
+            resolve_system_document(DemoSystemPromptView::default().build_root().unwrap())
                 .render_full(&TemplateEngine::new())
                 .await
                 .unwrap();

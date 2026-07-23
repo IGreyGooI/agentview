@@ -29,8 +29,11 @@
 //!
 #![deny(clippy::disallowed_types)]
 
+extern crate self as agentview;
+
 pub mod agent;
 pub mod agent_session;
+pub mod agent_view;
 pub mod control;
 pub mod llm_call;
 pub mod pom;
@@ -48,6 +51,7 @@ pub mod view_state;
 
 pub type StorageString = ecow::EcoString;
 
+pub use agent_view::AgentView;
 pub use agentview_derive::AgentView;
 
 /// Common imports for building an agent-facing ViewModel runtime.
@@ -56,6 +60,7 @@ pub mod prelude {
         Agent, AgentTurnBuilder, AgentViewModel, DefaultAgentViewModel, TextAgent, TurnFlow,
     };
     pub use crate::agent_session::AgentSession;
+    pub use crate::agent_view::AgentView;
     pub use crate::control::ControlReply;
     pub use crate::llm_call::{
         AgentTurnEvent, AgentTurnObserver, AgentTurnObserverHandle, AgentTurnOutcome,
@@ -64,11 +69,11 @@ pub mod prelude {
     };
     pub use crate::pom::{
         BlockBuilder, BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentContext,
-        ContentKind, ContentNode, ContentRef, DiffSlot, DiffStrategy, Document, DocumentProducer,
-        HeadingLevel, HeadingNode, InlineBuilder, InlineChildren, InlineContent, ListBuilder,
-        ListItem, ListKind, ListNode, MarkdownKind, MarkdownNode, MixedBuilder, MixedChildren,
-        MixedContent, ParagraphNode, PomError, ResolvedDocument, StrongNode, TextNode,
-        XmlAttribute, XmlAttributes, XmlName, XmlNode,
+        ContentKind, ContentNode, ContentRef, DiffSlot, DiffStrategy, Document, HeadingLevel,
+        HeadingNode, InlineBuilder, InlineChildren, InlineContent, ListBuilder, ListItem, ListKind,
+        ListNode, MarkdownKind, MarkdownNode, MixedBuilder, MixedChildren, MixedContent,
+        ParagraphNode, PomError, ResolvedDocument, StrongNode, TextNode, XmlAttribute,
+        XmlAttributes, XmlName, XmlNode,
     };
     pub use crate::pom_renderer::{render_pom_document, PomRenderError};
     pub use crate::pom_resolution::{
@@ -79,12 +84,13 @@ pub mod prelude {
     };
     pub use crate::semantic_view::{
         render_agent_view_diff_xml, render_agent_view_xml, render_semantic_fragment_xml,
-        render_semantic_node_xml, AgentView, AgentViewCollect, AgentViewRoot, SemanticField,
-        SemanticFragment, SemanticNode,
+        render_semantic_node_xml, AgentView as LegacyAgentView, AgentViewCollect, AgentViewRoot,
+        SemanticField, SemanticFragment, SemanticNode,
     };
     pub use crate::stream_parser::{HermesParser, XmlElement};
     pub use crate::streaming_tool::{
-        ParseContext, StreamingTool, StreamingToolError, StreamingToolRunner,
+        ParseContext, StreamingTool, StreamingToolError, StreamingToolRegistrationError,
+        StreamingToolRunner,
     };
     pub use crate::templates::{
         ContextBlockKind, ContextView, ContextViewBuilder, PromptFragment, PromptLayout,

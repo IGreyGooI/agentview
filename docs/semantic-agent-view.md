@@ -1,23 +1,37 @@
-# Semantic AgentView Derive
+# AgentView Derive: POM AST And Legacy Diff
 
-This document describes the current `AgentView` derive syntax and the XML-like
-semantic view it renders for the agent.
+This document describes the current `AgentView` derive syntax. The derive now
+builds a typed Prompt Object Model (POM) AST. During the user/context migration,
+ordinary XML and display views also receive a legacy semantic implementation so
+the existing context differ can keep operating.
 
-The semantic view is an agent-facing frontend tree. A struct's `kind` describes
-the concrete view model being rendered. A field name describes the role that a
+The POM view is an agent-facing frontend tree. A struct's `kind` describes the
+concrete XML view model being built. A field name describes the role that a
 child value plays inside its parent.
 
 ## Core Pipeline
 
-`AgentView` converts Rust values into a complete semantic tree before any prompt
-text is produced. Full rendering follows this pipeline:
+`AgentView` converts Rust values into a complete, typed AST before any prompt
+text is produced. The POM path follows this pipeline:
 
 ```text
-Rust struct instance -> complete semantic tree -> prompt renderer
+Rust struct instance
+    -> #[derive(AgentView)] / AgentView::build_root
+    -> complete POM AST
+    -> role-specific resolver
+    -> ResolvedDocument
+    -> prompt renderer
 ```
 
-Delta rendering builds the current and previous trees independently, compares
-those trees, and only then renders the resulting delta tree:
+`#[agent_view(kind = "...")]` produces `XmlNode`,
+`#[agent_view(document)]` produces `Document`,
+`#[agent_view(markdown = "paragraph")]` produces `ParagraphNode`, and
+`#[agent_view(display)]` produces `TextNode`. The associated `Root` type makes
+these distinctions compile-time facts.
+
+The current context delta path remains a compatibility path. It builds current
+and previous legacy trees independently, compares those trees, and only then
+renders the resulting delta tree:
 
 ```text
 current Rust instance  -> complete current semantic tree
@@ -34,9 +48,12 @@ previous Rust instance -> complete previous semantic tree
 ```
 
 The diff engine does not compare Rust structs directly and does not compare
-already-rendered prompt strings. `#[view(diff)]` retains a field boundary as a
-`SemanticDiffSlot` inside the complete semantic tree. Every root is the implicit
-first diff slot, so the root itself does not need a type-level marker.
+already-rendered prompt strings. On an XML view, `#[view(diff)]` now retains the
+boundary as a real POM `DiffSlot`; the temporary legacy implementation also
+retains the same boundary as `SemanticDiffSlot`. POM `DiffSlot::present` only
+accepts `XmlNode`, so a `Document`, Markdown root, or `TextNode` cannot become a
+diff value. System resolution materializes present slots without diffing. The
+stateful POM user-document differ is not integrated yet.
 
 ## Derive Syntax
 
@@ -56,33 +73,56 @@ struct ActorView {
 }
 ```
 
-`#[agent_view(kind = "...")]` overrides the view kind. If it is omitted, the
-kind is derived from the Rust type name in snake case, so `ActorView` becomes
-`actor_view`.
+Container modes are mutually exclusive:
+
+- `#[agent_view(kind = "...")]` builds an XML `XmlNode`. If omitted on a
+  structured view, the kind is derived from the Rust type name in snake case,
+  so `ActorView` becomes `actor_view`.
+- `#[agent_view(display)]` builds a scalar `TextNode` using `Display`.
+- `#[agent_view(document)]` builds a block-level `Document`.
+- `#[agent_view(markdown = "paragraph")]` builds a `ParagraphNode`.
 
 `#[agent_view(tag = "...")]` is not supported. The container metadata is `kind`,
 not `tag`.
 
-The current field modes are:
+XML view field modes are:
 
-- default: call the field value's `AgentView::render_field`.
+- default: call the field value's POM field adapter. Scalars normally become
+  attributes; structured values become role-wrapped XML children.
 - `#[view(attr)]`: render the field as an attribute using `Display`.
 - `#[view(attr, name = "...")]`: render the field as an attribute with a custom
   output name. Prefer changing the view struct field name when possible.
 - `#[view(element)]`: render the field as a child element using `Display`.
 - `#[view(text)]`: render the field as direct text inside the current node using
   `Display`.
-- `#[view(comment)]`: render the field as an XML comment fragment using
-  `Display`.
 - `#[view(flatten)]`: render the field value's children directly into the
   current node. For `Vec<T>`, this flattens the vector items without rendering
   the field-name wrapper. This splices rendered child fragments into the parent;
   it does not merge child attributes into the parent node.
+- `#[view(root)]`: insert the child value's own derived `XmlNode` root without a
+  field-role wrapper. This is used when a document-owned wrapper selects tool
+  contract nodes.
+- `#[view(code_span)]`: create a field-role XML element whose child is a
+  Markdown code span.
 - `#[view(skip)]`: omit the field from the semantic view entirely. Skipped fields
   are not rendered, are not compared for diffing, and do not need to implement
   `AgentView` or `Display`. Use this for runtime-only state that belongs on the
   Rust view model but should not enter the agent-facing tree, such as a reply
   schema or cached handle.
+
+`#[view(comment)]` is no longer supported because POM has no XML comment node.
+Use a prompt-visible Markdown note or an explicit XML element.
+
+Document view fields must choose a block mode:
+
+- `#[view(heading = 1)]` through `#[view(heading = 6)]`;
+- `#[view(paragraph)]`;
+- `#[view(ordered_list)]` or `#[view(unordered_list)]`, where each item derives
+  `AgentView<Root = ParagraphNode>`;
+- `#[view(xml)]`, where the field derives `AgentView<Root = XmlNode>`.
+
+A `#[agent_view(markdown = "paragraph")]` view accepts `#[view(text)]` and
+`#[view(code_span)]` fields. Field order is AST child order.
 
 `#[view(attr = "...")]` and `#[view(children)]` are still accepted as legacy
 aliases, but new examples should use `name = "..."` and `flatten`.
@@ -149,47 +189,53 @@ renders as:
 <display_actor id="actor.1" name="Rachel" />
 ```
 
-`#[agent_view(display)]` and `#[agent_view(kind = "...")]` are mutually
-exclusive. `display` means the type is a scalar view; `kind` means the type is a
-structured view. Unlike structured derive, `display` derive does not require a
-named-field struct; it works for newtypes and enums as long as the type
-implements `Display`.
+`kind`, `display`, `document`, and `markdown` are mutually exclusive.
+`display` means the type is a scalar view; `kind` means an XML view. Unlike the
+other modes, `display` derive does not require a named-field struct; it works
+for newtypes and enums as long as the type implements `Display`.
 
-## Root And Field Positions
+## POM Root And Field Positions
 
-`AgentView` has two rendering entry points:
+The public trait has one typed AST entry point:
 
 ```rust
 pub trait AgentView {
-    fn render_root(&self) -> SemanticFragment;
+    type Root;
 
-    fn render_field(&self, field_name: &'static str) -> SemanticField;
+    fn build_root(&self) -> Result<Self::Root, PomError>;
 }
 ```
 
-`render_root` is used when a value is rendered as the root view. The root node
-uses the value's own `kind` as the element name.
+`build_root` always builds a complete root. XML roots use the view's `kind` as
+the element name. `Option<T>::Root` is `Option<T::Root>`; nested `None` values
+are omitted rather than being converted into a synthetic POM node.
 
-`render_field` is used when a value is rendered inside a parent struct. It
-returns a `SemanticField`, not a direct mutation of the parent. The parent then
-applies the result with `SemanticNode::push_field`.
-
-`SemanticField` has these shapes:
+Nested XML positions use a derive-support adapter named `AgentViewValue`. It
+returns `ViewField`, not a direct mutation of the parent:
 
 ```rust
-pub enum SemanticField {
-    Empty,
-    Attr { name: String, value: String },
-    Fragment(SemanticFragment),
-    Fragments(Vec<SemanticFragment>),
+pub trait AgentViewValue: AgentView {
+    fn build_field(&self, role: XmlName) -> Result<ViewField, PomError>;
+    fn build_children(&self) -> Result<MixedChildren, PomError>;
 }
 ```
 
-Scalar fields usually return `Attr`. Structured fields usually return
-`Fragment`. Optional absent fields return `Empty`, which `SemanticNode::push_field`
-applies as a no-op. Flattened fields return `Fragments`, which are pushed into
-the parent directly. For a derived struct field, the field name becomes the
-element name, and the child's own view kind is preserved as `kind="..."`.
+`ViewField` has these shapes:
+
+```rust
+pub enum ViewField {
+    Empty,
+    Attribute(XmlAttribute),
+    Content(MixedContent),
+    Children(MixedChildren),
+}
+```
+
+Scalar fields usually return `Attribute`. Structured fields usually return
+`Content`. Optional absent fields return `Empty`. Flattened fields return
+`Children`, preserving ordinary nodes and `DiffSlot` edges in order. For a
+derived struct field, the field name becomes the element name, and the child's
+own view kind is preserved as `kind="..."`.
 
 For example:
 
@@ -216,7 +262,7 @@ renders as:
 </scene>
 ```
 
-Text and comment fields become direct fragments of the current node:
+Text fields become direct text. Prompt-visible notes use explicit elements:
 
 ```rust
 #[derive(AgentView)]
@@ -227,7 +273,7 @@ struct AnnotatedActorView {
     #[view(text)]
     description: String,
 
-    #[view(comment)]
+    #[view(element)]
     debug_note: String,
 
     #[view(element)]
@@ -240,7 +286,7 @@ renders as:
 ```xml
 <annotated_actor id="actor.1">
   Rachel Verinder, heiress of the Moonstone.
-  <!-- loaded from director state -->
+  <debug_note>loaded from director state</debug_note>
   <goal>find the Moonstone</goal>
 </annotated_actor>
 ```
@@ -344,8 +390,8 @@ This keeps the boundary explicit:
 
 ## Collections
 
-`Vec<T>` renders as a field container whose tag is the field name. Each item is
-rendered from `T::render_root`.
+`Vec<T>` builds a field container whose tag is the field name. Each item is
+built from `T::build_root`.
 
 For a vector of view structs:
 
@@ -394,13 +440,13 @@ fallback container:
 </list>
 ```
 
-`BTreeMap<K, V>` renders as a field container whose tag is the field name. Each
-pair renders as an `<entry>` node. The key and value are rendered through normal
-field rendering:
+`BTreeMap<K, V>` builds a field container whose tag is the field name. Each pair
+builds an `<entry>` node. The key and value pass through the normal nested-value
+adapter:
 
 ```rust
-entry.push_field(key.render_field("key"));
-entry.push_field(value.render_field("value"));
+push_view_field(&mut entry, key.build_field(XmlName::try_from("key")?)?)?;
+push_view_field(&mut entry, value.build_field(XmlName::try_from("value")?)?)?;
 ```
 
 For scalar strings, that becomes key/value attributes:
@@ -486,8 +532,9 @@ omits the whole container when it is `None`:
 </optional_actor>
 ```
 
-When an `Option<T>` is rendered directly as the root view, `Some` delegates to
-`T::render_root`, and `None` renders as:
+In POM, a root `Option<T>` has `Root = Option<T::Root>`: `Some` builds the
+inner root and `None` returns `None`. The temporary legacy renderer preserves
+its old compatibility output for root `None`:
 
 ```xml
 <none />
@@ -495,12 +542,16 @@ When an `Option<T>` is rendered directly as the root view, `Some` delegates to
 
 ## Field Diffs
 
-Every `AgentView` root is the implicit first diff slot. No type-level diff
-marker is needed. `AgentView` renders a complete semantic tree, and
-`#[view(diff)]` records a field boundary in that tree. The generic diff engine
-compares two complete trees: unmarked changes replace the current node, marked
-fields may recurse, and a removed marked field renders an explicit `<none />`
-patch.
+In POM, `#[view(diff)]` records a real `DiffSlot` edge in the complete
+`XmlNode`. A POM root is not automatically stateful: request assembly must place
+the XML root in an explicit outer `DiffSlot` when it wants a document-level
+boundary.
+
+The currently shipped `render_agent_view_diff_xml` compatibility API still
+treats every legacy root as the implicit first diff slot. Its generic diff
+engine compares two complete legacy trees: unmarked changes replace the current
+node, marked fields may recurse, and a removed marked field renders an explicit
+`<none />` patch.
 
 Diff rendering is requested explicitly:
 
@@ -528,11 +579,12 @@ struct SceneView {
 }
 ```
 
-`#[agent_view(diff)]` is not supported because every root already participates
-in diffing. A root does not need an opt-in marker, and `AgentView` has no
-type-specific diff methods or collection diff helpers to implement.
+`#[agent_view(diff)]` is not supported. On the compatibility API, the root
+already participates; on POM, an outer boundary is an explicit `DiffSlot`
+owned by document assembly. `AgentView` has no type-specific diff methods or
+collection diff helpers to implement.
 
-The comparison contract is:
+The current legacy comparison contract is:
 
 - Equal values produce `None`.
 - The root is always eligible for recursive comparison. A changed scalar or
@@ -561,11 +613,11 @@ are compile errors:
 ```rust
 #[view(attr, diff)]
 #[view(text, diff)]
-#[view(comment, diff)]
 #[view(flatten, diff)]
 #[view(skip, diff)]
 ```
 
+`#[view(comment)]` is invalid with or without `diff`.
 `#[view(element, diff)]` remains a supported compatibility spelling and has the
 same node-shaped behavior as `#[view(diff)]`. Conflicting rendering modes, such
 as `#[view(attr, element)]`, are also compile errors.
@@ -716,34 +768,31 @@ explicit none patch:
 </maybe_alias>
 ```
 
-## Semantic Tree
+## POM Tree And Legacy Compatibility
 
-The derive macro renders into `SemanticNode` and `SemanticFragment` first, then
-the semantic tree is rendered to XML-like text. Diffing is a second step over
-two complete trees; it is not an operation supplied by the rendered Rust value.
+The derive macro's primary result is POM AST: `XmlNode`, `Document`,
+`ParagraphNode`, or `TextNode`. It does not render prompt text. Resolution and
+rendering are later steps.
 
-The current semantic fragments are:
+Until the user/context path migrates, XML and display derives also generate an
+implementation of `semantic_view::AgentView`. That compatibility tree retains:
 
 - `Node(SemanticNode)`: an element with attributes and children.
 - `Text(String)`: escaped text.
-- `Comment(String)`: an escaped XML comment fragment.
 
-The derive macro currently supports all four field fragment modes above:
-attributes, elements, text, and comments.
+For a derived XML record, ordinary fields become ordinary POM content and each
+`#[view(diff)]` field becomes a `DiffSlot` with its complete XML value and
+selected strategy. The generated compatibility tree records the equivalent
+`SemanticDiffSlot`. Present slots appear as ordinary children in full output;
+absent optional slots are omitted. During legacy comparison, unchanged slots
+disappear from the delta, changed slots emit their patch, and a
+present-to-absent transition becomes `<field><none /></field>`.
 
-For a derived record, ordinary fields become ordinary semantic content and each
-`#[view(diff)]` field is retained as a diff slot with its field name, complete
-field value, and selected strategy. Present slots render exactly as ordinary
-children in a complete view; absent optional slots are omitted there. During a
-comparison, unchanged slots disappear from the delta, changed slots emit their
-field patch, and a present-to-absent transition becomes an explicit
-`<field><none /></field>` patch. This preserves the distinction between full
-tree omission and delta deletion.
-
-Derived root views also implement `AgentViewRoot`, which lets them enter the
-existing `ContextView` / `PromptRenderable` pipeline without hand-written
-rendering boilerplate. In other words, a `#[derive(AgentView)]` struct can be the
-`ContextViewBuilder::View` type directly:
+Legacy-compatible XML/display views also implement `AgentViewRoot`, which lets
+them enter the existing `ContextView` / `PromptRenderable` pipeline without
+hand-written rendering boilerplate. `Document` and Markdown roots do not
+implement that legacy marker. An XML `#[derive(AgentView)]` struct can therefore
+still be the `ContextViewBuilder::View` type directly:
 
 ```rust
 #[derive(AgentView)]
@@ -766,11 +815,10 @@ renders as plain prompt text through the legacy `PromptRenderable for String`
 implementation, so ordinary prompts are not XML-escaped just because `String`
 also implements `AgentView`.
 
-## Additive POM System Prompt Path
+## Derived POM System Prompt Path
 
-AgentView also has an additive Prompt Object Model path for authoring structured
-system prompts with Markdown and XML. This path does not replace the semantic
-context tree described above yet.
+System prompts use the same derive to author structured Markdown and XML. This
+path does not replace the legacy user/context differ yet.
 
 The implemented system pipeline is:
 
@@ -798,37 +846,46 @@ code fences, code spans, and XML mixed content. Structures with no canonical
 CommonMark representation, such as an empty paragraph, zero-item list, or empty
 code span, return `PomRenderError` instead of being silently dropped.
 
-The streaming tool-loop example authors its real provider system preamble this
-way:
+The shape used by the streaming tool-loop example is:
 
 ```rust
-let document = Document::try_build(|blocks| {
-    blocks.try_heading(1, |heading| {
-        heading.try_text("Demo intent selector")?;
-        Ok(())
-    })?;
-    blocks.try_paragraph(|paragraph| {
-        paragraph.try_text(
-            "Select 1-3 currently valid demo intents from the current context.",
-        )?;
-        Ok(())
-    })?;
-    blocks.xml(response_contract);
-    Ok(())
-})?;
+#[derive(AgentView)]
+#[agent_view(document)]
+struct DemoSystemPromptView {
+    #[view(heading = 1)]
+    title: String,
 
+    #[view(paragraph)]
+    task: String,
+
+    #[view(ordered_list)]
+    workflow: Vec<DemoWorkflowStepView>,
+
+    #[view(xml)]
+    response_contract: DemoResponseContractView,
+}
+
+let document = system_prompt_view.build_root()?;
 let system_prompt = resolve_system_document(document);
 ```
 
-The chess example uses the same system-document path while deliberately keeping
-its `ChessTaskView` turn prompt and semantic board diff on the legacy path.
+Both the response contract and every streaming tool contract are derived
+`XmlNode` views. `StreamingTool<C>` requires `AgentView<Root = XmlNode>`; there
+is no separate `build_prompt_node` or required `tag` method. Registration uses
+the `name` attribute for a derived `<tool>` contract; every other contract uses
+its derived XML root name. An ordinary payload attribute named `name` therefore
+cannot silently change the parser registration identity. A generic `<tool>`
+contract without `name` is rejected during registration.
+
+The chess example uses the same derived system-document path while deliberately
+keeping its `ChessTaskView` turn prompt and semantic board diff on the legacy path.
 Chess is an externally controlled `AgentViewApp`, not a provider-backed
 `Agent`, so `AgentViewApp` does not consume `build_system_prompt`. The standalone
 example explicitly builds and prints the resolved chess system prompt to make
 that boundary visible.
 
-This is deliberately a system-only integration slice. The current user prompt,
-context capture, semantic diff, and fixed `## View` / `## Turn Prompt`
+This is deliberately a system-focused integration slice. The current user
+prompt, context capture, semantic diff, and fixed `## View` / `## Turn Prompt`
 composition still use the legacy `SemanticNode` pipeline. User-document
-resolution, a `UserDocumentCursor`, and the final producer/differ cutover remain
+resolution, a `UserDocumentCursor`, and the final POM differ cutover remain
 separate work.

@@ -241,6 +241,13 @@ impl MixedChildren {
     pub fn iter(&self) -> impl Iterator<Item = ContentRef<'_>> {
         self.0.iter().map(MixedContent::as_ref)
     }
+
+    #[doc(hidden)]
+    pub fn extend(&mut self, children: Self) {
+        for child in children.0 {
+            self.push(child);
+        }
+    }
 }
 
 pub struct MixedBuilder<'a> {

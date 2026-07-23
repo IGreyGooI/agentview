@@ -170,14 +170,14 @@ struct AnnotatedActorView {
     id: String,
     #[view(text)]
     description: String,
-    #[view(comment)]
+    #[view(element)]
     debug_note: String,
     #[view(element)]
     goal: String,
 }
 
 #[test]
-fn derive_renders_text_and_comment_fields_as_fragments() {
+fn derive_renders_text_and_explicit_note_elements_as_fragments() {
     let actor = AnnotatedActorView {
         id: "actor.1".to_owned(),
         description: "Rachel Verinder, heiress of the Moonstone.".to_owned(),
@@ -189,7 +189,7 @@ fn derive_renders_text_and_comment_fields_as_fragments() {
         render_agent_view_xml(&actor),
         r#"<annotated_actor id="actor.1">
   Rachel Verinder, heiress of the Moonstone.
-  <!-- loaded from director state -->
+  <debug_note>loaded from director state</debug_note>
   <goal>find the Moonstone</goal>
 </annotated_actor>"#
     );

@@ -1,0 +1,5 @@
+error: field name does not infer a valid XML name; set `#[view(name = "...")]`
+ --> tests/ui/invalid_inferred_xml_field_name.rs:5:5
+  |
+5 |     naïve: String,
+  |     ^^^^^

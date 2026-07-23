@@ -1,0 +1,5 @@
+error: invalid XML name in `kind`
+ --> tests/ui/invalid_static_xml_kind.rs:4:21
+  |
+4 | #[agent_view(kind = "not:xml")]
+  |                     ^^^^^^^^^

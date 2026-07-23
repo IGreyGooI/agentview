@@ -1,4 +1,4 @@
-use super::{BlockBuilder, BlockChildren, PomError};
+use super::{BlockBuilder, BlockChildren, BlockContent, PomError, XmlNode};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Document {
@@ -12,6 +12,12 @@ impl Document {
 
     pub fn children(&self) -> &BlockChildren {
         &self.children
+    }
+
+    pub fn from_xml(node: XmlNode) -> Self {
+        let mut children = BlockChildren::new();
+        children.push(BlockContent::xml(node));
+        Self::new(children)
     }
 
     pub fn build(build: impl FnOnce(&mut BlockBuilder<'_>)) -> Self {

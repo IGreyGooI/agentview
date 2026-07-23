@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use agentview::prelude::{
-    render_agent_view_diff_xml, AgentView, SemanticField, SemanticFragment, SemanticNode,
+    render_agent_view_diff_xml, AgentView, LegacyAgentView, SemanticField, SemanticFragment,
+    SemanticNode,
 };
 use agentview::semantic_view::SemanticDiffStrategy;
 use serde_json::json;
@@ -109,6 +110,27 @@ struct MaybeAliasView {
 struct DynamicField(Option<String>);
 
 impl AgentView for DynamicField {
+    type Root = Option<agentview::pom::TextNode>;
+
+    fn build_root(&self) -> Result<Self::Root, agentview::pom::PomError> {
+        AgentView::build_root(&self.0)
+    }
+}
+
+impl agentview::agent_view::AgentViewValue for DynamicField {
+    fn build_field(
+        &self,
+        role: agentview::pom::XmlName,
+    ) -> Result<agentview::agent_view::ViewField, agentview::pom::PomError> {
+        agentview::agent_view::AgentViewValue::build_field(&self.0, role)
+    }
+
+    fn build_children(&self) -> Result<agentview::pom::MixedChildren, agentview::pom::PomError> {
+        agentview::agent_view::AgentViewValue::build_children(&self.0)
+    }
+}
+
+impl LegacyAgentView for DynamicField {
     fn render_root(&self) -> SemanticFragment {
         self.0
             .as_ref()
@@ -166,7 +188,7 @@ impl InterleavedChildrenView {
     }
 }
 
-impl AgentView for InterleavedChildrenView {
+impl LegacyAgentView for InterleavedChildrenView {
     fn render_root(&self) -> SemanticFragment {
         SemanticFragment::Node(self.render_node("interleaved"))
     }

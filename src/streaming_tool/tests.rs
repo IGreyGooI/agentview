@@ -14,11 +14,17 @@ enum DecisionError {
     FormatReminder { message: &'static str },
 }
 
+#[derive(crate::AgentView)]
+#[agent_view(kind = "parser_error")]
 struct DecisionErrorArtifact {
+    #[view(text)]
     error: DecisionError,
 }
 
+#[derive(crate::AgentView)]
+#[agent_view(kind = "behavior_feedback")]
 struct BehaviorFeedbackArtifact {
+    #[view(text)]
     message: &'static str,
 }
 
@@ -28,10 +34,7 @@ impl BehaviorFeedbackArtifact {
     }
 
     fn into_turn_artifact(self) -> TurnArtifact {
-        let document = self
-            .build_document()
-            .expect("the test feedback artifact uses static valid XML names");
-        TurnArtifact::try_from_document("behavior_feedback", document)
+        TurnArtifact::try_from_view(&self)
             .expect("the test feedback artifact never contains a DiffSlot")
     }
 }
@@ -42,35 +45,8 @@ impl DecisionErrorArtifact {
     }
 
     fn into_turn_artifact(self) -> TurnArtifact {
-        let document = self
-            .build_document()
-            .expect("the test decision artifact uses static valid XML names");
-        TurnArtifact::try_from_document("parser_error", document)
+        TurnArtifact::try_from_view(&self)
             .expect("the test decision artifact never contains a DiffSlot")
-    }
-}
-
-impl DocumentProducer for DecisionErrorArtifact {
-    fn build_document(&self) -> Result<Document, PomError> {
-        Document::try_build(|blocks| {
-            blocks.xml(XmlNode::try_build("parser_error", |children| {
-                children.text(TextNode::new(self.error.to_string()));
-                Ok(())
-            })?);
-            Ok(())
-        })
-    }
-}
-
-impl DocumentProducer for BehaviorFeedbackArtifact {
-    fn build_document(&self) -> Result<Document, PomError> {
-        Document::try_build(|blocks| {
-            blocks.xml(XmlNode::try_build("behavior_feedback", |children| {
-                children.text(TextNode::new(self.message));
-                Ok(())
-            })?);
-            Ok(())
-        })
     }
 }
 
@@ -120,30 +96,21 @@ impl ParseContext for NpcParseContext {
     }
 }
 
-struct SpeakTool;
+#[derive(crate::AgentView)]
+#[agent_view(kind = "speak")]
+struct SpeakTool {}
 
 #[test]
-fn streaming_tool_prompt_is_object_safe_and_uses_the_runtime_tag() {
-    let tool = SpeakTool;
+fn streaming_tool_is_object_safe_and_its_contract_is_derived() {
+    let tool = SpeakTool {};
     let prompt: &dyn StreamingTool<NpcParseContext> = &tool;
-    let node = prompt.build_prompt_node().unwrap();
+    let node = prompt.build_root().unwrap();
 
-    assert_eq!(node.name().as_str(), "tool");
-    assert_eq!(
-        node.attributes()
-            .get(&XmlName::try_from("name").unwrap())
-            .unwrap()
-            .value(),
-        prompt.tag()
-    );
+    assert_eq!(node.name().as_str(), "speak");
 }
 
 #[async_trait::async_trait]
 impl StreamingTool<NpcParseContext> for SpeakTool {
-    fn tag(&self) -> &'static str {
-        "speak"
-    }
-
     async fn on_open(
         &mut self,
         _elem: &XmlElement,
@@ -186,14 +153,90 @@ impl StreamingTool<NpcParseContext> for SpeakTool {
     }
 }
 
-struct RelationTool;
+#[derive(crate::AgentView)]
+#[agent_view(kind = "tool")]
+struct ContractDrivenTool {
+    #[view(attr, name = "name")]
+    contract_name: &'static str,
+}
+
+#[async_trait::async_trait]
+impl StreamingTool<NpcParseContext> for ContractDrivenTool {
+    async fn on_open(
+        &mut self,
+        _elem: &XmlElement,
+        ctx: &mut NpcParseContext,
+    ) -> Result<(), StreamingToolError> {
+        ctx.mark_speech_started();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn streaming_tool_registration_uses_the_derived_contract_identity() {
+    let mut runner =
+        StreamingToolRunner::new(NpcParseContext::new()).with_tool(ContractDrivenTool {
+            contract_name: "contract_driven",
+        });
+
+    runner.feed("<contract_driven/>").await;
+
+    assert!(runner.with_context(NpcParseContext::speech_started).await);
+}
+
+#[derive(crate::AgentView)]
+#[agent_view(kind = "tool")]
+struct NamelessTool {}
+
+#[async_trait::async_trait]
+impl StreamingTool<NpcParseContext> for NamelessTool {}
+
+#[test]
+fn generic_tool_contract_requires_an_explicit_name_attribute() {
+    let result = StreamingToolRunner::new(NpcParseContext::new()).try_with_tool(NamelessTool {});
+
+    assert!(matches!(
+        result,
+        Err(StreamingToolRegistrationError::MissingToolName)
+    ));
+}
+
+#[derive(crate::AgentView)]
+#[agent_view(kind = "named_action")]
+struct RootNamedActionTool {
+    name: &'static str,
+}
+
+#[async_trait::async_trait]
+impl StreamingTool<NpcParseContext> for RootNamedActionTool {
+    async fn on_open(
+        &mut self,
+        _elem: &XmlElement,
+        ctx: &mut NpcParseContext,
+    ) -> Result<(), StreamingToolError> {
+        ctx.mark_speech_started();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn non_tool_contract_uses_its_root_even_when_it_has_a_name_attribute() {
+    let mut runner =
+        StreamingToolRunner::new(NpcParseContext::new()).with_tool(RootNamedActionTool {
+            name: "payload_name",
+        });
+
+    runner.feed(r#"<named_action name="payload_name"/>"#).await;
+
+    assert!(runner.with_context(NpcParseContext::speech_started).await);
+}
+
+#[derive(crate::AgentView)]
+#[agent_view(kind = "update_relationship")]
+struct RelationTool {}
 
 #[async_trait::async_trait]
 impl StreamingTool<NpcParseContext> for RelationTool {
-    fn tag(&self) -> &'static str {
-        "update_relationship"
-    }
-
     async fn on_open(
         &mut self,
         elem: &XmlElement,
@@ -218,14 +261,12 @@ impl StreamingTool<NpcParseContext> for RelationTool {
     }
 }
 
-struct FailingTool;
+#[derive(crate::AgentView)]
+#[agent_view(kind = "emit_event")]
+struct FailingTool {}
 
 #[async_trait::async_trait]
 impl StreamingTool<NpcParseContext> for FailingTool {
-    fn tag(&self) -> &'static str {
-        "emit_event"
-    }
-
     async fn on_complete(
         &mut self,
         _elem: &XmlElement,
@@ -238,14 +279,12 @@ impl StreamingTool<NpcParseContext> for FailingTool {
     }
 }
 
-struct ThoughtTool;
+#[derive(crate::AgentView)]
+#[agent_view(kind = "thought")]
+struct ThoughtTool {}
 
 #[async_trait::async_trait]
 impl StreamingTool<NpcParseContext> for ThoughtTool {
-    fn tag(&self) -> &'static str {
-        "thought"
-    }
-
     async fn on_open(
         &mut self,
         _elem: &XmlElement,
@@ -297,7 +336,7 @@ fn drain_npc_turn_update(ctx: &mut NpcParseContext) -> TestTurnUpdate {
 
 #[tokio::test]
 async fn streaming_tool_updates_concrete_parse_context_in_parser_order() {
-    let mut runner = StreamingToolRunner::new(NpcParseContext::new()).with_tool(SpeakTool);
+    let mut runner = StreamingToolRunner::new(NpcParseContext::new()).with_tool(SpeakTool {});
 
     runner.feed("<thought>短想法</thought><speak>你好").await;
     assert!(runner.with_context(|ctx| ctx.speech_started()).await);
@@ -373,7 +412,7 @@ async fn sleep_feedback_uses_behavior_feedback_kind_for_next_awake() {
 #[tokio::test]
 async fn tool_checks_parse_context_before_committing_side_effect() {
     let engine = TemplateEngine::new();
-    let mut runner = StreamingToolRunner::new(NpcParseContext::new()).with_tool(SpeakTool);
+    let mut runner = StreamingToolRunner::new(NpcParseContext::new()).with_tool(SpeakTool {});
 
     runner.feed("<speak></speak><speak>second</speak>").await;
     runner.finalize().await;
@@ -405,7 +444,7 @@ async fn tool_checks_parse_context_before_committing_side_effect() {
 #[tokio::test]
 async fn invalid_attribute_becomes_parser_error_artifact() {
     let engine = TemplateEngine::new();
-    let mut runner = StreamingToolRunner::new(NpcParseContext::new()).with_tool(RelationTool);
+    let mut runner = StreamingToolRunner::new(NpcParseContext::new()).with_tool(RelationTool {});
 
     runner
         .feed(r#"<update_relationship target="player" trust_delta="high"/>"#)
@@ -443,8 +482,8 @@ async fn tool_error_artifact_escapes_dynamic_text_through_pom() {
 async fn execution_error_becomes_parser_error_and_stream_continues() {
     let engine = TemplateEngine::new();
     let mut runner = StreamingToolRunner::new(NpcParseContext::new())
-        .with_tool(FailingTool)
-        .with_tool(SpeakTool);
+        .with_tool(FailingTool {})
+        .with_tool(SpeakTool {});
 
     runner
         .feed("<emit_event>bad side effect</emit_event><speak>still speaks</speak>")
@@ -468,9 +507,9 @@ async fn execution_error_becomes_parser_error_and_stream_continues() {
 async fn multiple_tool_errors_accumulate_without_short_circuiting() {
     let engine = TemplateEngine::new();
     let mut runner = StreamingToolRunner::new(NpcParseContext::new())
-        .with_tool(RelationTool)
-        .with_tool(FailingTool)
-        .with_tool(SpeakTool);
+        .with_tool(RelationTool {})
+        .with_tool(FailingTool {})
+        .with_tool(SpeakTool {});
 
     runner
         .feed(
@@ -500,8 +539,8 @@ async fn multiple_tool_errors_accumulate_without_short_circuiting() {
 async fn thought_after_speech_is_feedback_but_does_not_rollback_speech() {
     let engine = TemplateEngine::new();
     let mut runner = StreamingToolRunner::new(NpcParseContext::new())
-        .with_tool(SpeakTool)
-        .with_tool(ThoughtTool);
+        .with_tool(SpeakTool {})
+        .with_tool(ThoughtTool {});
 
     runner
         .feed("<speak>visible first</speak><thought>private after speech</thought>")

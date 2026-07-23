@@ -10,7 +10,8 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::pom::{Document, PomError, ResolvedDocument, XmlName};
+use crate::agent_view::AgentView;
+use crate::pom::{Document, PomError, ResolvedDocument, XmlName, XmlNode};
 use crate::pom_renderer::render_pom_document;
 use crate::pom_resolution::{resolve_artifact_document, PomResolutionError};
 use crate::semantic_view::{render_agent_view_diff_xml, render_agent_view_xml, AgentViewRoot};
@@ -132,6 +133,9 @@ pub struct TurnArtifact {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TurnArtifactError {
+    #[error(transparent)]
+    Build(#[from] PomError),
+
     #[error("invalid turn artifact kind `{kind}`")]
     InvalidKind {
         kind: StorageString,
@@ -144,6 +148,22 @@ pub enum TurnArtifactError {
 }
 
 impl TurnArtifact {
+    /// Builds an artifact from a derived XML view.
+    ///
+    /// The XML root name is the artifact kind, so the kind and payload cannot
+    /// drift apart. Artifact resolution rejects any nested diff slot.
+    pub fn try_from_view<V>(view: &V) -> Result<Self, TurnArtifactError>
+    where
+        V: AgentView<Root = XmlNode>,
+    {
+        let root = view.build_root()?;
+        let kind = root.name().clone();
+        Ok(Self {
+            kind,
+            document: resolve_artifact_document(Document::from_xml(root))?,
+        })
+    }
+
     pub fn try_from_document(
         kind: impl Into<StorageString>,
         document: Document,

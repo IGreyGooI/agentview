@@ -2,6 +2,8 @@
 fn invalid_pom_apis_fail_to_compile() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/pom/diff_slot_rejects_text_node.rs");
+    t.compile_fail("tests/ui/pom/diff_slot_rejects_derived_document.rs");
+    t.compile_fail("tests/ui/pom/diff_slot_rejects_derived_markdown.rs");
     t.compile_fail("tests/ui/pom/diff_slot_present_rejects_explicit_role.rs");
     t.compile_fail("tests/ui/pom/markdown_payload_fields_are_private.rs");
     t.compile_fail("tests/ui/pom/inline_children_reject_heading.rs");

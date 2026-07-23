@@ -1,8 +1,8 @@
 # AgentView Prompt Object Model（POM）设计
 
-> 状态：设计已批准，Phase 2 additive POM AST 已实现，并已落地 typed system producer、system rendering 与 turn-artifact POM bridge。本文描述目标契约；“当前行为”只出现在已有脚手架和迁移说明中。
+> 状态：设计已批准。Phase 2 additive POM AST 与 Phase 3 associated-root derive 已实现，并已落地 typed system rendering、streaming-tool contract 与 turn-artifact POM bridge。本文描述目标契约；“当前行为”只出现在已有脚手架和迁移说明中。
 
-> 实现状态（2026-07-23）：新 `agentview::pom` AST 以 additive 方式存在；prompt-facing struct 可通过手写 `DocumentProducer` 构造 system `Document`，再经过 full slot resolution、canonical renderer 和 `PromptRenderable` 进入真实 `AgentTurnRequest.system`。streaming tool 可通过 `StreamingTool::build_prompt_node` 提供自己的 POM contract node；turn artifact 保存 slot-free `ResolvedDocument` 并在 legacy user envelope 的最后边界才渲染。完整 user document、cursor/differ、derive producer 和 context rendering 仍使用 legacy path。POM AST 本身仍是 additive；artifact authoring API 此处有意用 typed constructor 替换了原有 public raw payload fields。
+> 实现状态（2026-07-23）：`#[derive(AgentView)]` 已直接生成 POM AST。structured view 的 root 是 `XmlNode`，system prompt 可用 `#[agent_view(document)]` 生成 mixed `Document`，最小 Markdown paragraph/list authoring 也已进入同一个 derive。streaming tool 本身是 `AgentView<Root = XmlNode>`；turn artifact 通过 derived XML root 自动取得 kind，并保存 slot-free `ResolvedDocument`。demo 与 chess system prompt 已迁移到这条路径，`DocumentProducer` 与 `StreamingTool::build_prompt_node` 已删除。完整 user document、cursor/differ 和 context rendering 仍使用 legacy path。
 
 ## 1. 文档目标
 
@@ -51,10 +51,10 @@ POM 同时表达规范化 Markdown、XML、文本和 XML-only `DiffSlot`。它�
 - public builders 强制 canonical text normalization；同一语义不能因空 text 或相邻 text boundaries 不同而产生不同 tree。
 - 第一版迁移全部现有 diff strategies；differ 返回 typed `XmlPatch`，resolver 将 patch lower 到 slot-free `ResolvedDocument`，renderer 只接受 `ResolvedDocument`。
 - public child model 使用统一 `ContentNode` 和 opaque block/inline/mixed wrappers；同时提供 compositional constructors 与 closure builders，只暴露 read-only traversal。
-- `AgentView` 使用 associated root type 和 `build_*` producer API；structured derive 的 root 静态为 `XmlNode`，不使用 runtime downcast 或 implicit document-root bridge。
+- `AgentView` 使用 associated root type 和 `build_root` API；structured derive 的 root 静态为 `XmlNode`，不使用 runtime downcast 或 implicit document-root bridge。
 - `AgentViewModel` 构造完整 system/user `Document` 并拥有 section order；framework 不再注入固定 `## View` / `## Turn Prompt` envelope。
 - POM 类型实现 diagnostic `Serialize`，不实现 `Deserialize`；序列化格式不是 persistence 或 compatibility contract。
-- 当前 additive 阶段已完成 POM AST、手写 typed document producer、system full resolution、canonical renderer 和 typed turn-artifact bridge；完整 diff traversal、user cursor/session integration API、associated-root derive producer 和 Markdown derive syntax 后续分别设计。
+- 当前 additive 阶段已完成 POM AST、associated-root derive、最小 Document/Markdown derive、system full resolution、canonical renderer、derived streaming-tool contract 和 typed turn-artifact bridge；完整 diff traversal 与 user cursor/session integration API 仍待实现。
 
 ## 3. 已有脚手架
 
@@ -62,14 +62,14 @@ POM 同时表达规范化 Markdown、XML、文本和 XML-only `DiffSlot`。它�
 |---|---|---|
 | XML-shaped semantic AST | [`src/semantic_view.rs`](../../../src/semantic_view.rs) | `SemanticNode` 保存 tag、attributes、children、diff metadata 和 identity。 |
 | Generic semantic diff | [`src/semantic_diff.rs`](../../../src/semantic_diff.rs) | current/previous 各自先建完整 tree，再比较 tree 并产生 delta tree。 |
-| `AgentView` derive | [`agentview-derive/src/lib.rs`](../../../agentview-derive/src/lib.rs) | struct field 被映射为 XML attribute/element/text/comment/flatten 或 `DiffSlot`。 |
+| `AgentView` derive | [`agentview-derive/src/lib.rs`](../../../agentview-derive/src/lib.rs) | 根据 container mode 静态生成 `XmlNode`、`Document`、`ParagraphNode` 或 `TextNode`；XML field 可映射为 attribute/element/text/flatten/root 或 `DiffSlot`。 |
+| Associated-root `AgentView` | [`src/agent_view.rs`](../../../src/agent_view.rs) | `AgentView::build_root` 把 struct instance 转成具体 POM root；`ViewField` 与 `AgentViewValue` 保留 nested field、flatten 和 diff edge。 |
 | Prompt bridge | [`src/templates.rs`](../../../src/templates.rs) | `AgentViewRoot` 通过 blanket impl 进入 `PromptRenderable` / `ContextView`，目前固定使用 XML renderer。 |
 | Prompt assembly | [`src/agent.rs`](../../../src/agent.rs) | 最终 user message 使用 raw Markdown `## View` / `## Turn Prompt` envelope。 |
 | Session baseline | [`src/agent_session.rs`](../../../src/agent_session.rs), [`src/agent.rs`](../../../src/agent.rs) | 当前 `view_cursor` 与 prompt context 一起 clone/commit；history replacement 使 cursor 失效，provider 或 commit failure 不推进 cursor。 |
 | AST/diff tests | [`tests/semantic_view.rs`](../../../tests/semantic_view.rs), [`tests/agentview_diff.rs`](../../../tests/agentview_diff.rs) | 锁定 XML full/delta、nested diff、collection diff 和 optional deletion。 |
-| Typed POM producer | [`src/pom/producer.rs`](../../../src/pom/producer.rs) | `DocumentProducer` 只执行 prompt-facing struct -> unresolved `Document`，不 resolve 或 render。 |
-| Streaming tool POM contract | [`src/streaming_tool.rs`](../../../src/streaming_tool.rs) | `StreamingTool::build_prompt_node` 让每个 tool 提供自己的 `XmlNode`；默认实现保持已有 tool implementation source-compatible，runner 仍只负责解析与 callback。 |
-| Turn artifact POM bridge | [`src/templates.rs`](../../../src/templates.rs), [`src/agent.rs`](../../../src/agent.rs) | `TurnArtifact` 保存 slot-free `ResolvedDocument`；raw `Box<dyn PromptRenderable>` authoring path 已删除，legacy Minijinja envelope 只接收内部临时 renderer DTO。 |
+| Streaming tool POM contract | [`src/streaming_tool.rs`](../../../src/streaming_tool.rs) | `StreamingTool<C>: AgentView<Root = XmlNode>`；derived `<tool>` root 必须提供 `name` attribute 并用它作为 parser registration identity，其他 contract 使用 XML root name，不再读取第二个手写 tag。 |
+| Turn artifact POM bridge | [`src/templates.rs`](../../../src/templates.rs), [`src/agent.rs`](../../../src/agent.rs) | `TurnArtifact::try_from_view` 从 derived XML root 取得 kind，递归拒绝 `DiffSlot` 后保存 slot-free `ResolvedDocument`；legacy Minijinja envelope 只接收内部临时 renderer DTO。 |
 
 现有 `SemanticDiffSlot` 不是 XML output node，而是父子关系上的 AST metadata：
 
@@ -84,7 +84,7 @@ full render 会透明展开 present slot；delta comparison 才读取 slot 的 f
 
 ## 4. 总体数据流
 
-单个 Rust value 到 POM 的 producer 路径不生成 text：
+单个 Rust value 到 POM 的 derive 路径不生成 text：
 
 ```text
 Rust struct instance
@@ -111,22 +111,22 @@ user Document + previous cursor -----> stateful slot resolution --+-> ResolvedDo
                                                `-> successful commit only
 ```
 
-producer、AST、differ、resolver、renderer 必须是五个独立职责：
+derive/build、AST、differ、resolver、renderer 必须是五个独立职责：
 
-1. producer：把 Rust view value 转成完整 AST；
+1. derive/build：把 Rust view value 转成完整 AST；
 2. AST：只保存语义结构和 diff 所需的 slot metadata；
 3. differ：只比较两棵完整 `XmlNode` 并返回 typed `XmlPatch`；
 4. resolver：解释 system/user slot policy，把 `Document` 和 optional patch lower 成 slot-free `ResolvedDocument`；
 5. renderer：只遍历 `ResolvedDocument` 并生成 text。
 
-任何 producer 都不应直接拼 XML/Markdown string；任何 differ 都不应调用 renderer；任何 renderer 都不应读取 cursor 或解释 `DiffSlot`。
+任何 `AgentView::build_root` implementation 都不应直接拼 XML/Markdown string；任何 differ 都不应调用 renderer；任何 renderer 都不应读取 cursor 或解释 `DiffSlot`。
 
 prompt request 层明确维护两个 document：
 
 ```text
-system producers -> system Document -> full slot resolution -> ResolvedDocument -> renderer -> system text
+system AgentView -> system Document -> full slot resolution -> ResolvedDocument -> renderer -> system text
 
-user producers   -> current user Document ----+
+user AgentView   -> current user Document ----+
                                                 |
 previous UserDocumentCursor -----------------> slot resolution
                                                 |- ResolvedDocument -> renderer -> user text
@@ -142,8 +142,8 @@ system path 的 full slot resolution 不是 diff：它不访问 slot history，�
 当前 additive integration slice 已实现 typed system path：
 
 ```text
-prompt-facing struct
-    -> DocumentProducer
+prompt-facing system struct
+    -> #[derive(AgentView)] / AgentView::build_root
     -> system Document
     -> resolve_system_document
     -> ResolvedDocument
@@ -154,16 +154,19 @@ prompt-facing struct
 streaming tool 的 agent-facing contract 与 ephemeral feedback 也已有独立 POM 边界：
 
 ```text
-StreamingTool::build_prompt_node -----------------> XmlNode
+derived StreamingTool ----------------------------> XmlNode
+    `-> AgentView::build_root
 
-artifact struct -> DocumentProducer -> Document
+derived artifact struct -> XmlNode
+    -> TurnArtifact::try_from_view
+    -> Document::from_xml
     -> resolve_artifact_document（递归拒绝任何 DiffSlot）
     -> TurnArtifact { kind, ResolvedDocument }
     -> canonical renderer
     -> legacy user envelope
 ```
 
-`StreamingToolRunner` 不会自动把 tool 注入 system prompt；system document producer 明确选择 tool node 及排列顺序。artifact 也不复用 system slot policy：它没有 cursor，因此任意深度的 `DiffSlot` 都是错误。
+`StreamingToolRunner` 不会自动把 tool 注入 system prompt；system document view 通过 `#[view(root)]` 明确选择 tool node 及排列顺序。artifact 也不复用 system slot policy：它没有 cursor，因此任意深度的 `DiffSlot` 都是错误。
 
 普通 `Document` 没有 `PromptRenderable` implementation，因而 unresolved slot 不能绕过 resolver 直接进入 request。这个 slice 没有实现 user resolution，也没有改变现有 `SemanticNode` context diff、固定 user envelope 或 session cursor。
 
@@ -526,36 +529,23 @@ block_builder.try_push(node)?;
 
 ## 12. AgentView 与 derive 的迁移方向
 
-`AgentView` 继续负责 Rust value -> complete AST，但 method name 从 `render_*` 改成 `build_*`，并用 associated `Root` 保留具体 root 类型：
+`AgentView` 负责 Rust value -> complete AST，并用 associated `Root` 保留具体 root 类型：
 
 ```rust
 pub trait AgentView {
-    type Root: Into<ContentNode>;
+    type Root;
 
-    fn build_root(&self) -> Self::Root;
-    fn build_field(&self, field_name: XmlName) -> ViewField;
-
-    fn build_children(&self) -> MixedChildren {
-        MixedChildren::one(self.build_root().into())
-    }
+    fn build_root(&self) -> Result<Self::Root, PomError>;
 }
 ```
 
-structured derive 使用 `type Root = XmlNode`；`#[agent_view(display)]` 使用 `type Root = TextNode`。因此 `DiffSlot::present(strategy, view.build_root())` 在 compile time 已经知道 value 是 XML，而不是从 `ContentNode` runtime downcast。
+`Root` 不带 `Into<ContentNode>` bound，因为不可嵌套的 `Document` 也是合法 root。需要 XML 的边界使用 equality bound，例如 `AgentView<Root = XmlNode>`。因此 `DiffSlot::present(strategy, view.build_root()?)` 与 `TurnArtifact::try_from_view` 在 compile time 已经知道 value 是 XML，而不是从 `ContentNode` runtime downcast。
 
-POM cutover 后不再提供 implicit `AgentViewRoot -> PromptRenderable/ContextView` document bridge。`Document` 必须由 document producer 显式构造；scalar/display root 不会自动升级成 document block。
+POM cutover 后不再提供 implicit `AgentViewRoot -> PromptRenderable/ContextView` document bridge。`Document` 必须由 `#[agent_view(document)]` view 显式构造；scalar/display root 不会自动升级成 document block。
 
-当前 additive implementation 先提供一个不渲染、object-safe 的手写 producer boundary：
+当前 implementation 不存在独立 `DocumentProducer` trait。system prompt struct 本身使用 `#[derive(AgentView)] #[agent_view(document)]`，`build_root` 直接返回 unresolved `Document`。streaming demo 与 chess 的 system prompt 都走这条路径。
 
-```rust
-pub trait DocumentProducer {
-    fn build_document(&self) -> Result<Document, PomError>;
-}
-```
-
-这个 trait 只接收已经收集好的 prompt-facing struct，并返回 unresolved `Document`。streaming demo 的 `DemoSystemPromptView` 与 chess 的 `ChessSystemPromptView` 已沿用这条路径；它不是 Phase 3 associated-root `AgentView` migration，也没有引入 Markdown derive annotations。
-
-现有 `SemanticField` 是 producer adapter，不是 AST syntax node，应移出 AST module 并改名为 `ViewField`：
+`ViewField` 是 derive 的 nested-value adapter，不是 AST syntax node：
 
 ```rust
 pub enum ViewField {
@@ -566,21 +556,30 @@ pub enum ViewField {
 }
 ```
 
-`MixedContent` 可以保留普通 node 或 `DiffSlot` edge，因此 `ViewField` 不会像 `Vec<ContentNode>` 一样在 flatten/build_field 边界丢失 diff metadata。derive 中的 field name 在 macro expansion 时验证，并以 `XmlName` 进入 producer API；runtime 不再把任意 `&'static str` 当作合法 XML name。
+`MixedContent` 可以保留普通 node 或 `DiffSlot` edge，因此 `ViewField` 不会像 `Vec<ContentNode>` 一样在 flatten/build_field 边界丢失 diff metadata。derive 中的 field name 在 macro expansion 时验证，并以 `XmlName` 进入 build API；runtime 不再把任意 `&'static str` 当作合法 XML name。
 
-当前 derive 的默认映射在第一次迁移中仍保持 XML 语义：
+当前 derive container mode 与 root type 是：
+
+- `#[agent_view(kind = "...")]` -> `XmlNode`；
+- `#[agent_view(display)]` -> `TextNode`；
+- `#[agent_view(document)]` -> `Document`；
+- `#[agent_view(markdown = "paragraph")]` -> `ParagraphNode`。
+
+XML derive 保持原 field 语义并增加 mixed-POM authoring：
 
 - structured struct -> `XmlNode`；
 - default scalar field -> XML attribute；
 - `#[view(element)]` -> child `XmlNode`；
 - `#[view(text)]` -> `TextNode`；
 - `#[view(flatten)]` -> children；
+- `#[view(root)]` -> 插入 child 自己的 derived `XmlNode` root，不增加 field-role wrapper；
+- `#[view(code_span)]` -> field-role XML element 内的 Markdown `CodeSpanNode`；
 - `#[view(diff)]` 及带 strategy 的 diff attributes -> `DiffSlot`，并把 value 规范化为 addressable `XmlNode`。
-- `#[view(comment)]` 在 atomic cutover 时删除；需要表达 prompt-visible note 的调用点迁移为 Markdown 或显式 XML element。
+- `#[view(comment)]` 已是 compile error；需要表达 prompt-visible note 的调用点迁移为 Markdown 或显式 XML element。
 
-第一阶段不同时发明 Markdown derive annotations。先让手写 builders 能完整构造 mixed AST，并把现有 XML derive 迁到新 AST；Markdown derive 另开设计。
+Document fields 使用 `heading = N`、`paragraph`、`ordered_list`、`unordered_list` 和 `xml`。列表 item 必须是 `AgentView<Root = ParagraphNode>`。paragraph fields 使用 `text` 与 `code_span`，因此 Markdown 与 XML 仍由 typed node 组合，不接收 raw markup string。
 
-POM 不需要第二个 `XmlAgentView` marker trait。associated `Root` 已经表达 concrete producer result；是否参与 diff 仍由 user `Document` 内显式 `DiffSlot<XmlNode>` 决定。
+POM 不需要第二个 `XmlAgentView` marker trait。associated `Root` 已经表达 concrete AST root；是否参与 diff 仍由 user `Document` 内显式 `DiffSlot<XmlNode>` 决定。
 
 `AgentViewCollect<Source>` 只负责 domain/source -> prompt-facing struct，不涉及 AST 形状，保持不变。
 
@@ -610,11 +609,11 @@ async fn build_user_document(
 
 context view 的 structured derive root 是 `XmlNode`；view model 在希望 stateful diff 的位置显式调用 `DiffSlot::present`。一个 user document 也可以没有 context slot，或拥有多个 role 唯一的 outermost slots。
 
-system document 每次按当前 producer 结果构造并走 full resolution；session/provider adapter 可以复用已经成功提交的 stable rendered system text，但 POM 不强制 custom view model 的 system 永远静态。
+system document 每次按当前 derived view 结果构造并走 full resolution；session/provider adapter 可以复用已经成功提交的 stable rendered system text，但 POM 不强制 custom view model 的 system 永远静态。
 
 ## 13. 模块边界
 
-不要继续让一个 `semantic_view.rs` 同时拥有 AST、producer helpers、diff entry 和 XML serializer。目标模块拆分为：
+不要继续让一个 `semantic_view.rs` 同时拥有 AST、derive support、diff entry 和 XML serializer。目标模块拆分为：
 
 ```text
 src/
@@ -628,7 +627,6 @@ src/
     text.rs
     children.rs
     diff_slot.rs
-    producer.rs
     resolved.rs
   pom_cursor.rs
   pom_patch.rs
@@ -647,7 +645,7 @@ src/
 - `pom_resolution.rs`：按 system/user policy 解释 slots、lower patch；user path 返回 `ResolvedDocument` 与 next cursor；
 - `pom_renderer.rs`：`ResolvedDocument` -> `String`。
 
-当前 additive implementation 已新增 `pom/*`、`pom_resolution.rs` 和 `pom_renderer.rs`。`ResolvedDocument` 目前与 `Document` 一起定义在 `pom/document.rs`，尚未按目标目录草图拆出 `resolved.rs`。resolver 目前实现无状态的 system full resolution，以及 artifact 的 slot-rejecting resolution；renderer 只接收 `ResolvedDocument`。旧 `semantic_view.rs` 以及 user/context diff path 暂时保留，直到 associated-root producer、differ、user resolver 和 session integration 完成后再一次性切换 public API。
+当前 additive implementation 已新增 `agent_view.rs`、`pom/*`、`pom_resolution.rs` 和 `pom_renderer.rs`。`ResolvedDocument` 目前与 `Document` 一起定义在 `pom/document.rs`，尚未按目标目录草图拆出 `resolved.rs`。resolver 目前实现无状态的 system full resolution，以及 artifact 的 slot-rejecting resolution；renderer 只接收 `ResolvedDocument`。旧 `semantic_view.rs` 以及 user/context diff path 暂时保留，直到 POM differ、user resolver 和 session integration 完成后再一次性切换 public API。
 
 ## 14. 错误与规范化
 
@@ -780,16 +778,16 @@ implementation plan 必须把每个 task 的 RED command、expected failure、GR
 - 不能取得 raw mutable child vector；
 - 不能把 `Document`、`ResolvedDocument`、`UserDocumentCursor` 或 `XmlPatch` 作为 `serde::Deserialize` target；
 - 不能通过 public fields 给 `TurnArtifact` 注入 raw `PromptRenderable` / string payload；
-- `#[view(comment)]` 在 atomic cutover 后是 compile error。
+- `#[view(comment)]` 当前已是 compile error。
 
-producer/diff/renderer 迁移分别增加：
+derive/diff/renderer 迁移分别增加：
 
 - struct -> expected complete AST；
 - current/previous `XmlNode` -> expected typed `XmlPatch`；
 - current `Document` + cursor -> expected `ResolvedDocument` + next cursor；
 - `ResolvedDocument` -> expected prompt text。
 
-这些测试必须分开，避免一个 string snapshot 同时掩盖 producer、differ、resolver 和 renderer 的错误。session transaction suite 还必须覆盖 history replacement full resend、provider/commit/cancellation rollback、fork、并发 turn serialization 和 observer publication。
+这些测试必须分开，避免一个 string snapshot 同时掩盖 derive、differ、resolver 和 renderer 的错误。session transaction suite 还必须覆盖 history replacement full resend、provider/commit/cancellation rollback、fork、并发 turn serialization 和 observer publication。
 
 ## 16. 分阶段迁移
 
@@ -810,13 +808,16 @@ producer/diff/renderer 迁移分别增加：
 - 每个 constructor/invariant 严格走 RED -> GREEN -> REFACTOR，完成 AST-only tests；
 - runtime 仍使用旧 `semantic_view.rs`。
 
-### Phase 3：Producer migration
+### Phase 3：AgentView derive migration
 
-- 新增 associated-root `build_*` producer API 和 edge-preserving `ViewField`；
+- 新增 associated-root `build_root` API 和 edge-preserving `ViewField`；
 - 把现有 built-in scalar、Option、Vec、BTreeMap 和 derive expansion 切到新 AST；
 - structured derive 静态返回 `XmlNode`；display derive 返回 `TextNode`；
-- 本阶段在新 POM path 保持现有 XML element/attribute/text/flatten behavior；旧 comment path 只留在尚未 cutover 的 legacy implementation；
-- 不增加 Markdown derive syntax。
+- 新 POM path 保持现有 XML element/attribute/text/flatten behavior，并增加 `root`、`code_span` 与真实 `DiffSlot` edge；
+- `#[view(comment)]` 在 POM derive 中删除；
+- system prompt 所需的最小 `Document` / Markdown paragraph/list derive 与本阶段一起完成，避免保留另一套手写 document 构造 trait。
+
+本阶段已完成。为维持尚未迁移的 context/user diff，普通 XML/display derive 暂时同时生成 legacy semantic implementation；Document/Markdown 与 POM-only XML modes 不生成 legacy implementation。
 
 ### Phase 4：Differ migration
 
@@ -831,7 +832,7 @@ producer/diff/renderer 迁移分别增加：
 
 ### Phase 5：Renderer 与 prompt integration
 
-当前已落地 additive vertical slice：canonical Markdown/XML renderer、`ResolvedDocument: PromptRenderable`、手写 `DocumentProducer`、一个真实 provider-backed streaming example 的 typed POM system prompt，以及 chess `AgentViewApp` example 的 typed POM system document。streaming tool 通过 `StreamingTool::build_prompt_node` 提供 POM contract node；tool/parser feedback 通过 typed `TurnArtifact` 保留 POM 到最终 user-layout compatibility boundary，动态文本由 canonical renderer 转义，artifact kind 也受 `XmlName` 约束。Chess 仍是外部控制示例，其 turn prompt、context 和 diff 继续走 legacy path。完整 `AgentViewModel` system/user `Document` contract、user prompt cutover 和 session cursor integration 仍待实现。
+当前已落地 additive vertical slice：canonical Markdown/XML renderer、`ResolvedDocument: PromptRenderable`、associated-root `AgentView` derive、一个真实 provider-backed streaming example 的 typed POM system prompt，以及 chess `AgentViewApp` example 的 typed POM system document。streaming tool 直接实现 `AgentView<Root = XmlNode>`；tool/parser feedback 通过 derived XML view 与 typed `TurnArtifact` 保留 POM 到最终 user-layout compatibility boundary，动态文本由 canonical renderer 转义，artifact kind 来自 validated XML root name。Chess 仍是外部控制示例，其 turn prompt、context 和 diff 继续走 legacy path。完整 `AgentViewModel` system/user `Document` contract、user prompt cutover 和 session cursor integration 仍待实现。
 
 - 设计 canonical Markdown/XML renderer（system-only slice 已实现）；
 - renderer 只接受 slot-free `ResolvedDocument`；
@@ -869,7 +870,7 @@ producer/diff/renderer 迁移分别增加：
 - 不加入 ChatML/provider message protocol；
 - 不加入通用 `RawMarkdown` / `RawXml` escape hatch；
 - 不实现 `Deserialize` 或稳定 persistence wire format；
-- 不实现 Markdown derive annotations；
+- 不扩展当前 system prompt 之外的 Markdown derive subset；第一版只支持 paragraph root、heading、paragraph、ordered/unordered list、text 和 code span；
 - 不修改 Forgotten City runtime integration。
 
 ## 18. 已关闭的设计决策
@@ -888,4 +889,4 @@ producer/diff/renderer 迁移分别增加：
 - POM 实现 diagnostic `Serialize`，不实现 `Deserialize`；
 - 所有 implementation phases 强制执行可观察的 RED -> GREEN -> REFACTOR。
 
-当前 system renderer 的 whitespace/escaping 已由实现与 renderer tests 锁定，但不属于本文冻结的 POM type/state boundary；`XmlPatch` 的最终 XML vocabulary、完整 user integration 和 Markdown derive syntax 仍属于后续独立设计。
+当前 system renderer 的 whitespace/escaping 已由实现与 renderer tests 锁定，但不属于本文冻结的 POM type/state boundary；`XmlPatch` 的最终 XML vocabulary、完整 user integration 和更完整的 Markdown derive syntax 仍属于后续独立设计。

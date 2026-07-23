@@ -1,6 +1,6 @@
 use agentview::prelude::{
     render_agent_view_xml, render_semantic_fragment_xml, render_semantic_node_xml, AgentView,
-    ContextView, PromptRenderable, SemanticField, SemanticNode, TemplateEngine,
+    ContextView, LegacyAgentView, PromptRenderable, SemanticField, SemanticNode, TemplateEngine,
 };
 use agentview::semantic_view::SemanticDiffStrategy;
 
@@ -19,14 +19,14 @@ fn string_renders_as_root_text_and_field_attr() {
     assert_eq!(render_agent_view_xml(&text), "hello &lt;agent&gt;");
 
     let mut node = SemanticNode::new("actor");
-    node.push_field(AgentView::render_field(&text, "name"));
+    node.push_field(LegacyAgentView::render_field(&text, "name"));
     assert_eq!(
         render_semantic_node_xml(&node),
         r#"<actor name="hello &lt;agent&gt;" />"#
     );
 
     assert_eq!(
-        AgentView::render_field(&text, "name"),
+        LegacyAgentView::render_field(&text, "name"),
         SemanticField::Attr {
             name: "name".to_owned(),
             value: "hello <agent>".to_owned(),

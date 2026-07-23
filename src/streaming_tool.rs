@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::agent_view::AgentView;
 use crate::llm_call::{TextTurnEvent, TurnSink};
-use crate::pom::{Document, DocumentProducer, PomError, TextNode, XmlName, XmlNode};
+use crate::pom::{PomError, XmlName, XmlNode};
 use crate::stream_parser::{HermesParser, XmlElement};
 use crate::templates::TurnArtifact;
 
@@ -46,7 +47,19 @@ pub enum StreamingToolError {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum StreamingToolRegistrationError {
+    #[error(transparent)]
+    InvalidContract(#[from] PomError),
+
+    #[error("derived <tool> contract requires a `name` attribute")]
+    MissingToolName,
+}
+
+#[derive(crate::AgentView)]
+#[agent_view(kind = "parser_error")]
 pub struct ToolErrorArtifact {
+    #[view(text)]
     pub error: StreamingToolError,
 }
 
@@ -56,23 +69,8 @@ impl ToolErrorArtifact {
     }
 
     pub fn into_turn_artifact(self) -> TurnArtifact {
-        let document = self
-            .build_document()
-            .expect("the built-in parser-error POM uses static valid XML names");
-        TurnArtifact::try_from_document("parser_error", document)
+        TurnArtifact::try_from_view(&self)
             .expect("the built-in parser-error POM never contains a DiffSlot")
-    }
-}
-
-impl DocumentProducer for ToolErrorArtifact {
-    fn build_document(&self) -> Result<Document, PomError> {
-        Document::try_build(|blocks| {
-            blocks.xml(XmlNode::try_build("parser_error", |children| {
-                children.text(TextNode::new(self.error.to_string()));
-                Ok(())
-            })?);
-            Ok(())
-        })
     }
 }
 
@@ -94,24 +92,13 @@ pub trait ParseContext {
 
 /// Per-tag handler for XML function-call style streaming output.
 ///
-/// Tools own validation and commit boundaries for their tag. They should update
-/// the concrete parse context rather than deciding the whole agent loop.
+/// The parser registration identity comes from the derived POM contract: a
+/// `<tool>` contract uses its `name` attribute; every other contract uses its
+/// XML root name.
+/// Tools own validation and commit boundaries for that contract and should
+/// update the concrete parse context rather than deciding the whole agent loop.
 #[async_trait::async_trait]
-pub trait StreamingTool<C: ParseContext>: Send {
-    fn tag(&self) -> &'static str;
-
-    /// Builds this tool's agent-facing POM contract node.
-    ///
-    /// The node is intentionally smaller than a document: the system prompt
-    /// owns headings, workflow text, wrappers, and tool ordering. The default
-    /// contract is `<tool name="tag" />`; implementations can add attributes
-    /// or children while using [`Self::tag`] as the runtime identity.
-    fn build_prompt_node(&self) -> Result<XmlNode, PomError> {
-        let mut node = XmlNode::new(XmlName::try_from("tool")?);
-        node.push_attribute(XmlName::try_from("name")?, self.tag())?;
-        Ok(node)
-    }
-
+pub trait StreamingTool<C: ParseContext>: AgentView<Root = XmlNode> + Send {
     async fn on_open(
         &mut self,
         _elem: &XmlElement,
@@ -157,20 +144,30 @@ impl<C: ParseContext + Send + 'static> StreamingToolRunner<C> {
     where
         T: StreamingTool<C> + 'static,
     {
-        self.register_tool(tool);
+        self.register_tool(tool)
+            .expect("streaming tool must build a valid derived POM contract");
         self
     }
 
-    pub fn register_tool<T>(&mut self, tool: T)
+    pub fn try_with_tool<T>(mut self, tool: T) -> Result<Self, StreamingToolRegistrationError>
     where
         T: StreamingTool<C> + 'static,
     {
-        let tag = tool.tag();
+        self.register_tool(tool)?;
+        Ok(self)
+    }
+
+    pub fn register_tool<T>(&mut self, tool: T) -> Result<(), StreamingToolRegistrationError>
+    where
+        T: StreamingTool<C> + 'static,
+    {
+        let contract = tool.build_root()?;
+        let tag = streaming_tool_contract_tag(&contract)?;
         let tool: SharedTool<C> = Arc::new(TokioMutex::new(Box::new(tool)));
 
         let open_tool = Arc::clone(&tool);
         let open_ctx = Arc::clone(&self.ctx);
-        self.parser.on_open(tag, move |elem| {
+        self.parser.on_open(tag.clone(), move |elem| {
             let open_tool = Arc::clone(&open_tool);
             let open_ctx = Arc::clone(&open_ctx);
             Box::pin(async move {
@@ -190,7 +187,7 @@ impl<C: ParseContext + Send + 'static> StreamingToolRunner<C> {
 
         let stream_tool = Arc::clone(&tool);
         let stream_ctx = Arc::clone(&self.ctx);
-        self.parser.on_stream(tag, move |elem| {
+        self.parser.on_stream(tag.clone(), move |elem| {
             let stream_tool = Arc::clone(&stream_tool);
             let stream_ctx = Arc::clone(&stream_ctx);
             Box::pin(async move {
@@ -227,6 +224,8 @@ impl<C: ParseContext + Send + 'static> StreamingToolRunner<C> {
                 }
             })
         });
+
+        Ok(())
     }
 
     pub async fn feed(&mut self, chunk: &str) {
@@ -254,6 +253,21 @@ impl<C: ParseContext + Send + 'static> StreamingToolRunner<C> {
             .unwrap_or_else(|_| panic!("StreamingToolRunner context still has active references"))
             .into_inner()
     }
+}
+
+fn streaming_tool_contract_tag(
+    contract: &XmlNode,
+) -> Result<String, StreamingToolRegistrationError> {
+    if contract.name().as_str() == "tool" {
+        let name = XmlName::try_from("name")?;
+        let attribute = contract
+            .attributes()
+            .get(&name)
+            .ok_or(StreamingToolRegistrationError::MissingToolName)?;
+        return Ok(XmlName::new(attribute.value())?.to_string());
+    }
+
+    Ok(contract.name().to_string())
 }
 
 #[async_trait::async_trait]

@@ -198,7 +198,7 @@ struct ChessLastErrorPromptView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
 #[agent_view(kind = "instruction")]
-struct ChessInstructionPromptView {
+struct ChessTaskInstructionPromptView {
     #[view(text)]
     text: String,
 }
@@ -207,12 +207,12 @@ struct ChessInstructionPromptView {
 #[agent_view(kind = "reasoning_policy")]
 struct ChessReasoningPolicyPromptView {
     #[view(flatten)]
-    instructions: Vec<ChessInstructionPromptView>,
+    instructions: Vec<ChessTaskInstructionPromptView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
 #[agent_view(kind = "reply_contract")]
-struct ChessReplyContractPromptView {
+struct ChessTaskReplyContractPromptView {
     transport: String,
 
     #[view(element)]
@@ -228,11 +228,47 @@ struct ChessReplyContractPromptView {
     instruction: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, AgentView)]
+#[agent_view(markdown = "paragraph")]
+struct ChessReasoningPolicyItemPromptView {
+    #[view(text)]
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, AgentView)]
+#[agent_view(kind = "reply_contract")]
+struct ChessReplyContractPromptView {
+    transport: String,
+
+    #[view(code_span)]
+    command: String,
+
+    #[view(code_span)]
+    example: String,
+
+    #[view(code_span)]
+    promotion_example: String,
+
+    #[view(element)]
+    instruction: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, AgentView)]
+#[agent_view(document)]
 pub struct ChessSystemPromptView {
+    #[view(heading = 1)]
     title: String,
+
+    #[view(paragraph)]
     task: String,
-    reasoning_policy: ChessReasoningPolicyPromptView,
+
+    #[view(heading = 2)]
+    reasoning_policy_title: String,
+
+    #[view(unordered_list)]
+    reasoning_policy: Vec<ChessReasoningPolicyItemPromptView>,
+
+    #[view(xml)]
     reply_contract: ChessReplyContractPromptView,
 }
 
@@ -376,8 +412,8 @@ impl AgentViewCollect<ChessGameState> for ChessView {
     }
 }
 
-fn chess_instruction_prompt_view(text: &str) -> ChessInstructionPromptView {
-    ChessInstructionPromptView {
+fn chess_task_instruction_prompt_view(text: &str) -> ChessTaskInstructionPromptView {
+    ChessTaskInstructionPromptView {
         text: text.to_owned(),
     }
 }
@@ -385,14 +421,33 @@ fn chess_instruction_prompt_view(text: &str) -> ChessInstructionPromptView {
 fn chess_reasoning_policy_prompt_view() -> ChessReasoningPolicyPromptView {
     ChessReasoningPolicyPromptView {
         instructions: vec![
-            chess_instruction_prompt_view(CHESS_REASONING_PRIVATE),
-            chess_instruction_prompt_view(CHESS_REASONING_NO_COT),
+            chess_task_instruction_prompt_view(CHESS_REASONING_PRIVATE),
+            chess_task_instruction_prompt_view(CHESS_REASONING_NO_COT),
         ],
     }
 }
 
+fn chess_system_reasoning_policy_prompt_view() -> Vec<ChessReasoningPolicyItemPromptView> {
+    [CHESS_REASONING_PRIVATE, CHESS_REASONING_NO_COT]
+        .into_iter()
+        .map(|text| ChessReasoningPolicyItemPromptView {
+            text: text.to_owned(),
+        })
+        .collect()
+}
+
 fn chess_reply_contract_prompt_view() -> ChessReplyContractPromptView {
     ChessReplyContractPromptView {
+        transport: "cli".to_owned(),
+        command: CHESS_REPLY_COMMAND.to_owned(),
+        example: CHESS_REPLY_EXAMPLE.to_owned(),
+        promotion_example: CHESS_REPLY_PROMOTION_EXAMPLE.to_owned(),
+        instruction: CHESS_REPLY_INSTRUCTION.to_owned(),
+    }
+}
+
+fn chess_task_reply_contract_prompt_view() -> ChessTaskReplyContractPromptView {
+    ChessTaskReplyContractPromptView {
         transport: "cli".to_owned(),
         command: CHESS_REPLY_COMMAND.to_owned(),
         example: CHESS_REPLY_EXAMPLE.to_owned(),
@@ -406,94 +461,22 @@ impl Default for ChessSystemPromptView {
         Self {
             title: "Chess move agent".to_owned(),
             task: CHESS_SYSTEM_TASK.to_owned(),
-            reasoning_policy: chess_reasoning_policy_prompt_view(),
+            reasoning_policy_title: "Reasoning policy".to_owned(),
+            reasoning_policy: chess_system_reasoning_policy_prompt_view(),
             reply_contract: chess_reply_contract_prompt_view(),
         }
-    }
-}
-
-fn chess_system_code_element(name: &str, value: &str) -> Result<XmlNode, PomError> {
-    XmlNode::try_build(name, |children| {
-        children.markdown(MarkdownNode::CodeSpan(CodeSpanNode::new(TextNode::new(
-            value,
-        ))));
-        Ok(())
-    })
-}
-
-fn chess_system_text_element(name: &str, value: &str) -> Result<XmlNode, PomError> {
-    XmlNode::try_build(name, |children| {
-        children.text(TextNode::new(value));
-        Ok(())
-    })
-}
-
-impl DocumentProducer for ChessSystemPromptView {
-    fn build_document(&self) -> Result<Document, PomError> {
-        let mut reply_contract = XmlNode::try_build("reply_contract", |children| {
-            children.xml(chess_system_code_element(
-                "command",
-                &self.reply_contract.command,
-            )?);
-            children.xml(chess_system_code_element(
-                "example",
-                &self.reply_contract.example,
-            )?);
-            children.xml(chess_system_code_element(
-                "promotion_example",
-                &self.reply_contract.promotion_example,
-            )?);
-            children.xml(chess_system_text_element(
-                "instruction",
-                &self.reply_contract.instruction,
-            )?);
-            Ok(())
-        })?;
-        reply_contract.push_attribute(
-            XmlName::try_from("transport")?,
-            self.reply_contract.transport.clone(),
-        )?;
-
-        Document::try_build(|blocks| {
-            blocks.try_heading(1, |heading| {
-                heading.try_text(&self.title)?;
-                Ok(())
-            })?;
-            blocks.try_paragraph(|paragraph| {
-                paragraph.try_text(&self.task)?;
-                Ok(())
-            })?;
-            blocks.try_heading(2, |heading| {
-                heading.try_text("Reasoning policy")?;
-                Ok(())
-            })?;
-            blocks.try_list(ListKind::Unordered, |list| {
-                for instruction in &self.reasoning_policy.instructions {
-                    list.try_item(|item| {
-                        item.try_paragraph(|paragraph| {
-                            paragraph.try_text(&instruction.text)?;
-                            Ok(())
-                        })?;
-                        Ok(())
-                    })?;
-                }
-                Ok(())
-            })?;
-            blocks.xml(reply_contract);
-            Ok(())
-        })
     }
 }
 
 #[cfg(test)]
 #[test]
 fn chess_system_prompt_view_produces_the_exact_pom_document() {
-    fn assert_document_producer<T: DocumentProducer>() {}
+    fn assert_document_agent_view<T: AgentView<Root = Document>>() {}
 
-    assert_document_producer::<ChessSystemPromptView>();
+    assert_document_agent_view::<ChessSystemPromptView>();
 
     let prompt = ChessSystemPromptView::default();
-    let document = prompt.build_document().unwrap();
+    let document = prompt.build_root().unwrap();
     let rendered = render_pom_document(&resolve_system_document(document)).unwrap();
 
     assert_eq!(
@@ -639,7 +622,7 @@ pub struct ChessTaskView {
     reasoning_policy: ChessReasoningPolicyPromptView,
 
     #[view(flatten)]
-    reply_contract: ChessReplyContractPromptView,
+    reply_contract: ChessTaskReplyContractPromptView,
 }
 
 impl ChessTaskView {
@@ -648,7 +631,7 @@ impl ChessTaskView {
             task: task.into(),
             reply_schema,
             reasoning_policy: chess_reasoning_policy_prompt_view(),
-            reply_contract: chess_reply_contract_prompt_view(),
+            reply_contract: chess_task_reply_contract_prompt_view(),
         }
     }
 }
@@ -670,7 +653,7 @@ impl AgentViewModel<Turn, ()> for ChessViewModel {
         _source: &Self::Source,
     ) -> anyhow::Result<Self::SystemPrompt> {
         let prompt = ChessSystemPromptView::default();
-        let document = prompt.build_document()?;
+        let document = prompt.build_root()?;
         Ok(resolve_system_document(document))
     }
 

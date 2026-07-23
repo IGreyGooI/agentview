@@ -1,0 +1,5 @@
+error: invalid XML field name
+ --> tests/ui/invalid_static_xml_field_name.rs:5:25
+  |
+5 |     #[view(attr, name = "not:xml")]
+  |                         ^^^^^^^^^

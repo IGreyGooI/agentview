@@ -4,15 +4,15 @@ error[E0277]: the trait bound `Document: PromptRenderable` is not satisfied
 7 |     require_prompt_renderable::<Document>();
   |                                 ^^^^^^^^ the trait `AgentViewRoot` is not implemented for `Document`
   |
-  = help: the following other types implement trait `PromptRenderable`:
-            DefaultSystemPrompt
-            DefaultTurnPrompt
-            ResolvedDocument
-            String
-            TurnArtifact
+help: the trait `AgentViewRoot` is implemented for `ToolErrorArtifact`
+ --> src/streaming_tool.rs
+  |
+  | #[derive(crate::AgentView)]
+  |          ^^^^^^^^^^^^^^^^
   = note: required for `Document` to implement `PromptRenderable`
 note: required by a bound in `require_prompt_renderable`
  --> tests/ui/pom/document_is_not_prompt_renderable.rs:4:33
   |
 4 | fn require_prompt_renderable<T: PromptRenderable>() {}
   |                                 ^^^^^^^^^^^^^^^^ required by this bound in `require_prompt_renderable`
+  = note: this error originates in the derive macro `crate::AgentView` (in Nightly builds, run with -Z macro-backtrace for more info)

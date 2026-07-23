@@ -1,0 +1,5 @@
+error: type name does not infer a valid XML kind; set `#[agent_view(kind = "...")]`
+ --> tests/ui/invalid_inferred_xml_kind.rs:4:8
+  |
+4 | struct État {
+  |        ^^^^
