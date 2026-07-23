@@ -820,6 +820,13 @@ let document = Document::try_build(|blocks| {
 let system_prompt = resolve_system_document(document);
 ```
 
+The chess example uses the same system-document path while deliberately keeping
+its `ChessTaskView` turn prompt and semantic board diff on the legacy path.
+Chess is an externally controlled `AgentViewApp`, not a provider-backed
+`Agent`, so `AgentViewApp` does not consume `build_system_prompt`. The standalone
+example explicitly builds and prints the resolved chess system prompt to make
+that boundary visible.
+
 This is deliberately a system-only integration slice. The current user prompt,
 context capture, semantic diff, and fixed `## View` / `## Turn Prompt`
 composition still use the legacy `SemanticNode` pipeline. User-document

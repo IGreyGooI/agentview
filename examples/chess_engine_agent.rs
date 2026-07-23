@@ -25,6 +25,14 @@ async fn main() -> anyhow::Result<()> {
     );
     let templates = TemplateEngine::new();
 
+    let system_prompt = ChessViewModel
+        .build_system_prompt(app.session().context(), &source)
+        .await?;
+    println!(
+        "system:\n{}",
+        system_prompt.render_full(&templates).await?.as_str()
+    );
+
     let snapshot = app.observe("Choose white's next move.").await?;
     print_chess_full_snapshot("observe", &snapshot, &templates).await?;
 

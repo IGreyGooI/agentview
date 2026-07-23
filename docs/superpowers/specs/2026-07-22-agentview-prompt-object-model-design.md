@@ -798,7 +798,7 @@ producer/diff/renderer 迁移分别增加：
 
 ### Phase 5：Renderer 与 prompt integration
 
-当前已落地 system-only vertical slice：canonical Markdown/XML renderer、`ResolvedDocument: PromptRenderable`，以及一个真实 streaming example 的 POM system prompt。完整 `AgentViewModel` system/user `Document` contract、user prompt cutover、artifact migration 和 session cursor integration 仍待实现。
+当前已落地 system-only vertical slice：canonical Markdown/XML renderer、`ResolvedDocument: PromptRenderable`、一个真实 provider-backed streaming example 的 POM system prompt，以及 chess `AgentViewApp` example 的 POM system document。Chess 仍是外部控制示例，standalone binary 只显式构造并展示 system prompt；其 turn prompt、context 和 diff 继续走 legacy path。完整 `AgentViewModel` system/user `Document` contract、user prompt cutover、artifact migration 和 session cursor integration 仍待实现。
 
 - 设计 canonical Markdown/XML renderer（system-only slice 已实现）；
 - renderer 只接受 slot-free `ResolvedDocument`；

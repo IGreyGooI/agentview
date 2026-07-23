@@ -16,6 +16,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+const CHESS_SYSTEM_TASK: &str = "You are choosing legal chess moves from the rendered board.";
+const CHESS_REASONING_PRIVATE: &str = "Think privately about candidate moves before acting.";
+const CHESS_REASONING_NO_COT: &str =
+    "Do not print chain-of-thought; call the CLI only after deciding.";
+const CHESS_REPLY_COMMAND: &str =
+    "agentview chess act --piece <piece> --from <from> --to <to> [--promotion <promotion>] --uci <uci>";
+const CHESS_REPLY_EXAMPLE: &str = "agentview chess act --piece P --from e2 --to e4 --uci e2e4";
+const CHESS_REPLY_PROMOTION_EXAMPLE: &str =
+    "agentview chess act --piece P --from e7 --to e8 --promotion q --uci e7e8q";
+const CHESS_REPLY_INSTRUCTION: &str = "Choose one legal UCI move from the current view, include the move context flags first, then pass the canonical UCI move with --uci.";
+
 /// Shared chess game source used by `AgentViewApp`.
 #[derive(Debug, Clone)]
 pub struct ChessGameSource {
@@ -366,10 +377,8 @@ fn chess_instruction_prompt_view(text: &str) -> ChessInstructionPromptView {
 fn chess_reasoning_policy_prompt_view() -> ChessReasoningPolicyPromptView {
     ChessReasoningPolicyPromptView {
         instructions: vec![
-            chess_instruction_prompt_view("Think privately about candidate moves before acting."),
-            chess_instruction_prompt_view(
-                "Do not print chain-of-thought; call the CLI only after deciding.",
-            ),
+            chess_instruction_prompt_view(CHESS_REASONING_PRIVATE),
+            chess_instruction_prompt_view(CHESS_REASONING_NO_COT),
         ],
     }
 }
@@ -377,13 +386,73 @@ fn chess_reasoning_policy_prompt_view() -> ChessReasoningPolicyPromptView {
 fn chess_reply_contract_prompt_view() -> ChessReplyContractPromptView {
     ChessReplyContractPromptView {
         transport: "cli".to_owned(),
-        command: "agentview chess act --piece <piece> --from <from> --to <to> [--promotion <promotion>] --uci <uci>".to_owned(),
-        example: "agentview chess act --piece P --from e2 --to e4 --uci e2e4".to_owned(),
-        promotion_example: "agentview chess act --piece P --from e7 --to e8 --promotion q --uci e7e8q".to_owned(),
-        instruction:
-            "Choose one legal UCI move from the current view, include the move context flags first, then pass the canonical UCI move with --uci."
-                .to_owned(),
+        command: CHESS_REPLY_COMMAND.to_owned(),
+        example: CHESS_REPLY_EXAMPLE.to_owned(),
+        promotion_example: CHESS_REPLY_PROMOTION_EXAMPLE.to_owned(),
+        instruction: CHESS_REPLY_INSTRUCTION.to_owned(),
     }
+}
+
+fn chess_system_code_element(name: &str, value: &str) -> Result<XmlNode, PomError> {
+    XmlNode::try_build(name, |children| {
+        children.markdown(MarkdownNode::CodeSpan(CodeSpanNode::new(TextNode::new(
+            value,
+        ))));
+        Ok(())
+    })
+}
+
+fn chess_system_text_element(name: &str, value: &str) -> Result<XmlNode, PomError> {
+    XmlNode::try_build(name, |children| {
+        children.text(TextNode::new(value));
+        Ok(())
+    })
+}
+
+fn build_chess_system_document() -> Result<Document, PomError> {
+    let mut reply_contract = XmlNode::try_build("reply_contract", |children| {
+        children.xml(chess_system_code_element("command", CHESS_REPLY_COMMAND)?);
+        children.xml(chess_system_code_element("example", CHESS_REPLY_EXAMPLE)?);
+        children.xml(chess_system_code_element(
+            "promotion_example",
+            CHESS_REPLY_PROMOTION_EXAMPLE,
+        )?);
+        children.xml(chess_system_text_element(
+            "instruction",
+            CHESS_REPLY_INSTRUCTION,
+        )?);
+        Ok(())
+    })?;
+    reply_contract.push_attribute(XmlName::try_from("transport")?, "cli")?;
+
+    Document::try_build(|blocks| {
+        blocks.try_heading(1, |heading| {
+            heading.try_text("Chess move agent")?;
+            Ok(())
+        })?;
+        blocks.try_paragraph(|paragraph| {
+            paragraph.try_text(CHESS_SYSTEM_TASK)?;
+            Ok(())
+        })?;
+        blocks.try_heading(2, |heading| {
+            heading.try_text("Reasoning policy")?;
+            Ok(())
+        })?;
+        blocks.try_list(ListKind::Unordered, |list| {
+            for instruction in [CHESS_REASONING_PRIVATE, CHESS_REASONING_NO_COT] {
+                list.try_item(|item| {
+                    item.try_paragraph(|paragraph| {
+                        paragraph.try_text(instruction)?;
+                        Ok(())
+                    })?;
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+        blocks.xml(reply_contract);
+        Ok(())
+    })
 }
 
 /// Full chess VM snapshot for an outside chat/CLI/daemon/skill caller.
@@ -529,7 +598,7 @@ pub struct ChessViewModel;
 impl AgentViewModel<Turn, ()> for ChessViewModel {
     type Source = ChessGameSource;
     type View = ChessView;
-    type SystemPrompt = ChessTaskView;
+    type SystemPrompt = ResolvedDocument;
     type TurnPrompt = ChessTaskView;
     type ContextState = ();
 
@@ -538,10 +607,7 @@ impl AgentViewModel<Turn, ()> for ChessViewModel {
         _ctx: &PromptContext<Turn, Self::ContextState>,
         _source: &Self::Source,
     ) -> anyhow::Result<Self::SystemPrompt> {
-        Ok(ChessTaskView::new(
-            "You are choosing legal chess moves from the rendered board.",
-            move_reply_schema(),
-        ))
+        Ok(resolve_system_document(build_chess_system_document()?))
     }
 
     async fn capture_view(&self, source: &Self::Source) -> Self::View {

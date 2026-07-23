@@ -56,6 +56,43 @@ fn built_chess_task_view_is_agent_facing_view() {
 }
 
 #[tokio::test]
+async fn chess_system_prompt_is_authored_as_pom_markdown_and_xml() {
+    let source = ChessGameSource::new();
+    let context = PromptContext::<Turn, ()>::without_system();
+
+    let system_prompt = ChessViewModel
+        .build_system_prompt(&context, &source)
+        .await
+        .unwrap();
+    let _: &ResolvedDocument = &system_prompt;
+    let rendered = system_prompt
+        .render_full(&TemplateEngine::new())
+        .await
+        .unwrap()
+        .into_string();
+
+    assert_eq!(
+        rendered,
+        concat!(
+            "# Chess move agent\n\n",
+            "You are choosing legal chess moves from the rendered board.\n\n",
+            "## Reasoning policy\n\n",
+            "- Think privately about candidate moves before acting.\n",
+            "- Do not print chain-of-thought; call the CLI only after deciding.\n\n",
+            "<reply_contract transport=\"cli\">",
+            "<command>`agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; ",
+            "--to &lt;to&gt; [--promotion &lt;promotion&gt;] --uci &lt;uci&gt;`</command>",
+            "<example>`agentview chess act --piece P --from e2 --to e4 --uci e2e4`</example>",
+            "<promotion_example>`agentview chess act --piece P --from e7 --to e8 ",
+            "--promotion q --uci e7e8q`</promotion_example>",
+            "<instruction>Choose one legal UCI move from the current view, include the move ",
+            "context flags first, then pass the canonical UCI move with --uci.</instruction>",
+            "</reply_contract>"
+        )
+    );
+}
+
+#[tokio::test]
 async fn chess_view_can_be_collected_from_game_state_snapshot() {
     let source = ChessGameSource::new();
     let collected = ChessView::collect(&source.snapshot());
