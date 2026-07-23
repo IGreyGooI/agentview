@@ -64,14 +64,16 @@ pub mod prelude {
     };
     pub use crate::pom::{
         BlockBuilder, BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentContext,
-        ContentKind, ContentNode, ContentRef, DiffSlot, DiffStrategy, Document, HeadingLevel,
-        HeadingNode, InlineBuilder, InlineChildren, InlineContent, ListBuilder, ListItem, ListKind,
-        ListNode, MarkdownKind, MarkdownNode, MixedBuilder, MixedChildren, MixedContent,
-        ParagraphNode, PomError, ResolvedDocument, StrongNode, TextNode, XmlAttribute,
-        XmlAttributes, XmlName, XmlNode,
+        ContentKind, ContentNode, ContentRef, DiffSlot, DiffStrategy, Document, DocumentProducer,
+        HeadingLevel, HeadingNode, InlineBuilder, InlineChildren, InlineContent, ListBuilder,
+        ListItem, ListKind, ListNode, MarkdownKind, MarkdownNode, MixedBuilder, MixedChildren,
+        MixedContent, ParagraphNode, PomError, ResolvedDocument, StrongNode, TextNode,
+        XmlAttribute, XmlAttributes, XmlName, XmlNode,
     };
     pub use crate::pom_renderer::{render_pom_document, PomRenderError};
-    pub use crate::pom_resolution::resolve_system_document;
+    pub use crate::pom_resolution::{
+        resolve_artifact_document, resolve_system_document, PomResolutionError,
+    };
     pub use crate::prompt_context::{
         AgentTurnError, IdentityTransform, PromptContext, Role, Turn, TurnTransform,
     };
@@ -86,7 +88,7 @@ pub mod prelude {
     };
     pub use crate::templates::{
         ContextBlockKind, ContextView, ContextViewBuilder, PromptFragment, PromptLayout,
-        PromptRenderable, PromptSystemVars, TemplateEngine, TurnArtifact,
+        PromptRenderable, PromptSystemVars, TemplateEngine, TurnArtifact, TurnArtifactError,
     };
     pub use crate::view_app::{AgentViewApp, AgentViewAppError};
     pub use crate::view_awake::{ViewAwake, ViewAwakeHandle, ViewAwakeSubscription, ViewEpoch};

@@ -228,6 +228,14 @@ struct ChessReplyContractPromptView {
     instruction: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChessSystemPromptView {
+    title: String,
+    task: String,
+    reasoning_policy: ChessReasoningPolicyPromptView,
+    reply_contract: ChessReplyContractPromptView,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChessRankView {
     pub rank: u8,
@@ -393,6 +401,17 @@ fn chess_reply_contract_prompt_view() -> ChessReplyContractPromptView {
     }
 }
 
+impl Default for ChessSystemPromptView {
+    fn default() -> Self {
+        Self {
+            title: "Chess move agent".to_owned(),
+            task: CHESS_SYSTEM_TASK.to_owned(),
+            reasoning_policy: chess_reasoning_policy_prompt_view(),
+            reply_contract: chess_reply_contract_prompt_view(),
+        }
+    }
+}
+
 fn chess_system_code_element(name: &str, value: &str) -> Result<XmlNode, PomError> {
     XmlNode::try_build(name, |children| {
         children.markdown(MarkdownNode::CodeSpan(CodeSpanNode::new(TextNode::new(
@@ -409,50 +428,93 @@ fn chess_system_text_element(name: &str, value: &str) -> Result<XmlNode, PomErro
     })
 }
 
-fn build_chess_system_document() -> Result<Document, PomError> {
-    let mut reply_contract = XmlNode::try_build("reply_contract", |children| {
-        children.xml(chess_system_code_element("command", CHESS_REPLY_COMMAND)?);
-        children.xml(chess_system_code_element("example", CHESS_REPLY_EXAMPLE)?);
-        children.xml(chess_system_code_element(
-            "promotion_example",
-            CHESS_REPLY_PROMOTION_EXAMPLE,
-        )?);
-        children.xml(chess_system_text_element(
-            "instruction",
-            CHESS_REPLY_INSTRUCTION,
-        )?);
-        Ok(())
-    })?;
-    reply_contract.push_attribute(XmlName::try_from("transport")?, "cli")?;
+impl DocumentProducer for ChessSystemPromptView {
+    fn build_document(&self) -> Result<Document, PomError> {
+        let mut reply_contract = XmlNode::try_build("reply_contract", |children| {
+            children.xml(chess_system_code_element(
+                "command",
+                &self.reply_contract.command,
+            )?);
+            children.xml(chess_system_code_element(
+                "example",
+                &self.reply_contract.example,
+            )?);
+            children.xml(chess_system_code_element(
+                "promotion_example",
+                &self.reply_contract.promotion_example,
+            )?);
+            children.xml(chess_system_text_element(
+                "instruction",
+                &self.reply_contract.instruction,
+            )?);
+            Ok(())
+        })?;
+        reply_contract.push_attribute(
+            XmlName::try_from("transport")?,
+            self.reply_contract.transport.clone(),
+        )?;
 
-    Document::try_build(|blocks| {
-        blocks.try_heading(1, |heading| {
-            heading.try_text("Chess move agent")?;
-            Ok(())
-        })?;
-        blocks.try_paragraph(|paragraph| {
-            paragraph.try_text(CHESS_SYSTEM_TASK)?;
-            Ok(())
-        })?;
-        blocks.try_heading(2, |heading| {
-            heading.try_text("Reasoning policy")?;
-            Ok(())
-        })?;
-        blocks.try_list(ListKind::Unordered, |list| {
-            for instruction in [CHESS_REASONING_PRIVATE, CHESS_REASONING_NO_COT] {
-                list.try_item(|item| {
-                    item.try_paragraph(|paragraph| {
-                        paragraph.try_text(instruction)?;
+        Document::try_build(|blocks| {
+            blocks.try_heading(1, |heading| {
+                heading.try_text(&self.title)?;
+                Ok(())
+            })?;
+            blocks.try_paragraph(|paragraph| {
+                paragraph.try_text(&self.task)?;
+                Ok(())
+            })?;
+            blocks.try_heading(2, |heading| {
+                heading.try_text("Reasoning policy")?;
+                Ok(())
+            })?;
+            blocks.try_list(ListKind::Unordered, |list| {
+                for instruction in &self.reasoning_policy.instructions {
+                    list.try_item(|item| {
+                        item.try_paragraph(|paragraph| {
+                            paragraph.try_text(&instruction.text)?;
+                            Ok(())
+                        })?;
                         Ok(())
                     })?;
-                    Ok(())
-                })?;
-            }
+                }
+                Ok(())
+            })?;
+            blocks.xml(reply_contract);
             Ok(())
-        })?;
-        blocks.xml(reply_contract);
-        Ok(())
-    })
+        })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn chess_system_prompt_view_produces_the_exact_pom_document() {
+    fn assert_document_producer<T: DocumentProducer>() {}
+
+    assert_document_producer::<ChessSystemPromptView>();
+
+    let prompt = ChessSystemPromptView::default();
+    let document = prompt.build_document().unwrap();
+    let rendered = render_pom_document(&resolve_system_document(document)).unwrap();
+
+    assert_eq!(
+        rendered,
+        concat!(
+            "# Chess move agent\n\n",
+            "You are choosing legal chess moves from the rendered board.\n\n",
+            "## Reasoning policy\n\n",
+            "- Think privately about candidate moves before acting.\n",
+            "- Do not print chain-of-thought; call the CLI only after deciding.\n\n",
+            "<reply_contract transport=\"cli\">",
+            "<command>`agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; ",
+            "--to &lt;to&gt; [--promotion &lt;promotion&gt;] --uci &lt;uci&gt;`</command>",
+            "<example>`agentview chess act --piece P --from e2 --to e4 --uci e2e4`</example>",
+            "<promotion_example>`agentview chess act --piece P --from e7 --to e8 ",
+            "--promotion q --uci e7e8q`</promotion_example>",
+            "<instruction>Choose one legal UCI move from the current view, include the move ",
+            "context flags first, then pass the canonical UCI move with --uci.</instruction>",
+            "</reply_contract>"
+        )
+    );
 }
 
 /// Full chess VM snapshot for an outside chat/CLI/daemon/skill caller.
@@ -607,7 +669,9 @@ impl AgentViewModel<Turn, ()> for ChessViewModel {
         _ctx: &PromptContext<Turn, Self::ContextState>,
         _source: &Self::Source,
     ) -> anyhow::Result<Self::SystemPrompt> {
-        Ok(resolve_system_document(build_chess_system_document()?))
+        let prompt = ChessSystemPromptView::default();
+        let document = prompt.build_document()?;
+        Ok(resolve_system_document(document))
     }
 
     async fn capture_view(&self, source: &Self::Source) -> Self::View {

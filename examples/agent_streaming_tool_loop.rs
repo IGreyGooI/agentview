@@ -205,90 +205,113 @@ const DEMO_USER_TEMPLATE: &str = r#"{% if context_block %}{{ context_block }}
 {% endif %}{% for artifact in artifacts %}{{ artifact.rendered }}
 {% endfor %}<task>{{ task }}</task>"#;
 
-fn build_demo_system_document() -> Result<Document, PomError> {
-    let mut verify_tool = XmlNode::new(XmlName::try_from("tool")?);
-    verify_tool.push_attribute(XmlName::try_from("name")?, "verify_intent_budget")?;
-    verify_tool.push_attribute(XmlName::try_from("scope")?, "demo")?;
-    verify_tool.push_attribute(XmlName::try_from("required")?, "first")?;
+#[derive(Debug, Clone, Default)]
+struct DemoStreamingTools {
+    verify_intent_budget: VerifyIntentBudgetTool,
+    select: SelectTool,
+}
 
-    let mut select_tool = XmlNode::new(XmlName::try_from("tool")?);
-    select_tool.push_attribute(XmlName::try_from("name")?, "select")?;
-    select_tool.push_attribute(XmlName::try_from("attribute")?, "local_id")?;
-    select_tool.push_attribute(XmlName::try_from("cardinality")?, "1-3")?;
+#[derive(Debug, Clone)]
+struct DemoSystemPromptView {
+    title: String,
+    transport: &'static str,
+    tools: DemoStreamingTools,
+}
 
-    let mut response_contract = XmlNode::try_build("response_contract", |children| {
-        children.xml(verify_tool);
-        children.xml(select_tool);
-        Ok(())
-    })?;
-    response_contract.push_attribute(XmlName::try_from("transport")?, "xml")?;
+impl DemoSystemPromptView {
+    fn new(tools: DemoStreamingTools) -> Self {
+        Self {
+            title: "Demo intent selector".to_owned(),
+            transport: "xml",
+            tools,
+        }
+    }
+}
 
-    Document::try_build(|blocks| {
-        blocks.try_heading(1, |heading| {
-            heading.try_text("Demo intent selector")?;
+impl Default for DemoSystemPromptView {
+    fn default() -> Self {
+        Self::new(DemoStreamingTools::default())
+    }
+}
+
+impl DocumentProducer for DemoSystemPromptView {
+    fn build_document(&self) -> Result<Document, PomError> {
+        let verify_call = format!(
+            r#"<{} scope="{}"/>"#,
+            self.tools.verify_intent_budget.tag(),
+            self.tools.verify_intent_budget.scope
+        );
+        let select_call = format!(
+            r#"<{} {}="..."/>"#,
+            self.tools.select.tag(),
+            self.tools.select.attribute
+        );
+        let selection_range = format!(
+            "{}-{}",
+            self.tools.select.min_selections, self.tools.select.max_selections
+        );
+
+        let mut response_contract = XmlNode::try_build("response_contract", |children| {
+            children.xml(self.tools.verify_intent_budget.build_prompt_node()?);
+            children.xml(self.tools.select.build_prompt_node()?);
             Ok(())
         })?;
-        blocks.try_paragraph(|paragraph| {
-            paragraph
-                .try_text("Select 1-3 currently valid demo intents from the current context.")?;
-            Ok(())
-        })?;
-        blocks.try_heading(2, |heading| {
-            heading.try_text("Required workflow")?;
-            Ok(())
-        })?;
-        blocks.try_list(ListKind::Ordered { start: 1 }, |list| {
-            list.try_item(|item| {
-                item.try_paragraph(|paragraph| {
-                    paragraph.try_text("Call ")?;
-                    paragraph.code_span(TextNode::new(r#"<verify_intent_budget scope="demo"/>"#));
-                    paragraph.try_text(".")?;
+        response_contract.push_attribute(XmlName::try_from("transport")?, self.transport)?;
+
+        Document::try_build(|blocks| {
+            blocks.try_heading(1, |heading| {
+                heading.try_text(self.title.as_str())?;
+                Ok(())
+            })?;
+            blocks.try_paragraph(|paragraph| {
+                paragraph.try_text(format!(
+                    "Select {selection_range} currently valid demo intents from the current context."
+                ))?;
+                Ok(())
+            })?;
+            blocks.try_heading(2, |heading| {
+                heading.try_text("Required workflow")?;
+                Ok(())
+            })?;
+            blocks.try_list(ListKind::Ordered { start: 1 }, |list| {
+                list.try_item(|item| {
+                    item.try_paragraph(|paragraph| {
+                        paragraph.try_text("Call ")?;
+                        paragraph.code_span(TextNode::new(verify_call));
+                        paragraph.try_text(".")?;
+                        Ok(())
+                    })?;
+                    Ok(())
+                })?;
+                list.try_item(|item| {
+                    item.try_paragraph(|paragraph| {
+                        paragraph.try_text("After verification, return only ")?;
+                        paragraph.code_span(TextNode::new(select_call));
+                        paragraph.try_text(" elements.")?;
+                        Ok(())
+                    })?;
                     Ok(())
                 })?;
                 Ok(())
             })?;
-            list.try_item(|item| {
-                item.try_paragraph(|paragraph| {
-                    paragraph.try_text("After verification, return only ")?;
-                    paragraph.code_span(TextNode::new(r#"<select local_id="..."/>"#));
-                    paragraph.try_text(" elements.")?;
-                    Ok(())
-                })?;
-                Ok(())
-            })?;
+            blocks.xml(response_contract);
             Ok(())
-        })?;
-        blocks.xml(response_contract);
-        Ok(())
-    })
+        })
+    }
 }
 
 #[derive(Clone)]
 struct DemoViewModel {
     context_builder: DemoContextBuilder,
-    templates: TemplateEngine,
+    system_prompt: DemoSystemPromptView,
 }
 
 impl DemoViewModel {
-    fn new(context_builder: DemoContextBuilder) -> Self {
+    fn new(context_builder: DemoContextBuilder, system_prompt: DemoSystemPromptView) -> Self {
         Self {
             context_builder,
-            templates: TemplateEngine::new(),
+            system_prompt,
         }
-    }
-
-    async fn render_turn_artifacts(
-        &self,
-        artifacts: Vec<TurnArtifact>,
-    ) -> anyhow::Result<Vec<agentview::templates::RenderedTurnArtifact>> {
-        let mut rendered = Vec::new();
-        for artifact in artifacts {
-            rendered.push(agentview::templates::RenderedTurnArtifact {
-                kind: artifact.kind.clone(),
-                rendered: artifact.render_full(&self.templates).await?.into_string(),
-            });
-        }
-        Ok(rendered)
     }
 }
 
@@ -305,7 +328,9 @@ impl AgentViewModel<Turn, DemoParseContext> for DemoViewModel {
         _ctx: &PromptContext<Turn, Self::ContextState>,
         _source: &Self::Source,
     ) -> anyhow::Result<Self::SystemPrompt> {
-        Ok(resolve_system_document(build_demo_system_document()?))
+        Ok(resolve_system_document(
+            self.system_prompt.build_document()?,
+        ))
     }
 
     async fn capture_view(&self, source: &Self::Source) -> Self::View {
@@ -325,7 +350,7 @@ impl AgentViewModel<Turn, DemoParseContext> for DemoViewModel {
         };
         Ok(agentview::agent::DefaultTurnPrompt {
             task,
-            rendered_artifacts: ctx.context_state().feedback.artifacts.clone(),
+            artifacts: ctx.context_state().feedback.artifacts.clone(),
             template: DEMO_USER_TEMPLATE.into(),
         })
     }
@@ -376,7 +401,20 @@ impl ParseContext for DemoParseContext {
 
 static INTENT_BUDGET_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
-struct VerifyIntentBudgetTool;
+#[derive(Debug, Clone)]
+struct VerifyIntentBudgetTool {
+    scope: &'static str,
+    required: &'static str,
+}
+
+impl Default for VerifyIntentBudgetTool {
+    fn default() -> Self {
+        Self {
+            scope: "demo",
+            required: "first",
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl StreamingTool<DemoParseContext> for VerifyIntentBudgetTool {
@@ -384,23 +422,31 @@ impl StreamingTool<DemoParseContext> for VerifyIntentBudgetTool {
         "verify_intent_budget"
     }
 
+    fn build_prompt_node(&self) -> Result<XmlNode, PomError> {
+        let mut node = XmlNode::new(XmlName::try_from("tool")?);
+        node.push_attribute(XmlName::try_from("name")?, self.tag())?;
+        node.push_attribute(XmlName::try_from("scope")?, self.scope)?;
+        node.push_attribute(XmlName::try_from("required")?, self.required)?;
+        Ok(node)
+    }
+
     async fn on_open(
         &mut self,
         elem: &XmlElement,
         ctx: &mut DemoParseContext,
     ) -> Result<(), StreamingToolError> {
-        if elem.attr("scope") != Some("demo") {
+        if elem.attr("scope") != Some(self.scope) {
             return Err(StreamingToolError::InvalidAttribute {
-                tag: "verify_intent_budget",
+                tag: self.tag(),
                 attr: "scope",
-                reason: "expected scope=\"demo\"".to_string(),
+                reason: format!("expected scope=\"{}\"", self.scope),
             });
         }
 
         let attempt = INTENT_BUDGET_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
         if attempt == 1 {
             return Err(StreamingToolError::Rejected {
-                tag: "verify_intent_budget",
+                tag: self.tag(),
                 reason: "intent budget changed during validation; verify the budget again before selecting intents".to_string(),
             });
         }
@@ -410,7 +456,22 @@ impl StreamingTool<DemoParseContext> for VerifyIntentBudgetTool {
     }
 }
 
-struct SelectTool;
+#[derive(Debug, Clone)]
+struct SelectTool {
+    attribute: &'static str,
+    min_selections: usize,
+    max_selections: usize,
+}
+
+impl Default for SelectTool {
+    fn default() -> Self {
+        Self {
+            attribute: "local_id",
+            min_selections: 1,
+            max_selections: 3,
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl StreamingTool<DemoParseContext> for SelectTool {
@@ -418,18 +479,36 @@ impl StreamingTool<DemoParseContext> for SelectTool {
         "select"
     }
 
+    fn build_prompt_node(&self) -> Result<XmlNode, PomError> {
+        let mut node = XmlNode::new(XmlName::try_from("tool")?);
+        node.push_attribute(XmlName::try_from("name")?, self.tag())?;
+        node.push_attribute(XmlName::try_from("attribute")?, self.attribute)?;
+        node.push_attribute(
+            XmlName::try_from("cardinality")?,
+            format!("{}-{}", self.min_selections, self.max_selections),
+        )?;
+        Ok(node)
+    }
+
     async fn on_open(
         &mut self,
         elem: &XmlElement,
         ctx: &mut DemoParseContext,
     ) -> Result<(), StreamingToolError> {
-        let Some(local_id) = elem.attr("local_id") else {
+        let Some(local_id) = elem.attr(self.attribute) else {
             return Err(StreamingToolError::InvalidAttribute {
-                tag: "select",
-                attr: "local_id",
+                tag: self.tag(),
+                attr: self.attribute,
                 reason: "missing selected intent id".to_string(),
             });
         };
+
+        if ctx.selected.len() >= self.max_selections {
+            return Err(StreamingToolError::Rejected {
+                tag: self.tag(),
+                reason: format!("expected at most {} selected intents", self.max_selections),
+            });
+        }
 
         ctx.selected.push(local_id.to_string());
         Ok(())
@@ -442,30 +521,26 @@ struct ParserErrorArtifact {
 
 impl ParserErrorArtifact {
     fn turn_artifact(message: impl Into<String>) -> TurnArtifact {
-        TurnArtifact {
-            kind: "parser_error".to_string(),
-            payload: Box::new(Self {
-                message: message.into(),
-            }),
-        }
+        let artifact = Self {
+            message: message.into(),
+        };
+        let document = artifact
+            .build_document()
+            .expect("the demo parser-error POM uses a static valid XML name");
+        TurnArtifact::try_from_document("parser_error", document)
+            .expect("the demo parser-error POM never contains a DiffSlot")
     }
 }
 
-#[async_trait::async_trait]
-impl PromptRenderable for ParserErrorArtifact {
-    async fn render_full<'a>(
-        &'a self,
-        engine: &'a TemplateEngine,
-    ) -> anyhow::Result<PromptFragment> {
-        Ok(engine
-            .render_template(
-                "parser_error_artifact",
-                r#"<parser_error>{{ message }}</parser_error>"#,
-                minijinja::context! {
-                    message => self.message.as_str(),
-                },
-            )?
-            .into())
+impl DocumentProducer for ParserErrorArtifact {
+    fn build_document(&self) -> Result<Document, PomError> {
+        Document::try_build(|blocks| {
+            blocks.xml(XmlNode::try_build("parser_error", |children| {
+                children.text(TextNode::new(self.message.as_str()));
+                Ok(())
+            })?);
+            Ok(())
+        })
     }
 }
 
@@ -475,33 +550,56 @@ struct DemoLoopUpdate {
     task: Option<String>,
 }
 
-fn drain_demo_loop_update(ctx: &mut DemoParseContext) -> DemoLoopUpdate {
+fn drain_demo_loop_update(
+    ctx: &mut DemoParseContext,
+    tools: &DemoStreamingTools,
+) -> DemoLoopUpdate {
     if !ctx.intent_budget_verified {
         return DemoLoopUpdate {
             flow: TurnFlow::Continue,
             artifacts: vec![ParserErrorArtifact::turn_artifact(
-                "<verify_intent_budget scope=\"demo\"/> failed: intent budget changed during validation. Verify again before selecting intents.",
+                format!(
+                    r#"<{} scope="{}"/> failed: intent budget changed during validation. Verify again before selecting intents."#,
+                    tools.verify_intent_budget.tag(),
+                    tools.verify_intent_budget.scope
+                ),
             )],
-            task: Some("The intent budget verification failed because the budget changed during validation. In one response, call <verify_intent_budget scope=\"demo\"/> again and also return 1-3 <select local_id=\"...\"/> tags.".to_owned()),
+            task: Some(format!(
+                "The intent budget verification failed because the budget changed during validation. In one response, call <{} scope=\"{}\"/> again and also return {}-{} <{} {}=\"...\"/> tags.",
+                tools.verify_intent_budget.tag(),
+                tools.verify_intent_budget.scope,
+                tools.select.min_selections,
+                tools.select.max_selections,
+                tools.select.tag(),
+                tools.select.attribute,
+            )),
         };
     }
 
-    if ctx.selected.is_empty() {
+    if ctx.selected.len() < tools.select.min_selections {
         DemoLoopUpdate {
             flow: TurnFlow::Continue,
-            artifacts: vec![ParserErrorArtifact::turn_artifact(
-                "Expected at least one <select> tag.",
-            )],
-            task: Some(
-                "Return at least one <select local_id=\"...\"/> tag after verifying the intent budget."
-                    .to_owned(),
-            ),
+            artifacts: vec![ParserErrorArtifact::turn_artifact(format!(
+                "Expected at least {} <{}> tag.",
+                tools.select.min_selections,
+                tools.select.tag()
+            ))],
+            task: Some(format!(
+                "Return at least {} <{} {}=\"...\"/> tag after verifying the intent budget.",
+                tools.select.min_selections,
+                tools.select.tag(),
+                tools.select.attribute,
+            )),
         }
     } else {
         DemoLoopUpdate {
             flow: TurnFlow::Wait,
             artifacts: Vec::new(),
-            task: Some("Next awake: keep using <select local_id=\"...\"/> tags.".to_owned()),
+            task: Some(format!(
+                "Next awake: keep using <{} {}=\"...\"/> tags.",
+                tools.select.tag(),
+                tools.select.attribute,
+            )),
         }
     }
 }
@@ -515,11 +613,16 @@ async fn main() -> anyhow::Result<()> {
     INTENT_BUDGET_ATTEMPTS.store(0, Ordering::SeqCst);
 
     let executor = RigExampleExecutor;
+    let tools = DemoStreamingTools::default();
+    let system_prompt = DemoSystemPromptView::new(tools.clone());
     let agent: Agent<DemoViewModel, RigExampleExecutor, Turn, TextTurnEvent, DemoParseContext> =
         Agent::with_view(
-            DemoViewModel::new(DemoContextBuilder {
-                agent_id: "demo_agent".to_string(),
-            }),
+            DemoViewModel::new(
+                DemoContextBuilder {
+                    agent_id: "demo_agent".to_string(),
+                },
+                system_prompt,
+            ),
             std::env::var("AGENT_EXAMPLE_MODEL")
                 .unwrap_or_else(|_| "deepseek/deepseek-v3.2".to_string()),
             128,
@@ -531,7 +634,15 @@ async fn main() -> anyhow::Result<()> {
         scene: "demo scene captured from a tiny app source".to_string(),
     };
 
-    let mut task = "Select 1-3 currently valid demo intents. First call <verify_intent_budget scope=\"demo\"/>, then return <select local_id=\"...\"/> tags.".to_owned();
+    let mut task = format!(
+        "Select {}-{} currently valid demo intents. First call <{} scope=\"{}\"/>, then return <{} {}=\"...\"/> tags.",
+        tools.select.min_selections,
+        tools.select.max_selections,
+        tools.verify_intent_budget.tag(),
+        tools.verify_intent_budget.scope,
+        tools.select.tag(),
+        tools.select.attribute,
+    );
     for _ in 0..3 {
         let mut parse_ctx = agent
             .call("DemoSelect")
@@ -540,21 +651,16 @@ async fn main() -> anyhow::Result<()> {
                 &source,
                 &executor,
                 StreamingToolRunner::new(DemoParseContext::default())
-                    .with_tool(VerifyIntentBudgetTool)
-                    .with_tool(SelectTool),
+                    .with_tool(tools.verify_intent_budget.clone())
+                    .with_tool(tools.select.clone()),
             )
             .await?;
 
-        let update = drain_demo_loop_update(&mut parse_ctx);
-        let rendered_artifacts = agent
-            .config
-            .view
-            .render_turn_artifacts(update.artifacts)
-            .await?;
-        if !rendered_artifacts.is_empty() || update.task.is_some() {
+        let update = drain_demo_loop_update(&mut parse_ctx, &tools);
+        if !update.artifacts.is_empty() || update.task.is_some() {
             agent.session_mut().await.context_state_mut().feedback =
                 agentview::agent::DefaultAgentFeedback {
-                    artifacts: rendered_artifacts,
+                    artifacts: update.artifacts,
                     task: update.task,
                 };
         }
@@ -584,12 +690,84 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn demo_system_prompt_is_a_typed_document_producer() {
+        let prompt = DemoSystemPromptView::default();
+        let producer: &dyn DocumentProducer = &prompt;
+        let document = producer.build_document().unwrap();
+
+        assert!(!document.children().is_empty());
+    }
+
+    #[test]
+    fn streaming_tools_contribute_their_own_pom_contract_nodes() {
+        let tools = DemoStreamingTools::default();
+
+        let verify = tools.verify_intent_budget.build_prompt_node().unwrap();
+        let select = tools.select.build_prompt_node().unwrap();
+        let name = XmlName::try_from("name").unwrap();
+
+        assert_eq!(verify.name().as_str(), "tool");
+        assert_eq!(
+            verify.attributes().get(&name).unwrap().value(),
+            tools.verify_intent_budget.tag()
+        );
+        assert_eq!(
+            select.attributes().get(&name).unwrap().value(),
+            tools.select.tag()
+        );
+        assert_eq!(
+            verify
+                .attributes()
+                .get(&XmlName::try_from("scope").unwrap())
+                .unwrap()
+                .value(),
+            tools.verify_intent_budget.scope
+        );
+        assert_eq!(
+            select
+                .attributes()
+                .get(&XmlName::try_from("attribute").unwrap())
+                .unwrap()
+                .value(),
+            tools.select.attribute
+        );
+        assert_eq!(
+            select
+                .attributes()
+                .get(&XmlName::try_from("cardinality").unwrap())
+                .unwrap()
+                .value(),
+            format!(
+                "{}-{}",
+                tools.select.min_selections, tools.select.max_selections
+            )
+        );
+    }
+
+    #[test]
+    fn system_document_reads_dynamic_tool_configuration() {
+        let mut tools = DemoStreamingTools::default();
+        tools.verify_intent_budget.scope = "sandbox";
+        tools.select.max_selections = 4;
+        let prompt = DemoSystemPromptView::new(tools);
+
+        let rendered =
+            render_pom_document(&resolve_system_document(prompt.build_document().unwrap()))
+                .unwrap();
+
+        assert!(rendered.contains("Select 1-4 currently valid demo intents"));
+        assert!(rendered.contains("scope=\"sandbox\""));
+        assert!(rendered.contains("cardinality=\"1-4\""));
+    }
+
     #[tokio::test]
     async fn demo_system_prompt_is_authored_and_rendered_as_pom() {
-        let rendered = resolve_system_document(build_demo_system_document().unwrap())
-            .render_full(&TemplateEngine::new())
-            .await
-            .unwrap();
+        let rendered =
+            resolve_system_document(DemoSystemPromptView::default().build_document().unwrap())
+                .render_full(&TemplateEngine::new())
+                .await
+                .unwrap();
 
         assert_eq!(
             rendered.as_str(),

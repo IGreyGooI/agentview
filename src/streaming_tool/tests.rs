@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent::TurnFlow;
-use crate::templates::{PromptFragment, TemplateEngine};
+use crate::templates::{PromptRenderable, TemplateEngine};
 
 #[derive(Debug, thiserror::Error)]
 enum DecisionError {
@@ -28,10 +28,11 @@ impl BehaviorFeedbackArtifact {
     }
 
     fn into_turn_artifact(self) -> TurnArtifact {
-        TurnArtifact {
-            kind: "behavior_feedback".to_owned(),
-            payload: Box::new(self),
-        }
+        let document = self
+            .build_document()
+            .expect("the test feedback artifact uses static valid XML names");
+        TurnArtifact::try_from_document("behavior_feedback", document)
+            .expect("the test feedback artifact never contains a DiffSlot")
     }
 }
 
@@ -41,30 +42,35 @@ impl DecisionErrorArtifact {
     }
 
     fn into_turn_artifact(self) -> TurnArtifact {
-        TurnArtifact {
-            kind: "parser_error".to_owned(),
-            payload: Box::new(self),
-        }
+        let document = self
+            .build_document()
+            .expect("the test decision artifact uses static valid XML names");
+        TurnArtifact::try_from_document("parser_error", document)
+            .expect("the test decision artifact never contains a DiffSlot")
     }
 }
 
-#[async_trait::async_trait]
-impl PromptRenderable for DecisionErrorArtifact {
-    async fn render_full<'a>(
-        &'a self,
-        _engine: &'a TemplateEngine,
-    ) -> anyhow::Result<PromptFragment> {
-        Ok(format!("<parser_error>{}</parser_error>", self.error).into())
+impl DocumentProducer for DecisionErrorArtifact {
+    fn build_document(&self) -> Result<Document, PomError> {
+        Document::try_build(|blocks| {
+            blocks.xml(XmlNode::try_build("parser_error", |children| {
+                children.text(TextNode::new(self.error.to_string()));
+                Ok(())
+            })?);
+            Ok(())
+        })
     }
 }
 
-#[async_trait::async_trait]
-impl PromptRenderable for BehaviorFeedbackArtifact {
-    async fn render_full<'a>(
-        &'a self,
-        _engine: &'a TemplateEngine,
-    ) -> anyhow::Result<PromptFragment> {
-        Ok(format!("<behavior_feedback>{}</behavior_feedback>", self.message).into())
+impl DocumentProducer for BehaviorFeedbackArtifact {
+    fn build_document(&self) -> Result<Document, PomError> {
+        Document::try_build(|blocks| {
+            blocks.xml(XmlNode::try_build("behavior_feedback", |children| {
+                children.text(TextNode::new(self.message));
+                Ok(())
+            })?);
+            Ok(())
+        })
     }
 }
 
@@ -115,6 +121,22 @@ impl ParseContext for NpcParseContext {
 }
 
 struct SpeakTool;
+
+#[test]
+fn streaming_tool_prompt_is_object_safe_and_uses_the_runtime_tag() {
+    let tool = SpeakTool;
+    let prompt: &dyn StreamingTool<NpcParseContext> = &tool;
+    let node = prompt.build_prompt_node().unwrap();
+
+    assert_eq!(node.name().as_str(), "tool");
+    assert_eq!(
+        node.attributes()
+            .get(&XmlName::try_from("name").unwrap())
+            .unwrap()
+            .value(),
+        prompt.tag()
+    );
+}
 
 #[async_trait::async_trait]
 impl StreamingTool<NpcParseContext> for SpeakTool {
@@ -308,14 +330,14 @@ async fn decision_function_returns_retry_artifact_when_required_tool_missing() {
         )
     );
     assert_eq!(update.artifacts.len(), 1);
-    assert_eq!(update.artifacts[0].kind, "parser_error");
+    assert_eq!(update.artifacts[0].kind(), "parser_error");
     assert_eq!(
         update.artifacts[0]
             .render_full(&engine)
             .await
             .unwrap()
             .into_string(),
-        "<parser_error>Expected a <speak> tag to start speech.</parser_error>"
+        "<parser_error>Expected a &lt;speak&gt; tag to start speech.</parser_error>"
     );
 }
 
@@ -337,14 +359,14 @@ async fn sleep_feedback_uses_behavior_feedback_kind_for_next_awake() {
         Some("Remember the previous format reminder.")
     );
     assert_eq!(update.artifacts.len(), 1);
-    assert_eq!(update.artifacts[0].kind, "behavior_feedback");
+    assert_eq!(update.artifacts[0].kind(), "behavior_feedback");
     assert_eq!(
         update.artifacts[0]
             .render_full(&engine)
             .await
             .unwrap()
             .into_string(),
-        "<behavior_feedback>Use <thought> before <speak> next time.</behavior_feedback>"
+        "<behavior_feedback>Use &lt;thought&gt; before &lt;speak&gt; next time.</behavior_feedback>"
     );
 }
 
@@ -360,15 +382,15 @@ async fn tool_checks_parse_context_before_committing_side_effect() {
     assert!(ctx.speech_started());
     assert_eq!(ctx.completed, vec!["second"]);
     assert_eq!(ctx.artifacts.len(), 2);
-    assert_eq!(ctx.artifacts[0].kind, "parser_error");
-    assert_eq!(ctx.artifacts[1].kind, "parser_error");
+    assert_eq!(ctx.artifacts[0].kind(), "parser_error");
+    assert_eq!(ctx.artifacts[1].kind(), "parser_error");
     assert_eq!(
         ctx.artifacts[0]
             .render_full(&engine)
             .await
             .unwrap()
             .into_string(),
-        "<parser_error><speak> invalid content: speech content cannot be empty</parser_error>"
+        "<parser_error>&lt;speak&gt; invalid content: speech content cannot be empty</parser_error>"
     );
     assert_eq!(
         ctx.artifacts[1]
@@ -376,7 +398,7 @@ async fn tool_checks_parse_context_before_committing_side_effect() {
             .await
             .unwrap()
             .into_string(),
-        "<parser_error><speak> rejected: duplicate speech tag</parser_error>"
+        "<parser_error>&lt;speak&gt; rejected: duplicate speech tag</parser_error>"
     );
 }
 
@@ -392,10 +414,28 @@ async fn invalid_attribute_becomes_parser_error_artifact() {
 
     let ctx = runner.into_context().await;
     assert_eq!(ctx.artifacts.len(), 1);
-    assert_eq!(ctx.artifacts[0].kind, "parser_error");
+    assert_eq!(ctx.artifacts[0].kind(), "parser_error");
     assert_eq!(
         ctx.artifacts[0].render_full(&engine).await.unwrap().into_string(),
-        "<parser_error><update_relationship> invalid attribute `trust_delta`: expected integer</parser_error>"
+        "<parser_error>&lt;update\\_relationship&gt; invalid attribute \\`trust\\_delta\\`: expected integer</parser_error>"
+    );
+}
+
+#[tokio::test]
+async fn tool_error_artifact_escapes_dynamic_text_through_pom() {
+    let artifact = ToolErrorArtifact::new(StreamingToolError::InvalidContent {
+        tag: "select",
+        reason: "<select>&".to_owned(),
+    })
+    .into_turn_artifact();
+
+    assert_eq!(
+        artifact
+            .render_full(&TemplateEngine::new())
+            .await
+            .unwrap()
+            .as_str(),
+        "<parser_error>&lt;select&gt; invalid content: &lt;select&gt;&amp;</parser_error>"
     );
 }
 
@@ -420,7 +460,7 @@ async fn execution_error_becomes_parser_error_and_stream_continues() {
             .await
             .unwrap()
             .into_string(),
-        "<parser_error><emit_event> execution failed: event channel closed</parser_error>"
+        "<parser_error>&lt;emit\\_event&gt; execution failed: event channel closed</parser_error>"
     );
 }
 
@@ -444,7 +484,7 @@ async fn multiple_tool_errors_accumulate_without_short_circuiting() {
     assert_eq!(ctx.artifacts.len(), 2);
     assert_eq!(
         ctx.artifacts[0].render_full(&engine).await.unwrap().into_string(),
-        "<parser_error><update_relationship> invalid attribute `trust_delta`: missing trust delta</parser_error>"
+        "<parser_error>&lt;update\\_relationship&gt; invalid attribute \\`trust\\_delta\\`: missing trust delta</parser_error>"
     );
     assert_eq!(
         ctx.artifacts[1]
@@ -452,7 +492,7 @@ async fn multiple_tool_errors_accumulate_without_short_circuiting() {
             .await
             .unwrap()
             .into_string(),
-        "<parser_error><emit_event> execution failed: event channel closed</parser_error>"
+        "<parser_error>&lt;emit\\_event&gt; execution failed: event channel closed</parser_error>"
     );
 }
 
@@ -471,9 +511,9 @@ async fn thought_after_speech_is_feedback_but_does_not_rollback_speech() {
     let ctx = runner.into_context().await;
     assert_eq!(ctx.completed, vec!["visible first"]);
     assert_eq!(ctx.artifacts.len(), 1);
-    assert_eq!(ctx.artifacts[0].kind, "parser_error");
+    assert_eq!(ctx.artifacts[0].kind(), "parser_error");
     assert_eq!(
         ctx.artifacts[0].render_full(&engine).await.unwrap().into_string(),
-        "<parser_error><thought> appeared after <speak>. Put private reasoning before visible speech next time.</parser_error>"
+        "<parser_error>&lt;thought&gt; appeared after &lt;speak&gt;. Put private reasoning before visible speech next time.</parser_error>"
     );
 }

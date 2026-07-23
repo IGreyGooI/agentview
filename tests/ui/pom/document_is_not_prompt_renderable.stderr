@@ -9,7 +9,6 @@ error[E0277]: the trait bound `Document: PromptRenderable` is not satisfied
             DefaultTurnPrompt
             ResolvedDocument
             String
-            ToolErrorArtifact
             TurnArtifact
   = note: required for `Document` to implement `PromptRenderable`
 note: required by a bound in `require_prompt_renderable`

@@ -1,0 +1,15 @@
+error[E0560]: struct `TurnArtifact` has no field named `payload`
+ --> tests/ui/pom/turn_artifact_rejects_raw_payload.rs:6:9
+  |
+6 |         payload: Box::new(String::from("<parser_error>raw</parser_error>")),
+  |         ^^^^^^^ `TurnArtifact` does not have this field
+  |
+  = note: all struct fields are already assigned
+
+error[E0277]: the trait bound `XmlName: From<&str>` is not satisfied
+ --> tests/ui/pom/turn_artifact_rejects_raw_payload.rs:5:30
+  |
+5 |         kind: "parser_error".into(),
+  |                              ^^^^ the trait `From<&str>` is not implemented for `XmlName`
+  |
+  = note: required for `&str` to implement `Into<XmlName>`

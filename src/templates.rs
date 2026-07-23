@@ -10,9 +10,11 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::pom::ResolvedDocument;
+use crate::pom::{Document, PomError, ResolvedDocument, XmlName};
 use crate::pom_renderer::render_pom_document;
+use crate::pom_resolution::{resolve_artifact_document, PomResolutionError};
 use crate::semantic_view::{render_agent_view_diff_xml, render_agent_view_xml, AgentViewRoot};
+use crate::StorageString;
 
 pub const AGENT_SYSTEM_LAYOUT_TEMPLATE: &str = "agent_system_layout";
 pub const AGENT_USER_LAYOUT_TEMPLATE: &str = "agent_user_layout";
@@ -120,22 +122,64 @@ impl From<&str> for PromptFragment {
 
 /// Ephemeral information for one LLM turn that is not part of persistent context.
 ///
-/// Kept open for now; concrete agents can decide what artifact kinds they need.
+/// The payload is a resolved POM document, so artifact authors cannot inject
+/// trusted raw prompt markup or carry stateful diff slots into a turn.
+#[derive(Debug, Clone, Serialize)]
 pub struct TurnArtifact {
-    pub kind: String,
-    pub payload: Box<dyn PromptRenderable>,
+    kind: XmlName,
+    document: ResolvedDocument,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-/// A pre-rendered artifact inserted into an agent prompt layout.
-///
-/// Convention: `rendered` is trusted prompt markup owned by the artifact
-/// implementation. The outer layout inserts it as-is and does not escape or
-/// validate XML/Markdown/etc. Artifact authors are responsible for producing
-/// safe, well-formed prompt text for their agent.
+#[derive(Debug, thiserror::Error)]
+pub enum TurnArtifactError {
+    #[error("invalid turn artifact kind `{kind}`")]
+    InvalidKind {
+        kind: StorageString,
+        #[source]
+        source: PomError,
+    },
+
+    #[error(transparent)]
+    Resolution(#[from] PomResolutionError),
+}
+
+impl TurnArtifact {
+    pub fn try_from_document(
+        kind: impl Into<StorageString>,
+        document: Document,
+    ) -> Result<Self, TurnArtifactError> {
+        let kind = kind.into();
+        let kind = XmlName::new(kind.clone())
+            .map_err(|source| TurnArtifactError::InvalidKind { kind, source })?;
+        Ok(Self {
+            kind,
+            document: resolve_artifact_document(document)?,
+        })
+    }
+
+    pub fn kind(&self) -> &str {
+        self.kind.as_str()
+    }
+
+    pub fn document(&self) -> &ResolvedDocument {
+        &self.document
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+/// Internal compatibility DTO for the legacy Minijinja user envelope.
 pub struct RenderedTurnArtifact {
-    pub kind: String,
-    pub rendered: String,
+    kind: StorageString,
+    rendered: String,
+}
+
+impl RenderedTurnArtifact {
+    pub(crate) fn new(kind: impl Into<StorageString>, rendered: String) -> Self {
+        Self {
+            kind: kind.into(),
+            rendered,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -156,6 +200,7 @@ pub struct PromptSystemVars {
 pub struct PromptUserVars {
     pub context_kind: ContextBlockKind,
     pub context_block: String,
+    #[serde(default, skip_deserializing)]
     pub artifacts: Vec<RenderedTurnArtifact>,
     pub task: String,
 }
@@ -217,8 +262,8 @@ pub trait PromptRenderable: Send + Sync {
 
 #[async_trait::async_trait]
 impl PromptRenderable for TurnArtifact {
-    async fn render_full<'a>(&'a self, templates: &'a TemplateEngine) -> Result<PromptFragment> {
-        self.payload.render_full(templates).await
+    async fn render_full<'a>(&'a self, _templates: &'a TemplateEngine) -> Result<PromptFragment> {
+        Ok(render_pom_document(&self.document)?.into())
     }
 }
 

@@ -125,7 +125,8 @@ pub struct DefaultContextState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DefaultAgentFeedback {
-    pub artifacts: Vec<RenderedTurnArtifact>,
+    #[serde(default, skip_deserializing)]
+    pub artifacts: Vec<TurnArtifact>,
     pub task: Option<String>,
 }
 
@@ -181,7 +182,8 @@ impl PromptRenderable for DefaultSystemPrompt {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultTurnPrompt {
     pub task: String,
-    pub rendered_artifacts: Vec<RenderedTurnArtifact>,
+    #[serde(default, skip_deserializing)]
+    pub artifacts: Vec<TurnArtifact>,
     pub template: StorageString,
 }
 
@@ -191,6 +193,14 @@ impl PromptRenderable for DefaultTurnPrompt {
         &'a self,
         templates: &'a TemplateEngine,
     ) -> anyhow::Result<PromptFragment> {
+        let mut rendered_artifacts = Vec::with_capacity(self.artifacts.len());
+        for artifact in &self.artifacts {
+            rendered_artifacts.push(RenderedTurnArtifact::new(
+                artifact.kind(),
+                artifact.render_full(templates).await?.into_string(),
+            ));
+        }
+
         Ok(templates
             .render_template(
                 AGENT_USER_LAYOUT_TEMPLATE,
@@ -198,7 +208,7 @@ impl PromptRenderable for DefaultTurnPrompt {
                 minijinja::Value::from_serialize(&PromptUserVars {
                     context_kind: ContextBlockKind::Empty,
                     context_block: String::new(),
-                    artifacts: self.rendered_artifacts.clone(),
+                    artifacts: rendered_artifacts,
                     task: self.task.clone(),
                 }),
             )?
@@ -269,7 +279,7 @@ pub struct RenderedAgentView<V> {
     pub context_snapshot: V,
     pub context_kind: ContextBlockKind,
     pub context_block: PromptFragment,
-    pub rendered_artifacts: Vec<RenderedTurnArtifact>,
+    pub artifacts: Vec<TurnArtifact>,
 }
 
 impl<B, T> DefaultAgentViewModel<B, T>
@@ -299,7 +309,7 @@ where
         current_view: &B::View,
         previous_view: Option<&B::View>,
         call_id: &str,
-        rendered_artifacts: Vec<RenderedTurnArtifact>,
+        artifacts: Vec<TurnArtifact>,
     ) -> anyhow::Result<RenderedAgentView<B::View>> {
         let (context_kind, context_block) = match previous_view {
             None => {
@@ -338,22 +348,8 @@ where
             context_snapshot: current_view.clone(),
             context_kind,
             context_block,
-            rendered_artifacts,
+            artifacts,
         })
-    }
-
-    pub async fn render_turn_artifacts(
-        &self,
-        artifacts: Vec<TurnArtifact>,
-    ) -> anyhow::Result<Vec<RenderedTurnArtifact>> {
-        let mut rendered = Vec::new();
-        for artifact in artifacts {
-            rendered.push(RenderedTurnArtifact {
-                kind: artifact.kind.clone(),
-                rendered: artifact.render_full(&self.templates).await?.into_string(),
-            });
-        }
-        Ok(rendered)
     }
 }
 
@@ -417,7 +413,7 @@ where
         };
         Ok(DefaultTurnPrompt {
             task,
-            rendered_artifacts: ctx.context_state().feedback.artifacts.clone(),
+            artifacts: ctx.context_state().feedback.artifacts.clone(),
             template: self.user_template.clone(),
         })
     }

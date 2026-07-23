@@ -17,8 +17,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::llm_call::{TextTurnEvent, TurnSink};
+use crate::pom::{Document, DocumentProducer, PomError, TextNode, XmlName, XmlNode};
 use crate::stream_parser::{HermesParser, XmlElement};
-use crate::templates::{PromptFragment, PromptRenderable, TemplateEngine, TurnArtifact};
+use crate::templates::TurnArtifact;
 
 // ── Errors / artifacts ────────────────────────────────────────────────────────
 
@@ -55,20 +56,23 @@ impl ToolErrorArtifact {
     }
 
     pub fn into_turn_artifact(self) -> TurnArtifact {
-        TurnArtifact {
-            kind: "parser_error".to_owned(),
-            payload: Box::new(self),
-        }
+        let document = self
+            .build_document()
+            .expect("the built-in parser-error POM uses static valid XML names");
+        TurnArtifact::try_from_document("parser_error", document)
+            .expect("the built-in parser-error POM never contains a DiffSlot")
     }
 }
 
-#[async_trait::async_trait]
-impl PromptRenderable for ToolErrorArtifact {
-    async fn render_full<'a>(
-        &'a self,
-        _engine: &'a TemplateEngine,
-    ) -> anyhow::Result<PromptFragment> {
-        Ok(format!("<parser_error>{}</parser_error>", self.error).into())
+impl DocumentProducer for ToolErrorArtifact {
+    fn build_document(&self) -> Result<Document, PomError> {
+        Document::try_build(|blocks| {
+            blocks.xml(XmlNode::try_build("parser_error", |children| {
+                children.text(TextNode::new(self.error.to_string()));
+                Ok(())
+            })?);
+            Ok(())
+        })
     }
 }
 
@@ -95,6 +99,18 @@ pub trait ParseContext {
 #[async_trait::async_trait]
 pub trait StreamingTool<C: ParseContext>: Send {
     fn tag(&self) -> &'static str;
+
+    /// Builds this tool's agent-facing POM contract node.
+    ///
+    /// The node is intentionally smaller than a document: the system prompt
+    /// owns headings, workflow text, wrappers, and tool ordering. The default
+    /// contract is `<tool name="tag" />`; implementations can add attributes
+    /// or children while using [`Self::tag`] as the runtime identity.
+    fn build_prompt_node(&self) -> Result<XmlNode, PomError> {
+        let mut node = XmlNode::new(XmlName::try_from("tool")?);
+        node.push_attribute(XmlName::try_from("name")?, self.tag())?;
+        Ok(node)
+    }
 
     async fn on_open(
         &mut self,

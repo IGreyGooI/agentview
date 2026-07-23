@@ -4,6 +4,7 @@ mod diff_slot;
 mod document;
 mod error;
 mod markdown;
+mod producer;
 mod text;
 mod xml;
 
@@ -18,5 +19,6 @@ pub use markdown::{
     CodeBlockNode, CodeSpanNode, HeadingLevel, HeadingNode, ListBuilder, ListItem, ListKind,
     ListNode, MarkdownNode, ParagraphNode, StrongNode,
 };
+pub use producer::DocumentProducer;
 pub use text::TextNode;
 pub use xml::{XmlAttribute, XmlAttributes, XmlName, XmlNode};
