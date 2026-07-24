@@ -2,7 +2,7 @@
 //!
 //! This is the chat/CLI/daemon/skill sibling of the provider-backed
 //! `AgentTurn` path. It does not call a model provider. It captures the
-//! application view, builds the current turn prompt, accepts an external reply,
+//! application view, builds the current user document, accepts an external reply,
 //! and commits that reply through caller-provided parsing/apply functions.
 
 use std::marker::PhantomData;
@@ -13,6 +13,9 @@ use crate::agent::AgentViewModel;
 use crate::agent_session::AgentSession;
 use crate::control::ControlReply;
 use crate::llm_call::TurnSink;
+use crate::pom::ResolvedDocument;
+use crate::pom_renderer::render_pom_document;
+use crate::pom_resolution::resolve_user_document;
 use crate::prompt_context::{PromptContext, Turn};
 use crate::view_awake::{ViewAwake, ViewAwakeHandle, ViewEpoch};
 use crate::view_state::{ViewSnapshot, ViewTurnId, ViewUpdate};
@@ -25,7 +28,7 @@ where
 {
     view_model: VM,
     source: VM::Source,
-    session: AgentSession<I, VM::ContextState, VM::View>,
+    session: AgentSession<I, VM::ContextState>,
     awake: ViewAwake,
     latest_turn_id: Option<ViewTurnId>,
     next_turn_index: u64,
@@ -68,20 +71,20 @@ where
     }
 
     /// The durable prompt session owned by this app.
-    pub fn session(&self) -> &AgentSession<I, VM::ContextState, VM::View> {
+    pub fn session(&self) -> &AgentSession<I, VM::ContextState> {
         &self.session
     }
 
     /// Mutable access to the durable prompt session owned by this app.
-    pub fn session_mut(&mut self) -> &mut AgentSession<I, VM::ContextState, VM::View> {
+    pub fn session_mut(&mut self) -> &mut AgentSession<I, VM::ContextState> {
         &mut self.session
     }
 
-    /// Capture a full view snapshot and current turn prompt.
+    /// Capture a full view snapshot and resolved current user document.
     pub async fn observe(
         &mut self,
         task: impl Into<String>,
-    ) -> anyhow::Result<ViewSnapshot<VM::View, VM::TurnPrompt>> {
+    ) -> anyhow::Result<ViewSnapshot<VM::View, ResolvedDocument>> {
         self.capture_snapshot(task.into()).await
     }
 
@@ -90,7 +93,7 @@ where
         &mut self,
         epoch: ViewEpoch,
         task: impl Into<String>,
-    ) -> anyhow::Result<ViewSnapshot<VM::View, VM::TurnPrompt>> {
+    ) -> anyhow::Result<ViewSnapshot<VM::View, ResolvedDocument>> {
         self.awake.wait_after(epoch).await;
         self.capture_snapshot(task.into()).await
     }
@@ -103,16 +106,17 @@ where
         sink: S,
         apply: F,
         next_task: impl Into<String>,
-    ) -> anyhow::Result<ViewUpdate<VM::View, VM::TurnPrompt>>
+    ) -> anyhow::Result<ViewUpdate<VM::View, ResolvedDocument>>
     where
         S: TurnSink<ControlReply>,
         F: FnOnce(
-            &mut AgentSession<I, VM::ContextState, VM::View>,
+            &mut AgentSession<I, VM::ContextState>,
             &VM::Source,
             S::Output,
         ) -> anyhow::Result<()>,
     {
         self.ensure_current_turn(turn_id)?;
+        self.latest_turn_id = None;
 
         let base_epoch = self.awake.current_epoch();
         let mut sink = Box::new(sink);
@@ -144,21 +148,24 @@ where
     async fn capture_snapshot(
         &mut self,
         task: String,
-    ) -> anyhow::Result<ViewSnapshot<VM::View, VM::TurnPrompt>> {
+    ) -> anyhow::Result<ViewSnapshot<VM::View, ResolvedDocument>> {
         loop {
             let view_epoch = self.awake.current_epoch();
             let turn_id = self.next_turn_id();
             let view = self.view_model.capture_view(&self.source).await;
-            let turn_prompt = self
+            let user_document = self
                 .view_model
-                .build_turn_prompt(self.session.context(), &turn_id, task.clone())
+                .build_user_document(self.session.context(), &turn_id, task.clone().into(), &view)
                 .await?;
+            let (user_document, next_cursor) =
+                resolve_user_document(user_document, self.session.user_document_cursor())?;
+            render_pom_document(&user_document)?;
 
             if self.awake.current_epoch() == view_epoch {
-                self.session.set_view_cursor(view.clone());
+                self.session.set_user_document_cursor(next_cursor);
                 self.latest_turn_id = Some(turn_id.clone());
                 self.next_turn_index += 1;
-                return Ok(ViewSnapshot::new(view_epoch, turn_id, view, turn_prompt));
+                return Ok(ViewSnapshot::new(view_epoch, turn_id, view, user_document));
             }
         }
     }

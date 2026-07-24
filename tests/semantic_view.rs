@@ -1,8 +1,9 @@
 use agentview::prelude::{
     render_agent_view_xml, render_semantic_fragment_xml, render_semantic_node_xml, AgentView,
-    ContextView, LegacyAgentView, PromptRenderable, SemanticField, SemanticNode, TemplateEngine,
+    LegacyAgentView, SemanticField, SemanticNode,
 };
 use agentview::semantic_view::SemanticDiffStrategy;
+use agentview::templates::{ContextView, PromptRenderable, TemplateEngine};
 
 #[derive(AgentView)]
 #[agent_view(kind = "hello")]

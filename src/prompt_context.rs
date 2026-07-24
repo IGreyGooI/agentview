@@ -118,6 +118,10 @@ impl<I, CS> PromptContext<I, CS> {
         }
     }
 
+    pub(crate) fn set_system_snapshot(&mut self, system: impl Into<StorageString>) {
+        self.system = Some(system.into());
+    }
+
     pub fn has_system(&self) -> bool {
         self.system.is_some()
     }

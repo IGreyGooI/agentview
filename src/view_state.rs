@@ -5,30 +5,30 @@ use serde::{Deserialize, Serialize};
 use crate::view_awake::ViewEpoch;
 use crate::StorageString;
 
-/// Identifier for the active turn prompt inside a view snapshot.
+/// Identifier for the active user document inside a view snapshot.
 pub type ViewTurnId = StorageString;
 
 /// Full view state captured at a view epoch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ViewSnapshot<View, TurnPrompt = ()> {
+pub struct ViewSnapshot<View, UserDocument = ()> {
     pub view_epoch: ViewEpoch,
     pub turn_id: ViewTurnId,
     pub view: View,
-    pub turn_prompt: TurnPrompt,
+    pub user_document: UserDocument,
 }
 
-impl<View, TurnPrompt> ViewSnapshot<View, TurnPrompt> {
+impl<View, UserDocument> ViewSnapshot<View, UserDocument> {
     pub fn new(
         view_epoch: ViewEpoch,
         turn_id: impl Into<ViewTurnId>,
         view: View,
-        turn_prompt: TurnPrompt,
+        user_document: UserDocument,
     ) -> Self {
         Self {
             view_epoch,
             turn_id: turn_id.into(),
             view,
-            turn_prompt,
+            user_document,
         }
     }
 }
@@ -47,14 +47,14 @@ impl ViewPatch {
 
 /// Full-or-partial transition between view epochs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ViewUpdate<View, TurnPrompt = ()> {
+pub struct ViewUpdate<View, UserDocument = ()> {
     pub base_epoch: ViewEpoch,
     pub view_epoch: ViewEpoch,
-    pub body: ViewUpdateBody<View, TurnPrompt>,
+    pub body: ViewUpdateBody<View, UserDocument>,
 }
 
-impl<View, TurnPrompt> ViewUpdate<View, TurnPrompt> {
-    pub fn full(base_epoch: ViewEpoch, snapshot: ViewSnapshot<View, TurnPrompt>) -> Self {
+impl<View, UserDocument> ViewUpdate<View, UserDocument> {
+    pub fn full(base_epoch: ViewEpoch, snapshot: ViewSnapshot<View, UserDocument>) -> Self {
         Self {
             base_epoch,
             view_epoch: snapshot.view_epoch,
@@ -70,7 +70,7 @@ impl<View, TurnPrompt> ViewUpdate<View, TurnPrompt> {
         }
     }
 
-    pub fn snapshot(&self) -> Option<&ViewSnapshot<View, TurnPrompt>> {
+    pub fn snapshot(&self) -> Option<&ViewSnapshot<View, UserDocument>> {
         match &self.body {
             ViewUpdateBody::Full(snapshot) => Some(snapshot),
             ViewUpdateBody::Partial(_) => None,
@@ -86,7 +86,7 @@ impl<View, TurnPrompt> ViewUpdate<View, TurnPrompt> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ViewUpdateBody<View, TurnPrompt = ()> {
-    Full(ViewSnapshot<View, TurnPrompt>),
+pub enum ViewUpdateBody<View, UserDocument = ()> {
+    Full(ViewSnapshot<View, UserDocument>),
     Partial(ViewPatch),
 }

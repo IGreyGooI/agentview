@@ -10,14 +10,19 @@ The recommended public entry point is `agentview::prelude::*`. Module paths stay
 
 1. `src/lib.rs`
 2. `src/agent.rs`
-3. `src/llm_call.rs`
-4. `src/prompt_context.rs`
-5. `src/templates.rs`
-6. `src/stream_parser.rs`
-7. `src/streaming_tool.rs`
-8. `examples/agent_streaming_tool_loop.rs`
+3. `src/agent_view.rs`
+4. `src/pom/`
+5. `src/pom_resolution.rs`
+6. `src/pom_renderer.rs`
+7. `src/llm_call.rs`
+8. `src/prompt_context.rs`
+9. `src/streaming_tool.rs`
+10. `examples/agent_streaming_tool_loop.rs`
 
-That order mirrors the actual layering: public exports, long-lived agent/session logic, one-turn execution, durable prompt state, rendering, low-level streaming parse, higher-level streaming tools, and finally the end-to-end example.
+That order mirrors the active layering: public exports, long-lived
+agent/session logic, Rust-to-POM projection, typed prompt objects,
+resolution/rendering, one-turn execution, durable state, streaming tools, and
+finally the end-to-end example.
 
 ## Code Map
 
@@ -31,15 +36,26 @@ That order mirrors the actual layering: public exports, long-lived agent/session
 
 - Owns the long-lived `Agent` session object.
 - Defines `AgentViewModel`, `DefaultAgentViewModel`, `TextAgent`, and `TurnFlow`.
-- Builds requests by combining:
-  - durable prompt context from `PromptContext`
-  - the latest captured context view
-  - rendered prompt templates
-  - per-turn task text
+- Builds requests from separate typed system/user POM `Document` values.
+- Resolves user `DiffSlot` edges against `UserDocumentCursor`, then renders only
+  the slot-free `ResolvedDocument`.
 - Commits successful turns back into history through `AgentViewModel::commit_turn`.
-- Stores the last rendered view in `view_cursor` so later turns can render full, delta, or empty context blocks.
+- Commits the candidate user-document cursor only with a successful turn.
 
 Important invariant: `Agent` owns session state, but a single model-backed request is still delegated to `AgentTurn` from `src/llm_call.rs`.
+
+### `src/agent_view.rs`, `src/pom/`, and POM resolution
+
+- `AgentView::build_root` projects Rust values into a statically known POM root.
+- `Document` can mix typed Markdown and XML; only `XmlNode` values can be
+  `DiffSlot` payloads.
+- System resolution materializes slots without diffing.
+- User resolution returns a `ResolvedDocument` plus a candidate
+  `UserDocumentCursor`.
+- The canonical renderer accepts only `ResolvedDocument`.
+
+Important invariant: derive/build, diff, resolution, and rendering are separate
+stages. Business code should not construct prompt markup strings.
 
 ### `src/llm_call.rs`
 
@@ -63,15 +79,13 @@ Important invariant: if you change commit behavior, check `transform_user`, `tra
 
 ### `src/templates.rs`
 
-- Defines the prompt rendering surface:
-  - `TemplateEngine`
-  - `PromptRenderable`
-  - `ContextView`
-  - `ContextViewBuilder`
-  - `TurnArtifact`
-- Supports full render, delta render, and agent-visible per-turn artifacts.
+- Keeps `TemplateEngine`, `PromptRenderable`, and `ContextView` only as legacy
+  compatibility APIs.
+- Defines the current `ContextViewBuilder` projection boundary and typed
+  `TurnArtifact`.
 
-Important invariant: if a view can render a delta, it should still behave correctly when there is no previous snapshot or no meaningful change.
+Important invariant: new request paths use POM documents. A `TurnArtifact`
+stores a slot-free typed document, never trusted pre-rendered markup.
 
 ### `src/stream_parser.rs`
 
@@ -84,7 +98,8 @@ Important invariant: parser changes must be validated against chunk boundaries, 
 ### `src/streaming_tool.rs`
 
 - Higher-level tool runner built on top of `HermesParser`.
-- Registers handlers by XML tag.
+- Registers `<tool>` contracts by their derived `name` attribute and other
+  contracts by their derived XML root name.
 - Updates a concrete `ParseContext`.
 - Converts validation/execution failures into prompt artifacts instead of crashing the whole parse path.
 
@@ -93,7 +108,8 @@ Important invariant: streaming tools should update parse context and artifacts, 
 ### `examples/agent_streaming_tool_loop.rs`
 
 - Best end-to-end reference in the repo.
-- Shows how `LLMExecutor`, `TurnSink`, `StreamingToolRunner`, `ContextView`, and `Agent` fit together.
+- Shows how derived system/user documents, typed streaming-tool contracts,
+  `LLMExecutor`, `TurnSink`, `StreamingToolRunner`, and `Agent` fit together.
 - Also shows the expected environment split:
   - default feature uses OpenRouter
   - non-`openrouter` path uses an OpenAI-compatible base URL
@@ -114,9 +130,11 @@ If a change blurs those lines, it is probably going in the wrong file.
 
 This crate is deliberately generic. Avoid baking NPC/game/product-specific semantics into the core modules unless they are clearly reusable abstractions.
 
-### Trust the implementation over stale comments
+### Keep documentation on the POM-first path
 
-The crate docs in `src/agent.rs` still mention a two-phase snapshot pattern, but the current implementation captures the view inside turn execution via `capture_view(source)` and updates `view_cursor` after commit. When comments and code diverge, treat the current code as the source of truth and update the docs.
+When comments and code diverge, treat the current code as the source of truth
+and update the docs. Do not reintroduce fixed `## View` / `## Turn Prompt`
+envelopes, manual XML formatting, or a rendered-string AST boundary.
 
 ## Change Guidance
 
@@ -138,8 +156,16 @@ The crate docs in `src/agent.rs` still mention a two-phase snapshot pattern, but
 
 ### If you touch `src/templates.rs`
 
-- Verify full-context, delta-context, and unchanged-context behavior.
-- Remember that `RenderedTurnArtifact.rendered` is treated as trusted prompt markup.
+- Keep legacy rendering isolated from active request assembly.
+- Verify that `TurnArtifact` composition stays typed and rejects unresolved
+  `DiffSlot` edges.
+
+### If you touch POM derive, resolution, or rendering
+
+- Verify full, changed, unchanged, deletion, and every collection strategy.
+- Verify cursor rollback on provider/commit/render failure and epoch retry.
+- Add compile-fail tests when an invalid field-mode combination should be
+  rejected statically.
 
 ### If you touch `src/stream_parser.rs` or `src/streaming_tool.rs`
 
@@ -150,9 +176,10 @@ The crate docs in `src/agent.rs` still mention a two-phase snapshot pattern, but
 
 Run these before wrapping up:
 
-- `cargo test`
-- `cargo test stream_parser`
-- `cargo test streaming_tool`
+- `cargo fmt --all -- --check`
+- `cargo test --workspace --all-targets`
+- `cargo test --doc`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 
 If you changed the example or provider integration path, also exercise:
 

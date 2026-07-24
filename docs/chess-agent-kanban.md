@@ -148,7 +148,7 @@ itself should not be only a rendered string.
 
 ### Doing
 
-- [ ] Add configurable Stockfish strength/Elo to the VM and turn prompt.
+- [ ] Add configurable Stockfish strength/Elo to the VM and user document.
 
 ### Ready
 
@@ -183,7 +183,7 @@ The first slice should be deliberately small:
 ```text
 observe
   -> full chess board snapshot
-  -> turn_prompt asks for a legal UCI move through:
+  -> resolved user document asks for a legal UCI move through:
      agentview chess act <uci>
 
 agentview chess act e2e4
@@ -206,7 +206,7 @@ AgentView source can independently progress and wake the view.
 - Unit: parse text move reply.
 - Unit: reject illegal move.
 - Unit: render full chess snapshot from a starting position.
-- Unit: turn prompt includes `turn_id` and legal move contract.
+- Unit: user document includes `turn_id` and legal move contract.
 - Integration: observe returns starting board.
 - Integration: act applies caller move and advances epoch.
 - Integration: hook waits for a Stockfish-compatible UCI engine move and returns

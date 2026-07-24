@@ -11,7 +11,6 @@ use std::time::Duration;
 use agentview::prelude::*;
 use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square, ALL_FILES, ALL_RANKS};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -340,7 +339,10 @@ impl AgentViewCollect<ChessBoardStateSource<'_>> for ChessBoardStatePromptView {
 
 #[cfg(test)]
 fn render_chess_board_state_xml(view: &ChessView) -> String {
-    render_agent_view_xml(&view.board_state)
+    render_pom_document(&resolve_system_document(Document::from_xml(
+        view.board_state.build_root().unwrap(),
+    )))
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -604,7 +606,10 @@ impl ChessView {
         square_index: usize,
     ) -> Option<String> {
         let square = self.square_for_test(rank_index, square_index)?;
-        Some(render_agent_view_xml(square))
+        render_pom_document(&resolve_system_document(Document::from_xml(
+            square.build_root().ok()?,
+        )))
+        .ok()
     }
 }
 
@@ -613,10 +618,10 @@ impl ChessView {
 #[agent_view(kind = "chess_task")]
 pub struct ChessTaskView {
     #[view(element)]
-    pub task: String,
+    pub instruction: String,
 
-    #[view(skip)]
-    pub reply_schema: serde_json::Value,
+    #[view(element)]
+    pub active_turn_id: String,
 
     #[view(flatten)]
     reasoning_policy: ChessReasoningPolicyPromptView,
@@ -626,14 +631,24 @@ pub struct ChessTaskView {
 }
 
 impl ChessTaskView {
-    pub fn new(task: impl Into<String>, reply_schema: serde_json::Value) -> Self {
+    pub fn new(instruction: impl Into<String>, active_turn_id: impl Into<String>) -> Self {
         Self {
-            task: task.into(),
-            reply_schema,
+            instruction: instruction.into(),
+            active_turn_id: active_turn_id.into(),
             reasoning_policy: chess_reasoning_policy_prompt_view(),
             reply_contract: chess_task_reply_contract_prompt_view(),
         }
     }
+}
+
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(document)]
+struct ChessUserDocumentView {
+    #[view(name = "agent_context", diff)]
+    context: ChessView,
+
+    #[view(xml)]
+    task: ChessTaskView,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -643,34 +658,33 @@ pub struct ChessViewModel;
 impl AgentViewModel<Turn, ()> for ChessViewModel {
     type Source = ChessGameSource;
     type View = ChessView;
-    type SystemPrompt = ResolvedDocument;
-    type TurnPrompt = ChessTaskView;
     type ContextState = ();
 
-    async fn build_system_prompt(
+    async fn build_system_document(
         &self,
         _ctx: &PromptContext<Turn, Self::ContextState>,
         _source: &Self::Source,
-    ) -> anyhow::Result<Self::SystemPrompt> {
+    ) -> anyhow::Result<Document> {
         let prompt = ChessSystemPromptView::default();
-        let document = prompt.build_root()?;
-        Ok(resolve_system_document(document))
+        Ok(prompt.build_root()?)
     }
 
     async fn capture_view(&self, source: &Self::Source) -> Self::View {
         ChessView::collect(&source.snapshot())
     }
 
-    async fn build_turn_prompt(
+    async fn build_user_document(
         &self,
         _ctx: &PromptContext<Turn, Self::ContextState>,
         call_id: &str,
-        task: String,
-    ) -> anyhow::Result<Self::TurnPrompt> {
-        Ok(ChessTaskView::new(
-            format!("{task} Active turn id: {call_id}."),
-            move_reply_schema(),
-        ))
+        task: StorageString,
+        current_view: &Self::View,
+    ) -> anyhow::Result<Document> {
+        Ok(ChessUserDocumentView {
+            context: current_view.clone(),
+            task: ChessTaskView::new(task, call_id),
+        }
+        .build_root()?)
     }
 
     async fn commit_turn(
@@ -774,7 +788,7 @@ impl TurnSink<ControlReply> for ChessMoveSink {
 }
 
 pub fn apply_player_move(
-    session: &mut AgentSession<Turn, (), ChessView>,
+    session: &mut AgentSession<Turn, ()>,
     source: &ChessGameSource,
     output: ChessMoveOutput,
 ) -> anyhow::Result<()> {
@@ -973,19 +987,6 @@ fn legal_uci_moves(board: &Board) -> Vec<String> {
         .collect::<Vec<_>>();
     moves.sort();
     moves
-}
-
-fn move_reply_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "required": ["uci"],
-        "properties": {
-            "uci": {
-                "type": "string",
-                "description": "A legal move in UCI long algebraic notation, such as e2e4 or e7e8q."
-            }
-        }
-    })
 }
 
 fn board_status_name(status: BoardStatus) -> &'static str {

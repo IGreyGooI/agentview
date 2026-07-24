@@ -61,7 +61,7 @@ pub struct AgentTurnRequest<I = Turn> {
 #[derive(Debug, Clone)]
 pub enum ContextPreparation<I = Turn> {
     /// Execute the prepared request as-is.
-    Ready(AgentTurnRequest<I>),
+    Ready,
     /// Replace committed history, invalidate the rendered view baseline, and
     /// prepare the same logical turn again.
     ReplaceHistory { history: Vec<I> },
@@ -209,13 +209,13 @@ pub trait LLMExecutor<I = Turn, E = TextTurnEvent>: Send + Sync {
     /// request a history replacement for context compaction.
     async fn prepare_context(
         &self,
-        request: AgentTurnRequest<I>,
+        _request: &AgentTurnRequest<I>,
         _budget: ContextPreparationBudget,
     ) -> anyhow::Result<ContextPreparation<I>>
     where
         I: Send + 'static,
     {
-        Ok(ContextPreparation::Ready(request))
+        Ok(ContextPreparation::Ready)
     }
 
     /// Execute one model turn and return the transcript items to append.
@@ -573,15 +573,12 @@ mod tests {
         };
 
         let prepared = StaticExecutor
-            .prepare_context(request, ContextPreparationBudget::new(0, 3, 0))
+            .prepare_context(&request, ContextPreparationBudget::new(0, 3, 0))
             .await
             .unwrap();
 
         match prepared {
-            ContextPreparation::Ready(request) => {
-                assert_eq!(request.call_id.as_ref(), "call");
-                assert_eq!(request.user, "user");
-            }
+            ContextPreparation::Ready => {}
             ContextPreparation::ReplaceHistory { .. } => {
                 panic!("default context preparation replaced history")
             }

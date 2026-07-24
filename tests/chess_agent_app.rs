@@ -23,12 +23,14 @@ fn new_app(source: ChessGameSource) -> (AgentViewApp<ChessViewModel, Turn, ()>, 
     )
 }
 
+type ChessSnapshot = ViewSnapshot<ChessView, ResolvedDocument>;
+
 async fn apply_test_move(
     app: &mut AgentViewApp<ChessViewModel, Turn, ()>,
     source: &ChessGameSource,
-    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
+    snapshot: &ChessSnapshot,
     uci: &str,
-) -> ViewSnapshot<ChessView, ChessTaskView> {
+) -> ChessSnapshot {
     app.act_with_sink(
         &snapshot.turn_id,
         ControlReply::structured(json!({ "uci": uci })),
@@ -61,15 +63,10 @@ async fn chess_system_prompt_is_authored_as_pom_markdown_and_xml() {
     let context = PromptContext::<Turn, ()>::without_system();
 
     let system_prompt = ChessViewModel
-        .build_system_prompt(&context, &source)
+        .build_system_document(&context, &source)
         .await
         .unwrap();
-    let _: &ResolvedDocument = &system_prompt;
-    let rendered = system_prompt
-        .render_full(&TemplateEngine::new())
-        .await
-        .unwrap()
-        .into_string();
+    let rendered = render_pom_document(&resolve_system_document(system_prompt)).unwrap();
 
     assert_eq!(
         rendered,
@@ -96,10 +93,14 @@ async fn chess_system_prompt_is_authored_as_pom_markdown_and_xml() {
 async fn chess_view_can_be_collected_from_game_state_snapshot() {
     let source = ChessGameSource::new();
     let collected = ChessView::collect(&source.snapshot());
+    let rendered = render_pom_document(&resolve_system_document(Document::from_xml(
+        collected.build_root().unwrap(),
+    )))
+    .unwrap();
 
     assert_eq!(collected.side_to_move(), "white");
     assert!(collected.legal_uci_moves().contains(&"e2e4"));
-    assert!(render_agent_view_xml(&collected).starts_with("<prompt_board>"));
+    assert!(rendered.starts_with("<prompt_board>"));
 }
 
 #[tokio::test]
@@ -136,15 +137,12 @@ async fn chess_board_squares_render_as_a_flat_agent_facing_list() {
     let (mut app, _awake) = new_app(source);
     let snapshot = app.observe("Choose white's next move.").await.unwrap();
 
-    let rendered = snapshot
-        .view
-        .render_full(&TemplateEngine::new())
-        .await
-        .unwrap()
-        .into_string();
+    let rendered = render_pom_document(&resolve_system_document(Document::from_xml(
+        snapshot.view.build_root().unwrap(),
+    )))
+    .unwrap();
 
-    assert!(rendered
-        .contains("\n  <board_squares>\n    <square id=\"a8\" file=\"a\" rank=\"8\">r</square>"));
+    assert!(rendered.contains("<board_squares><square id=\"a8\" file=\"a\" rank=\"8\">r</square>"));
     assert!(rendered.contains("<square id=\"a8\" file=\"a\" rank=\"8\">r</square>"));
     assert!(rendered.contains("<square id=\"e1\" file=\"e\" rank=\"1\">K</square>"));
     assert!(!rendered.contains("<rank "));
@@ -169,16 +167,14 @@ async fn chess_board_squares_render_as_a_flat_agent_facing_list() {
 
 #[tokio::test]
 async fn chess_task_view_escapes_task_text() {
-    let prompt = ChessTaskView::new("Choose <e2e4> & verify.", json!({}));
+    let prompt = ChessTaskView::new("Choose <e2e4> & verify.", "turn<&>");
+    let rendered = render_pom_document(&resolve_system_document(Document::from_xml(
+        prompt.build_root().unwrap(),
+    )))
+    .unwrap();
 
-    let rendered = prompt
-        .render_full(&TemplateEngine::new())
-        .await
-        .unwrap()
-        .into_string();
-
-    assert!(rendered.contains("<task>Choose &lt;e2e4&gt; &amp; verify.</task>"));
-    assert!(!rendered.contains("<task>Choose <e2e4> & verify.</task>"));
+    assert!(rendered.contains("<instruction>Choose &lt;e2e4&gt; &amp; verify.</instruction>"));
+    assert!(rendered.contains("<active_turn_id>turn&lt;&amp;&gt;</active_turn_id>"));
 }
 
 #[cfg(unix)]
@@ -233,45 +229,35 @@ async fn observe_renders_starting_board_and_move_contract() {
     assert_eq!(snapshot.view.piece_symbol_for_test(7, 4), Some('K'));
     assert!(snapshot.view.legal_uci_moves().contains(&"e2e4"));
     assert!(snapshot.view.legal_uci_moves().contains(&"g1f3"));
-    assert!(snapshot
-        .turn_prompt
-        .task
-        .contains("Choose white's next move."));
-    assert_eq!(
-        snapshot.turn_prompt.reply_schema["required"],
-        json!(["uci"])
-    );
-
-    let rendered_view = snapshot
-        .view
-        .render_full(&TemplateEngine::new())
-        .await
-        .unwrap()
-        .into_string();
+    let rendered_view = render_pom_document(&resolve_system_document(Document::from_xml(
+        snapshot.view.build_root().unwrap(),
+    )))
+    .unwrap();
     assert!(rendered_view.starts_with("<prompt_board>"));
     assert!(!rendered_view.contains("render_mode=\"full\""));
     assert!(!rendered_view.contains("<rendering_mode"));
-    assert!(rendered_view.contains("\n  <board_state kind=\"board_state\">\n    <board_ascii>"));
-    assert!(rendered_view.contains("\n  <board_squares>\n    <square id=\"a8\""));
-    assert!(rendered_view.contains("\n  <legal_moves>"));
-    assert!(rendered_view.contains("\n    <move>e2e4</move>"));
-    assert!(rendered_view.contains("\n  <engine kind=\"engine\">\n    <pending>false</pending>"));
+    assert!(rendered_view.contains("<board_state kind=\"board_state\"><board_ascii>"));
+    assert!(rendered_view.contains("<board_squares><square id=\"a8\""));
+    assert!(rendered_view.contains("<legal_moves>"));
+    assert!(rendered_view.contains("<move>e2e4</move>"));
+    assert!(rendered_view.contains("<engine kind=\"engine\"><pending>false</pending>"));
     assert!(!rendered_view.contains("<chess_view>"));
 
-    let rendered_prompt = snapshot
-        .turn_prompt
-        .render_full(&TemplateEngine::new())
-        .await
-        .unwrap()
-        .into_string();
-    assert!(rendered_prompt.starts_with("<chess_task>"));
-    assert!(rendered_prompt.contains("\n  <reasoning_policy>"));
+    let rendered_prompt = render_pom_document(&snapshot.user_document).unwrap();
+    assert!(rendered_prompt.starts_with("<agent_context kind=\"prompt_board\">"));
+    assert!(rendered_prompt.contains("<chess_task>"));
+    assert!(
+        rendered_prompt.contains("<instruction>Choose white's next move.</instruction>"),
+        "{rendered_prompt}"
+    );
+    assert!(rendered_prompt.contains("<active_turn_id>turn-1</active_turn_id>"));
+    assert!(rendered_prompt.contains("<reasoning_policy>"));
     assert!(rendered_prompt.contains("Think privately about candidate moves before acting."));
     assert!(rendered_prompt
         .contains("Do not print chain-of-thought; call the CLI only after deciding."));
-    assert!(rendered_prompt.contains("\n  <reply_contract transport=\"cli\">"));
+    assert!(rendered_prompt.contains("<reply_contract transport=\"cli\">"));
     assert!(rendered_prompt.contains(
-        "<command>agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; --to &lt;to&gt; [--promotion &lt;promotion&gt;] --uci &lt;uci&gt;</command>"
+        "<command>agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; --to &lt;to&gt; \\[--promotion &lt;promotion&gt;\\] --uci &lt;uci&gt;</command>"
     ));
     assert!(rendered_prompt
         .contains("<example>agentview chess act --piece P --from e2 --to e4 --uci e2e4</example>"));
@@ -391,34 +377,31 @@ async fn chess_view_uses_generic_field_diff_for_a_player_move() {
         .await
         .unwrap();
 
-    let rendered = update
-        .snapshot()
-        .unwrap()
-        .view
-        .render_delta(&snapshot.view, &TemplateEngine::new())
-        .await
-        .unwrap()
-        .unwrap()
-        .into_string();
+    let rendered = render_pom_document(&update.snapshot().unwrap().user_document).unwrap();
 
-    assert!(rendered.starts_with("<prompt_board rendering_mode=\"delta\">"));
+    assert!(
+        rendered.starts_with("<agent_context rendering_mode=\"delta\" kind=\"prompt_board\">"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "<board_state rendering_mode=\"delta\"><replace><board_state kind=\"board_state\">"
+        ),
+        "{rendered}"
+    );
     assert!(rendered.contains(
-        "\n  <board_state rendering_mode=\"delta\">\n    <replace>\n      <board_state kind=\"board_state\">"
+        "<board_squares rendering_mode=\"delta\"><update><square id=\"e2\" file=\"e\" rank=\"2\">.</square>"
     ));
-    assert!(rendered.contains(
-        "\n  <board_squares rendering_mode=\"delta\">\n    <update>\n      <square id=\"e2\" file=\"e\" rank=\"2\">.</square>"
-    ));
-    assert!(rendered
-        .contains("\n    <update>\n      <square id=\"e4\" file=\"e\" rank=\"4\">P</square>"));
-    assert_eq!(rendered.matches("\n    <update>").count(), 2);
+    assert!(rendered.contains("<update><square id=\"e4\" file=\"e\" rank=\"4\">P</square>"));
+    assert_eq!(rendered.matches("<update>").count(), 2);
     assert_eq!(rendered.matches("<square id=").count(), 2);
     assert!(!rendered.contains("<square id=\"a8\""));
-    assert!(rendered.contains("\n  <legal_moves rendering_mode=\"delta\">"));
-    assert!(rendered.contains("\n    <insert>"));
-    assert!(rendered.contains("\n    <remove>"));
-    assert!(rendered.contains("\n  <move_history rendering_mode=\"delta\">"));
+    assert!(rendered.contains("<legal_moves rendering_mode=\"delta\">"));
+    assert!(rendered.contains("<insert>"));
+    assert!(rendered.contains("<remove>"));
+    assert!(rendered.contains("<move_history rendering_mode=\"delta\">"));
     assert!(rendered.contains("<move>e2e4</move>"));
-    assert!(rendered.contains("\n  <engine rendering_mode=\"delta\">\n    <replace>"));
+    assert!(rendered.contains("<engine rendering_mode=\"delta\"><replace>"));
     assert!(rendered.contains("<pending>true</pending>"));
     assert!(!rendered.contains("render_mode="));
     assert!(!rendered.contains("<added>"));
@@ -436,15 +419,9 @@ async fn chess_view_keyed_diff_emits_all_four_castling_square_updates() {
     }
 
     let after_castling = apply_test_move(&mut app, &source, &snapshot, "e1g1").await;
-    let rendered = after_castling
-        .view
-        .render_delta(&snapshot.view, &TemplateEngine::new())
-        .await
-        .unwrap()
-        .unwrap()
-        .into_string();
+    let rendered = render_pom_document(&after_castling.user_document).unwrap();
 
-    assert_eq!(rendered.matches("\n    <update>").count(), 4);
+    assert_eq!(rendered.matches("<update>").count(), 4, "{rendered}");
     assert_eq!(rendered.matches("<square id=").count(), 4);
     assert!(rendered.contains("<square id=\"e1\" file=\"e\" rank=\"1\">.</square>"));
     assert!(rendered.contains("<square id=\"f1\" file=\"f\" rank=\"1\">R</square>"));

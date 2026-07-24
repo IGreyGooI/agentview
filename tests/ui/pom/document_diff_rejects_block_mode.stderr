@@ -1,0 +1,5 @@
+error: document diff fields cannot also use a block rendering mode
+  --> tests/ui/pom/document_diff_rejects_block_mode.rs:13:5
+   |
+13 |     context: Context,
+   |     ^^^^^^^

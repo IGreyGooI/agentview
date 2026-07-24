@@ -2,19 +2,19 @@ use agentview::prelude::*;
 use serde_json::json;
 
 #[test]
-fn full_update_wraps_snapshot_with_turn_prompt() {
-    let turn_prompt = json!({
+fn full_update_wraps_snapshot_with_user_document() {
+    let user_document = json!({
         "instructions": "submit a legal UCI move",
         "schema": {
             "type": "object",
             "required": ["uci"]
         }
     });
-    let snapshot = ViewSnapshot::new(12, "turn-1", "fen board", turn_prompt.clone());
+    let snapshot = ViewSnapshot::new(12, "turn-1", "fen board", user_document.clone());
 
     assert_eq!(snapshot.view_epoch, 12);
     assert_eq!(snapshot.turn_id, "turn-1");
-    assert_eq!(snapshot.turn_prompt, turn_prompt);
+    assert_eq!(snapshot.user_document, user_document);
 
     let update = ViewUpdate::full(10, snapshot.clone());
 

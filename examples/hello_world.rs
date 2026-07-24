@@ -40,17 +40,11 @@ impl ContextViewBuilder for HelloViewBuilder {
     }
 }
 
-#[derive(Debug, Clone)]
-struct HelloLayout;
-
-impl PromptLayout for HelloLayout {
-    fn system_template(&self) -> &'static str {
-        "{{ instructions }}"
-    }
-
-    fn user_template(&self) -> &'static str {
-        "{{ task }}"
-    }
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(document)]
+struct HelloSystemDocument {
+    #[view(paragraph)]
+    instructions: &'static str,
 }
 
 #[derive(Default)]
@@ -82,11 +76,9 @@ async fn main() -> anyhow::Result<()> {
     }));
 
     let view_model = DefaultAgentViewModel::new(
-        HelloLayout,
         HelloViewBuilder,
-        PromptSystemVars {
-            instructions: "Ask for a name, then say hello.".to_owned(),
-            output_schema: None,
+        HelloSystemDocument {
+            instructions: "Ask for a name, then say hello.",
         },
         IdentityTransform,
     );
@@ -102,15 +94,7 @@ async fn main() -> anyhow::Result<()> {
         "observe epoch={} turn={}",
         snapshot.view_epoch, snapshot.turn_id
     );
-    println!(
-        "view: {}",
-        snapshot
-            .view
-            .render_full(&TemplateEngine::new())
-            .await?
-            .as_str()
-    );
-    println!("prompt: {}", snapshot.turn_prompt.task);
+    println!("user: {}", render_pom_document(&snapshot.user_document)?);
 
     let update = app
         .act_with_sink(
@@ -132,14 +116,7 @@ async fn main() -> anyhow::Result<()> {
         .snapshot()
         .ok_or_else(|| anyhow::anyhow!("hello world example expected a full update"))?;
     println!("update epoch={} turn={}", next.view_epoch, next.turn_id);
-    println!(
-        "view: {}",
-        next.view
-            .render_full(&TemplateEngine::new())
-            .await?
-            .as_str()
-    );
-    println!("prompt: {}", next.turn_prompt.task);
+    println!("user: {}", render_pom_document(&next.user_document)?);
 
     Ok(())
 }

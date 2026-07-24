@@ -115,7 +115,8 @@ fn observe_then_act_share_an_implicit_server_session() {
     let observe_stdout = String::from_utf8_lossy(&observe.stdout);
     assert!(observe_stdout.contains("observe epoch=0 turn=turn-1"));
     assert!(observe_stdout.contains(r#"view: <hello greeting="Hello" />"#));
-    assert!(observe_stdout.contains("prompt: Ask the caller for their name."));
+    assert!(observe_stdout.contains("prompt:\n<agent_context kind=\"hello\" greeting=\"Hello\" />"));
+    assert!(observe_stdout.contains("\n\nAsk the caller for their name."));
 
     let act = run_cli(&addr, &["act", "world"]);
 
@@ -124,10 +125,11 @@ fn observe_then_act_share_an_implicit_server_session() {
     assert!(act.status.success(), "{act:?}");
     let act_stdout = String::from_utf8_lossy(&act.stdout);
     assert!(act_stdout.contains("update epoch=1 turn=turn-2"));
-    assert!(act_stdout.contains("view:\n<hello greeting=\"Hello\">"));
-    assert!(act_stdout.contains("  <name>world</name>"));
-    assert!(act_stdout.contains("</hello>"));
-    assert!(act_stdout.contains("prompt: Say hello to the named caller."));
+    assert!(act_stdout.contains("view: <hello greeting=\"Hello\"><name>world</name></hello>"));
+    assert!(act_stdout.contains(
+        "prompt:\n<agent_context rendering_mode=\"delta\" kind=\"hello\"><name>world</name></agent_context>"
+    ));
+    assert!(act_stdout.contains("\n\nSay hello to the named caller."));
 }
 
 #[test]
@@ -147,7 +149,7 @@ fn chess_commands_share_an_implicit_server_session() {
     assert!(observe_stdout.contains("<board_squares>"));
     assert!(!observe_stdout.contains("<board_squares kind="));
     assert!(observe_stdout.contains(
-        "<command>agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; --to &lt;to&gt; [--promotion &lt;promotion&gt;] --uci &lt;uci&gt;</command>"
+        "<command>agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; --to &lt;to&gt; \\[--promotion &lt;promotion&gt;\\] --uci &lt;uci&gt;</command>"
     ));
     assert!(observe_stdout
         .contains("<example>agentview chess act --piece P --from e2 --to e4 --uci e2e4</example>"));
@@ -162,28 +164,32 @@ fn chess_commands_share_an_implicit_server_session() {
     assert!(act.status.success(), "{act:?}");
     let act_stdout = String::from_utf8_lossy(&act.stdout);
     assert!(act_stdout.contains("act epoch=1 turn=turn-2"));
-    assert!(act_stdout.contains("<prompt_board rendering_mode=\"delta\">"));
-    assert!(!act_stdout.contains("<prompt_board_update>"));
-    assert!(act_stdout.contains("<board_state rendering_mode=\"delta\">"));
-    assert!(act_stdout.contains("<board_squares rendering_mode=\"delta\">"));
-    assert!(act_stdout.contains("<update>"));
-    assert!(act_stdout.contains("<square id=\"e2\" file=\"e\" rank=\"2\">.</square>"));
-    assert!(act_stdout.contains("<square id=\"e4\" file=\"e\" rank=\"4\">P</square>"));
-    assert!(!act_stdout.contains("<square id=\"a8\""));
-    assert!(!act_stdout.contains("<rank n="));
-    assert!(!act_stdout.contains("<changed_sections>"));
-    assert!(act_stdout.contains("<legal_moves rendering_mode=\"delta\">"));
-    assert!(act_stdout.contains("<insert>"));
-    assert!(act_stdout.contains("<remove>"));
-    assert!(act_stdout.contains("<move_history rendering_mode=\"delta\">"));
-    assert!(act_stdout.contains("<move>e2e4</move>"));
-    assert!(act_stdout.contains("<move>e7e5</move>"));
-    assert!(act_stdout.contains("<engine rendering_mode=\"delta\">"));
-    assert!(act_stdout.contains("<replace>"));
-    assert!(act_stdout.contains("<pending>true</pending>"));
-    assert!(!act_stdout.contains("render_mode="));
-    assert!(!act_stdout.contains("<added>"));
-    assert!(!act_stdout.contains("<removed>"));
+    let act_prompt = act_stdout
+        .split_once("prompt:\n")
+        .expect("act response should contain a prompt")
+        .1;
+    assert!(act_prompt.contains("<agent_context rendering_mode=\"delta\" kind=\"prompt_board\">"));
+    assert!(!act_prompt.contains("<prompt_board_update>"));
+    assert!(act_prompt.contains("<board_state rendering_mode=\"delta\">"));
+    assert!(act_prompt.contains("<board_squares rendering_mode=\"delta\">"));
+    assert!(act_prompt.contains("<update>"));
+    assert!(act_prompt.contains("<square id=\"e2\" file=\"e\" rank=\"2\">.</square>"));
+    assert!(act_prompt.contains("<square id=\"e4\" file=\"e\" rank=\"4\">P</square>"));
+    assert!(!act_prompt.contains("<square id=\"a8\""));
+    assert!(!act_prompt.contains("<rank n="));
+    assert!(!act_prompt.contains("<changed_sections>"));
+    assert!(act_prompt.contains("<legal_moves rendering_mode=\"delta\">"));
+    assert!(act_prompt.contains("<insert>"));
+    assert!(act_prompt.contains("<remove>"));
+    assert!(act_prompt.contains("<move_history rendering_mode=\"delta\">"));
+    assert!(act_prompt.contains("<move>e2e4</move>"));
+    assert!(act_prompt.contains("<move>e7e5</move>"));
+    assert!(act_prompt.contains("<engine rendering_mode=\"delta\">"));
+    assert!(act_prompt.contains("<replace>"));
+    assert!(act_prompt.contains("<pending>true</pending>"));
+    assert!(!act_prompt.contains("render_mode="));
+    assert!(!act_prompt.contains("<added>"));
+    assert!(!act_prompt.contains("<removed>"));
 
     let hook = run_cli_with_env(&addr, &["chess", "hook", "1"], &envs);
 
@@ -192,27 +198,31 @@ fn chess_commands_share_an_implicit_server_session() {
     assert!(hook.status.success(), "{hook:?}");
     let hook_stdout = String::from_utf8_lossy(&hook.stdout);
     assert!(hook_stdout.contains("hook epoch=2 turn=turn-3"));
-    assert!(hook_stdout.contains("<prompt_board rendering_mode=\"delta\">"));
-    assert!(!hook_stdout.contains("<prompt_board_update>"));
-    assert!(hook_stdout.contains("<board_state rendering_mode=\"delta\">"));
-    assert!(hook_stdout.contains("<board_squares rendering_mode=\"delta\">"));
-    assert!(hook_stdout.contains("<update>"));
-    assert!(hook_stdout.contains("<square id=\"e7\" file=\"e\" rank=\"7\">.</square>"));
-    assert!(hook_stdout.contains("<square id=\"e5\" file=\"e\" rank=\"5\">p</square>"));
-    assert!(!hook_stdout.contains("<square id=\"a8\""));
-    assert!(!hook_stdout.contains("<rank n="));
-    assert!(!hook_stdout.contains("<changed_sections>"));
-    assert!(hook_stdout.contains("<legal_moves rendering_mode=\"delta\">"));
-    assert!(hook_stdout.contains("<insert>"));
-    assert!(hook_stdout.contains("<remove>"));
-    assert!(hook_stdout.contains("<move_history rendering_mode=\"delta\">"));
-    assert!(hook_stdout.contains("<move>e7e5</move>"));
-    assert!(hook_stdout.contains("<engine rendering_mode=\"delta\">"));
-    assert!(hook_stdout.contains("<replace>"));
-    assert!(hook_stdout.contains("<pending>false</pending>"));
-    assert!(!hook_stdout.contains("render_mode="));
-    assert!(!hook_stdout.contains("<added>"));
-    assert!(!hook_stdout.contains("<removed>"));
+    let hook_prompt = hook_stdout
+        .split_once("prompt:\n")
+        .expect("hook response should contain a prompt")
+        .1;
+    assert!(hook_prompt.contains("<agent_context rendering_mode=\"delta\" kind=\"prompt_board\">"));
+    assert!(!hook_prompt.contains("<prompt_board_update>"));
+    assert!(hook_prompt.contains("<board_state rendering_mode=\"delta\">"));
+    assert!(hook_prompt.contains("<board_squares rendering_mode=\"delta\">"));
+    assert!(hook_prompt.contains("<update>"));
+    assert!(hook_prompt.contains("<square id=\"e7\" file=\"e\" rank=\"7\">.</square>"));
+    assert!(hook_prompt.contains("<square id=\"e5\" file=\"e\" rank=\"5\">p</square>"));
+    assert!(!hook_prompt.contains("<square id=\"a8\""));
+    assert!(!hook_prompt.contains("<rank n="));
+    assert!(!hook_prompt.contains("<changed_sections>"));
+    assert!(hook_prompt.contains("<legal_moves rendering_mode=\"delta\">"));
+    assert!(hook_prompt.contains("<insert>"));
+    assert!(hook_prompt.contains("<remove>"));
+    assert!(hook_prompt.contains("<move_history rendering_mode=\"delta\">"));
+    assert!(hook_prompt.contains("<move>e7e5</move>"));
+    assert!(hook_prompt.contains("<engine rendering_mode=\"delta\">"));
+    assert!(hook_prompt.contains("<replace>"));
+    assert!(hook_prompt.contains("<pending>false</pending>"));
+    assert!(!hook_prompt.contains("render_mode="));
+    assert!(!hook_prompt.contains("<added>"));
+    assert!(!hook_prompt.contains("<removed>"));
 
     let _ = fs::remove_dir_all(dir);
 }

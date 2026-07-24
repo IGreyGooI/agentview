@@ -1,9 +1,12 @@
-# AgentView Derive: POM AST And Legacy Diff
+# AgentView Derive: POM Documents And Stateful XML Diff
 
 This document describes the current `AgentView` derive syntax. The derive now
-builds a typed Prompt Object Model (POM) AST. During the user/context migration,
-ordinary XML and display views also receive a legacy semantic implementation so
-the existing context differ can keep operating.
+builds a typed Prompt Object Model (POM) AST. `Agent` and `AgentViewApp` use
+that AST for both complete system documents and stateful user documents.
+Legacy-compatible XML/display derives also receive a semantic implementation
+for isolated compatibility APIs and characterization tests. POM-only field
+modes such as `root` and `code_span` do not generate that duplicate
+implementation, and request assembly never uses it.
 
 The POM view is an agent-facing frontend tree. A struct's `kind` describes the
 concrete XML view model being built. A field name describes the role that a
@@ -29,31 +32,29 @@ Rust struct instance
 `#[agent_view(display)]` produces `TextNode`. The associated `Root` type makes
 these distinctions compile-time facts.
 
-The current context delta path remains a compatibility path. It builds current
-and previous legacy trees independently, compares those trees, and only then
-renders the resulting delta tree:
+System and user documents use different resolvers:
 
 ```text
-current Rust instance  -> complete current semantic tree
-previous Rust instance -> complete previous semantic tree
-                                      |
-                                      v
-                              semantic tree diff
-                                      |
-                                      v
-                              delta semantic tree
-                                      |
-                                      v
-                                prompt renderer
+system struct -> Document -> full materialization -> ResolvedDocument -> renderer
+
+user struct -> Document + previous UserDocumentCursor
+            -> stateful slot resolution
+               |- ResolvedDocument -> renderer
+               `- candidate cursor -> successful turn/snapshot commit only
 ```
 
 The diff engine does not compare Rust structs directly and does not compare
-already-rendered prompt strings. On an XML view, `#[view(diff)]` now retains the
-boundary as a real POM `DiffSlot`; the temporary legacy implementation also
-retains the same boundary as `SemanticDiffSlot`. POM `DiffSlot::present` only
-accepts `XmlNode`, so a `Document`, Markdown root, or `TextNode` cannot become a
-diff value. System resolution materializes present slots without diffing. The
-stateful POM user-document differ is not integrated yet.
+already-rendered prompt strings. On an XML view, `#[view(diff)]` retains the
+boundary as a real POM `DiffSlot`. A Document-level `#[view(diff)]` creates an
+outermost cursor boundary; nested XML slots remain inside that complete
+baseline and are consumed by recursive XML comparison. POM `DiffSlot::present`
+only accepts `XmlNode`, so a `Document`, Markdown root, or `TextNode` cannot
+become a diff value. System resolution materializes present slots without
+diffing.
+
+XML examples below are indented for readability. The canonical POM renderer
+may emit an inline-only XML subtree compactly; renderer snapshot tests, not the
+presentation whitespace in this guide, define the exact bytes.
 
 ## Derive Syntax
 
@@ -119,10 +120,25 @@ Document view fields must choose a block mode:
 - `#[view(paragraph)]`;
 - `#[view(ordered_list)]` or `#[view(unordered_list)]`, where each item derives
   `AgentView<Root = ParagraphNode>`;
-- `#[view(xml)]`, where the field derives `AgentView<Root = XmlNode>`.
+- `#[view(xml)]`, where the field derives `AgentView<Root = XmlNode>`;
+- `#[view(block)]`, which splices a block-shaped root, optional block, nested
+  `Document`, `TurnArtifact`, or each item of a directly declared `Vec<T>`;
+- `#[view(diff)]`, which creates an outermost XML `DiffSlot`.
+
+Only a Document diff field can use `#[view(name = "...", diff)]`; the name is
+its prompt-facing cursor role. Its value must statically build an `XmlNode`.
+Derived structured XML views and raw `XmlNode` values are supported;
+`Option<T>::None` creates an explicit absent slot. A `Vec<T>` diff field must
+choose `append`, `seq`, `set`, or `key`. Collection strategies cannot be used
+on a non-`Vec` field, outside `diff`, or together with `replace`.
+
+The current `#[view(block)]` vector expansion recognizes a directly written
+`Vec<T>` type. A type alias, slice, or array is not promised the same special
+handling; wrap those values in an explicit block/document view.
 
 A `#[agent_view(markdown = "paragraph")]` view accepts `#[view(text)]` and
-`#[view(code_span)]` fields. Field order is AST child order.
+`#[view(code_span)]` fields. It can also use `#[view(xml)]` for a typed inline
+XML island. Field order is AST child order.
 
 `#[view(attr = "...")]` and `#[view(children)]` are still accepted as legacy
 aliases, but new examples should use `name = "..."` and `flatten`.
@@ -326,8 +342,8 @@ non-prompt state:
 
 ```rust
 #[derive(AgentView)]
-#[agent_view(kind = "turn_prompt")]
-struct TurnPromptView {
+#[agent_view(kind = "choice_request")]
+struct ChoiceRequestView {
     #[view(element)]
     task: String,
 
@@ -339,9 +355,9 @@ struct TurnPromptView {
 renders as:
 
 ```xml
-<turn_prompt>
+<choice_request>
   <task>Choose a move.</task>
-</turn_prompt>
+</choice_request>
 ```
 
 If a view struct cannot use the output name directly, use the explicit escape
@@ -542,22 +558,24 @@ its old compatibility output for root `None`:
 
 ## Field Diffs
 
-In POM, `#[view(diff)]` records a real `DiffSlot` edge in the complete
-`XmlNode`. A POM root is not automatically stateful: request assembly must place
-the XML root in an explicit outer `DiffSlot` when it wants a document-level
-boundary.
-
-The currently shipped `render_agent_view_diff_xml` compatibility API still
-treats every legacy root as the implicit first diff slot. Its generic diff
-engine compares two complete legacy trees: unmarked changes replace the current
-node, marked fields may recurse, and a removed marked field renders an explicit
-`<none />` patch.
-
-Diff rendering is requested explicitly:
+`#[view(diff)]` records a real `DiffSlot` edge in the complete POM tree. An XML
+root is not automatically stateful. A user `Document` establishes the
+document-level boundary explicitly:
 
 ```rust
-render_agent_view_diff_xml(&current, &previous)
+#[derive(AgentView)]
+#[agent_view(document)]
+struct SceneUserDocument {
+    #[view(name = "agent_context", diff)]
+    scene: SceneView,
+}
 ```
+
+`resolve_user_document(current_document, previous_cursor)` compares the current
+complete `<agent_context>` node with that role's last successfully committed
+complete node. It returns a slot-free `ResolvedDocument` and a candidate next
+cursor. Ordinary task/artifact/Markdown blocks are current content and are
+preserved every turn; only marked XML slots enter the cursor.
 
 For example, this root can produce either a complete replacement or a delta:
 
@@ -579,16 +597,15 @@ struct SceneView {
 }
 ```
 
-`#[agent_view(diff)]` is not supported. On the compatibility API, the root
-already participates; on POM, an outer boundary is an explicit `DiffSlot`
-owned by document assembly. `AgentView` has no type-specific diff methods or
+`#[agent_view(diff)]` is not supported. The outer boundary is an explicit
+Document `DiffSlot`; `AgentView` has no type-specific diff methods or
 collection diff helpers to implement.
 
-The current legacy comparison contract is:
+The POM comparison contract is:
 
 - Equal values produce `None`.
-- The root is always eligible for recursive comparison. A changed scalar or
-  other non-node root is replaced with its complete current rendering.
+- An outer slot uses its declared strategy. A recursive slot compares its
+  complete current/previous XML roots.
 - If a node's tag, attributes, or unmarked content changes, the diff replaces
   that complete current node.
 - `#[view(diff)]` marks a field that can be expanded. If only diff fields
@@ -604,6 +621,10 @@ The current legacy comparison contract is:
   `#[view(diff(key = "attr_name"))]`.
 - `BTreeMap<K, V>` diff fields use their map keys as identity and render
   `insert`, `remove`, and `update` operation wrappers.
+- A strategy change sends the complete current slot and begins a new baseline.
+- An explicit absent slot emits `<role rendering_mode="delta"><none /></role>`
+  and deletes that role's baseline. Omitting a slot from one current Document
+  leaves its old baseline untouched.
 
 ### Invalid Diff Combinations
 
@@ -621,6 +642,11 @@ are compile errors:
 `#[view(element, diff)]` remains a supported compatibility spelling and has the
 same node-shaped behavior as `#[view(diff)]`. Conflicting rendering modes, such
 as `#[view(attr, element)]`, are also compile errors.
+
+Within `#[agent_view(document)]`, a diff field uses the default field mode;
+combining it with `block`, `xml`, `paragraph`, or another block mode is a
+compile error. Text, Markdown, and Document roots fail their static
+`XmlNode`/`DocumentDiffValue` bound.
 
 For example, if an unmarked field such as `title` changes, the root is rendered
 as the current full view:
@@ -716,7 +742,7 @@ items:
 ```
 
 `key` mode treats a vector like a keyed collection. The key is read from an
-attribute on each item's rendered root node:
+attribute on each item's built `XmlNode` root:
 
 ```rust
 #[derive(AgentView)]
@@ -774,11 +800,13 @@ The derive macro's primary result is POM AST: `XmlNode`, `Document`,
 `ParagraphNode`, or `TextNode`. It does not render prompt text. Resolution and
 rendering are later steps.
 
-Until the user/context path migrates, XML and display derives also generate an
-implementation of `semantic_view::AgentView`. That compatibility tree retains:
+Legacy-compatible XML and display derives also generate an implementation of
+`semantic_view::AgentView`. That compatibility tree retains:
 
 - `Node(SemanticNode)`: an element with attributes and children.
-- `Text(String)`: escaped text.
+- `Text(String)`: raw text escaped later by the legacy serializer.
+- `Comment(String)`: raw comment content normalized/escaped by the legacy
+  serializer.
 
 For a derived XML record, ordinary fields become ordinary POM content and each
 `#[view(diff)]` field becomes a `DiffSlot` with its complete XML value and
@@ -788,11 +816,10 @@ absent optional slots are omitted. During legacy comparison, unchanged slots
 disappear from the delta, changed slots emit their patch, and a
 present-to-absent transition becomes `<field><none /></field>`.
 
-Legacy-compatible XML/display views also implement `AgentViewRoot`, which lets
-them enter the existing `ContextView` / `PromptRenderable` pipeline without
-hand-written rendering boilerplate. `Document` and Markdown roots do not
-implement that legacy marker. An XML `#[derive(AgentView)]` struct can therefore
-still be the `ContextViewBuilder::View` type directly:
+This duplicate implementation is a compatibility surface, not the active
+request pipeline. `Agent`, `DefaultAgentViewModel`, and `AgentViewApp` require
+the POM `AgentView<Root = XmlNode> + AgentViewValue` contract. A derived XML
+struct is therefore the `ContextViewBuilder::View` directly:
 
 ```rust
 #[derive(AgentView)]
@@ -810,82 +837,121 @@ impl ContextViewBuilder for HelloViewBuilder {
 }
 ```
 
-This bridge is intentionally marker-based. Built-in scalar `String` still
-renders as plain prompt text through the legacy `PromptRenderable for String`
-implementation, so ordinary prompts are not XML-escaped just because `String`
-also implements `AgentView`.
+The old APIs remain for legacy callers and characterization tests.
+`AgentViewRoot`, the `Semantic*` types, and legacy render helpers are still
+re-exported by the prelude for compatibility. `ContextView`,
+`PromptRenderable`, and `TemplateEngine` require explicit
+`agentview::templates` imports and are not part of the recommended request
+path. No new system/user request code should use their rendered strings as an
+AST boundary.
 
-## Derived POM System Prompt Path
+## Derived System And User Documents
 
-System prompts use the same derive to author structured Markdown and XML. This
-path does not replace the legacy user/context differ yet.
+`AgentViewModel` owns both complete documents:
 
-The implemented system pipeline is:
+```rust
+async fn build_system_document(
+    &self,
+    ctx: &PromptContext<I, Self::ContextState>,
+    source: &Self::Source,
+) -> anyhow::Result<Document>;
 
-```text
-POM Document
-    -> resolve_system_document
-    -> ResolvedDocument
-    -> render_pom_document / PromptRenderable
-    -> AgentTurnRequest.system
+async fn build_user_document(
+    &self,
+    ctx: &PromptContext<I, Self::ContextState>,
+    call_id: &str,
+    task: StorageString,
+    current_view: &Self::View,
+) -> anyhow::Result<Document>;
 ```
 
-`Document` is the authoring type and may contain `DiffSlot` edges.
-`resolve_system_document` applies system semantics recursively:
+The framework does not add `## View`, `## Turn Prompt`, or any other fixed
+envelope. Field order in the derived user-document struct is prompt order, so
+context, typed artifacts, retry feedback, task, and additional sections can be
+composed freely.
 
-- a present slot is expanded to its complete `XmlNode`;
+System resolution always materializes:
+
+- a present slot expands to its complete `XmlNode`;
 - an absent slot is omitted;
-- slot roles and strategies are ignored;
-- no previous state, cursor, delta, warning, or session mutation is involved.
+- role and strategy metadata are ignored;
+- no cursor is read or changed.
 
-The result is the opaque, slot-free `ResolvedDocument`. Only that resolved type
-implements `PromptRenderable`; an unresolved `Document` cannot be sent directly
-through the prompt bridge. The renderer then emits canonical Markdown plus XML,
-including Markdown/XML context escaping, ordered and unordered lists, dynamic
-code fences, code spans, and XML mixed content. Structures with no canonical
-CommonMark representation, such as an empty paragraph, zero-item list, or empty
-code span, return `PomRenderError` instead of being silently dropped.
+User resolution is stateful:
 
-The shape used by the streaming tool-loop example is:
+- ordinary current blocks are preserved; if slot omission empties an otherwise
+  nonempty Markdown container, resolution prunes that now-empty container so
+  the resolved document remains renderable;
+- a first-seen present slot is sent in full and recorded;
+- an unchanged slot is omitted;
+- a changed slot emits recursive/replacement/collection output;
+- an explicit absent slot emits deletion and removes the baseline;
+- a slot missing from one current Document keeps its baseline;
+- duplicate outermost roles are rejected before output/cursor publication.
+
+The returned cursor is a candidate. `Agent` commits it only after provider
+execution and `commit_turn` both succeed. History replacement clears the draft
+cursor and rebuilds the request in full. Provider/commit failure and
+cancellation keep the old cursor. `AgentViewApp` uses the same rule across
+epoch retries: a candidate built for an unstable epoch is discarded. It also
+validates canonical rendering before publishing a stable snapshot/cursor.
+`act_with_sink` consumes the accepted turn id before applying external side
+effects, so a later snapshot failure cannot replay the same action.
+
+Both resolvers return opaque, slot-free `ResolvedDocument`; only that type can
+be passed to `render_pom_document`. The renderer emits canonical Markdown plus
+XML and owns escaping, list syntax, code fences/spans, XML mixed content, and
+error reporting. Empty paragraphs, zero-item lists, empty code spans, and
+invalid XML characters fail rather than falling back to raw markup.
+
+The streaming demo authors workflow prose with paragraph views that contain
+the actual typed tool value as `#[view(xml)]`:
+
+```rust
+#[derive(AgentView)]
+#[agent_view(markdown = "paragraph")]
+struct WorkflowStep<T>
+where
+    T: AgentView<Root = XmlNode>,
+{
+    #[view(text)]
+    before: &'static str,
+
+    #[view(xml)]
+    call: T,
+
+    #[view(text)]
+    after: &'static str,
+}
+```
+
+It does not call `tag()`, build an `XmlNode` manually, or `format!` an XML call
+string. `StreamingTool<C>` itself requires `AgentView<Root = XmlNode>`.
+Registration uses the derived contract identity; system-document composition
+chooses where each tool node appears.
+
+The demo user document shows the full composition pattern:
 
 ```rust
 #[derive(AgentView)]
 #[agent_view(document)]
-struct DemoSystemPromptView {
-    #[view(heading = 1)]
-    title: String,
+struct DemoUserDocument {
+    #[view(name = "agent_context", diff)]
+    context: DemoContextView,
 
-    #[view(paragraph)]
-    task: String,
+    #[view(block)]
+    artifacts: Vec<TurnArtifact>,
 
-    #[view(ordered_list)]
-    workflow: Vec<DemoWorkflowStepView>,
+    #[view(block)]
+    feedback: Option<PromptParagraph>,
 
-    #[view(xml)]
-    response_contract: DemoResponseContractView,
+    #[view(block)]
+    task: Option<PromptParagraph>,
 }
-
-let document = system_prompt_view.build_root()?;
-let system_prompt = resolve_system_document(document);
 ```
 
-Both the response contract and every streaming tool contract are derived
-`XmlNode` views. `StreamingTool<C>` requires `AgentView<Root = XmlNode>`; there
-is no separate `build_prompt_node` or required `tag` method. Registration uses
-the `name` attribute for a derived `<tool>` contract; every other contract uses
-its derived XML root name. An ordinary payload attribute named `name` therefore
-cannot silently change the parser registration identity. A generic `<tool>`
-contract without `name` is rejected during registration.
-
-The chess example uses the same derived system-document path while deliberately
-keeping its `ChessTaskView` turn prompt and semantic board diff on the legacy path.
-Chess is an externally controlled `AgentViewApp`, not a provider-backed
-`Agent`, so `AgentViewApp` does not consume `build_system_prompt`. The standalone
-example explicitly builds and prints the resolved chess system prompt to make
-that boundary visible.
-
-This is deliberately a system-focused integration slice. The current user
-prompt, context capture, semantic diff, and fixed `## View` / `## Turn Prompt`
-composition still use the legacy `SemanticNode` pipeline. User-document
-resolution, a `UserDocumentCursor`, and the final POM differ cutover remain
-separate work.
+Chess uses the same pattern for its board context and typed `ChessTaskView`.
+Its keyed square diff, legal-move set diff, move-history sequence diff, and
+replace fields all run through the POM cursor path. The hello/default model
+uses a derived system Document and the framework's derived default user
+Document. None of these business paths manually render prompt markup.

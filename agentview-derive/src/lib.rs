@@ -181,13 +181,14 @@ fn expand_agent_view(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
                 ));
             }
             FieldMode::Xml
+            | FieldMode::Block
             | FieldMode::Paragraph
             | FieldMode::Heading(_)
             | FieldMode::OrderedList
             | FieldMode::UnorderedList => {
                 return Err(syn::Error::new_spanned(
                     &field_ident,
-                    "this field mode is only valid in a document view",
+                    "this field mode is only valid in a document or Markdown paragraph view",
                 ));
             }
         }
@@ -393,11 +394,76 @@ fn expand_document_view(
     let mut block_builders = Vec::new();
     for field in fields.named {
         let field_ident = field.ident.expect("named field");
+        let field_is_vec = is_vec_type(&field.ty);
+        let raw_field_name = field_ident.to_string();
+        let field_name = raw_field_name
+            .strip_prefix("r#")
+            .unwrap_or(&raw_field_name)
+            .to_owned();
         let options = field_options(&field.attrs)?;
         if options.skip {
             validate_skipped_field(&field_ident, &options)?;
             continue;
         }
+
+        if options.diff && field_is_vec && options.collection_diff_mode.is_none() {
+            return Err(syn::Error::new_spanned(
+                &field_ident,
+                "Vec diff fields must choose a collection mode, for example `#[view(diff(append))]`",
+            ));
+        }
+        if options.replace && !options.diff {
+            return Err(syn::Error::new_spanned(
+                &field_ident,
+                "`replace` requires `#[view(diff(replace))]`",
+            ));
+        }
+        if options.collection_diff_mode.is_some() && !options.diff {
+            return Err(syn::Error::new_spanned(
+                &field_ident,
+                "collection diff modes require `#[view(diff(...))]`",
+            ));
+        }
+        if options.replace && options.collection_diff_mode.is_some() {
+            return Err(syn::Error::new_spanned(
+                &field_ident,
+                "`replace` cannot be combined with collection diff modes",
+            ));
+        }
+        if options.collection_diff_mode.is_some() && !field_is_vec {
+            return Err(syn::Error::new_spanned(
+                &field_ident,
+                "collection diff modes are only supported on Vec fields",
+            ));
+        }
+
+        if options.diff {
+            if !matches!(options.mode, FieldMode::Default) {
+                return Err(syn::Error::new_spanned(
+                    &field_ident,
+                    "document diff fields cannot also use a block rendering mode",
+                ));
+            }
+            let role = options.name.clone().unwrap_or_else(|| field_name.clone());
+            validate_inferred_xml_name(
+                &role,
+                field_ident.span(),
+                "document diff field name is not a valid XML name",
+            )?;
+            let strategy =
+                pom_diff_strategy(options.replace, options.collection_diff_mode.as_ref());
+            block_builders.push(quote! {
+                document.xml_slot(
+                    ::agentview::agent_view::build_document_diff_slot(
+                        &self.#field_ident,
+                        ::agentview::pom::XmlName::try_from(#role)?,
+                        #strategy,
+                    )?,
+                );
+            });
+            continue;
+        }
+
         validate_non_diff_field(&field_ident, &options, "document")?;
         if options.name.is_some() {
             return Err(syn::Error::new_spanned(
@@ -450,10 +516,24 @@ fn expand_document_view(
                     )?,
                 );
             },
+            FieldMode::Block if field_is_vec => quote! {
+                for item in &self.#field_ident {
+                    document.extend(
+                        ::agentview::agent_view::build_block_children(item)?,
+                    );
+                }
+            },
+            FieldMode::Block => quote! {
+                document.extend(
+                    ::agentview::agent_view::build_block_children(
+                        &self.#field_ident,
+                    )?,
+                );
+            },
             FieldMode::Default => {
                 return Err(syn::Error::new_spanned(
                     &field_ident,
-                    "document fields need an explicit block mode such as `heading`, `paragraph`, `ordered_list`, or `xml`",
+                    "document fields need an explicit block mode such as `heading`, `paragraph`, `block`, `ordered_list`, or `xml`",
                 ));
             }
             FieldMode::Attr
@@ -525,10 +605,17 @@ fn expand_paragraph_view(
                     ),
                 ));
             },
+            FieldMode::Xml => quote! {
+                children.push(::agentview::pom::InlineContent::xml(
+                    ::agentview::agent_view::build_xml_root(
+                        &self.#field_ident,
+                    )?,
+                ));
+            },
             FieldMode::Default => {
                 return Err(syn::Error::new_spanned(
                     &field_ident,
-                    "Markdown paragraph fields need an explicit `text` or `code_span` mode",
+                    "Markdown paragraph fields need an explicit `text`, `code_span`, or `xml` mode",
                 ));
             }
             FieldMode::Attr
@@ -536,7 +623,7 @@ fn expand_paragraph_view(
             | FieldMode::Comment
             | FieldMode::Flatten
             | FieldMode::Root
-            | FieldMode::Xml
+            | FieldMode::Block
             | FieldMode::Paragraph
             | FieldMode::Heading(_)
             | FieldMode::OrderedList
@@ -685,6 +772,7 @@ enum FieldMode {
     Flatten,
     Root,
     Xml,
+    Block,
     CodeSpan,
     Paragraph,
     Heading(u8),
@@ -772,6 +860,8 @@ fn field_options(attrs: &[syn::Attribute]) -> syn::Result<FieldOptions> {
                 set_field_mode(&mut mode, FieldMode::Root, &meta)
             } else if meta.path.is_ident("xml") {
                 set_field_mode(&mut mode, FieldMode::Xml, &meta)
+            } else if meta.path.is_ident("block") {
+                set_field_mode(&mut mode, FieldMode::Block, &meta)
             } else if meta.path.is_ident("code_span") {
                 set_field_mode(&mut mode, FieldMode::CodeSpan, &meta)
             } else if meta.path.is_ident("paragraph") {
@@ -962,6 +1052,7 @@ fn render_field_expr(
         }
         FieldMode::Root
         | FieldMode::Xml
+        | FieldMode::Block
         | FieldMode::CodeSpan
         | FieldMode::Paragraph
         | FieldMode::Heading(_)
@@ -1056,6 +1147,7 @@ fn pom_field_expr(
         },
         FieldMode::Comment
         | FieldMode::Xml
+        | FieldMode::Block
         | FieldMode::Paragraph
         | FieldMode::Heading(_)
         | FieldMode::OrderedList

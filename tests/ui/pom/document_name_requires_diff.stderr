@@ -1,0 +1,5 @@
+error: `name` is not valid on document fields
+ --> tests/ui/pom/document_name_requires_diff.rs:7:5
+  |
+7 |     task: String,
+  |     ^^^^

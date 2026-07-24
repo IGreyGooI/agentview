@@ -14,6 +14,11 @@ impl Document {
         &self.children
     }
 
+    #[doc(hidden)]
+    pub fn into_children(self) -> BlockChildren {
+        self.children
+    }
+
     pub fn from_xml(node: XmlNode) -> Self {
         let mut children = BlockChildren::new();
         children.push(BlockContent::xml(node));
@@ -37,9 +42,9 @@ impl Document {
 
 /// A complete prompt document with every diff slot resolved.
 ///
-/// Resolved documents can only be produced by a role-specific resolver. This
-/// keeps callers from accidentally treating an unresolved [`Document`] as a
-/// complete prompt.
+/// Resolved documents can only be produced by the system, user, or artifact
+/// resolution boundaries. This keeps callers from accidentally treating an
+/// unresolved [`Document`] as a complete prompt.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ResolvedDocument {
     children: BlockChildren,

@@ -16,14 +16,18 @@ session state, action validity, and control-loop progress.
 `AgentViewApp`. The app covers full `observe`, sync `hook`, and
 `act_with_sink` with a full-update response. External replies are parsed through
 `TurnSink<ControlReply>`, so the same sink concept handles provider streams and
-CLI/daemon replies. It does not yet define the patch decider or any daemon/CLI
-transport envelope.
+CLI/daemon replies. Each snapshot carries the captured typed view plus a
+slot-free POM `ResolvedDocument` for the current user role. `AgentViewApp`
+resolves that document against its `UserDocumentCursor` and only publishes the
+candidate cursor after a stable view epoch. It does not yet define the patch
+decider or any daemon/CLI transport envelope.
 
 The current `agentview::Agent` loop is model-turn shaped:
 
-1. `AgentViewModel` captures a view and renders prompts.
-2. `AgentTurnRequest` is built from system prompt, history, rendered view, and
-   turn prompt.
+1. `AgentViewModel` captures an XML-root view and builds separate system/user
+   POM `Document` values.
+2. Role-specific resolvers and the canonical renderer build
+   `AgentTurnRequest.system` / `.user`.
 3. `LLMExecutor::execute_llm` runs one model-backed turn.
 4. `AgentViewModel::commit_turn` commits the result into `PromptContext`.
 5. `TurnFlow` decides whether the loop waits or continues.
@@ -60,10 +64,9 @@ the same lower-level pieces:
 
 - `PromptContext`
 - `AgentViewModel`
-- `ContextView`
-- `PromptRenderable`
-- `PromptFragment`
-- full and delta rendering
+- typed POM `Document` / `ResolvedDocument`
+- `UserDocumentCursor`
+- system/user resolution and canonical rendering
 - commit policy
 - optional `TurnSink` / streaming-tool parsing
 
@@ -77,7 +80,7 @@ This design has two loops. Keeping them separate is the main coherence rule.
 Loop A is the `AgentView` session loop. It is frontend-like: lazy, reactive, and
 state-facing. It owns or references the application source, uses
 `AgentViewModel` to capture a view, uses the same view model to build a
-`turn_prompt`, tracks `ViewEpoch`, and exposes `observe`, `act`, and `hook`.
+user `Document`, tracks `ViewEpoch`, and exposes `observe`, `act`, and `hook`.
 It does not run the outside chat agent's LLM.
 
 Loop B is the outside chat/CLI/daemon/skill loop. It has its own history, model,
@@ -89,19 +92,19 @@ and `hook` to wait for app-side asynchronous work.
 The data crossing from Loop A to Loop B is a `ViewSnapshot`:
 
 ```rust
-struct ViewSnapshot<View, TurnPrompt> {
+struct ViewSnapshot<View, UserDocument> {
     view_epoch: ViewEpoch,
     turn_id: ViewTurnId,
     view: View,
-    turn_prompt: TurnPrompt,
+    user_document: UserDocument,
 }
 ```
 
-The `turn_id` identifies the active turn prompt so `act` can reject stale
-replies. The `turn_prompt` is the caller-facing prompt/contract. There is no
-separate `ControlRequest` layer in `agentview` core. This mirrors the existing
+The `turn_id` identifies the active user document so `act` can reject stale
+replies. The `ResolvedDocument` is the caller-facing prompt/contract. There is
+no separate `ControlRequest` layer in `agentview` core. This mirrors the
 provider-backed path, where `AgentViewModel::capture_view` and
-`AgentViewModel::build_turn_prompt` are composed into the user message.
+`AgentViewModel::build_user_document` produce the current user message.
 
 The data crossing from Loop B back to Loop A is a `ControlReply`. The
 `AgentView` session feeds that reply into `TurnSink<ControlReply>`, then commits
@@ -148,21 +151,26 @@ act(reply)       -> ViewUpdate
 hook(epoch)      -> full ViewSnapshot
 ```
 
-`observe` is always a full render. It is the synchronization and recovery
-operation. A caller can discard all local state and call `observe` to get the
-truth.
+`observe` always returns a full transport snapshot with the complete typed
+view. Its resolved user document still follows the session's committed
+`UserDocumentCursor`, so unchanged stateful slots may be omitted. A caller that
+has lost that prompt lineage must first reset the cursor (for example through
+`AgentSession::reset_user_document_cursor` or a transport-level force-full
+operation) and then observe again.
 
 `act` is the normal progress operation. It resumes the daemon with a response to
-the current turn prompt, advances the daemon as far as the daemon's loop
+the current user document, advances the daemon as far as the daemon's loop
 chooses, and returns an update.
 
 ## Snapshot Invariant
 
-Every `ViewSnapshot` must be self-contained.
+Every `ViewSnapshot` is complete at the transport and typed-view layers.
 
-A caller that only has the latest full snapshot must be able to understand the
-current view and the current turn prompt. It must not need older patches or
-private daemon state.
+A caller can inspect the complete current view and the current resolved user
+document without private daemon state. Understanding omitted context, however,
+can require earlier messages in the same prompt lineage. “Full snapshot”
+describes the transport envelope and typed view; it does not mean every
+stateful user-document slot is resent in full.
 
 This invariant is evaluated at the root rendered prompt-context boundary. It is
 not a rule that every nested view fragment must locally hydrate every reference
@@ -180,17 +188,17 @@ has entered the prompt context, later graph facts can cite the stable
 Current core shape:
 
 ```rust
-struct ViewSnapshot<View, TurnPrompt> {
+struct ViewSnapshot<View, UserDocument> {
     view_epoch: ViewEpoch,
     turn_id: ViewTurnId,
     view: View,
-    turn_prompt: TurnPrompt,
+    user_document: UserDocument,
 }
 ```
 
 Transport-level envelopes may add session ids, status, events, or serialized
 metadata. The reusable core type stays focused on the captured view plus the
-turn identity, view, and turn prompt.
+turn identity, view, and resolved user document.
 
 ## Update Invariant
 
@@ -201,20 +209,22 @@ implementation returns a full update while the patch decider is still separate.
 Suggested shape:
 
 ```rust
-struct ViewUpdate<View, TurnPrompt> {
+struct ViewUpdate<View, UserDocument> {
     base_epoch: ViewEpoch,
     view_epoch: ViewEpoch,
-    body: ViewUpdateBody<View, TurnPrompt>,
+    body: ViewUpdateBody<View, UserDocument>,
 }
 
-enum ViewUpdateBody<View, TurnPrompt> {
+enum ViewUpdateBody<View, UserDocument> {
     Partial(ViewPatch),
-    Full(ViewSnapshot<View, TurnPrompt>),
+    Full(ViewSnapshot<View, UserDocument>),
 }
 ```
 
-The daemon should still render or be able to render the full next view internally.
-Partial updates are response shaping, not the source of truth.
+The daemon should still capture the complete next typed view and resolve the
+current user document internally. A transport adapter may render the
+`ResolvedDocument` when it needs provider text. Partial updates are response
+shaping, not the source of truth.
 
 ## Patch Decider
 
@@ -258,36 +268,39 @@ enum ViewUpdateDecision {
 The first implementation can be intentionally simple. Real tuning should come
 from traces of outer LLM agents and humans using the protocol.
 
-## Turn Prompt Model
+## User Document Model
 
-The view tells the outside caller what the daemon sees. The `turn_prompt` tells
-the caller how to answer this view, if an answer is needed.
+The typed view tells the outside caller what the daemon sees. The resolved user
+document decides what enters the current prompt turn: a stateful context slot,
+task, typed reply contract, artifacts, feedback, or other Markdown/XML blocks.
 
-This deliberately reuses the existing `AgentViewModel` vocabulary:
+This reuses the current `AgentViewModel` contract:
 
 ```rust
 async fn capture_view(&self, source: &Self::Source) -> Self::View;
 
-async fn build_turn_prompt(
+async fn build_user_document(
     &self,
     ctx: &PromptContext<I, Self::ContextState>,
     call_id: &str,
-    task: String,
-) -> anyhow::Result<Self::TurnPrompt>;
+    task: StorageString,
+    current_view: &Self::View,
+) -> anyhow::Result<Document>;
 ```
 
-The provider-backed `Agent` path composes rendered view plus turn prompt into an
-`AgentTurnRequest` and sends it to `LLMExecutor`.
+The provider-backed `Agent` path resolves this document against the session
+cursor, renders the resulting `ResolvedDocument`, and sends it in
+`AgentTurnRequest.user`.
 
-The observe/act path returns the captured view plus turn prompt as a
+The observe/act path returns the captured view plus resolved user document as a
 `ViewSnapshot`. The outside chat/CLI/daemon/skill loop reads that snapshot in
 its own context and may later call `act` with a `ControlReply`.
 
 The important point is negative: `agentview` core should not invent a separate
 `ControlRequest` layer. The reusable core has `turn_id` for stale-reply
 protection. If a target needs status, schemas, or transport metadata, those
-belong either in the `turn_prompt` type or in a transport/session envelope
-around `ViewSnapshot`.
+belong either in typed POM content or in a transport/session envelope around
+`ViewSnapshot`.
 
 ## Tool Abstraction
 
@@ -396,7 +409,7 @@ impl TurnSink<ControlReply> for MyReplyParser {
 }
 
 enum ControlReply {
-    Text(String),
+    Text(StorageString),
     Structured(serde_json::Value),
 }
 ```
@@ -478,7 +491,7 @@ struct ViewHookRequest {
 
 enum ViewHookCondition {
     Awoken,
-    TurnPromptChanged,
+    UserDocumentChanged,
     ToolResultAvailable { call_id: ToolCallId },
     StatusChanged,
     Custom(serde_json::Value),
@@ -501,7 +514,8 @@ How sync hooks relate to the VM:
 
 ```text
 observe
-  -> render full ViewSnapshot
+  -> capture view and resolve user document
+  -> build full ViewSnapshot
   -> return snapshot
 
 act(reply)
@@ -509,12 +523,13 @@ act(reply)
   -> if reply contains tool calls:
        execute/proxy tool
   -> resume daemon state
-  -> render next VM/update
+  -> capture/resolve next VM update
   -> return update
 
 hook(condition)
   -> wait until the view owner awakes after after_epoch
-  -> render full ViewSnapshot
+  -> capture view and resolve user document
+  -> build full ViewSnapshot
   -> optionally check a condition over the recaptured snapshot
   -> return hook result
 ```
@@ -574,7 +589,7 @@ Internally the daemon may:
 2. wake or resume session code;
 3. process events;
 4. update `PromptContext` or application state;
-5. render the next view;
+5. capture the next view and resolve its user document;
 6. ask the patch decider whether to return partial or full.
 
 The important KISS rule is that the public API does not expose a separate
@@ -585,21 +600,22 @@ The important KISS rule is that the public API does not expose a separate
 The existing `Agent` loop should not be stretched into this by forcing the
 daemon to implement `LLMExecutor`.
 
-Instead, add a new observe/act-oriented loop that reuses the rendering and state
-building blocks. The old loop remains useful for ordinary provider-backed
-agents. The new loop is for stateful daemon sessions driven by an external
-caller through CLI or skill transport.
+`AgentViewApp` is the observe/act-oriented sibling that reuses the POM and state
+building blocks. The provider-backed loop remains useful for ordinary agents;
+`AgentViewApp` serves stateful daemon sessions driven by an external caller
+through CLI or skill transport and can continue evolving with patch selection
+and transport-specific recovery.
 
 The extraction point is around request/view preparation and commit semantics.
 The first `AgentViewApp` pulls out the external observe/hook/act path.
 Further implementation may need reusable helpers that can:
 
 - capture the current AgentView view;
-- render full prompt/view state for external observation;
-- build the current turn prompt;
+- resolve and validate the current user document for external observation;
+- build the current user document;
 - parse an externally supplied control reply;
 - commit parsed control output;
-- update the view cursor and epoch.
+- publish the user-document cursor and view epoch at their success boundaries.
 
 ## Open Questions
 

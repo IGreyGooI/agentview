@@ -1,0 +1,20 @@
+error[E0271]: type mismatch resolving `<NestedParagraph as AgentView>::Root == XmlNode`
+  --> tests/ui/pom/paragraph_xml_rejects_non_xml_root.rs:10:10
+   |
+10 | #[derive(agentview::AgentView)]
+   |          ^^^^^^^^^^^^^^^^^^^^ type mismatch resolving `<NestedParagraph as AgentView>::Root == XmlNode`
+   |
+note: expected this to be `XmlNode`
+  --> tests/ui/pom/paragraph_xml_rejects_non_xml_root.rs:3:10
+   |
+ 3 | #[derive(agentview::AgentView)]
+   |          ^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `build_xml_root`
+  --> src/agent_view.rs
+   |
+   | pub fn build_xml_root<V>(value: &V) -> Result<XmlNode, PomError>
+   |        -------------- required by a bound in this function
+   | where
+   |     V: AgentView<Root = XmlNode> + ?Sized,
+   |                  ^^^^^^^^^^^^^^ required by this bound in `build_xml_root`
+   = note: this error originates in the derive macro `agentview::AgentView` (in Nightly builds, run with -Z macro-backtrace for more info)

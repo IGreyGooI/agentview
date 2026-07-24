@@ -55,6 +55,11 @@ impl BlockChildren {
     pub fn iter(&self) -> impl Iterator<Item = ContentRef<'_>> {
         self.0.iter().map(BlockContent::as_ref)
     }
+
+    #[doc(hidden)]
+    pub fn extend(&mut self, children: Self) {
+        self.0.extend(children.0);
+    }
 }
 
 pub struct BlockBuilder<'a> {
@@ -68,6 +73,11 @@ impl<'a> BlockBuilder<'a> {
 
     pub fn push(&mut self, content: BlockContent) {
         self.children.push(content);
+    }
+
+    #[doc(hidden)]
+    pub fn extend(&mut self, children: BlockChildren) {
+        self.children.extend(children);
     }
 
     pub fn heading(&mut self, level: HeadingLevel, build: impl FnOnce(&mut InlineBuilder<'_>)) {

@@ -41,6 +41,39 @@ struct ResponseContractView {
 }
 
 #[derive(agentview::AgentView)]
+#[agent_view(kind = "verify")]
+struct VerifyCallView {
+    scope: String,
+}
+
+#[derive(agentview::AgentView)]
+#[agent_view(markdown = "paragraph")]
+struct InlineXmlInstructionView {
+    #[view(text)]
+    before: String,
+
+    #[view(xml)]
+    call: VerifyCallView,
+
+    #[view(text)]
+    after: String,
+}
+
+#[derive(agentview::AgentView)]
+#[agent_view(markdown = "paragraph")]
+struct ExistingXmlInstructionView {
+    #[view(xml)]
+    call: XmlNode,
+}
+
+#[derive(agentview::AgentView)]
+#[agent_view(document)]
+struct TypedBlockDocumentView {
+    #[view(block)]
+    instruction: WorkflowStepView,
+}
+
+#[derive(agentview::AgentView)]
 #[agent_view(kind = "notebook")]
 struct OptionalNotesView {
     notes: Vec<Option<String>>,
@@ -192,6 +225,75 @@ fn markdown_paragraph_derive_preserves_text_code_span_text_edges() {
         children[2],
         ContentRef::Node(ContentNode::Text(_))
     ));
+}
+
+#[test]
+fn markdown_paragraph_derive_embeds_a_derived_xml_root_inline() {
+    let paragraph = build_paragraph(&InlineXmlInstructionView {
+        before: "Call ".to_owned(),
+        call: VerifyCallView {
+            scope: "demo".to_owned(),
+        },
+        after: " before selecting.".to_owned(),
+    });
+
+    let children = paragraph.children().iter().collect::<Vec<_>>();
+    assert_eq!(children.len(), 3);
+    assert!(matches!(
+        children[0],
+        ContentRef::Node(ContentNode::Text(_))
+    ));
+    let ContentRef::Node(ContentNode::Xml(call)) = children[1] else {
+        panic!("expected an inline XML call");
+    };
+    assert_eq!(call.name().as_str(), "verify");
+    assert_eq!(
+        call.attributes()
+            .get(&XmlName::try_from("scope").unwrap())
+            .unwrap()
+            .value(),
+        "demo"
+    );
+    assert!(matches!(
+        children[2],
+        ContentRef::Node(ContentNode::Text(_))
+    ));
+}
+
+#[test]
+fn markdown_paragraph_xml_field_accepts_an_existing_xml_node() {
+    let call = build_xml(&VerifyCallView {
+        scope: "demo".to_owned(),
+    });
+    let paragraph = build_paragraph(&ExistingXmlInstructionView { call: call.clone() });
+
+    let children = paragraph.children().iter().collect::<Vec<_>>();
+    let [ContentRef::Node(ContentNode::Xml(embedded))] = children.as_slice() else {
+        panic!("expected the existing XML node inline");
+    };
+    assert_eq!(embedded, &call);
+}
+
+#[test]
+fn document_block_field_embeds_a_derived_typed_block_root() {
+    let document = build_document(&TypedBlockDocumentView {
+        instruction: WorkflowStepView {
+            before: "Call ".to_owned(),
+            call: r#"<verify scope="demo"/>"#.to_owned(),
+            after: ".".to_owned(),
+        },
+    });
+
+    let children = document.children().iter().collect::<Vec<_>>();
+    assert_eq!(children.len(), 1);
+    assert!(matches!(
+        children[0],
+        ContentRef::Node(ContentNode::Markdown(MarkdownNode::Paragraph(_)))
+    ));
+    assert_eq!(
+        render_pom_document(&resolve_system_document(document)).unwrap(),
+        r#"Call `<verify scope="demo"/>`."#
+    );
 }
 
 #[test]

@@ -55,17 +55,17 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::agent_session::AgentSession;
+use crate::agent_view::AgentView as PomAgentView;
 use crate::llm_call::{
     notify_observers, AgentTurn, AgentTurnEvent, AgentTurnFlow, AgentTurnObserverHandle,
     AgentTurnOutcome, AgentTurnRequest, ContextPreparation, ContextPreparationBudget,
     ExecutorCommit, LLMExecutor, NoopTurnSink, TextTurnEvent, TurnSink,
 };
+use crate::pom::{Document, XmlNode};
+use crate::pom_renderer::render_pom_document;
+use crate::pom_resolution::{resolve_system_document, resolve_user_document};
 use crate::prompt_context::{IdentityTransform, PromptContext, Role, Turn, TurnTransform};
-use crate::templates::{
-    ContextBlockKind, ContextView, ContextViewBuilder, PromptFragment, PromptLayout,
-    PromptRenderable, PromptSystemVars, PromptUserVars, RenderedTurnArtifact, TemplateEngine,
-    TurnArtifact, AGENT_SYSTEM_LAYOUT_TEMPLATE, AGENT_USER_LAYOUT_TEMPLATE,
-};
+use crate::templates::{ContextViewBuilder, TurnArtifact};
 use crate::StorageString;
 
 // ── AgentViewModel ────────────────────────────────────────────────────────────
@@ -78,16 +78,20 @@ use crate::StorageString;
 #[async_trait::async_trait]
 pub trait AgentViewModel<I = Turn, TurnOutput = ()>: Send + Sync {
     type Source: Sync;
-    type View: ContextView + Clone + Send + 'static;
-    type SystemPrompt: PromptRenderable + Send + Sync + 'static;
-    type TurnPrompt: PromptRenderable + Send + Sync + 'static;
+    type View: PomAgentView<Root = XmlNode>
+        + crate::agent_view::AgentViewValue
+        + Clone
+        + Send
+        + Sync
+        + 'static;
     type ContextState: Default + Clone + Send + 'static;
 
-    async fn build_system_prompt(
+    /// Build the complete system-role POM document for this request.
+    async fn build_system_document(
         &self,
         ctx: &PromptContext<I, Self::ContextState>,
         source: &Self::Source,
-    ) -> anyhow::Result<Self::SystemPrompt>;
+    ) -> anyhow::Result<Document>;
 
     fn history(&self, ctx: &PromptContext<I, Self::ContextState>) -> Vec<I>
     where
@@ -100,12 +104,18 @@ pub trait AgentViewModel<I = Turn, TurnOutput = ()>: Send + Sync {
 
     async fn capture_view(&self, source: &Self::Source) -> Self::View;
 
-    async fn build_turn_prompt(
+    /// Build the complete user-role POM document.
+    ///
+    /// This method owns section order and explicitly decides where the current
+    /// view participates as a [`DiffSlot`]. The runtime does not inject a
+    /// context or turn-prompt envelope around the returned document.
+    async fn build_user_document(
         &self,
         ctx: &PromptContext<I, Self::ContextState>,
         call_id: &str,
-        task: String,
-    ) -> anyhow::Result<Self::TurnPrompt>;
+        task: StorageString,
+        current_view: &Self::View,
+    ) -> anyhow::Result<Document>;
 
     async fn commit_turn(
         &self,
@@ -151,271 +161,154 @@ struct CommittedAgentTurn<O> {
     sink_output: O,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DefaultSystemPrompt {
-    Rendered(StorageString),
-    Template {
-        vars: PromptSystemVars,
-        template: StorageString,
-    },
+#[derive(Debug, Clone, crate::AgentView)]
+#[agent_view(markdown = "paragraph")]
+struct DefaultParagraphView {
+    #[view(text)]
+    text: String,
 }
 
-#[async_trait::async_trait]
-impl PromptRenderable for DefaultSystemPrompt {
-    async fn render_full<'a>(
-        &'a self,
-        templates: &'a TemplateEngine,
-    ) -> anyhow::Result<PromptFragment> {
-        match self {
-            Self::Rendered(text) => Ok(text.as_ref().into()),
-            Self::Template { vars, template } => Ok(templates
-                .render_template(
-                    AGENT_SYSTEM_LAYOUT_TEMPLATE,
-                    template,
-                    minijinja::Value::from_serialize(vars),
-                )?
-                .into()),
-        }
-    }
-}
+#[derive(Debug, Clone, crate::AgentView)]
+#[agent_view(document)]
+struct DefaultUserDocumentView<V>
+where
+    V: PomAgentView<Root = XmlNode> + crate::agent_view::AgentViewValue,
+{
+    #[view(name = "agent_context", diff)]
+    context: V,
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DefaultTurnPrompt {
-    pub task: String,
-    #[serde(default, skip_deserializing)]
-    pub artifacts: Vec<TurnArtifact>,
-    pub template: StorageString,
-}
+    #[view(block)]
+    artifacts: Vec<TurnArtifact>,
 
-#[async_trait::async_trait]
-impl PromptRenderable for DefaultTurnPrompt {
-    async fn render_full<'a>(
-        &'a self,
-        templates: &'a TemplateEngine,
-    ) -> anyhow::Result<PromptFragment> {
-        let mut rendered_artifacts = Vec::with_capacity(self.artifacts.len());
-        for artifact in &self.artifacts {
-            rendered_artifacts.push(RenderedTurnArtifact::new(
-                artifact.kind(),
-                artifact.render_full(templates).await?.into_string(),
-            ));
-        }
+    #[view(block)]
+    feedback: Option<DefaultParagraphView>,
 
-        Ok(templates
-            .render_template(
-                AGENT_USER_LAYOUT_TEMPLATE,
-                &self.template,
-                minijinja::Value::from_serialize(&PromptUserVars {
-                    context_kind: ContextBlockKind::Empty,
-                    context_block: String::new(),
-                    artifacts: rendered_artifacts,
-                    task: self.task.clone(),
-                }),
-            )?
-            .into())
-    }
+    #[view(block)]
+    task: Option<DefaultParagraphView>,
 }
 
 /// Captures and renders the app surface shown to a language agent.
-pub struct DefaultAgentViewModel<B, T = IdentityTransform>
+pub struct DefaultAgentViewModel<B, S, T = IdentityTransform>
 where
     B: ContextViewBuilder,
+    S: PomAgentView<Root = Document>,
 {
     /// Builder that knows how to capture the concrete root context view.
     pub context_builder: B,
 
-    /// Stable variables used to lazily render the system prompt.
-    pub system_vars: PromptSystemVars,
-
-    /// Template source for the stable system prompt envelope.
-    pub system_template: StorageString,
-
-    /// Template source for each user prompt envelope.
-    pub user_template: StorageString,
-
-    /// Per-agent prompt template registry.
-    pub templates: TemplateEngine,
+    /// Stable typed system-document view.
+    pub system_document: S,
 
     /// Text-only default commit policy.
     pub transform: T,
 }
 
-impl<B, T> fmt::Debug for DefaultAgentViewModel<B, T>
+impl<B, S, T> fmt::Debug for DefaultAgentViewModel<B, S, T>
 where
     B: ContextViewBuilder + fmt::Debug,
     B::View: fmt::Debug,
+    S: PomAgentView<Root = Document> + fmt::Debug,
     T: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DefaultAgentViewModel")
             .field("context_builder", &self.context_builder)
-            .field("system_vars", &self.system_vars)
-            .field("system_template", &"<template-source>")
-            .field("user_template", &"<template-source>")
-            .field("templates", &"<template-engine>")
+            .field("system_document", &self.system_document)
             .field("transform", &self.transform)
             .finish()
     }
 }
 
-impl<B, T> Clone for DefaultAgentViewModel<B, T>
+impl<B, S, T> Clone for DefaultAgentViewModel<B, S, T>
 where
     B: ContextViewBuilder + Clone,
+    S: PomAgentView<Root = Document> + Clone,
     T: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             context_builder: self.context_builder.clone(),
-            system_vars: self.system_vars.clone(),
-            system_template: self.system_template.clone(),
-            user_template: self.user_template.clone(),
-            templates: self.templates.clone(),
+            system_document: self.system_document.clone(),
             transform: self.transform.clone(),
         }
     }
 }
 
-pub struct RenderedAgentView<V> {
-    pub context_snapshot: V,
-    pub context_kind: ContextBlockKind,
-    pub context_block: PromptFragment,
-    pub artifacts: Vec<TurnArtifact>,
-}
-
-impl<B, T> DefaultAgentViewModel<B, T>
+impl<B, S, T> DefaultAgentViewModel<B, S, T>
 where
     B: ContextViewBuilder,
-    B::View: Clone + Send + 'static,
+    B::View: PomAgentView<Root = XmlNode> + Clone + Send + 'static,
+    S: PomAgentView<Root = Document>,
     T: TurnTransform,
 {
-    pub fn new(
-        layout: impl PromptLayout,
-        context_builder: B,
-        system_vars: PromptSystemVars,
-        transform: T,
-    ) -> Self {
+    pub fn new(context_builder: B, system_document: S, transform: T) -> Self {
         Self {
             context_builder,
-            system_vars,
-            system_template: layout.system_template().into(),
-            user_template: layout.user_template().into(),
-            templates: TemplateEngine::new(),
+            system_document,
             transform,
         }
     }
-
-    pub async fn render_view_block(
-        &self,
-        current_view: &B::View,
-        previous_view: Option<&B::View>,
-        call_id: &str,
-        artifacts: Vec<TurnArtifact>,
-    ) -> anyhow::Result<RenderedAgentView<B::View>> {
-        let (context_kind, context_block) = match previous_view {
-            None => {
-                tracing::debug!(
-                    target: "agentview::agent",
-                    call_id,
-                    "rendering full agent context"
-                );
-                (
-                    ContextBlockKind::Full,
-                    current_view.render_full(&self.templates).await?,
-                )
-            }
-            Some(prev) => match current_view.render_delta(prev, &self.templates).await {
-                Ok(Some(delta)) => {
-                    tracing::debug!(
-                        target: "agentview::agent",
-                        call_id,
-                        "rendering delta agent context"
-                    );
-                    (ContextBlockKind::Delta, delta)
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        target: "agentview::agent",
-                        call_id,
-                        "agent context unchanged"
-                    );
-                    (ContextBlockKind::Empty, PromptFragment::new(String::new()))
-                }
-                Err(e) => return Err(e),
-            },
-        };
-
-        Ok(RenderedAgentView {
-            context_snapshot: current_view.clone(),
-            context_kind,
-            context_block,
-            artifacts,
-        })
-    }
 }
 
-impl<B, T> DefaultAgentViewModel<B, T>
+impl<B, S, T> DefaultAgentViewModel<B, S, T>
 where
     B: ContextViewBuilder + Clone,
     B::View: Clone,
+    S: PomAgentView<Root = Document> + Clone,
     T: TurnTransform + Clone,
 {
     pub fn with_context_builder(&self, context_builder: B) -> Self {
         Self {
             context_builder,
-            system_vars: self.system_vars.clone(),
-            system_template: self.system_template.clone(),
-            user_template: self.user_template.clone(),
-            templates: self.templates.clone(),
+            system_document: self.system_document.clone(),
             transform: self.transform.clone(),
         }
     }
 }
 
 #[async_trait::async_trait]
-impl<B, T, TurnOutput> AgentViewModel<Turn, TurnOutput> for DefaultAgentViewModel<B, T>
+impl<B, S, T, TurnOutput> AgentViewModel<Turn, TurnOutput> for DefaultAgentViewModel<B, S, T>
 where
     B: ContextViewBuilder + Clone + Send + Sync,
     B::Source: Sync,
-    B::View: Clone + Send + 'static,
+    B::View: PomAgentView<Root = XmlNode> + Clone + Send + Sync + 'static,
+    S: PomAgentView<Root = Document> + Clone + Send + Sync + 'static,
     T: TurnTransform + Clone + Send + Sync,
     TurnOutput: Send + Sync,
 {
     type Source = B::Source;
     type View = B::View;
-    type SystemPrompt = DefaultSystemPrompt;
-    type TurnPrompt = DefaultTurnPrompt;
     type ContextState = DefaultContextState;
 
-    async fn build_system_prompt(
+    async fn build_system_document(
         &self,
-        ctx: &PromptContext<Turn, Self::ContextState>,
+        _ctx: &PromptContext<Turn, Self::ContextState>,
         _source: &Self::Source,
-    ) -> anyhow::Result<Self::SystemPrompt> {
-        match ctx.system() {
-            Some(system) => Ok(DefaultSystemPrompt::Rendered(system.into())),
-            None => Ok(DefaultSystemPrompt::Template {
-                vars: self.system_vars.clone(),
-                template: self.system_template.clone(),
-            }),
-        }
+    ) -> anyhow::Result<Document> {
+        Ok(self.system_document.build_root()?)
     }
 
-    async fn build_turn_prompt(
+    async fn build_user_document(
         &self,
         ctx: &PromptContext<Turn, Self::ContextState>,
         _call_id: &str,
-        task: String,
-    ) -> anyhow::Result<Self::TurnPrompt> {
-        let task = match ctx.context_state().feedback.task.as_deref() {
-            Some(feedback_task) if task.is_empty() => feedback_task.to_owned(),
-            Some(feedback_task) => format!("{feedback_task}\n\n{task}"),
-            None => task,
-        };
-        Ok(DefaultTurnPrompt {
-            task,
+        task: StorageString,
+        current_view: &Self::View,
+    ) -> anyhow::Result<Document> {
+        Ok(DefaultUserDocumentView {
+            context: current_view.clone(),
             artifacts: ctx.context_state().feedback.artifacts.clone(),
-            template: self.user_template.clone(),
-        })
+            feedback: ctx
+                .context_state()
+                .feedback
+                .task
+                .clone()
+                .map(|text| DefaultParagraphView { text }),
+            task: (!task.is_empty()).then(|| DefaultParagraphView {
+                text: task.to_string(),
+            }),
+        }
+        .build_root()?)
     }
 
     async fn capture_view(&self, source: &Self::Source) -> Self::View {
@@ -429,10 +322,6 @@ where
         executor_commit: ExecutorCommit<Turn>,
         _sink_output: &mut TurnOutput,
     ) -> anyhow::Result<TurnFlow> {
-        if !ctx.has_system() {
-            ctx.set_system_once(request.system.clone());
-        }
-
         if let Some(user) = self.transform.transform_user(&request.user) {
             ctx.push_history(Turn::user(user));
         }
@@ -456,8 +345,8 @@ where
 // ── AgentConfig ────────────────────────────────────────────────────────────────
 
 /// Default text agent built from a [`ContextViewBuilder`] and [`TurnTransform`].
-pub type TextAgent<B, E, T, EV = TextTurnEvent, TurnOutput = ()> =
-    Agent<DefaultAgentViewModel<B, T>, E, Turn, EV, TurnOutput>;
+pub type TextAgent<B, S, E, T, EV = TextTurnEvent, TurnOutput = ()> =
+    Agent<DefaultAgentViewModel<B, S, T>, E, Turn, EV, TurnOutput>;
 
 /// Read-only session configuration shared across forks of an agent.
 pub struct AgentConfig<VM, E, I = Turn, EV = TextTurnEvent, TurnOutput = ()>
@@ -493,7 +382,7 @@ where
 
 // ── Agent ──────────────────────────────────────────────────────────────────────
 
-type SharedAgentSession<I, CS, V> = Arc<RwLock<AgentSession<I, CS, V>>>;
+type SharedAgentSession<I, CS> = Arc<RwLock<AgentSession<I, CS>>>;
 
 /// Stateful LLM agent parameterized over view model, executor, and transcript.
 ///
@@ -508,7 +397,7 @@ where
     /// Read-only configuration shared with forks.
     pub config: Arc<AgentConfig<VM, E, I, EV, TurnOutput>>,
 
-    session: SharedAgentSession<I, VM::ContextState, VM::View>,
+    session: SharedAgentSession<I, VM::ContextState>,
 
     turn_lock: Arc<Mutex<()>>,
     observers: Vec<AgentTurnObserverHandle>,
@@ -529,31 +418,32 @@ where
 }
 
 /// Exclusive access to an agent session, serialized with model-backed turns.
-pub struct AgentSessionWriteGuard<'a, I, CS, V> {
-    session_guard: RwLockWriteGuard<'a, AgentSession<I, CS, V>>,
+pub struct AgentSessionWriteGuard<'a, I, CS> {
+    session_guard: RwLockWriteGuard<'a, AgentSession<I, CS>>,
     _turn_guard: MutexGuard<'a, ()>,
 }
 
-impl<I, CS, V> Deref for AgentSessionWriteGuard<'_, I, CS, V> {
-    type Target = AgentSession<I, CS, V>;
+impl<I, CS> Deref for AgentSessionWriteGuard<'_, I, CS> {
+    type Target = AgentSession<I, CS>;
 
     fn deref(&self) -> &Self::Target {
         &self.session_guard
     }
 }
 
-impl<I, CS, V> DerefMut for AgentSessionWriteGuard<'_, I, CS, V> {
+impl<I, CS> DerefMut for AgentSessionWriteGuard<'_, I, CS> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.session_guard
     }
 }
 
-impl<B, E, T, EV, TurnOutput> Agent<DefaultAgentViewModel<B, T>, E, Turn, EV, TurnOutput>
+impl<B, S, E, T, EV, TurnOutput> Agent<DefaultAgentViewModel<B, S, T>, E, Turn, EV, TurnOutput>
 where
     B: ContextViewBuilder + Clone + Send + Sync,
     E: LLMExecutor<Turn, EV> + Clone,
-    B::View: Clone + Send + 'static,
+    B::View: PomAgentView<Root = XmlNode> + Clone + Send + Sync + 'static,
     B::Source: Sync,
+    S: PomAgentView<Root = Document> + Clone + Send + Sync + 'static,
     T: TurnTransform + Clone + Send + Sync,
     EV: Send + 'static,
     TurnOutput: Send + Sync + 'static,
@@ -564,14 +454,13 @@ where
     /// [`AgentTurnBuilder::execute`].
     pub fn new(
         context_builder: B,
-        layout: impl PromptLayout,
-        system_vars: PromptSystemVars,
+        system_document: S,
         model: impl Into<String>,
         max_tokens: u64,
         transform: T,
     ) -> Self {
         let model = model.into();
-        let view = DefaultAgentViewModel::new(layout, context_builder, system_vars, transform);
+        let view = DefaultAgentViewModel::new(context_builder, system_document, transform);
         Self {
             config: Arc::new(AgentConfig {
                 view,
@@ -638,14 +527,12 @@ where
     }
 
     /// Read the last successfully committed session.
-    pub async fn session(
-        &self,
-    ) -> RwLockReadGuard<'_, AgentSession<I, VM::ContextState, VM::View>> {
+    pub async fn session(&self) -> RwLockReadGuard<'_, AgentSession<I, VM::ContextState>> {
         self.session.read().await
     }
 
     /// Mutate committed session state after any in-flight turn completes.
-    pub async fn session_mut(&self) -> AgentSessionWriteGuard<'_, I, VM::ContextState, VM::View> {
+    pub async fn session_mut(&self) -> AgentSessionWriteGuard<'_, I, VM::ContextState> {
         let turn_guard = self.turn_lock.lock().await;
         let session_guard = self.session.write().await;
         AgentSessionWriteGuard {
@@ -738,9 +625,10 @@ where
     EV: Send + 'static,
     TurnOutput: Send + Sync + 'static,
 {
-    /// Set the call-specific user content appended after the context block.
+    /// Set the call-specific task passed to `AgentViewModel::build_user_document`.
     ///
-    /// Examples:
+    /// The view model owns where and how this value appears in its typed POM
+    /// document. Examples:
     /// - NPC dialogue turn: `"玩家说：「{player_intent}」"`
     /// - Intent generation: `"NPC刚才说：{last}\n\n请生成对话选项："`
     pub fn with_user(mut self, content: impl Into<String>) -> Self {
@@ -913,11 +801,11 @@ where
     /// `source` — the app runtime/source used to run the LLM call.
     ///
     /// Pipeline:
-    /// 1. Capture current context, render context block (delta or full).
-    /// 2. Build user message: `context_block + "\n\n" + user_content`.
-    /// 3. Execute via the injected runtime with explicit per-call sinks.
-    /// 4. On success: commit history, update the view model's previous snapshot.
-    /// 5. On failure: return `Err` (agent state unchanged).
+    /// 1. Capture the current typed view.
+    /// 2. Build and resolve the complete system/user POM documents.
+    /// 3. Render the resolved documents and execute with the per-call sinks.
+    /// 4. On success, commit history and the candidate user-document cursor.
+    /// 5. On failure, return `Err` with the session state unchanged.
     pub async fn execute(self, source: &VM::Source, executor: &E) -> anyhow::Result<()> {
         let AgentTurnBuilder {
             agent,
@@ -944,66 +832,6 @@ where
         )
         .await
         .map(|_: CommittedAgentTurn<()>| ())
-    }
-}
-
-async fn render_view_block<V>(
-    current_view: &V,
-    previous_view: Option<&V>,
-    templates: &TemplateEngine,
-    call_id: &str,
-) -> anyhow::Result<(ContextBlockKind, PromptFragment)>
-where
-    V: ContextView,
-{
-    match previous_view {
-        None => {
-            tracing::debug!(
-                target: "agentview::agent",
-                call_id,
-                "rendering full agent context"
-            );
-            Ok((
-                ContextBlockKind::Full,
-                current_view
-                    .render_full(templates)
-                    .await?
-                    .with_memo("context:full"),
-            ))
-        }
-        Some(prev) => match current_view.render_delta(prev, templates).await {
-            Ok(Some(delta)) => {
-                tracing::debug!(
-                    target: "agentview::agent",
-                    call_id,
-                    "rendering delta agent context"
-                );
-                Ok((ContextBlockKind::Delta, delta.with_memo("context:delta")))
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    target: "agentview::agent",
-                    call_id,
-                    "agent context unchanged"
-                );
-                Ok((
-                    ContextBlockKind::Empty,
-                    PromptFragment::new(String::new()).with_memo("context:empty"),
-                ))
-            }
-            Err(e) => Err(e),
-        },
-    }
-}
-
-fn compose_user_message(context_block: PromptFragment, turn_prompt: PromptFragment) -> String {
-    let context = context_block.as_str().trim();
-    let turn = turn_prompt.as_str().trim();
-    match (context.is_empty(), turn.is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => format!("## Turn Prompt\n\n{turn}"),
-        (false, true) => format!("## View\n\n{context}"),
-        (false, false) => format!("## View\n\n{context}\n\n## Turn Prompt\n\n{turn}"),
     }
 }
 
@@ -1083,30 +911,26 @@ where
 
     let mut draft_session = { agent.session.read().await.clone() };
     let mut preparation_replacements = 0;
-    let (request, current_view, context_kind, had_system) = loop {
+    let (request, next_user_document_cursor) = loop {
         // ── Build request against the private turn draft ──────────────────
         let ctx_for_request = draft_session.context();
         let committed_history_len = ctx_for_request.history().len();
-        let had_system = ctx_for_request.has_system();
-        let previous_view = draft_session.view_cursor();
         let current_view = agent.config.view.capture_view(source).await;
-        let templates = TemplateEngine::new();
-        let system_prompt = agent
+        let system_document = agent
             .config
             .view
-            .build_system_prompt(ctx_for_request, source)
+            .build_system_document(ctx_for_request, source)
             .await?;
-        let system = system_prompt.render_full(&templates).await?.into_string();
+        let system = render_pom_document(&resolve_system_document(system_document))?;
         let history = agent.config.view.history(ctx_for_request);
-        let (context_kind, context_block) =
-            render_view_block(&current_view, previous_view, &templates, call_id).await?;
-        let turn_prompt = agent
+        let user_document = agent
             .config
             .view
-            .build_turn_prompt(ctx_for_request, call_id, task.clone())
+            .build_user_document(ctx_for_request, call_id, task.clone().into(), &current_view)
             .await?;
-        let turn_prompt = turn_prompt.render_full(&templates).await?;
-        let user = compose_user_message(context_block, turn_prompt);
+        let (resolved_user_document, next_user_document_cursor) =
+            resolve_user_document(user_document, draft_session.user_document_cursor())?;
+        let user = render_pom_document(&resolved_user_document)?;
         let request = AgentTurnRequest {
             call_id: call_id.into(),
             system,
@@ -1122,11 +946,11 @@ where
             committed_history_len,
         );
         match executor
-            .prepare_context(request, preparation_budget)
+            .prepare_context(&request, preparation_budget)
             .await?
         {
-            ContextPreparation::Ready(request) => {
-                break (request, current_view, context_kind, had_system);
+            ContextPreparation::Ready => {
+                break (request, next_user_document_cursor);
             }
             ContextPreparation::ReplaceHistory { history } => {
                 if preparation_replacements >= max_context_preparations {
@@ -1146,21 +970,18 @@ where
             }
         }
     };
-    if !had_system {
-        notify_observers(
-            &observers,
-            AgentTurnEvent::SystemPromptRendered {
-                call_id: call_id.into(),
-                text: request.system.clone(),
-            },
-        )
-        .await;
-    }
+    notify_observers(
+        &observers,
+        AgentTurnEvent::SystemPromptRendered {
+            call_id: call_id.into(),
+            text: request.system.clone(),
+        },
+    )
+    .await;
     tracing::debug!(
         target: "agentview::agent",
         call_id,
         history_len = request.history.len(),
-        context_kind = ?context_kind,
         user_msg_len = request.user.len(),
         "built agent turn request"
     );
@@ -1203,7 +1024,8 @@ where
                     &mut sink_output,
                 )
                 .await?;
-            draft_session.set_view_cursor(current_view);
+            draft_session.set_system_snapshot(request_for_commit.system.clone());
+            draft_session.set_user_document_cursor(next_user_document_cursor);
             *agent.session.write().await = draft_session;
             tracing::debug!(
                 target: "agentview::agent",

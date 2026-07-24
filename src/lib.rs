@@ -37,6 +37,8 @@ pub mod agent_view;
 pub mod control;
 pub mod llm_call;
 pub mod pom;
+pub mod pom_cursor;
+mod pom_diff;
 pub mod pom_renderer;
 pub mod pom_resolution;
 pub mod prompt_context;
@@ -75,9 +77,11 @@ pub mod prelude {
         ParagraphNode, PomError, ResolvedDocument, StrongNode, TextNode, XmlAttribute,
         XmlAttributes, XmlName, XmlNode,
     };
+    pub use crate::pom_cursor::UserDocumentCursor;
     pub use crate::pom_renderer::{render_pom_document, PomRenderError};
     pub use crate::pom_resolution::{
-        resolve_artifact_document, resolve_system_document, PomResolutionError,
+        resolve_artifact_document, resolve_system_document, resolve_user_document,
+        PomResolutionError,
     };
     pub use crate::prompt_context::{
         AgentTurnError, IdentityTransform, PromptContext, Role, Turn, TurnTransform,
@@ -92,10 +96,7 @@ pub mod prelude {
         ParseContext, StreamingTool, StreamingToolError, StreamingToolRegistrationError,
         StreamingToolRunner,
     };
-    pub use crate::templates::{
-        ContextBlockKind, ContextView, ContextViewBuilder, PromptFragment, PromptLayout,
-        PromptRenderable, PromptSystemVars, TemplateEngine, TurnArtifact, TurnArtifactError,
-    };
+    pub use crate::templates::{ContextViewBuilder, TurnArtifact, TurnArtifactError};
     pub use crate::view_app::{AgentViewApp, AgentViewAppError};
     pub use crate::view_awake::{ViewAwake, ViewAwakeHandle, ViewAwakeSubscription, ViewEpoch};
     pub use crate::view_state::{ViewPatch, ViewSnapshot, ViewTurnId, ViewUpdate, ViewUpdateBody};

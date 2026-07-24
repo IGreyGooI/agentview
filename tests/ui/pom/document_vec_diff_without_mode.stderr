@@ -1,0 +1,5 @@
+error: Vec diff fields must choose a collection mode, for example `#[view(diff(append))]`
+ --> tests/ui/pom/document_vec_diff_without_mode.rs:7:5
+  |
+7 |     items: Vec<String>,
+  |     ^^^^^

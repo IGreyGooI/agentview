@@ -1,7 +1,9 @@
-//! Shared template engine and prompt rendering traits.
+//! Typed turn artifacts plus the legacy prompt-rendering compatibility surface.
 //!
-//! Application-specific system frames and instruction blocks should live in the
-//! application crate. This crate only owns the reusable rendering surface.
+//! New request paths author system and user messages as POM `Document` values
+//! and use role-specific resolution plus the canonical POM renderer. The
+//! Minijinja and `ContextView` APIs remain module-scoped compatibility tools;
+//! they are intentionally not re-exported by the crate prelude.
 
 // ── Minijinja-backed engine ───────────────────────────────────────────────────
 
@@ -10,15 +12,12 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::agent_view::AgentView;
+use crate::agent_view::{AgentView, AgentViewValue};
 use crate::pom::{Document, PomError, ResolvedDocument, XmlName, XmlNode};
 use crate::pom_renderer::render_pom_document;
 use crate::pom_resolution::{resolve_artifact_document, PomResolutionError};
 use crate::semantic_view::{render_agent_view_diff_xml, render_agent_view_xml, AgentViewRoot};
 use crate::StorageString;
-
-pub const AGENT_SYSTEM_LAYOUT_TEMPLATE: &str = "agent_system_layout";
-pub const AGENT_USER_LAYOUT_TEMPLATE: &str = "agent_user_layout";
 
 #[derive(Debug, thiserror::Error)]
 pub enum TemplateError {
@@ -186,49 +185,12 @@ impl TurnArtifact {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-/// Internal compatibility DTO for the legacy Minijinja user envelope.
-pub struct RenderedTurnArtifact {
-    kind: StorageString,
-    rendered: String,
-}
+impl AgentView for TurnArtifact {
+    type Root = Document;
 
-impl RenderedTurnArtifact {
-    pub(crate) fn new(kind: impl Into<StorageString>, rendered: String) -> Self {
-        Self {
-            kind: kind.into(),
-            rendered,
-        }
+    fn build_root(&self) -> Result<Self::Root, PomError> {
+        Ok(Document::new(self.document.children().clone()))
     }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextBlockKind {
-    Full,
-    Delta,
-    Empty,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptSystemVars {
-    pub instructions: String,
-    pub output_schema: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptUserVars {
-    pub context_kind: ContextBlockKind,
-    pub context_block: String,
-    #[serde(default, skip_deserializing)]
-    pub artifacts: Vec<RenderedTurnArtifact>,
-    pub task: String,
-}
-
-/// Agent-specific prompt envelope templates.
-pub trait PromptLayout {
-    fn system_template(&self) -> &'static str;
-    fn user_template(&self) -> &'static str;
 }
 
 impl TemplateEngine {
@@ -364,7 +326,7 @@ impl ContextView for String {
 #[async_trait::async_trait]
 pub trait ContextViewBuilder: Send + Sync {
     type Source: Sync;
-    type View: ContextView;
+    type View: AgentView<Root = XmlNode> + AgentViewValue;
 
     async fn capture(&self, source: &Self::Source) -> Self::View;
 }

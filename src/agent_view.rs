@@ -8,8 +8,9 @@ use std::{collections::BTreeMap, fmt::Display};
 
 use crate::{
     pom::{
-        ContentNode, DiffSlot, DiffStrategy, MarkdownNode, MixedChildren, MixedContent,
-        ParagraphNode, PomError, TextNode, XmlAttribute, XmlName, XmlNode,
+        BlockChildren, BlockContent, CodeBlockNode, ContentNode, DiffSlot, DiffStrategy, Document,
+        HeadingNode, ListNode, MarkdownNode, MixedChildren, MixedContent, ParagraphNode, PomError,
+        TextNode, XmlAttribute, XmlName, XmlNode,
     },
     StorageString,
 };
@@ -49,6 +50,126 @@ pub trait AgentViewValue: AgentView {
 #[doc(hidden)]
 pub trait IntoViewContent {
     fn into_view_content(self) -> Option<ContentNode>;
+}
+
+/// Converts a statically block-shaped derived root into document content.
+///
+/// Inline-only and ambiguous roots intentionally have no implementation, so a
+/// generated document cannot accept them through `#[view(block)]`.
+#[doc(hidden)]
+pub trait IntoBlockContent {
+    fn into_block_content(self) -> Option<BlockContent>;
+}
+
+/// Converts a statically block-shaped root into an ordered document fragment.
+#[doc(hidden)]
+pub trait IntoBlockChildren {
+    fn into_block_children(self) -> BlockChildren;
+}
+
+fn one_block(content: Option<BlockContent>) -> BlockChildren {
+    let mut children = BlockChildren::new();
+    if let Some(content) = content {
+        children.push(content);
+    }
+    children
+}
+
+impl IntoBlockContent for BlockContent {
+    fn into_block_content(self) -> Option<BlockContent> {
+        Some(self)
+    }
+}
+
+impl IntoBlockChildren for BlockContent {
+    fn into_block_children(self) -> BlockChildren {
+        one_block(Some(self))
+    }
+}
+
+impl IntoBlockContent for HeadingNode {
+    fn into_block_content(self) -> Option<BlockContent> {
+        Some(BlockContent::heading(self))
+    }
+}
+
+impl IntoBlockChildren for HeadingNode {
+    fn into_block_children(self) -> BlockChildren {
+        one_block(self.into_block_content())
+    }
+}
+
+impl IntoBlockContent for ParagraphNode {
+    fn into_block_content(self) -> Option<BlockContent> {
+        Some(BlockContent::paragraph(self))
+    }
+}
+
+impl IntoBlockChildren for ParagraphNode {
+    fn into_block_children(self) -> BlockChildren {
+        one_block(self.into_block_content())
+    }
+}
+
+impl IntoBlockContent for ListNode {
+    fn into_block_content(self) -> Option<BlockContent> {
+        Some(BlockContent::list(self))
+    }
+}
+
+impl IntoBlockChildren for ListNode {
+    fn into_block_children(self) -> BlockChildren {
+        one_block(self.into_block_content())
+    }
+}
+
+impl IntoBlockContent for CodeBlockNode {
+    fn into_block_content(self) -> Option<BlockContent> {
+        Some(BlockContent::code_block(self))
+    }
+}
+
+impl IntoBlockChildren for CodeBlockNode {
+    fn into_block_children(self) -> BlockChildren {
+        one_block(self.into_block_content())
+    }
+}
+
+impl IntoBlockContent for XmlNode {
+    fn into_block_content(self) -> Option<BlockContent> {
+        Some(BlockContent::xml(self))
+    }
+}
+
+impl IntoBlockChildren for XmlNode {
+    fn into_block_children(self) -> BlockChildren {
+        one_block(self.into_block_content())
+    }
+}
+
+impl IntoBlockChildren for Document {
+    fn into_block_children(self) -> BlockChildren {
+        self.into_children()
+    }
+}
+
+impl<T> IntoBlockContent for Option<T>
+where
+    T: IntoBlockContent,
+{
+    fn into_block_content(self) -> Option<BlockContent> {
+        self.and_then(IntoBlockContent::into_block_content)
+    }
+}
+
+impl<T> IntoBlockChildren for Option<T>
+where
+    T: IntoBlockChildren,
+{
+    fn into_block_children(self) -> BlockChildren {
+        self.map(IntoBlockChildren::into_block_children)
+            .unwrap_or_default()
+    }
 }
 
 impl IntoViewContent for ContentNode {
@@ -138,6 +259,119 @@ pub fn render_children_field(
     value: &(impl AgentViewValue + ?Sized),
 ) -> Result<ViewField, PomError> {
     value.build_children().map(ViewField::Children)
+}
+
+/// Builds one optional block edge for generated document fields.
+#[doc(hidden)]
+pub fn build_block_content<V>(value: &V) -> Result<Option<BlockContent>, PomError>
+where
+    V: AgentView + ?Sized,
+    V::Root: IntoBlockContent,
+{
+    value.build_root().map(IntoBlockContent::into_block_content)
+}
+
+/// Builds an ordered block fragment for generated document fields.
+#[doc(hidden)]
+pub fn build_block_children<V>(value: &V) -> Result<BlockChildren, PomError>
+where
+    V: AgentView + ?Sized,
+    V::Root: IntoBlockChildren,
+{
+    value
+        .build_root()
+        .map(IntoBlockChildren::into_block_children)
+}
+
+/// Values that can become an explicitly addressable XML slot in a document.
+#[doc(hidden)]
+pub trait DocumentDiffValue {
+    fn build_document_diff_slot(
+        &self,
+        role: XmlName,
+        strategy: DiffStrategy,
+    ) -> Result<DiffSlot, PomError>;
+}
+
+impl<T> DocumentDiffValue for T
+where
+    T: AgentView<Root = XmlNode> + AgentViewValue,
+{
+    fn build_document_diff_slot(
+        &self,
+        role: XmlName,
+        strategy: DiffStrategy,
+    ) -> Result<DiffSlot, PomError> {
+        let field = self.build_field(role.clone())?;
+        Ok(match field_into_xml_node(role.clone(), field) {
+            Some(value) => DiffSlot::present(strategy, value),
+            None => DiffSlot::absent(role, strategy),
+        })
+    }
+}
+
+impl<T> DocumentDiffValue for Option<T>
+where
+    T: AgentView<Root = XmlNode> + AgentViewValue,
+{
+    fn build_document_diff_slot(
+        &self,
+        role: XmlName,
+        strategy: DiffStrategy,
+    ) -> Result<DiffSlot, PomError> {
+        match self {
+            Some(value) => value.build_document_diff_slot(role, strategy),
+            None => Ok(DiffSlot::absent(role, strategy)),
+        }
+    }
+}
+
+/// Builds one document-level XML diff slot without rendering text.
+#[doc(hidden)]
+pub fn build_document_diff_slot<V>(
+    value: &V,
+    role: XmlName,
+    strategy: DiffStrategy,
+) -> Result<DiffSlot, PomError>
+where
+    V: DocumentDiffValue + ?Sized,
+{
+    value.build_document_diff_slot(role, strategy)
+}
+
+/// Builds an XML root for generated inline XML fields.
+#[doc(hidden)]
+pub fn build_xml_root<V>(value: &V) -> Result<XmlNode, PomError>
+where
+    V: AgentView<Root = XmlNode> + ?Sized,
+{
+    value.build_root()
+}
+
+impl AgentView for XmlNode {
+    type Root = XmlNode;
+
+    fn build_root(&self) -> Result<Self::Root, PomError> {
+        Ok(self.clone())
+    }
+}
+
+impl AgentViewValue for XmlNode {
+    fn build_field(&self, role: XmlName) -> Result<ViewField, PomError> {
+        Ok(ViewField::Content(MixedContent::xml(
+            field_into_xml_node(
+                role.clone(),
+                ViewField::Content(MixedContent::xml(self.clone())),
+            )
+            .expect("an XML field always produces an XML node"),
+        )))
+    }
+
+    fn build_children(&self) -> Result<MixedChildren, PomError> {
+        let mut children = MixedChildren::new();
+        children.push(MixedContent::xml(self.clone()));
+        Ok(children)
+    }
 }
 
 impl AgentView for String {

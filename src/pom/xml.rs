@@ -213,6 +213,25 @@ impl XmlNode {
         self
     }
 
+    pub(crate) fn metadata(&self) -> &XmlMetadata {
+        &self.metadata
+    }
+
+    pub(crate) fn is_map(&self) -> bool {
+        self.metadata.collection_kind == Some(IntrinsicCollectionKind::Map)
+    }
+
+    pub(crate) fn identity(&self) -> Option<&ContentNode> {
+        self.metadata.identity.as_deref()
+    }
+
+    pub(crate) fn diff_slots(&self) -> impl Iterator<Item = &super::DiffSlot> {
+        self.children.iter().filter_map(|child| match child {
+            super::ContentRef::DiffSlot(slot) => Some(slot),
+            super::ContentRef::Node(_) => None,
+        })
+    }
+
     pub(crate) fn mark_as_map(&mut self) {
         self.metadata.collection_kind = Some(IntrinsicCollectionKind::Map);
     }

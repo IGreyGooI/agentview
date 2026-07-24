@@ -1,20 +1,22 @@
 //! Durable prompt state shared by provider-backed agents and external view apps.
 
+use crate::pom::XmlName;
+use crate::pom_cursor::UserDocumentCursor;
 use crate::prompt_context::PromptContext;
 
-/// The last successfully committed prompt context and its rendered view baseline.
+/// The last successfully committed prompt context and user-document baselines.
 #[derive(Debug, Clone)]
-pub struct AgentSession<I, CS, V> {
+pub struct AgentSession<I, CS> {
     context: PromptContext<I, CS>,
-    view_cursor: Option<V>,
+    user_document_cursor: UserDocumentCursor,
 }
 
-impl<I, CS, V> AgentSession<I, CS, V> {
-    /// Start a session from a prompt context with no rendered view baseline.
+impl<I, CS> AgentSession<I, CS> {
+    /// Start a session from a prompt context with no user-document baseline.
     pub fn new(context: PromptContext<I, CS>) -> Self {
         Self {
             context,
-            view_cursor: None,
+            user_document_cursor: UserDocumentCursor::default(),
         }
     }
 
@@ -37,6 +39,10 @@ impl<I, CS, V> AgentSession<I, CS, V> {
         self.context.set_system_once(system);
     }
 
+    pub(crate) fn set_system_snapshot(&mut self, system: impl Into<crate::StorageString>) {
+        self.context.set_system_snapshot(system);
+    }
+
     /// Append one item to committed history.
     pub fn push_history(&mut self, item: I) {
         self.context.push_history(item);
@@ -52,45 +58,69 @@ impl<I, CS, V> AgentSession<I, CS, V> {
         self.context.push_working_set(item);
     }
 
-    /// Replace the mutable working set without changing the view baseline.
+    /// Replace the mutable working set without changing user-document baselines.
     pub fn replace_working_set(&mut self, items: Vec<I>) {
         self.context.replace_working_set(items);
     }
 
-    /// Clear the mutable working set without changing the view baseline.
+    /// Clear the mutable working set without changing user-document baselines.
     pub fn clear_working_set(&mut self) {
         self.context.clear_working_set();
     }
 
-    /// The last view successfully rendered into this prompt lineage.
-    pub fn view_cursor(&self) -> Option<&V> {
-        self.view_cursor.as_ref()
+    /// Baselines for explicitly marked stateful slots in the last committed
+    /// user-document lineage.
+    pub fn user_document_cursor(&self) -> &UserDocumentCursor {
+        &self.user_document_cursor
     }
 
-    /// Replace durable history and start a new rendered-view lineage.
+    /// Forget every stateful user-document slot so the next publication sends
+    /// each present slot in full.
+    pub fn reset_user_document_cursor(&mut self) {
+        self.user_document_cursor.clear();
+    }
+
+    /// Forget one stateful user-document slot by its prompt-facing role.
+    pub fn forget_user_document_slot(&mut self, role: &XmlName) -> bool {
+        self.user_document_cursor.remove(role)
+    }
+
+    /// Replace durable history and start a new user-document lineage.
     pub fn replace_history(&mut self, history: Vec<I>) {
         self.context.replace_history(history);
-        self.view_cursor = None;
+        self.reset_user_document_cursor();
     }
 
-    pub(crate) fn set_view_cursor(&mut self, view: V) {
-        self.view_cursor = Some(view);
+    pub(crate) fn set_user_document_cursor(&mut self, cursor: UserDocumentCursor) {
+        self.user_document_cursor = cursor;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::AgentSession;
-    use crate::prompt_context::{PromptContext, Turn};
+    use crate::{
+        pom::{DiffSlot, DiffStrategy, Document, XmlNode},
+        pom_cursor::UserDocumentCursor,
+        pom_resolution::resolve_user_document,
+        prompt_context::{PromptContext, Turn},
+    };
 
     #[test]
-    fn replacing_history_preserves_context_and_invalidates_the_view_cursor() {
+    fn replacing_history_preserves_context_and_invalidates_the_user_document_cursor() {
         let mut context = PromptContext::<Turn, usize>::new("system");
         context.push_history(Turn::user("old history"));
         context.push_working_set(Turn::user("working context"));
         *context.context_state_mut() = 7;
         let mut session = AgentSession::new(context);
-        session.set_view_cursor("view".to_owned());
+        let source = Document::build(|blocks| {
+            blocks.xml_slot(DiffSlot::present(
+                DiffStrategy::Recursive,
+                XmlNode::try_build("agent_context", |_| Ok(())).unwrap(),
+            ));
+        });
+        let (_, cursor) = resolve_user_document(source, &UserDocumentCursor::default()).unwrap();
+        session.set_user_document_cursor(cursor);
 
         session.replace_history(vec![Turn::user("summary")]);
 
@@ -98,6 +128,29 @@ mod tests {
         assert_eq!(&*session.context().history()[0].text, "summary");
         assert_eq!(&*session.context().working_set()[0].text, "working context");
         assert_eq!(*session.context().context_state(), 7);
-        assert!(session.view_cursor().is_none());
+        assert!(session.user_document_cursor().is_empty());
+    }
+
+    #[test]
+    fn session_can_forget_one_slot_or_reset_the_whole_cursor() {
+        let context = PromptContext::<Turn>::without_system();
+        let mut session = AgentSession::new(context);
+        let source = Document::build(|blocks| {
+            for role in ["agent_context", "workspace_session"] {
+                blocks.xml_slot(DiffSlot::present(
+                    DiffStrategy::Recursive,
+                    XmlNode::try_build(role, |_| Ok(())).unwrap(),
+                ));
+            }
+        });
+        let (_, cursor) = resolve_user_document(source, &UserDocumentCursor::default()).unwrap();
+        session.set_user_document_cursor(cursor);
+
+        let agent_context = crate::pom::XmlName::try_from("agent_context").unwrap();
+        assert!(session.forget_user_document_slot(&agent_context));
+        assert_eq!(session.user_document_cursor().len(), 1);
+
+        session.reset_user_document_cursor();
+        assert!(session.user_document_cursor().is_empty());
     }
 }

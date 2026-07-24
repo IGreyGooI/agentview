@@ -20,8 +20,8 @@ use std::os::unix::process::CommandExt;
 mod chess_support;
 
 use chess_support::{
-    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessTaskView, ChessView,
-    ChessViewModel, StockfishEngine,
+    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessViewModel,
+    StockfishEngine,
 };
 
 const INTERNAL_DAEMON_ARG: &str = "--__agentview-daemon";
@@ -64,17 +64,11 @@ impl ContextViewBuilder for HelloViewBuilder {
     }
 }
 
-#[derive(Debug, Clone)]
-struct HelloLayout;
-
-impl PromptLayout for HelloLayout {
-    fn system_template(&self) -> &'static str {
-        "{{ instructions }}"
-    }
-
-    fn user_template(&self) -> &'static str {
-        "{{ task }}"
-    }
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(document)]
+struct HelloSystemDocument {
+    #[view(paragraph)]
+    instructions: &'static str,
 }
 
 #[derive(Default)]
@@ -140,7 +134,8 @@ enum DaemonResponse {
     },
 }
 
-type HelloViewModel = DefaultAgentViewModel<HelloViewBuilder, IdentityTransform>;
+type HelloViewModel =
+    DefaultAgentViewModel<HelloViewBuilder, HelloSystemDocument, IdentityTransform>;
 type HelloApp = AgentViewApp<HelloViewModel, Turn, ()>;
 type ChessApp = AgentViewApp<ChessViewModel, Turn, ()>;
 
@@ -154,7 +149,6 @@ struct ChessRuntime {
     source: ChessGameSource,
     awake: ViewAwakeHandle,
     engine: StockfishEngine,
-    last_view: Option<ChessView>,
 }
 
 #[tokio::main]
@@ -539,11 +533,9 @@ fn new_hello_app() -> HelloApp {
     }));
 
     let view_model = DefaultAgentViewModel::new(
-        HelloLayout,
         HelloViewBuilder,
-        PromptSystemVars {
-            instructions: "Ask for a name, then say hello.".to_owned(),
-            output_schema: None,
+        HelloSystemDocument {
+            instructions: "Ask for a name, then say hello.",
         },
         IdentityTransform,
     );
@@ -569,12 +561,40 @@ fn new_chess_runtime() -> ChessRuntime {
         source,
         awake,
         engine: StockfishEngine::new(stockfish_command()),
-        last_view: None,
     }
 }
 
 fn stockfish_command() -> String {
     env::var(STOCKFISH_BIN_ENV).unwrap_or_else(|_| "stockfish".to_owned())
+}
+
+fn render_snapshot_response<V>(
+    event: &str,
+    snapshot: &ViewSnapshot<V, ResolvedDocument>,
+) -> DaemonResponse
+where
+    V: AgentView<Root = XmlNode>,
+{
+    let rendered = (|| -> anyhow::Result<(String, String)> {
+        let view = render_pom_document(&resolve_system_document(Document::from_xml(
+            snapshot.view.build_root()?,
+        )))?;
+        let prompt = render_pom_document(&snapshot.user_document)?;
+        Ok((view, prompt))
+    })();
+
+    match rendered {
+        Ok((view, prompt)) => DaemonResponse::Snapshot {
+            event: event.to_owned(),
+            epoch: snapshot.view_epoch,
+            turn_id: snapshot.turn_id.to_string(),
+            view,
+            prompt,
+        },
+        Err(err) => DaemonResponse::Error {
+            message: err.to_string(),
+        },
+    }
 }
 
 async fn handle_connection(state: &mut DaemonState, stream: TcpStream) -> anyhow::Result<bool> {
@@ -602,17 +622,8 @@ async fn handle_connection(state: &mut DaemonState, stream: TcpStream) -> anyhow
 }
 
 async fn observe_hello(app: &mut HelloApp) -> DaemonResponse {
-    match app
-        .observe("Ask the caller for their name.")
-        .await
-        .map(|snapshot| DaemonResponse::Snapshot {
-            event: "observe".to_owned(),
-            epoch: snapshot.view_epoch,
-            turn_id: snapshot.turn_id.to_string(),
-            view: render_agent_view_xml(&snapshot.view),
-            prompt: snapshot.turn_prompt.task,
-        }) {
-        Ok(response) => response,
+    match app.observe("Ask the caller for their name.").await {
+        Ok(snapshot) => render_snapshot_response("observe", &snapshot),
         Err(err) => DaemonResponse::Error {
             message: err.to_string(),
         },
@@ -643,13 +654,7 @@ async fn act_hello(app: &mut HelloApp, text: String) -> DaemonResponse {
         .await
     {
         Ok(update) => match update.snapshot() {
-            Some(snapshot) => DaemonResponse::Snapshot {
-                event: "update".to_owned(),
-                epoch: snapshot.view_epoch,
-                turn_id: snapshot.turn_id.to_string(),
-                view: render_agent_view_xml(&snapshot.view),
-                prompt: snapshot.turn_prompt.task.clone(),
-            },
+            Some(snapshot) => render_snapshot_response("update", snapshot),
             None => DaemonResponse::Error {
                 message: "expected a full view update".to_owned(),
             },
@@ -661,9 +666,8 @@ async fn act_hello(app: &mut HelloApp, text: String) -> DaemonResponse {
 }
 
 async fn observe_chess(runtime: &mut ChessRuntime) -> DaemonResponse {
-    let templates = TemplateEngine::new();
     match runtime.app.observe("Choose white's next move.").await {
-        Ok(snapshot) => render_chess_full_snapshot("observe", runtime, &snapshot, &templates).await,
+        Ok(snapshot) => render_snapshot_response("observe", &snapshot),
         Err(err) => DaemonResponse::Error {
             message: err.to_string(),
         },
@@ -677,7 +681,6 @@ async fn act_chess(runtime: &mut ChessRuntime, uci: String) -> DaemonResponse {
         };
     };
 
-    let templates = TemplateEngine::new();
     match runtime
         .app
         .act_with_sink(
@@ -694,7 +697,7 @@ async fn act_chess(runtime: &mut ChessRuntime, uci: String) -> DaemonResponse {
                 if snapshot.view.engine_pending() {
                     schedule_chess_engine(runtime);
                 }
-                render_chess_update("act", runtime, snapshot, &templates).await
+                render_snapshot_response("act", snapshot)
             }
             None => DaemonResponse::Error {
                 message: "expected a full chess view update".to_owned(),
@@ -707,14 +710,13 @@ async fn act_chess(runtime: &mut ChessRuntime, uci: String) -> DaemonResponse {
 }
 
 async fn hook_chess(runtime: &mut ChessRuntime, epoch: ViewEpoch) -> DaemonResponse {
-    let templates = TemplateEngine::new();
     match timeout(
         Duration::from_secs(5),
         runtime.app.hook(epoch, "Choose white's next move."),
     )
     .await
     {
-        Ok(Ok(snapshot)) => render_chess_update("hook", runtime, &snapshot, &templates).await,
+        Ok(Ok(snapshot)) => render_snapshot_response("hook", &snapshot),
         Ok(Err(err)) => DaemonResponse::Error {
             message: err.to_string(),
         },
@@ -735,90 +737,6 @@ fn schedule_chess_engine(runtime: &ChessRuntime) {
     });
 }
 
-async fn render_chess_full_snapshot(
-    event: &str,
-    runtime: &mut ChessRuntime,
-    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
-    templates: &TemplateEngine,
-) -> DaemonResponse {
-    let view = match snapshot.view.render_full(templates).await {
-        Ok(view) => view.into_string(),
-        Err(err) => {
-            return DaemonResponse::Error {
-                message: err.to_string(),
-            };
-        }
-    };
-    let response = render_chess_response(event, snapshot, view, templates).await;
-    commit_chess_view_after_render(&mut runtime.last_view, &snapshot.view, &response);
-    response
-}
-
-async fn render_chess_update(
-    event: &str,
-    runtime: &mut ChessRuntime,
-    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
-    templates: &TemplateEngine,
-) -> DaemonResponse {
-    let view = match runtime.last_view.as_ref() {
-        Some(prev) => match snapshot.view.render_delta(prev, templates).await {
-            Ok(Some(view)) => view.into_string(),
-            Ok(None) => String::new(),
-            Err(err) => {
-                return DaemonResponse::Error {
-                    message: err.to_string(),
-                };
-            }
-        },
-        None => match snapshot.view.render_full(templates).await {
-            Ok(view) => view.into_string(),
-            Err(err) => {
-                return DaemonResponse::Error {
-                    message: err.to_string(),
-                };
-            }
-        },
-    };
-
-    let response = render_chess_response(event, snapshot, view, templates).await;
-    commit_chess_view_after_render(&mut runtime.last_view, &snapshot.view, &response);
-    response
-}
-
-async fn render_chess_response(
-    event: &str,
-    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
-    view: String,
-    templates: &TemplateEngine,
-) -> DaemonResponse {
-    let prompt = match snapshot.turn_prompt.render_full(templates).await {
-        Ok(prompt) => prompt.into_string(),
-        Err(err) => {
-            return DaemonResponse::Error {
-                message: err.to_string(),
-            };
-        }
-    };
-
-    DaemonResponse::Snapshot {
-        event: event.to_owned(),
-        epoch: snapshot.view_epoch,
-        turn_id: snapshot.turn_id.to_string(),
-        view,
-        prompt,
-    }
-}
-
-fn commit_chess_view_after_render(
-    last_view: &mut Option<ChessView>,
-    current: &ChessView,
-    response: &DaemonResponse,
-) {
-    if matches!(response, DaemonResponse::Snapshot { .. }) {
-        *last_view = Some(current.clone());
-    }
-}
-
 async fn write_response(mut stream: TcpStream, response: &DaemonResponse) -> anyhow::Result<()> {
     let line = serde_json::to_string(response)?;
     stream.write_all(line.as_bytes()).await?;
@@ -829,31 +747,6 @@ async fn write_response(mut stream: TcpStream, response: &DaemonResponse) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn chess_diff_baseline_advances_only_after_snapshot_response() {
-        let current = ChessView::collect(&ChessGameSource::new().snapshot());
-        let mut last_view = None;
-        let error = DaemonResponse::Error {
-            message: "prompt rendering failed".to_owned(),
-        };
-
-        commit_chess_view_after_render(&mut last_view, &current, &error);
-
-        assert!(last_view.is_none());
-
-        let response = DaemonResponse::Snapshot {
-            event: "act".to_owned(),
-            epoch: 1,
-            turn_id: "turn-2".to_owned(),
-            view: "<prompt_board rendering_mode=\"delta\" />".to_owned(),
-            prompt: "next turn".to_owned(),
-        };
-
-        commit_chess_view_after_render(&mut last_view, &current, &response);
-
-        assert_eq!(last_view, Some(current));
-    }
 
     #[test]
     fn help_does_not_show_internal_mode() {

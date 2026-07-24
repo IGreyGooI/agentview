@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use agentview::pom::{
     ContentNode, ContentRef, DiffSlot, DiffStrategy, Document, InlineChildren, InlineContent,
-    ListKind, MarkdownNode, ParagraphNode, ResolvedDocument, TextNode, XmlName, XmlNode,
+    ListKind, MarkdownNode, ParagraphNode, TextNode, XmlName, XmlNode,
 };
 use agentview::pom_resolution::resolve_system_document;
 use agentview::prelude::{
     Agent, AgentTurnRequest, AgentViewModel, ExecutorCommit, LLMExecutor, PromptContext,
     TextTurnEvent, Turn, TurnFlow, TurnSink,
 };
+use agentview::{AgentView, StorageString};
 use tokio::sync::Mutex;
 
 fn assert_slot_free<'a>(children: impl Iterator<Item = ContentRef<'a>>) {
@@ -103,6 +104,28 @@ fn system_resolution_recursively_expands_present_and_omits_absent_slots() {
         instructions.children().iter().next(),
         Some(ContentRef::Node(ContentNode::Xml(xml))) if xml.name().as_str() == "edge"
     ));
+}
+
+#[test]
+fn system_resolution_prunes_markdown_containers_emptied_by_absent_slots() {
+    let document = Document::try_build(|blocks| {
+        blocks.try_paragraph(|paragraph| {
+            paragraph.try_strong(|strong| {
+                strong.xml_slot(DiffSlot::absent(
+                    XmlName::try_from("retired_context")?,
+                    DiffStrategy::Recursive,
+                ));
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .unwrap();
+
+    let resolved = resolve_system_document(document);
+
+    assert!(resolved.children().is_empty());
 }
 
 fn text_xml(name: &str, text: &str) -> XmlNode {
@@ -282,6 +305,30 @@ fn system_resolution_ignores_all_strategies_and_duplicate_roles() {
 #[derive(Clone)]
 struct PomRequestViewModel;
 
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(kind = "request_context")]
+struct PomRequestContextView {
+    #[view(text)]
+    text: String,
+}
+
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(markdown = "paragraph")]
+struct PomRequestTask {
+    #[view(text)]
+    text: String,
+}
+
+#[derive(Debug, Clone, AgentView)]
+#[agent_view(document)]
+struct PomRequestUserDocument {
+    #[view(name = "agent_context", diff)]
+    context: PomRequestContextView,
+
+    #[view(block)]
+    task: PomRequestTask,
+}
+
 fn request_system_document() -> Document {
     let mut reply_contract = XmlNode::try_build("reply_contract", |children| {
         children.text(TextNode::new("Return <action>."));
@@ -315,30 +362,37 @@ fn request_system_document() -> Document {
 #[async_trait::async_trait]
 impl AgentViewModel<Turn, ()> for PomRequestViewModel {
     type Source = ();
-    type View = String;
-    type SystemPrompt = ResolvedDocument;
-    type TurnPrompt = String;
+    type View = PomRequestContextView;
     type ContextState = ();
 
-    async fn build_system_prompt(
+    async fn build_system_document(
         &self,
         _ctx: &PromptContext<Turn, Self::ContextState>,
         _source: &Self::Source,
-    ) -> anyhow::Result<Self::SystemPrompt> {
-        Ok(resolve_system_document(request_system_document()))
+    ) -> anyhow::Result<Document> {
+        Ok(request_system_document())
     }
 
     async fn capture_view(&self, _source: &Self::Source) -> Self::View {
-        "current context".to_owned()
+        PomRequestContextView {
+            text: "current context".to_owned(),
+        }
     }
 
-    async fn build_turn_prompt(
+    async fn build_user_document(
         &self,
         _ctx: &PromptContext<Turn, Self::ContextState>,
         _call_id: &str,
-        task: String,
-    ) -> anyhow::Result<Self::TurnPrompt> {
-        Ok(task)
+        task: StorageString,
+        current_view: &Self::View,
+    ) -> anyhow::Result<Document> {
+        Ok(PomRequestUserDocument {
+            context: current_view.clone(),
+            task: PomRequestTask {
+                text: task.to_string(),
+            },
+        }
+        .build_root()?)
     }
 
     async fn commit_turn(
@@ -403,7 +457,7 @@ async fn resolved_system_document_reaches_the_real_agent_request_path() {
             "</reply_contract>"
         )
     );
-    assert!(requests[0].user.contains("## View"));
+    assert!(requests[0].user.contains("<agent_context"));
     assert!(requests[0].user.contains("current context"));
     assert!(requests[0].user.contains("Act now."));
 }

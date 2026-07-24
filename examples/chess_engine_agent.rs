@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use agentview::prelude::*;
 use chess_support::{
-    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessTaskView, ChessView,
+    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessView,
     ChessViewModel, StockfishEngine,
 };
 use serde_json::json;
@@ -23,18 +23,16 @@ async fn main() -> anyhow::Result<()> {
         source.clone(),
         PromptContext::<Turn, ()>::without_system(),
     );
-    let templates = TemplateEngine::new();
-
     let system_prompt = ChessViewModel
-        .build_system_prompt(app.session().context(), &source)
+        .build_system_document(app.session().context(), &source)
         .await?;
     println!(
         "system:\n{}",
-        system_prompt.render_full(&templates).await?.as_str()
+        render_pom_document(&resolve_system_document(system_prompt))?
     );
 
     let snapshot = app.observe("Choose white's next move.").await?;
-    print_chess_full_snapshot("observe", &snapshot, &templates).await?;
+    print_chess_snapshot("observe", &snapshot)?;
 
     let update = app
         .act_with_sink(
@@ -49,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let after_player = update
         .snapshot()
         .ok_or_else(|| anyhow::anyhow!("chess example expected a full update"))?;
-    print_chess_update("act", after_player, &snapshot.view, &templates).await?;
+    print_chess_snapshot("act", after_player)?;
 
     let engine = StockfishEngine::new(
         std::env::var("AGENTVIEW_STOCKFISH_BIN").unwrap_or_else(|_| "stockfish".to_owned()),
@@ -65,49 +63,20 @@ async fn main() -> anyhow::Result<()> {
     let after_engine = app
         .hook(after_player.view_epoch, "Choose white's next move.")
         .await?;
-    print_chess_update("hook", &after_engine, &after_player.view, &templates).await?;
+    print_chess_snapshot("hook", &after_engine)?;
 
     Ok(())
 }
 
-async fn print_chess_full_snapshot(
+fn print_chess_snapshot(
     event: &str,
-    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
-    templates: &TemplateEngine,
+    snapshot: &ViewSnapshot<ChessView, ResolvedDocument>,
 ) -> anyhow::Result<()> {
     println!(
         "{event} epoch={} turn={}",
         snapshot.view_epoch, snapshot.turn_id
     );
-    println!(
-        "view:\n{}",
-        snapshot.view.render_full(templates).await?.as_str()
-    );
-    println!(
-        "prompt:\n{}",
-        snapshot.turn_prompt.render_full(templates).await?.as_str()
-    );
-
-    Ok(())
-}
-
-async fn print_chess_update(
-    event: &str,
-    snapshot: &ViewSnapshot<ChessView, ChessTaskView>,
-    previous_view: &ChessView,
-    templates: &TemplateEngine,
-) -> anyhow::Result<()> {
-    println!(
-        "{event} epoch={} turn={}",
-        snapshot.view_epoch, snapshot.turn_id
-    );
-    if let Some(view) = snapshot.view.render_delta(previous_view, templates).await? {
-        println!("view:\n{}", view.as_str());
-    }
-    println!(
-        "prompt:\n{}",
-        snapshot.turn_prompt.render_full(templates).await?.as_str()
-    );
+    println!("user:\n{}", render_pom_document(&snapshot.user_document)?);
 
     Ok(())
 }

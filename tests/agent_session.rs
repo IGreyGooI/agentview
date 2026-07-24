@@ -1,21 +1,21 @@
 use agentview::prelude::*;
 
 #[test]
-fn new_agent_session_starts_without_a_view_cursor() {
+fn new_agent_session_starts_without_a_user_document_cursor() {
     let mut context = PromptContext::<Turn, usize>::new("system");
     context.push_history(Turn::user("committed"));
 
-    let session = AgentSession::<Turn, usize, String>::new(context);
+    let session = AgentSession::<Turn, usize>::new(context);
 
     assert_eq!(session.context().system(), Some("system"));
     assert_eq!(session.context().history().len(), 1);
-    assert!(session.view_cursor().is_none());
+    assert!(session.user_document_cursor().is_empty());
 }
 
 #[test]
 fn context_state_can_be_updated_through_the_session() {
     let context = PromptContext::<Turn, usize>::new("system");
-    let mut session = AgentSession::<Turn, usize, String>::new(context);
+    let mut session = AgentSession::<Turn, usize>::new(context);
 
     *session.context_state_mut() = 7;
 
@@ -25,7 +25,7 @@ fn context_state_can_be_updated_through_the_session() {
 #[test]
 fn session_exposes_safe_prompt_context_mutations() {
     let context = PromptContext::<Turn>::without_system();
-    let mut session = AgentSession::<Turn, (), String>::new(context);
+    let mut session = AgentSession::<Turn, ()>::new(context);
 
     session.set_system_once("system");
     session.push_history(Turn::user("first"));

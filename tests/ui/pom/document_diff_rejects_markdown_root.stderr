@@ -1,0 +1,53 @@
+error[E0271]: type mismatch resolving `<MarkdownContext as AgentView>::Root == XmlNode`
+  --> tests/ui/pom/document_diff_rejects_markdown_root.rs:10:10
+   |
+10 | #[derive(AgentView)]
+   |          ^^^^^^^^^ type mismatch resolving `<MarkdownContext as AgentView>::Root == XmlNode`
+   |
+note: expected this to be `XmlNode`
+  --> tests/ui/pom/document_diff_rejects_markdown_root.rs:3:10
+   |
+ 3 | #[derive(AgentView)]
+   |          ^^^^^^^^^
+   = note: required for `MarkdownContext` to implement `DocumentDiffValue`
+note: required by a bound in `agentview::agent_view::build_document_diff_slot`
+  --> src/agent_view.rs
+   |
+   | pub fn build_document_diff_slot<V>(
+   |        ------------------------ required by a bound in this function
+...
+   |     V: DocumentDiffValue + ?Sized,
+   |        ^^^^^^^^^^^^^^^^^ required by this bound in `build_document_diff_slot`
+   = note: this error originates in the derive macro `AgentView` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `MarkdownContext: DocumentDiffValue` is not satisfied
+  --> tests/ui/pom/document_diff_rejects_markdown_root.rs:10:10
+   |
+10 | #[derive(AgentView)]
+   |          ^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AgentViewValue` is not implemented for `MarkdownContext`
+  --> tests/ui/pom/document_diff_rejects_markdown_root.rs:5:1
+   |
+ 5 | struct MarkdownContext {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AgentViewValue`:
+             &T
+             BTreeMap<K, V>
+             Option<T>
+             String
+             ToolErrorArtifact
+             Vec<T>
+             XmlNode
+             bool
+           and $N others
+   = note: required for `MarkdownContext` to implement `DocumentDiffValue`
+note: required by a bound in `agentview::agent_view::build_document_diff_slot`
+  --> src/agent_view.rs
+   |
+   | pub fn build_document_diff_slot<V>(
+   |        ------------------------ required by a bound in this function
+...
+   |     V: DocumentDiffValue + ?Sized,
+   |        ^^^^^^^^^^^^^^^^^ required by this bound in `build_document_diff_slot`
+   = note: this error originates in the derive macro `AgentView` (in Nightly builds, run with -Z macro-backtrace for more info)

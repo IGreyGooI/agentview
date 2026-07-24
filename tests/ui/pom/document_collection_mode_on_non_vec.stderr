@@ -1,0 +1,5 @@
+error: collection diff modes are only supported on Vec fields
+  --> tests/ui/pom/document_collection_mode_on_non_vec.rs:13:5
+   |
+13 |     context: Context,
+   |     ^^^^^^^
