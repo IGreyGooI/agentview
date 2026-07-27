@@ -12,6 +12,21 @@ use agentview::prelude::*;
 
 ## Core Idea
 
+An LLM-native application does not embed an LLM as a function inside a
+predefined workflow. The LLM is the application's semantic operator and
+decision-making control plane; the application provides legible state,
+composable capabilities, validation, persistence, and resource/safety
+boundaries.
+
+```text
+Agent != Application + LLM
+Agent = Application for LLM
+```
+
+`agentview` exists to support this boundary: it gives an LLM a structured view
+of the application and turn/session semantics without baking product workflow
+into the runtime.
+
 `agentview` treats agent interaction as a ViewModel problem.
 
 Your app exposes state through a `ContextViewBuilder`. `agentview` renders that state into prompts, runs one model-backed turn through your executor, and commits successful results back into durable context.

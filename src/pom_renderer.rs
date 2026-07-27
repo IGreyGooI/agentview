@@ -69,7 +69,14 @@ impl Renderer {
             ContentRef::Node(ContentNode::Markdown(node)) => {
                 self.render_block_markdown(node, xml_context)
             }
-            ContentRef::Node(ContentNode::Xml(node)) => self.render_xml(node),
+            ContentRef::Node(ContentNode::Xml(node)) => {
+                let placement = if xml_context {
+                    XmlPlacement::Embedded
+                } else {
+                    XmlPlacement::Block
+                };
+                self.render_xml(node, placement)
+            }
             ContentRef::Node(ContentNode::Text(_)) => {
                 unreachable!("resolved block children cannot contain direct text")
             }
@@ -138,7 +145,9 @@ impl Renderer {
                 ContentRef::Node(ContentNode::Markdown(MarkdownNode::CodeSpan(node))) => {
                     self.render_code_span(node, xml_context)?
                 }
-                ContentRef::Node(ContentNode::Xml(node)) => self.render_xml(node)?,
+                ContentRef::Node(ContentNode::Xml(node)) => {
+                    self.render_xml(node, XmlPlacement::Embedded)?
+                }
                 ContentRef::Node(ContentNode::Markdown(
                     MarkdownNode::Heading(_)
                     | MarkdownNode::Paragraph(_)
@@ -318,7 +327,11 @@ impl Renderer {
         Ok(rendered)
     }
 
-    fn render_xml(&self, node: &XmlNode) -> Result<String, PomRenderError> {
+    fn render_xml(
+        &self,
+        node: &XmlNode,
+        placement: XmlPlacement,
+    ) -> Result<String, PomRenderError> {
         let mut opening = format!("<{}", node.name().as_str());
         for attribute in node.attributes().iter() {
             opening.push(' ');
@@ -331,6 +344,28 @@ impl Renderer {
         if node.children().is_empty() {
             opening.push_str(" />");
             return Ok(opening);
+        }
+
+        if placement == XmlPlacement::Block
+            && element_only_children(node)
+            && !contains_block_markdown(node)
+        {
+            let children = node
+                .children()
+                .iter()
+                .map(|content| {
+                    let ContentRef::Node(ContentNode::Xml(child)) = content else {
+                        unreachable!("element-only XML contains only XML child nodes")
+                    };
+                    self.render_xml(child, XmlPlacement::Block)
+                        .map(|rendered| indent_continuation_lines(&rendered, "  ", true))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join("\n");
+            return Ok(format!(
+                "{opening}>\n{children}\n</{}>",
+                node.name().as_str()
+            ));
         }
 
         let mixed = self.render_mixed_children(node.children())?;
@@ -387,7 +422,7 @@ impl Renderer {
                     )?);
                 }
                 ContentRef::Node(ContentNode::Xml(node)) => {
-                    flow.push_str(&self.render_xml(node)?);
+                    flow.push_str(&self.render_xml(node, XmlPlacement::Embedded)?);
                 }
                 ContentRef::DiffSlot(_) => {
                     unreachable!("ResolvedDocument cannot contain diff slots")
@@ -501,6 +536,42 @@ impl Renderer {
 struct RenderedMixed {
     text: String,
     multiline: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XmlPlacement {
+    Block,
+    Embedded,
+}
+
+fn element_only_children(node: &XmlNode) -> bool {
+    node.children()
+        .iter()
+        .all(|content| matches!(content, ContentRef::Node(ContentNode::Xml(_))))
+}
+
+fn contains_block_markdown(node: &XmlNode) -> bool {
+    node.children().iter().any(content_contains_block_markdown)
+}
+
+fn content_contains_block_markdown(content: ContentRef<'_>) -> bool {
+    match content {
+        ContentRef::Node(ContentNode::Xml(node)) => contains_block_markdown(node),
+        ContentRef::Node(ContentNode::Markdown(node)) if node.is_block() => true,
+        ContentRef::Node(ContentNode::Markdown(MarkdownNode::Strong(node))) => {
+            node.children().iter().any(content_contains_block_markdown)
+        }
+        ContentRef::Node(ContentNode::Markdown(MarkdownNode::CodeSpan(_)))
+        | ContentRef::Node(ContentNode::Text(_)) => false,
+        ContentRef::Node(ContentNode::Markdown(
+            MarkdownNode::Heading(_)
+            | MarkdownNode::Paragraph(_)
+            | MarkdownNode::List(_)
+            | MarkdownNode::CodeBlock(_)
+            | MarkdownNode::ThematicBreak,
+        )) => unreachable!("block Markdown was handled by the guarded match arm"),
+        ContentRef::DiffSlot(_) => true,
+    }
 }
 
 fn longest_run(value: &str, needle: char) -> usize {

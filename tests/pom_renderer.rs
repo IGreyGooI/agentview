@@ -1,6 +1,6 @@
 use agentview::pom::{
-    Document, InlineChildren, InlineContent, ListKind, MarkdownNode, StrongNode, TextNode, XmlName,
-    XmlNode,
+    BlockChildren, BlockContent, Document, InlineChildren, InlineContent, ListItem, ListKind,
+    ListNode, MarkdownNode, StrongNode, TextNode, XmlName, XmlNode,
 };
 use agentview::pom_renderer::{render_pom_document, PomRenderError};
 use agentview::pom_resolution::resolve_system_document;
@@ -81,6 +81,182 @@ fn renders_canonical_markdown_and_xml_system_document() {
             "<response_contract transport=\"xml &amp; strict\">",
             "Return &lt;select&gt; &amp; **nothing else**.",
             "</response_contract>"
+        )
+    );
+}
+
+#[test]
+fn renderer_pretty_prints_block_element_only_xml_without_expanding_leaves() {
+    let context = XmlNode::try_build("agent_context", |children| {
+        children.xml(XmlNode::try_build("phase", |phase| {
+            phase.text(TextNode::new("execute"));
+            Ok(())
+        })?);
+        children.xml(XmlNode::try_build("focus", |focus| {
+            focus.xml(XmlNode::try_build("summary", |summary| {
+                summary.text(TextNode::new("Attach the verified edge."));
+                Ok(())
+            })?);
+            focus.xml(XmlNode::try_build("rationale", |rationale| {
+                rationale.xml(XmlNode::try_build("none", |_| Ok(()))?);
+                Ok(())
+            })?);
+            Ok(())
+        })?);
+        Ok(())
+    })
+    .unwrap();
+
+    let document = Document::build(|blocks| blocks.xml(context));
+
+    assert_eq!(
+        render_pom_document(&resolve_system_document(document)).unwrap(),
+        concat!(
+            "<agent_context>\n",
+            "  <phase>execute</phase>\n",
+            "  <focus>\n",
+            "    <summary>Attach the verified edge.</summary>\n",
+            "    <rationale>\n",
+            "      <none />\n",
+            "    </rationale>\n",
+            "  </focus>\n",
+            "</agent_context>",
+        )
+    );
+}
+
+#[test]
+fn renderer_keeps_inline_and_mixed_xml_compact() {
+    let tool = XmlNode::try_build("tool", |children| {
+        children.xml(XmlNode::try_build("purpose", |purpose| {
+            purpose.text(TextNode::new("Inspect one edge."));
+            Ok(())
+        })?);
+        Ok(())
+    })
+    .unwrap();
+    let mixed = XmlNode::try_build("message", |children| {
+        children.text(TextNode::new("before "));
+        children.xml(XmlNode::try_build("emphasis", |emphasis| {
+            emphasis.text(TextNode::new("middle"));
+            Ok(())
+        })?);
+        children.text(TextNode::new(" after"));
+        Ok(())
+    })
+    .unwrap();
+    let document = Document::try_build(|blocks| {
+        blocks.try_paragraph(|paragraph| {
+            paragraph.try_text("Call ")?;
+            paragraph.xml(tool);
+            paragraph.try_text(" now.")
+        })?;
+        blocks.xml(mixed);
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        render_pom_document(&resolve_system_document(document)).unwrap(),
+        concat!(
+            "Call <tool><purpose>Inspect one edge.</purpose></tool> now.\n\n",
+            "<message>before <emphasis>middle</emphasis> after</message>",
+        )
+    );
+}
+
+#[test]
+fn renderer_does_not_indent_nested_block_markdown_as_xml_layout() {
+    let child = XmlNode::try_build("child", |children| {
+        let mut paragraph = InlineChildren::new();
+        paragraph.push(InlineContent::try_text("Markdown block").unwrap());
+        children.markdown(MarkdownNode::Paragraph(agentview::pom::ParagraphNode::new(
+            paragraph,
+        )));
+        Ok(())
+    })
+    .unwrap();
+    let outer = XmlNode::try_build("outer", |children| {
+        children.xml(child);
+        Ok(())
+    })
+    .unwrap();
+    let document = Document::build(|blocks| blocks.xml(outer));
+
+    assert_eq!(
+        render_pom_document(&resolve_system_document(document)).unwrap(),
+        "<outer>\n<child>\nMarkdown block\n</child>\n</outer>",
+    );
+}
+
+#[test]
+fn renderer_combines_xml_layout_with_markdown_list_indentation_only_when_safe() {
+    fn nested_xml() -> XmlNode {
+        XmlNode::try_build("root", |children| {
+            children.xml(XmlNode::try_build("leaf", |leaf| {
+                leaf.text(TextNode::new("value"));
+                Ok(())
+            })?);
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    let xml_with_list = XmlNode::try_build("outer", |children| {
+        let mut item_children = BlockChildren::new();
+        item_children.push(BlockContent::xml(nested_xml()));
+        let list = ListNode::new(ListKind::Unordered, vec![ListItem::new(item_children)]);
+        children.markdown(MarkdownNode::List(list));
+        Ok(())
+    })
+    .unwrap();
+    let document = Document::try_build(|blocks| {
+        blocks.try_list(ListKind::Unordered, |items| {
+            items.try_item(|item| {
+                item.xml(nested_xml());
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        blocks.xml(xml_with_list);
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        render_pom_document(&resolve_system_document(document)).unwrap(),
+        concat!(
+            "- <root>\n",
+            "    <leaf>value</leaf>\n",
+            "  </root>\n\n",
+            "<outer>\n",
+            "- <root><leaf>value</leaf></root>\n",
+            "</outer>",
+        )
+    );
+}
+
+#[test]
+fn renderer_keeps_attributes_and_authored_multiline_text_on_one_xml_line() {
+    let mut message = XmlNode::try_build("message", |children| {
+        children.text(TextNode::new("line one\nline two"));
+        Ok(())
+    })
+    .unwrap();
+    message
+        .push_attribute(
+            XmlName::try_from("note").unwrap(),
+            "attribute one\nattribute two",
+        )
+        .unwrap();
+    let document = Document::build(|blocks| blocks.xml(message));
+
+    assert_eq!(
+        render_pom_document(&resolve_system_document(document)).unwrap(),
+        concat!(
+            "<message note=\"attribute one&#10;attribute two\">",
+            "line one&#10;line two",
+            "</message>",
         )
     );
 }

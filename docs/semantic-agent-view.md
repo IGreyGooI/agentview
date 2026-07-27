@@ -622,8 +622,15 @@ The POM comparison contract is:
 - `BTreeMap<K, V>` diff fields use their map keys as identity and render
   `insert`, `remove`, and `update` operation wrappers.
 - A strategy change sends the complete current slot and begins a new baseline.
-- An explicit absent slot emits `<role rendering_mode="delta"><none /></role>`
-  and deletes that role's baseline. Omitting a slot from one current Document
+- An explicit absent slot emits:
+
+  ```xml
+  <role rendering_mode="delta">
+    <none />
+  </role>
+  ```
+
+  This deletes that role's baseline. Omitting a slot from one current Document
   leaves its old baseline untouched.
 
 ### Invalid Diff Combinations

@@ -332,6 +332,62 @@ POM 使用 prompt-safe XML subset：element/attribute name 必须匹配 ASCII `[
 
 `XmlMetadata` 是 crate-private typed metadata，不是任意 key/value bag。它只保存现有 semantic diff 确实需要、但不属于可见 prompt 的信息，例如 `IntrinsicCollectionKind::Map` 和 map-entry identity。它不能重新引入 `diff_boundary: bool`；boundary 只由 `DiffSlot` 表达。
 
+### 7.1 Canonical hybrid readable XML rendering
+
+POM 的 canonical renderer 使用 context-sensitive hybrid layout，而不是把所有
+XML 一律压成单行或一律 pretty-print。结构化 block XML 应当便于模型和人直接
+识别层级，同时 inline XML、mixed content 与 XML 内的 Markdown 不能因为美化
+而改变语义。
+
+renderer 遵守以下 contract：
+
+- 只有已经完成 system/user resolution 和 semantic diff 的
+  `ResolvedDocument` 才进入 formatting。formatting 只生成最终 prompt text，
+  不向 POM AST 插入 whitespace `TextNode`，也不改变 semantic equality、
+  `DiffSlot`、user cursor、baseline 或 diff result。
+- 位于 block position、direct children 为 XML elements 的 element-only
+  container 使用 readable layout：opening tag、每个 direct child 和 closing
+  tag 分行，嵌套层级固定使用 2 spaces。text leaf 保持
+  `<phase>execute</phase>` 这样的单行形式，empty element 保持 `<none />`。
+- 位于 `Heading`、`Paragraph` 或 `Strong` 等 inline position 的 XML island
+  不应用 readable XML indentation。没有 block Markdown 时整棵保持 compact；
+  合法 subtree 自身含 block Markdown 时保留既有 block flow。renderer 不能
+  为了展示 XML 层级而额外插入会终止或重解释 Markdown inline flow 的换行。
+- 只要 XML node 的 direct children 构成 mixed/phrasing content，例如
+  `Text -> XmlNode -> Text`、`Strong` 或 `CodeSpan` 与 XML 相邻，renderer
+  就保持其 authored order 和连续 flow，不在 siblings 之间插入 structural
+  whitespace。
+- 含 block Markdown 的 XML subtree 使用保守 layout，不对其中的 Markdown
+  lines 施加 XML indentation，也不做 reflow。特别是不能让 4-space
+  indentation 把 paragraph/list/code fence 意外解释成 Markdown code block。
+- attribute 始终保留在所属 opening tag 的同一行；layout 新增的换行统一使用
+  LF (`\n`)，formatter 不会合成 trailing spaces。attribute escaping 和
+  insertion order、text/code body 的 authored whitespace 继续由既有
+  renderer contract 保证。
+
+例如，block-position 的 element-only delta tree canonicalize 为：
+
+```xml
+<agent_context rendering_mode="delta">
+  <focus rendering_mode="delta">
+    <summary>Inspect the owner edge.</summary>
+  </focus>
+  <transient_hint rendering_mode="delta">
+    <none />
+  </transient_hint>
+</agent_context>
+```
+
+而 paragraph 中的 executable tool call 仍保持 inline：
+
+```markdown
+Call <inspect_edge edge_id="edge.owner" /> before updating the graph.
+```
+
+这个 layout distinction 属于 resolved renderer 的 textual contract，不属于
+`XmlNode` 的 semantic state。调用者不能通过比较 rendered strings 代替 POM
+semantic diff。
+
 ## 8. Text 节点
 
 ```rust
@@ -885,7 +941,7 @@ demo、chess、hello 与 CLI 示例均已使用这一 contract。streaming tool 
 
 ## 17. 本阶段明确不做
 
-- 不在本文中冻结 Markdown/XML renderer 的全部 lexical 细节；canonical whitespace、escaping、indentation 和错误边界由 renderer tests 锁定；
+- 除第 7.1 节的 canonical hybrid XML layout contract 外，不在本文中冻结 Markdown/XML renderer 的全部 lexical 细节；escaping 和错误边界继续由 renderer tests 锁定；
 - 不决定 delta prompt 的最终 textual vocabulary；
 - 不改变现有 session draft、atomic commit 和 fork 生命周期；cursor 的持久化内容收窄为 slot baselines；
 - 不在本文中设计 history compaction 除“history replacement 清空 cursor”以外的策略；
@@ -907,6 +963,7 @@ demo、chess、hello 与 CLI 示例均已使用这一 contract。streaming tool 
 - 第一版使用最小 CommonMark semantic subset 与 prompt-safe XML subset；
 - 不保留 comment/raw markup bypass；
 - attribute order 不参与 semantic equality，text representation 强制 canonicalize；
+- resolved renderer 对 block element-only XML 使用 2-space readable layout；inline/mixed XML 保持 compact，含 block Markdown 的 XML 保留既有 block flow 且不接受额外 XML indentation；
 - 全量迁移现有 diff strategies，present role 从 XML name 派生；
 - differ 返回 typed `XmlPatch`，resolver 返回 slot-free `ResolvedDocument`；
 - public API 使用统一 node union、typed content wrappers、双 builder façade 和 read-only traversal；

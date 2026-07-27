@@ -321,8 +321,8 @@ fn document_derive_builds_and_renders_mixed_markdown_and_xml_in_field_order() {
             "Choose one intent.\n\n",
             "## Required workflow\n\n",
             "1. Call `<verify scope=\"demo\"/>`.\n\n",
-            "<response_contract transport=\"xml\">",
-            "<instruction>Return only tool elements.</instruction>",
+            "<response_contract transport=\"xml\">\n",
+            "  <instruction>Return only tool elements.</instruction>\n",
             "</response_contract>",
         )
     );
@@ -357,7 +357,13 @@ fn structured_flatten_preserves_the_child_root_in_pom_and_legacy_trees() {
 
     assert_eq!(
         pom,
-        "<panel><details id=\"details.1\"><summary>Ready</summary></details></panel>"
+        concat!(
+            "<panel>\n",
+            "  <details id=\"details.1\">\n",
+            "    <summary>Ready</summary>\n",
+            "  </details>\n",
+            "</panel>"
+        )
     );
     assert_eq!(
         render_agent_view_xml(&view),
@@ -382,7 +388,13 @@ fn map_flatten_preserves_the_map_root_in_pom_and_legacy_trees() {
 
     assert_eq!(
         pom,
-        "<map_panel><map><entry key=\"mood\" value=\"tense\" /></map></map_panel>"
+        concat!(
+            "<map_panel>\n",
+            "  <map>\n",
+            "    <entry key=\"mood\" value=\"tense\" />\n",
+            "  </map>\n",
+            "</map_panel>"
+        )
     );
     assert_eq!(
         render_agent_view_xml(&view),

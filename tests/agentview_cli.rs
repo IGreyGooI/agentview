@@ -125,9 +125,12 @@ fn observe_then_act_share_an_implicit_server_session() {
     assert!(act.status.success(), "{act:?}");
     let act_stdout = String::from_utf8_lossy(&act.stdout);
     assert!(act_stdout.contains("update epoch=1 turn=turn-2"));
-    assert!(act_stdout.contains("view: <hello greeting=\"Hello\"><name>world</name></hello>"));
+    assert!(
+        act_stdout.contains("view:\n<hello greeting=\"Hello\">\n  <name>world</name>\n</hello>"),
+        "{act_stdout}"
+    );
     assert!(act_stdout.contains(
-        "prompt:\n<agent_context rendering_mode=\"delta\" kind=\"hello\"><name>world</name></agent_context>"
+        "prompt:\n<agent_context rendering_mode=\"delta\" kind=\"hello\">\n  <name>world</name>\n</agent_context>"
     ));
     assert!(act_stdout.contains("\n\nSay hello to the named caller."));
 }

@@ -227,6 +227,29 @@ fn first_seen_slot_materializes_full_and_records_only_its_complete_baseline() {
 }
 
 #[test]
+fn user_document_cursor_serializes_to_diagnostic_json_with_role_keys() {
+    let source = user_document(
+        "Choose an action.",
+        Some(DiffSlot::present(
+            DiffStrategy::Recursive,
+            context("same", "ready"),
+        )),
+    );
+    let (_, cursor) = resolve_user_document(source, &UserDocumentCursor::default()).unwrap();
+
+    let diagnostic = serde_json::to_value(&cursor).unwrap();
+
+    assert_eq!(
+        diagnostic["slots"]["agent_context"]["strategy"],
+        serde_json::Value::String("Recursive".to_owned())
+    );
+    assert_eq!(
+        diagnostic["slots"]["agent_context"]["value"]["name"],
+        serde_json::Value::String("agent_context".to_owned())
+    );
+}
+
+#[test]
 fn unchanged_slot_is_omitted_while_ordinary_current_content_is_preserved() {
     let current = context("same", "ready");
     let (_, previous) = resolve_user_document(

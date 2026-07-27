@@ -76,15 +76,15 @@ async fn chess_system_prompt_is_authored_as_pom_markdown_and_xml() {
             "## Reasoning policy\n\n",
             "- Think privately about candidate moves before acting.\n",
             "- Do not print chain-of-thought; call the CLI only after deciding.\n\n",
-            "<reply_contract transport=\"cli\">",
-            "<command>`agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; ",
+            "<reply_contract transport=\"cli\">\n",
+            "  <command>`agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; ",
             "--to &lt;to&gt; [--promotion &lt;promotion&gt;] --uci &lt;uci&gt;`</command>",
-            "<example>`agentview chess act --piece P --from e2 --to e4 --uci e2e4`</example>",
-            "<promotion_example>`agentview chess act --piece P --from e7 --to e8 ",
+            "\n  <example>`agentview chess act --piece P --from e2 --to e4 --uci e2e4`</example>",
+            "\n  <promotion_example>`agentview chess act --piece P --from e7 --to e8 ",
             "--promotion q --uci e7e8q`</promotion_example>",
-            "<instruction>Choose one legal UCI move from the current view, include the move ",
+            "\n  <instruction>Choose one legal UCI move from the current view, include the move ",
             "context flags first, then pass the canonical UCI move with --uci.</instruction>",
-            "</reply_contract>"
+            "\n</reply_contract>"
         )
     );
 }
@@ -142,7 +142,8 @@ async fn chess_board_squares_render_as_a_flat_agent_facing_list() {
     )))
     .unwrap();
 
-    assert!(rendered.contains("<board_squares><square id=\"a8\" file=\"a\" rank=\"8\">r</square>"));
+    assert!(rendered
+        .contains("<board_squares>\n    <square id=\"a8\" file=\"a\" rank=\"8\">r</square>"));
     assert!(rendered.contains("<square id=\"a8\" file=\"a\" rank=\"8\">r</square>"));
     assert!(rendered.contains("<square id=\"e1\" file=\"e\" rank=\"1\">K</square>"));
     assert!(!rendered.contains("<rank "));
@@ -236,11 +237,11 @@ async fn observe_renders_starting_board_and_move_contract() {
     assert!(rendered_view.starts_with("<prompt_board>"));
     assert!(!rendered_view.contains("render_mode=\"full\""));
     assert!(!rendered_view.contains("<rendering_mode"));
-    assert!(rendered_view.contains("<board_state kind=\"board_state\"><board_ascii>"));
-    assert!(rendered_view.contains("<board_squares><square id=\"a8\""));
+    assert!(rendered_view.contains("<board_state kind=\"board_state\">\n    <board_ascii>"));
+    assert!(rendered_view.contains("<board_squares>\n    <square id=\"a8\""));
     assert!(rendered_view.contains("<legal_moves>"));
     assert!(rendered_view.contains("<move>e2e4</move>"));
-    assert!(rendered_view.contains("<engine kind=\"engine\"><pending>false</pending>"));
+    assert!(rendered_view.contains("<engine kind=\"engine\">\n    <pending>false</pending>"));
     assert!(!rendered_view.contains("<chess_view>"));
 
     let rendered_prompt = render_pom_document(&snapshot.user_document).unwrap();
@@ -385,14 +386,14 @@ async fn chess_view_uses_generic_field_diff_for_a_player_move() {
     );
     assert!(
         rendered.contains(
-            "<board_state rendering_mode=\"delta\"><replace><board_state kind=\"board_state\">"
+            "<board_state rendering_mode=\"delta\">\n    <replace>\n      <board_state kind=\"board_state\">"
         ),
         "{rendered}"
     );
     assert!(rendered.contains(
-        "<board_squares rendering_mode=\"delta\"><update><square id=\"e2\" file=\"e\" rank=\"2\">.</square>"
+        "<board_squares rendering_mode=\"delta\">\n    <update>\n      <square id=\"e2\" file=\"e\" rank=\"2\">.</square>"
     ));
-    assert!(rendered.contains("<update><square id=\"e4\" file=\"e\" rank=\"4\">P</square>"));
+    assert!(rendered.contains("<update>\n      <square id=\"e4\" file=\"e\" rank=\"4\">P</square>"));
     assert_eq!(rendered.matches("<update>").count(), 2);
     assert_eq!(rendered.matches("<square id=").count(), 2);
     assert!(!rendered.contains("<square id=\"a8\""));
@@ -401,7 +402,7 @@ async fn chess_view_uses_generic_field_diff_for_a_player_move() {
     assert!(rendered.contains("<remove>"));
     assert!(rendered.contains("<move_history rendering_mode=\"delta\">"));
     assert!(rendered.contains("<move>e2e4</move>"));
-    assert!(rendered.contains("<engine rendering_mode=\"delta\"><replace>"));
+    assert!(rendered.contains("<engine rendering_mode=\"delta\">\n    <replace>"));
     assert!(rendered.contains("<pending>true</pending>"));
     assert!(!rendered.contains("render_mode="));
     assert!(!rendered.contains("<added>"));

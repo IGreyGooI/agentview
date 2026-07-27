@@ -149,10 +149,12 @@ async fn observe_returns_full_snapshot_with_user_document() {
     assert_eq!(
         render_pom_document(&snapshot.user_document).unwrap(),
         concat!(
-            "<agent_context kind=\"counter\"><value>0</value></agent_context>\n\n",
-            "<counter_task turn_id=\"turn-1\">",
-            "<instruction>increment once</instruction>",
-            "<reply_contract>{\"delta\": number}</reply_contract>",
+            "<agent_context kind=\"counter\">\n",
+            "  <value>0</value>\n",
+            "</agent_context>\n\n",
+            "<counter_task turn_id=\"turn-1\">\n",
+            "  <instruction>increment once</instruction>\n",
+            "  <reply_contract>{\"delta\": number}</reply_contract>\n",
             "</counter_task>"
         )
     );
@@ -215,8 +217,9 @@ async fn act_applies_parsed_reply_and_returns_full_update() {
     assert_eq!(next.view, CounterView { value: 3 });
     assert_eq!(app.session().user_document_cursor().len(), 1);
     let rendered = render_pom_document(&next.user_document).unwrap();
-    assert!(rendered
-        .starts_with("<agent_context rendering_mode=\"delta\" kind=\"counter\"><value>3</value>"));
+    assert!(rendered.starts_with(
+        "<agent_context rendering_mode=\"delta\" kind=\"counter\">\n  <value>3</value>\n</agent_context>"
+    ));
     assert!(rendered.contains("<instruction>increment again</instruction>"));
     assert_eq!(app.session().context().history().len(), 1);
 }
@@ -446,6 +449,6 @@ async fn epoch_retry_does_not_commit_the_discarded_candidate_cursor() {
         vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
     );
     assert_eq!(rendered.matches("<insert>").count(), 2, "{rendered}");
-    assert!(rendered.contains("<insert><item>b</item></insert>"));
-    assert!(rendered.contains("<insert><item>c</item></insert>"));
+    assert!(rendered.contains("<insert>\n      <item>b</item>\n    </insert>"));
+    assert!(rendered.contains("<insert>\n      <item>c</item>\n    </insert>"));
 }

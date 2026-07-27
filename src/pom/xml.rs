@@ -5,6 +5,7 @@ use std::fmt;
 use super::{ContentNode, MixedBuilder, MixedChildren, PomError};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(transparent)]
 pub struct XmlName {
     value: StorageString,
 }

@@ -727,9 +727,9 @@ mod tests {
                 "## Required workflow\n\n",
                 "First, call <verify_intent_budget scope=\"demo\" required=\"first\" />.\n\n",
                 "Then, after verification, return only <select local_id=\"...\" cardinality=\"1-3\" /> elements.\n\n",
-                "<response_contract transport=\"xml\">",
-                "<verify_intent_budget scope=\"demo\" required=\"first\" />",
-                "<select local_id=\"...\" cardinality=\"1-3\" />",
+                "<response_contract transport=\"xml\">\n",
+                "  <verify_intent_budget scope=\"demo\" required=\"first\" />\n",
+                "  <select local_id=\"...\" cardinality=\"1-3\" />\n",
                 "</response_contract>"
             )
         );
