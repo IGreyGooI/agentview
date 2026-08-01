@@ -22,7 +22,9 @@ use std::os::unix::process::CommandExt;
 #[path = "../../examples/chess_engine_mounted_external.rs"]
 mod mounted_external_chess;
 
-use mounted_external_chess::{MountedChessCliSnapshot, MountedExternalChessCli};
+use mounted_external_chess::{
+    MountedChessCliSnapshot, MountedChessSystemAttachment, MountedExternalChessCli,
+};
 
 const INTERNAL_DAEMON_ARG: &str = "--__agentview-daemon";
 const INTERNAL_SHUTDOWN_ARG: &str = "--__agentview-shutdown";
@@ -99,10 +101,23 @@ enum CliCommand {
     ChessActHelp,
     ChessHookHelp,
     Observe,
-    Act { text: String },
+    Act {
+        text: String,
+    },
+    ChessAttach,
+    ChessAttachAck {
+        delivery_id: String,
+    },
     ChessObserve,
-    ChessAct { command: String },
-    ChessHook { epoch: ViewEpoch },
+    ChessAck {
+        action_handle: String,
+    },
+    ChessAct {
+        action_handle: String,
+        raw_reply: String,
+    },
+    ChessHook,
+    ChessResync,
     InternalDaemon,
     InternalShutdown,
 }
@@ -111,10 +126,23 @@ enum CliCommand {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum DaemonRequest {
     Observe,
-    Act { text: String },
+    Act {
+        text: String,
+    },
+    ChessAttach,
+    ChessAttachAck {
+        delivery_id: String,
+    },
     ChessObserve,
-    ChessAct { command: String },
-    ChessHook { epoch: ViewEpoch },
+    ChessAck {
+        action_handle: String,
+    },
+    ChessAct {
+        action_handle: String,
+        raw_reply: String,
+    },
+    ChessHook,
+    ChessResync,
     Shutdown,
 }
 
@@ -127,6 +155,21 @@ enum DaemonResponse {
         turn_id: String,
         view: String,
         prompt: String,
+    },
+    ChessFrame {
+        event: String,
+        frame: MountedChessCliSnapshot,
+    },
+    SystemAttachment {
+        attachment: MountedChessSystemAttachment,
+    },
+    UserAcknowledgement {
+        action_handle: String,
+        status: String,
+    },
+    UserResync {
+        status: String,
+        frame: MountedChessCliSnapshot,
     },
     Ok,
     Error {
@@ -181,16 +224,41 @@ async fn run() -> anyhow::Result<()> {
             let response = request_with_autostart(&DaemonRequest::Act { text }).await?;
             print_response(response)
         }
+        CliCommand::ChessAttach => {
+            let response = request_with_autostart(&DaemonRequest::ChessAttach).await?;
+            print_response(response)
+        }
+        CliCommand::ChessAttachAck { delivery_id } => {
+            let response =
+                request_with_autostart(&DaemonRequest::ChessAttachAck { delivery_id }).await?;
+            print_response(response)
+        }
         CliCommand::ChessObserve => {
             let response = request_with_autostart(&DaemonRequest::ChessObserve).await?;
             print_response(response)
         }
-        CliCommand::ChessAct { command } => {
-            let response = request_with_autostart(&DaemonRequest::ChessAct { command }).await?;
+        CliCommand::ChessAck { action_handle } => {
+            let response =
+                request_with_autostart(&DaemonRequest::ChessAck { action_handle }).await?;
             print_response(response)
         }
-        CliCommand::ChessHook { epoch } => {
-            let response = request_with_autostart(&DaemonRequest::ChessHook { epoch }).await?;
+        CliCommand::ChessAct {
+            action_handle,
+            raw_reply,
+        } => {
+            let response = request_with_autostart(&DaemonRequest::ChessAct {
+                action_handle,
+                raw_reply,
+            })
+            .await?;
+            print_response(response)
+        }
+        CliCommand::ChessHook => {
+            let response = request_with_autostart(&DaemonRequest::ChessHook).await?;
+            print_response(response)
+        }
+        CliCommand::ChessResync => {
+            let response = request_with_autostart(&DaemonRequest::ChessResync).await?;
             print_response(response)
         }
         CliCommand::InternalDaemon => run_daemon(daemon_addr()?).await,
@@ -209,28 +277,40 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> anyhow::Result<CliComman
         [cmd, text] if cmd == "act" => Ok(CliCommand::Act { text: text.clone() }),
         [cmd] if cmd == "act" => anyhow::bail!("usage: agentview act <text>\n\n{}", help_text()),
         [scope, arg] if scope == "chess" && is_help_arg(arg) => Ok(CliCommand::ChessHelp),
+        [scope, cmd] if scope == "chess" && cmd == "attach" => Ok(CliCommand::ChessAttach),
+        [scope, cmd, delivery_id] if scope == "chess" && cmd == "attach-ack" => {
+            Ok(CliCommand::ChessAttachAck {
+                delivery_id: delivery_id.clone(),
+            })
+        }
         [scope, cmd] if scope == "chess" && cmd == "observe" => Ok(CliCommand::ChessObserve),
+        [scope, cmd, action_handle] if scope == "chess" && cmd == "ack" => {
+            Ok(CliCommand::ChessAck {
+                action_handle: action_handle.clone(),
+            })
+        }
         [scope, cmd, arg] if scope == "chess" && cmd == "act" && is_help_arg(arg) => {
             Ok(CliCommand::ChessActHelp)
         }
-        [scope, cmd, rest @ ..] if scope == "chess" && cmd == "act" && !rest.is_empty() => {
+        [scope, cmd, action_handle, raw_reply] if scope == "chess" && cmd == "act" => {
             Ok(CliCommand::ChessAct {
-                command: MountedExternalChessCli::command_from_cli_args(rest)?,
+                action_handle: action_handle.clone(),
+                raw_reply: raw_reply.clone(),
             })
         }
         [scope, cmd, arg] if scope == "chess" && cmd == "hook" && is_help_arg(arg) => {
             Ok(CliCommand::ChessHookHelp)
         }
-        [scope, cmd, epoch] if scope == "chess" && cmd == "hook" => Ok(CliCommand::ChessHook {
-            epoch: epoch
-                .parse::<ViewEpoch>()
-                .with_context(|| format!("failed to parse chess hook epoch `{epoch}`"))?,
-        }),
-        [scope, cmd] if scope == "chess" && cmd == "act" => {
-            anyhow::bail!("usage: agentview chess act <uci>\n\n{}", help_text())
+        [scope, cmd] if scope == "chess" && cmd == "hook" => Ok(CliCommand::ChessHook),
+        [scope, cmd] if scope == "chess" && cmd == "resync" => Ok(CliCommand::ChessResync),
+        [scope, cmd, ..] if scope == "chess" && cmd == "act" => {
+            anyhow::bail!(
+                "usage: agentview chess act <action-handle> '<move uci=\"...\" />'\n\n{}",
+                help_text()
+            )
         }
-        [scope, cmd] if scope == "chess" && cmd == "hook" => {
-            anyhow::bail!("usage: agentview chess hook <epoch>\n\n{}", help_text())
+        [scope, cmd, ..] if scope == "chess" && cmd == "hook" => {
+            anyhow::bail!("usage: agentview chess hook\n\n{}", help_text())
         }
         _ => anyhow::bail!("{}", help_text()),
     }
@@ -247,9 +327,13 @@ fn help_text() -> &'static str {
         "USAGE:\n",
         "  agentview observe\n",
         "  agentview act <text>\n",
+        "  agentview chess attach\n",
+        "  agentview chess attach-ack <system-delivery-id>\n",
         "  agentview chess observe\n",
-        "  agentview chess act --piece <piece> --from <square> --to <square> [--promotion <piece>] --uci <uci>\n",
-        "  agentview chess hook <epoch>\n",
+        "  agentview chess ack <action-handle>\n",
+        "  agentview chess act <action-handle> '<move uci=\"...\" />'\n",
+        "  agentview chess hook\n",
+        "  agentview chess resync\n",
         "\n",
         "COMMANDS:\n",
         "  observe    Print the current AgentView snapshot\n",
@@ -267,14 +351,22 @@ fn chess_help_text() -> &'static str {
         "agentview chess\n",
         "\n",
         "USAGE:\n",
+        "  agentview chess attach\n",
+        "  agentview chess attach-ack <system-delivery-id>\n",
         "  agentview chess observe\n",
-        "  agentview chess act --piece <piece> --from <square> --to <square> [--promotion <piece>] --uci <uci>\n",
-        "  agentview chess hook <epoch>\n",
+        "  agentview chess ack <action-handle>\n",
+        "  agentview chess act <action-handle> '<move uci=\"...\" />'\n",
+        "  agentview chess hook\n",
+        "  agentview chess resync\n",
         "\n",
         "COMMANDS:\n",
+        "  attach     Return the sole System delivery until acknowledged\n",
+        "  attach-ack Confirm the exact System delivery\n",
         "  observe    Print the current chess AgentView snapshot\n",
-        "  act        Send a chess move for the latest turn\n",
+        "  ack        Confirm an exact Actionable User delivery\n",
+        "  act        Submit raw XML against its exact action handle\n",
         "  hook       Wait for a later chess view epoch\n",
+        "  resync     Replace an unacknowledged delta with one full User\n",
         "  help       Print this help\n",
     )
 }
@@ -284,18 +376,11 @@ fn chess_act_help_text() -> &'static str {
         "agentview chess act\n",
         "\n",
         "USAGE:\n",
-        "  agentview chess act --piece <piece> --from <square> --to <square> [--promotion <piece>] --uci <uci>\n",
-        "\n",
-        "OPTIONS:\n",
-        "  --uci <uci>              UCI move, such as e2e4 or e7e8q\n",
-        "  --piece <piece>          Context flag for the moving piece\n",
-        "  --from <square>          Context flag for the source square\n",
-        "  --to <square>            Context flag for the target square\n",
-        "  --promotion <piece>      Context flag for promotion piece\n",
+        "  agentview chess act <action-handle> '<move uci=\"...\" />'\n",
         "\n",
         "NOTES:\n",
-        "  This host-owned CLI envelope is translated to the shared move contract.\n",
-        "  The submitted values must agree with the canonical UCI move.\n",
+        "  The handle must match the exact acknowledged Actionable delivery.\n",
+        "  The raw reply is decoded by the same XML contract shown in System.\n",
     )
 }
 
@@ -304,9 +389,9 @@ fn chess_hook_help_text() -> &'static str {
         "agentview chess hook\n",
         "\n",
         "USAGE:\n",
-        "  agentview chess hook <epoch>\n",
+        "  agentview chess hook\n",
         "\n",
-        "Wait for a chess view update after <epoch>.\n",
+        "Wait for Stockfish and return the next chess frame.\n",
     )
 }
 
@@ -408,6 +493,13 @@ fn print_response(response: DaemonResponse) -> anyhow::Result<()> {
             print_block("prompt", &prompt);
             Ok(())
         }
+        response @ (DaemonResponse::ChessFrame { .. }
+        | DaemonResponse::SystemAttachment { .. }
+        | DaemonResponse::UserAcknowledgement { .. }
+        | DaemonResponse::UserResync { .. }) => {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(())
+        }
         DaemonResponse::Ok => Ok(()),
         DaemonResponse::Error { message } => anyhow::bail!("{message}"),
     }
@@ -504,12 +596,9 @@ where
 }
 
 fn render_mounted_chess_response(event: &str, snapshot: MountedChessCliSnapshot) -> DaemonResponse {
-    DaemonResponse::Snapshot {
+    DaemonResponse::ChessFrame {
         event: event.to_owned(),
-        epoch: snapshot.epoch,
-        turn_id: snapshot.turn_id,
-        view: snapshot.view,
-        prompt: snapshot.prompt,
+        frame: snapshot,
     }
 }
 
@@ -521,9 +610,20 @@ async fn handle_connection(state: &mut DaemonState, stream: TcpStream) -> anyhow
     let response = match serde_json::from_str::<DaemonRequest>(&request) {
         Ok(DaemonRequest::Observe) => observe_hello(&mut state.hello).await,
         Ok(DaemonRequest::Act { text }) => act_hello(&mut state.hello, text).await,
+        Ok(DaemonRequest::ChessAttach) => attach_chess(&state.chess),
+        Ok(DaemonRequest::ChessAttachAck { delivery_id }) => {
+            acknowledge_chess_system(&mut state.chess, delivery_id)
+        }
         Ok(DaemonRequest::ChessObserve) => observe_chess(&mut state.chess).await,
-        Ok(DaemonRequest::ChessAct { command }) => act_chess(&mut state.chess, command).await,
-        Ok(DaemonRequest::ChessHook { epoch }) => hook_chess(&mut state.chess, epoch).await,
+        Ok(DaemonRequest::ChessAck { action_handle }) => {
+            acknowledge_chess_user(&mut state.chess, action_handle).await
+        }
+        Ok(DaemonRequest::ChessAct {
+            action_handle,
+            raw_reply,
+        }) => act_chess(&mut state.chess, action_handle, raw_reply).await,
+        Ok(DaemonRequest::ChessHook) => hook_chess(&mut state.chess).await,
+        Ok(DaemonRequest::ChessResync) => resync_chess(&mut state.chess).await,
         Ok(DaemonRequest::Shutdown) => {
             state.chess.mounted.close().await;
             write_response(reader.into_inner(), &DaemonResponse::Ok).await?;
@@ -591,8 +691,55 @@ async fn observe_chess(runtime: &mut ChessRuntime) -> DaemonResponse {
     }
 }
 
-async fn act_chess(runtime: &mut ChessRuntime, command: String) -> DaemonResponse {
-    match runtime.mounted.act(command).await {
+fn attach_chess(runtime: &ChessRuntime) -> DaemonResponse {
+    DaemonResponse::SystemAttachment {
+        attachment: runtime.mounted.system_attachment(),
+    }
+}
+
+fn acknowledge_chess_system(runtime: &mut ChessRuntime, delivery_id: String) -> DaemonResponse {
+    match runtime.mounted.acknowledge_system(&delivery_id) {
+        Ok(()) => attach_chess(runtime),
+        Err(err) => DaemonResponse::Error {
+            message: err.to_string(),
+        },
+    }
+}
+
+async fn acknowledge_chess_user(
+    runtime: &mut ChessRuntime,
+    action_handle: String,
+) -> DaemonResponse {
+    match runtime
+        .mounted
+        .acknowledge_user_delivery(&action_handle)
+        .await
+    {
+        Ok(outcome) => DaemonResponse::UserAcknowledgement {
+            action_handle,
+            status: match outcome {
+                agentview::component::advanced::external::ExternalUserDeliveryAckOutcome::Acknowledged => {
+                    "acknowledged"
+                }
+                agentview::component::advanced::external::ExternalUserDeliveryAckOutcome::AlreadyAcknowledged => {
+                    "already_acknowledged"
+                }
+                _ => "unknown",
+            }
+            .to_owned(),
+        },
+        Err(err) => DaemonResponse::Error {
+            message: err.to_string(),
+        },
+    }
+}
+
+async fn act_chess(
+    runtime: &mut ChessRuntime,
+    action_handle: String,
+    raw_reply: String,
+) -> DaemonResponse {
+    match runtime.mounted.act(&action_handle, raw_reply).await {
         Ok(snapshot) => render_mounted_chess_response("act", snapshot),
         Err(err) => DaemonResponse::Error {
             message: err.to_string(),
@@ -600,14 +747,35 @@ async fn act_chess(runtime: &mut ChessRuntime, command: String) -> DaemonRespons
     }
 }
 
-async fn hook_chess(runtime: &mut ChessRuntime, epoch: ViewEpoch) -> DaemonResponse {
-    match timeout(Duration::from_secs(5), runtime.mounted.hook(epoch)).await {
+async fn hook_chess(runtime: &mut ChessRuntime) -> DaemonResponse {
+    match timeout(Duration::from_secs(5), runtime.mounted.hook()).await {
         Ok(Ok(snapshot)) => render_mounted_chess_response("hook", snapshot),
         Ok(Err(err)) => DaemonResponse::Error {
             message: err.to_string(),
         },
         Err(_) => DaemonResponse::Error {
-            message: format!("timed out waiting for chess view epoch after {epoch}"),
+            message: "timed out waiting for Stockfish".to_owned(),
+        },
+    }
+}
+
+async fn resync_chess(runtime: &mut ChessRuntime) -> DaemonResponse {
+    match runtime.mounted.request_user_resync().await {
+        Ok((outcome, frame)) => DaemonResponse::UserResync {
+            status: match outcome {
+                agentview::component::advanced::external::ExternalUserResyncOutcome::Requested => {
+                    "requested"
+                }
+                agentview::component::advanced::external::ExternalUserResyncOutcome::AlreadyRequested => {
+                    "already_requested"
+                }
+                _ => "unknown",
+            }
+            .to_owned(),
+            frame,
+        },
+        Err(err) => DaemonResponse::Error {
+            message: err.to_string(),
         },
     }
 }
@@ -650,38 +818,23 @@ mod tests {
             parse_cli(["chess".to_owned(), "observe".to_owned()]).unwrap(),
             CliCommand::ChessObserve
         );
-        assert!(parse_cli(["chess".to_owned(), "act".to_owned(), "e2e4".to_owned()]).is_err());
         assert_eq!(
             parse_cli([
                 "chess".to_owned(),
                 "act".to_owned(),
-                "--piece".to_owned(),
-                "P".to_owned(),
-                "--from".to_owned(),
-                "e2".to_owned(),
-                "--to".to_owned(),
-                "e4".to_owned(),
-                "--uci".to_owned(),
-                "e2e4".to_owned()
+                "delivery-1".to_owned(),
+                "<move uci=\"e2e4\" />".to_owned(),
             ])
             .unwrap(),
             CliCommand::ChessAct {
-                command: "<move uci=\"e2e4\" />".to_owned()
+                action_handle: "delivery-1".to_owned(),
+                raw_reply: "<move uci=\"e2e4\" />".to_owned(),
             }
         );
-        assert!(parse_cli([
-            "chess".to_owned(),
-            "act".to_owned(),
-            "--piece=P".to_owned(),
-            "--from=e7".to_owned(),
-            "--to=e8".to_owned(),
-            "--promotion=q".to_owned(),
-            "--uci=e7e8q".to_owned()
-        ])
-        .is_err());
+        assert!(parse_cli(["chess".to_owned(), "act".to_owned(), "e2e4".to_owned()]).is_err());
         assert_eq!(
-            parse_cli(["chess".to_owned(), "hook".to_owned(), "1".to_owned()]).unwrap(),
-            CliCommand::ChessHook { epoch: 1 }
+            parse_cli(["chess".to_owned(), "hook".to_owned()]).unwrap(),
+            CliCommand::ChessHook
         );
     }
 

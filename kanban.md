@@ -12,19 +12,18 @@ Last reviewed: 2026-08-01
   wake supersession, replay, reopen, and visible engine-failure recovery. A
   prompt-only trace or hard-coded `e2e4` does not satisfy this target.
 
-- The dual-driver Chess target now has a local executable proof. The mounted
-  external CLI/skill has played multiple rounds against real Stockfish with
-  `System attach/ack -> full Actionable ack -> full Passive -> delta
-  Actionable`. A stable logical consumer id owns that lineage across process
-  reopen; every Actionable frame exposes an exact serializable handle, and the
-  CLI submits the real raw XML reply contract against that handle. The external
-  `resync` command intentionally retains the delta model: it may tombstone an
-  unacknowledged Actionable delta, emits one User-only full replacement without
-  another System delivery, and resumes delta only after that replacement is
-  acknowledged. An already acknowledged prompt cannot be tombstoned. A fresh
-  cross-process skill run on 2026-08-01 played `e2e4 c7c5 g1f3 b8c6` and
-  observed `full -> delta -> resync full -> explicit ack -> delta`; the final
-  `base_delivery` was the resync full receipt, not either Passive frame.
+- The dual-driver Chess target now has two AgentView runnable references. The
+  canonical external entrypoint is `target/debug/agentview chess` plus the
+  repository skill: it auto-starts a loopback daemon, exposes
+  `attach/attach-ack/observe/ack/act/hook/resync`, and returns
+  `kind: "chess_frame"` with protocol fields nested under `frame`. Separate
+  CLI client subprocesses share the reference state only while they use the
+  same live daemon; a daemon exit loses the System receipt, handles, delta
+  cursor, board and engine work, so it is not a SQLite/reopen proof. Within
+  that lifetime it proves `System attach/ack -> full Actionable ack -> full
+  Passive -> delta Actionable`, exact serializable handles, raw XML replies,
+  and User-only full resync. The scripted provider example supplies the other
+  AgentView reference path.
 - The provider example uses the same semantic move contract, a scripted
   provider, a strict streaming/publication gate, typed Commit staging,
   replay-safe local outbox, and real Stockfish between provider turns. Invalid
@@ -46,6 +45,8 @@ Last reviewed: 2026-08-01
   closed and are constrained by schema/migration guards. Recovery-scanned
   supervision, passive failure publication, daemon restart recovery,
   replacement-consumer resync, and real remote-provider validation remain open.
+  This is consumer integration and durability evidence, not the canonical
+  playable CLI/skill entrypoint.
 
 - Feature audit: 4 `implemented`, 4 `local-proof`, 7 `partial`, and 1
   `internal-proof`; no production consumer migration is complete.
@@ -169,10 +170,11 @@ Last reviewed: 2026-08-01
   a 786-byte System once, and renders 5124/4100-byte User turns. The exact
   legacy `ChessViewModel` comparison now lives in the example's `#[cfg(test)]`
   compatibility module, so the proof remains without obscuring authoring. It
-  deliberately does not replace `chess_engine_agent`: the new mounted
-  external controller now supplies the local action/reply lifecycle contract,
-  but Forgotten City still needs a real transactional port and consumer
-  migration before this example can become end to end.
+  deliberately does not replace `chess_engine_agent`: the new mounted external
+  controller supplies the local action/reply lifecycle contract, while
+  `agentview chess` supplies the daemon-backed end-to-end reference. Forgotten
+  City's SQLite port is retained for consumer integration rather than as this
+  example's user-facing entrypoint.
 - A separate author-only rewrite now lives in
   `examples/chess_agent_mounted_turn.rs`. It imports only
   `agentview::component::prelude` and puts the durable System POM, per-turn User
@@ -189,9 +191,10 @@ Last reviewed: 2026-08-01
   mounted facade at that point had no externally observable User
   snapshot/action token or reply ingress, and its pure `SessionReducer` could
   not atomically mutate `ChessGameSource`. That review produced the acceptance
-  contract now implemented by the isolated `MountedExternalController`; the
-  real chess host still has not supplied its transactional port, so
-  `chess_engine_mounted` remains a prompt-lifecycle proof only.
+  contract now implemented by the isolated `MountedExternalController`.
+  `chess_engine_mounted` remains a prompt-lifecycle proof only; the AgentView
+  daemon is the runnable reference and Forgotten City's SQLite host is the
+  durability-oriented consumer integration.
 - `chess_engine_mounted_external` now directly reproduces the compatibility
   chess flow: one System render, initial User, typed `e2e4` commit, a visible
   post-player waiting User, asynchronous real Stockfish execution, and a final
@@ -204,9 +207,11 @@ Last reviewed: 2026-08-01
   exact receipt/bytes, while safely cancelling an unacknowledged prompt forces
   the successor full. Missing Stockfish publishes a passive full recovery view
   with `last_error` before reporting failure and never exposes a black-to-move
-  action token. `MountedExternalChessCli` and the repository skill now extend
-  this into an interactive multi-move local proof. Its mutex-backed host remains
-  a teaching fake, not durable transport/database or cross-process recovery.
+  action token. AgentView's `agentview chess` daemon and repository skill now
+  extend this into the canonical interactive multi-move local proof. Its
+  mutex-backed host survives separate CLI client subprocesses only while the
+  daemon remains alive; it is not durable transport/database or cross-daemon
+  recovery.
 - `chess_engine_mounted_agentloop` now supplies the provider counterpart: the
   shared System/User POM and `ChessMoveContract` drive a real-time Live preview,
   exact-envelope/one-Output/no-Diagnostic gate, typed Commit, atomic local
@@ -216,8 +221,8 @@ Last reviewed: 2026-08-01
   full and reject-after-commit -> delta from the last good baseline. A real
   Stockfish move separates the provider turns. Forgotten City additionally
   runs the same mounted Chess shape through its OpenAI Conversations adapter
-  and SQLite outbox, but the executable example is still scripted-provider and
-  neither path yet has a production Chess domain transaction.
+  and SQLite outbox as consumer integration; the AgentView executable reference
+  remains scripted-provider, and neither path is a managed production service.
 - A second independent component author wrote
   `examples/mounted_author_review.rs` from the public surface without copying
   host internals. It converged on essentially the same prompt-only shape as
@@ -1583,7 +1588,7 @@ isolated unit test is not a production claim.
 | `AV-F06` Structured Streaming | `local-proof` | Strict incremental parser and fresh reducers; Forgotten City mounted SelectIntent focused suite is 21/21, including legacy-equivalent initial/retry User POM, accepted-stream callback ordering, mounted loop policy, drop/reopen no-second-System and runtime-drop joined cancellation. | Production selector install and Phrase migration. |
 | `AV-F07` Provider-native Tools | `local-proof` | Pure `ProviderCapabilityContract`, versioned host `ProviderDispatcherRegistry`, generic `MountedHostBindings`, Create/reopen manifest preflight, grouped ordered dispatch, correlation, result routing, attempt replay, and collision tests. | Real Provider/Cube/Forgotten City adapters, legacy builder quarantine, and durable cross-attempt replay policy. |
 | `AV-F08` Effect Lifecycle | `partial` | Typed lanes, awaited Live, compensation, private Commit staging; selector proves ordered/revocable Live delivery. Forgotten City's SQLite host now supports stable-id player Commit dedup, atomic board/job transaction, fenced Stockfish completion, expiry reclaim, retry/dead-letter, and capture admission across pending/delivering/dead-letter states. | Recovery-scanned supervisor, passive engine-failure observer, child scopes, and authoritative production effect adapter. |
-| `AV-F09` Reactive Observe/Act | `partial` | Public legacy observe/hook/act has epoch and stale-turn fencing. The advanced mounted external controller adds typed Actionable/Passive frames, stable action/reply/wake/source and User-delivery identities, host-owned System/User outbox publication, ack-before-act, acknowledged cursor delta, exact replay, safe cancellation/full-resync, typed decode, hook and recovery fencing. Forgotten City's SQLite facade and repository CLI/skill add stable consumer identity, System attach/ack, exact action handles and raw XML, and exercise multi-round full -> passive full -> delta against real Stockfish. | Managed remote/server transport, bounded durable receipt/reply retention, process-kill recovery, replacement-consumer/cross-transport handoff, and production supervision/migration. |
+| `AV-F09` Reactive Observe/Act | `partial` | Public legacy observe/hook/act has epoch and stale-turn fencing. The advanced mounted external controller adds typed Actionable/Passive frames, stable action/reply/wake/source and User-delivery identities, host-owned System/User outbox publication, ack-before-act, acknowledged cursor delta, exact replay, safe cancellation/full-resync, typed decode, hook and recovery fencing. AgentView's canonical `agentview chess` CLI/skill provides the daemon-backed in-memory external reference with System attach/ack, nested `chess_frame` output, exact action handles/raw XML and full/delta/resync; it spans client subprocesses but not daemon loss. Forgotten City's SQLite facade is the durable consumer integration proof, not the example entrypoint. | Managed remote/server transport, bounded durable receipt/reply retention, process-kill recovery, replacement-consumer/cross-transport handoff, and production supervision/migration. |
 | `AV-F10` Model Turn Loop | `implemented` | Compatibility transactional loop and public local mounted Continue recapture are executable. `TurnLoopPolicy` fixes the mounted loop bound at the durable harness; call inputs can only lower it, same-id policy drift is rejected, and the selector preserves its three-turn migration budget. | Production mounted loop and durable continuation ownership. |
 | `AV-F11` Session/Fork/Isolation | `partial` | Compatibility fork/cursor and factory-scoped mounted isolation are tested. | Durable child sessions, scope ownership, and production registry. |
 | `AV-F12` Safe Call Lifecycle | `local-proof` | Admission/replay/collision, start-future guards, dropped wait, joined cancel, Live cleanup, and FC stale-delivery withdrawal are covered. Exact-fence owner and actual process-local store tests prove all cursor dispositions, reason mismatch, timeout, revision/publication/epoch/stored-or-replacement-cursor/lease recovery, foreign-fence rejection, and same-fence recovery retry without another revision. The internal reconciliation controller now claims a persisted recovery fence, reconstructs the exact remote operation, restores only a live-fenced `NeverAccepted` checkpoint, and retains recovery for every other status; stale-fence and durable-backend reload tests cover this transition without provider/tool/Live replay. Public `MountedAgent::lookup` projects a lease-free durable call snapshot before and after reopen and reports admitted progress from the same owner instance without waiting behind an active call. That owner can restore one attached handle after handle loss; overlapping or cross-owner reattach remains read-only. Borrowed raw execution is test-only/module-private, so production entry always has a detached owner. | Bind observation into a production supervisor; add fenced cross-owner/process control and recovery, production lease policy, a concrete durable store/transport adapter, and a real provider operation ledger. |
@@ -2423,9 +2428,11 @@ turn abort.
       passive waiting presentation, asynchronous Stockfish wake, and fresh
       delta User hook. A missing engine produces a passive recovery view before
       the error is reported, with no invalid black-to-move action token.
-      Its in-memory host intentionally demonstrates the transaction shape only;
-      it does not claim a durable database, reliable transport, interactive CLI
-      input, or a multi-move provider loop.
+      Its in-memory host intentionally demonstrates the transaction shape only.
+      `target/debug/agentview chess` now wraps the same reference host in the
+      canonical daemon-backed interactive CLI/skill: separate client processes
+      can share one live daemon, but daemon loss resets the entire reference
+      session. Neither form claims a durable database or managed transport.
 - [x] Add a non-actionable external User publication contract.
       `ExternalUserView` compiles pure props into either Actionable Prompt or
       Passive Presentation; only the former creates an `ExternalActionToken`.
@@ -2441,19 +2448,22 @@ turn abort.
       acknowledged base receipt; unacknowledged cancellation requires host
       tombstoning and forces the successor full. This is a single-consumer
       local proof, not a production transport implementation.
-- [x] Bind that chess trace to Forgotten City's SQLite transactional host and
-      cross-process CLI protocol. The facade durably owns one logical consumer,
+- [x] Bind that chess trace to Forgotten City's SQLite transactional consumer
+      integration. The facade durably owns one logical consumer,
       System attach/ack, immutable User delivery and explicit ack, exact action
       handle/raw XML reply, reply replay/collision, hook wake, acknowledged
       delta cursor, User-only resync, create-lease takeover, and transport
       conflict fencing. Focused tests cover same-consumer reopen and reject a
-      replacement consumer from inheriting the lineage.
+      replacement consumer from inheriting the lineage. This is not the public
+      Chess example entrypoint; that role belongs to AgentView's daemon CLI and
+      repository skill.
 - [ ] Bind the same protocol to a production remote transport and recovery-
       scanned supervisor. Add process-kill tests around System/User outbox
       publication, bounded receipt/reply retention, wake tokens bound to
       session/delivery, and explicit replacement-consumer or cross-transport
-      handoff. CLI stdout plus SQLite is the executable reference protocol, not
-      proof of a managed server delivery path.
+      handoff. AgentView's daemon CLI is the executable reference protocol;
+      SQLite remains consumer integration evidence, not proof of a managed
+      server delivery path.
 - [x] Have an independent component author implement a mounted application
       from the public API. `examples/mounted_author_review.rs` runs one System
       attachment and two fresh User turns, but independently converges on the

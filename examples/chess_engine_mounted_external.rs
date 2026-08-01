@@ -8,8 +8,13 @@
 //! durable database adapter. Its in-memory outbox shows the required User
 //! delivery receipt, acknowledgement, and delta-baseline boundary.
 //!
-//! Run with:
-//! `cargo run --example chess_engine_mounted_external`
+//! The canonical multi-process client is the AgentView binary:
+//!
+//! `cargo build --bin agentview`
+//! `target/debug/agentview chess --help`
+//!
+//! Run `cargo run --example chess_engine_mounted_external` for the direct
+//! single-process teaching trace.
 
 use std::{
     collections::BTreeMap,
@@ -28,9 +33,10 @@ use agentview::{
                 ExternalFingerprint, ExternalObservation, ExternalObserveOutcome, ExternalReplyId,
                 ExternalSourceRevision, ExternalStateMutation, ExternalStateSnapshot,
                 ExternalStateWrite, ExternalStateWriteOutcome, ExternalSystemDeliveryReceipt,
-                ExternalUserDeliveryCandidate, ExternalUserDeliveryLane,
-                ExternalUserDeliveryReceipt, ExternalUserFrame, ExternalWakeCursor,
-                MountedExternalController, MountedExternalPort,
+                ExternalUserDeliveryAckOutcome, ExternalUserDeliveryCandidate,
+                ExternalUserDeliveryLane, ExternalUserDeliveryReceipt, ExternalUserFrame,
+                ExternalUserResyncOutcome, ExternalWakeCursor, MountedExternalController,
+                MountedExternalPort,
             },
             persistence::{MountedStateBlob, MountedStateGeneration},
         },
@@ -668,7 +674,7 @@ fn presentation(
 /// `prompt` is the host-owned User delivery. `view` is only a convenient full
 /// inspection render for the local CLI; it is not an additional prompt
 /// delivery and therefore never participates in the delta cursor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MountedChessCliSnapshot {
     pub epoch: u64,
     pub turn_id: String,
@@ -676,6 +682,37 @@ pub struct MountedChessCliSnapshot {
     pub prompt: String,
     pub delivery_receipt: String,
     pub actionable: bool,
+    pub action_handle: Option<String>,
+    pub prompt_mode: Option<MountedChessPromptMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum MountedChessPromptMode {
+    Full,
+    Delta { base_delivery: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum MountedChessSystemAttachment {
+    InstallSystemOnce {
+        delivery_id: String,
+        document: String,
+    },
+    Attached {
+        delivery_id: String,
+    },
+}
+
+impl MountedChessSystemAttachment {
+    pub fn delivery_id(&self) -> &str {
+        match self {
+            Self::InstallSystemOnce { delivery_id, .. } | Self::Attached { delivery_id } => {
+                delivery_id
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -686,7 +723,7 @@ struct MountedChessCliFrame {
 
 #[derive(Clone)]
 struct MountedChessCliReplay {
-    command: String,
+    raw_reply: String,
     ticket: ExternalActionTicket,
     response: MountedChessCliSnapshot,
 }
@@ -695,12 +732,16 @@ struct MountedChessCliReplay {
 ///
 /// It intentionally uses the example's in-memory port, but it drives the
 /// exact mounted-external state machine: System is delivered only on epoch
-/// creation, an `act` first acknowledges the currently rendered Actionable
-/// delivery, and only acknowledged Actionable frames become delta bases.
+/// creation. The external consumer must explicitly acknowledge the currently
+/// rendered Actionable delivery before `act`; only acknowledged Actionable
+/// frames become delta bases.
 /// Passive Stockfish frames are always self-contained presentations.
 pub struct MountedExternalChessCli {
     host: Arc<InMemoryChessHost>,
     controller: MountedExternalController<ChessTurnProps, ChessReplyContract, InMemoryChessHost>,
+    system_delivery_id: String,
+    system_document: String,
+    system_acknowledged: bool,
     engine: StockfishEngine,
     next_frame_index: u64,
     current: Option<MountedChessCliFrame>,
@@ -717,10 +758,17 @@ impl MountedExternalChessCli {
             DurableSessionId::new("agentview-cli/chess-session-1")?,
         )
         .await?;
+        let system_delivery_id = opened.system_delivery_receipt().as_str().to_owned();
+        let system_document = host
+            .delivered_system()
+            .ok_or_else(|| anyhow::anyhow!("example host did not retain the System delivery"))?;
 
         Ok(Self {
             host,
             controller: opened.into_controller(),
+            system_delivery_id,
+            system_document,
+            system_acknowledged: false,
             engine: StockfishEngine::new(stockfish_command.into()),
             next_frame_index: 1,
             current: None,
@@ -729,14 +777,42 @@ impl MountedExternalChessCli {
         })
     }
 
-    /// Translate the host-owned CLI envelope into the single semantic chess
-    /// reply. The CLI flags are not prompt grammar: `ChessCliTransport` owns
-    /// their validation, and the mounted controller receives the same XML
-    /// `<move uci="..." />` contract used by the provider path.
+    pub fn system_attachment(&self) -> MountedChessSystemAttachment {
+        if self.system_acknowledged {
+            MountedChessSystemAttachment::Attached {
+                delivery_id: self.system_delivery_id.clone(),
+            }
+        } else {
+            MountedChessSystemAttachment::InstallSystemOnce {
+                delivery_id: self.system_delivery_id.clone(),
+                document: self.system_document.clone(),
+            }
+        }
+    }
+
+    pub fn acknowledge_system(&mut self, delivery_id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            delivery_id == self.system_delivery_id,
+            "unknown Chess System delivery `{delivery_id}`"
+        );
+        self.system_acknowledged = true;
+        Ok(())
+    }
+
+    fn ensure_system_acknowledged(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.system_acknowledged,
+            "Chess System must be acknowledged before User delivery"
+        );
+        Ok(())
+    }
+
+    /// Legacy adapter retained by the interactive example below. The daemon
+    /// CLI accepts the raw XML reply directly.
     pub fn command_from_cli_args(args: &[String]) -> anyhow::Result<String> {
         anyhow::ensure!(
             !args.is_empty(),
-            "usage: agentview chess act --piece <piece> --from <square> --to <square> [--promotion <piece>] --uci <uci>"
+            "usage: chess_engine_mounted_external --piece <piece> --from <square> --to <square> [--promotion <piece>] --uci <uci>"
         );
         let command = format!("agentview chess act {}", args.join(" "));
         let action = ChessCliTransport::decode(&command).map_err(anyhow::Error::msg)?;
@@ -744,11 +820,12 @@ impl MountedExternalChessCli {
     }
 
     pub async fn observe(&mut self) -> anyhow::Result<MountedChessCliSnapshot> {
+        self.ensure_system_acknowledged()?;
         if let Some(current) = self.current.as_ref() {
             return self.snapshot(current);
         }
         if self.pending_wake.is_some() {
-            anyhow::bail!("Stockfish is pending; call `agentview chess hook <epoch>`");
+            anyhow::bail!("Stockfish is pending; call `agentview chess hook`");
         }
 
         let frame_index = self.next_frame_index;
@@ -774,23 +851,55 @@ impl MountedExternalChessCli {
         Ok(snapshot)
     }
 
-    /// A submitted reply proves that this local CLI consumer has received the
-    /// current Actionable frame. The acknowledgement is persisted before the
-    /// reply is decoded or the chess domain changes.
-    pub async fn act(&mut self, command: String) -> anyhow::Result<MountedChessCliSnapshot> {
+    pub async fn acknowledge_user_delivery(
+        &mut self,
+        action_handle: &str,
+    ) -> anyhow::Result<ExternalUserDeliveryAckOutcome> {
+        self.ensure_system_acknowledged()?;
+        let current = self.current.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("no active chess turn; run `agentview chess observe` first")
+        })?;
+        let ticket = current.frame.action_ticket().ok_or_else(|| {
+            anyhow::anyhow!("the current Chess frame is Passive and has no action handle")
+        })?;
+        anyhow::ensure!(
+            ticket.delivery_receipt().as_str() == action_handle,
+            "stale Chess action handle `{action_handle}`; current handle is `{}`",
+            ticket.delivery_receipt()
+        );
+        Ok(self
+            .controller
+            .acknowledge_user_delivery(ticket.delivery_receipt())
+            .await?)
+    }
+
+    /// Submit raw reply bytes against the exact acknowledged Actionable frame.
+    /// Delivery acknowledgement is intentionally a separate operation.
+    pub async fn act(
+        &mut self,
+        action_handle: &str,
+        raw_reply: String,
+    ) -> anyhow::Result<MountedChessCliSnapshot> {
+        self.ensure_system_acknowledged()?;
         if let Some(replay) = self.last_action.as_ref() {
-            if replay.command == command
-                && self
-                    .current
-                    .as_ref()
-                    .is_some_and(|current| matches!(current.frame, ExternalUserFrame::Passive(_)))
-            {
+            if replay.ticket.delivery_receipt().as_str() == action_handle {
+                anyhow::ensure!(
+                    replay.raw_reply == raw_reply,
+                    "Chess action handle `{action_handle}` was already answered with different reply bytes"
+                );
+                anyhow::ensure!(
+                    self.current.as_ref().is_some_and(|current| matches!(
+                        current.frame,
+                        ExternalUserFrame::Passive(_)
+                    )),
+                    "the replayed Chess action is no longer the current transition"
+                );
                 match self
                     .controller
                     .act(
                         replay.ticket.token(),
-                        Self::reply_id(replay.ticket.delivery_receipt(), &command)?,
-                        ControlReply::text(command),
+                        Self::reply_id(replay.ticket.delivery_receipt(), &raw_reply)?,
+                        ControlReply::text(raw_reply),
                     )
                     .await?
                 {
@@ -809,19 +918,21 @@ impl MountedExternalChessCli {
         let current = self.current.as_ref().ok_or_else(|| {
             anyhow::anyhow!("no active chess turn; run `agentview chess observe` first")
         })?;
-        let ticket = current.frame.action_ticket().cloned().ok_or_else(|| {
-            anyhow::anyhow!("Stockfish is pending; call `agentview chess hook <epoch>`")
-        })?;
-
-        self.controller
-            .acknowledge_user_delivery(ticket.delivery_receipt())
-            .await?;
+        let ticket =
+            current.frame.action_ticket().cloned().ok_or_else(|| {
+                anyhow::anyhow!("Stockfish is pending; call `agentview chess hook`")
+            })?;
+        anyhow::ensure!(
+            ticket.delivery_receipt().as_str() == action_handle,
+            "stale Chess action handle `{action_handle}`; current handle is `{}`",
+            ticket.delivery_receipt()
+        );
         let committed = match self
             .controller
             .act(
                 ticket.token(),
-                Self::reply_id(ticket.delivery_receipt(), &command)?,
-                ControlReply::text(command.clone()),
+                Self::reply_id(ticket.delivery_receipt(), &raw_reply)?,
+                ControlReply::text(raw_reply.clone()),
             )
             .await?
         {
@@ -864,7 +975,7 @@ impl MountedExternalChessCli {
         let response = self.snapshot(&current)?;
         self.pending_wake = Some(committed.wake_cursor().clone());
         self.last_action = Some(MountedChessCliReplay {
-            command,
+            raw_reply,
             ticket,
             response: response.clone(),
         });
@@ -880,18 +991,32 @@ impl MountedExternalChessCli {
         Ok(response)
     }
 
-    pub async fn hook(&mut self, after_epoch: u64) -> anyhow::Result<MountedChessCliSnapshot> {
+    pub async fn request_user_resync(
+        &mut self,
+    ) -> anyhow::Result<(ExternalUserResyncOutcome, MountedChessCliSnapshot)> {
+        self.ensure_system_acknowledged()?;
+        let replaces_actionable = self
+            .current
+            .as_ref()
+            .is_some_and(|current| matches!(current.frame, ExternalUserFrame::Actionable(_)));
+        let outcome = self.controller.request_user_document_resync().await?;
+        if replaces_actionable || self.current.is_none() {
+            self.current = None;
+            self.last_action = None;
+            return Ok((outcome, self.observe().await?));
+        }
+        let current = self
+            .current
+            .as_ref()
+            .expect("the Passive current frame was checked above");
+        Ok((outcome, self.snapshot(current)?))
+    }
+
+    pub async fn hook(&mut self) -> anyhow::Result<MountedChessCliSnapshot> {
+        self.ensure_system_acknowledged()?;
         let current = self.current.as_ref().ok_or_else(|| {
             anyhow::anyhow!("no active chess turn; run `agentview chess observe` first")
         })?;
-        let current_epoch = Self::frame_epoch(&current.frame);
-        if after_epoch < current_epoch {
-            return self.snapshot(current);
-        }
-        anyhow::ensure!(
-            after_epoch == current_epoch,
-            "current chess epoch is {current_epoch}; cannot wait after future epoch {after_epoch}"
-        );
         anyhow::ensure!(
             matches!(current.frame, ExternalUserFrame::Passive(_)),
             "the current chess frame is actionable; submit `agentview chess act ...` first"
@@ -938,6 +1063,17 @@ impl MountedExternalChessCli {
 
     fn snapshot(&self, current: &MountedChessCliFrame) -> anyhow::Result<MountedChessCliSnapshot> {
         let receipt = current.frame.delivery_receipt();
+        let delivery = self.host.user_delivery(receipt)?;
+        let action_handle = current
+            .frame
+            .action_ticket()
+            .map(|ticket| ticket.delivery_receipt().as_str().to_owned());
+        let prompt_mode = action_handle.as_ref().map(|_| match delivery.base_receipt {
+            Some(base) => MountedChessPromptMode::Delta {
+                base_delivery: base.as_str().to_owned(),
+            },
+            None => MountedChessPromptMode::Full,
+        });
         Ok(MountedChessCliSnapshot {
             epoch: Self::frame_epoch(&current.frame),
             turn_id: current.turn_id.clone(),
@@ -945,6 +1081,8 @@ impl MountedExternalChessCli {
             prompt: self.host.rendered_user(receipt)?,
             delivery_receipt: receipt.as_str().to_owned(),
             actionable: current.frame.action_ticket().is_some(),
+            action_handle,
+            prompt_mode,
         })
     }
 

@@ -27,8 +27,8 @@ The repo already has the right base pieces:
   full `ViewSnapshot`.
 - `ViewUpdate` already has a `Partial(ViewPatch)` variant, but the session
   currently returns full updates only.
-- `src/bin/agentview.rs` proves a hidden loopback daemon plus thin CLI, but it
-  only supports the hello-world `observe` and `act` path.
+- `src/bin/agentview.rs` now exposes both the hello-world path and the mounted
+  Chess `attach/observe/ack/act/hook/resync` reference protocol.
 
 The main current gap is async engine work. `act_with_sink` takes a synchronous
 apply closure, so a UCI engine reply should not be hidden inside that closure in
@@ -138,11 +138,12 @@ itself should not be only a rendered string.
 - [x] Use a mock Stockfish-compatible UCI process in tests so test runs do not
   require the real engine binary.
 - [x] Implement `examples/chess_engine_agent.rs` with observe, act, and hook.
-- [x] Render the chess turn contract as a CLI call:
-  `agentview chess act <uci>`.
+- [x] Bind the chess turn contract to an exact Actionable handle and raw XML:
+  `agentview chess act <action-handle> '<move uci="..." />'`.
 - [x] Add a hidden-daemon CLI path for the chess example without exposing daemon
   commands in help.
-- [x] Add `agentview chess hook <epoch>` for the Stockfish awake path.
+- [x] Add `agentview chess hook` for the Stockfish awake path; the daemon owns
+  the internal wake/epoch cursor.
 - [x] Implement the Stockfish UCI subprocess adapter and remove the in-process
   non-Stockfish engine path.
 
@@ -181,20 +182,26 @@ itself should not be only a rendered string.
 The first slice should be deliberately small:
 
 ```text
-observe
-  -> full chess board snapshot
-  -> resolved user document asks for a legal UCI move through:
-     agentview chess act <uci>
+attach -> attach-ack
+  -> install the sole System document for the live daemon epoch
 
-agentview chess act e2e4
+observe -> ack <action-handle>
+  -> deliver an Actionable full/delta User document
+  -> explicitly promote only that receipt to the delta baseline
+
+agentview chess act <action-handle> '<move uci="e2e4" />'
   -> validate legal move
   -> apply caller move
   -> start Stockfish engine task
-  -> return full update after caller move
+  -> return a full Passive update after caller move
 
-agentview chess hook epoch
-  -> wait until engine task updates the source and calls awake
-  -> return full snapshot after engine move
+agentview chess hook
+  -> wait on the daemon-owned wake cursor
+  -> return the next Actionable delta from the last acknowledged baseline
+
+agentview chess resync
+  -> replace an unacknowledged delta with one full User document
+  -> never redeliver System
 ```
 
 This proves the important shape: the caller controls its own loop, while the
