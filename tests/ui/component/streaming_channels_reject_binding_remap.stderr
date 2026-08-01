@@ -1,0 +1,15 @@
+error[E0624]: method `map_effect` is private
+  --> tests/ui/component/streaming_channels_reject_binding_remap.rs:26:52
+   |
+26 |       let _ = raw_view.map_binding(|binding| binding.map_effect(|_| 1_u8));
+   |                                                      ^^^^^^^^^^ private method
+   |
+  ::: src/component/streaming.rs
+   |
+   | /     pub(crate) fn map_effect<C, F>(self, map: F) -> StreamingBinding<C, D>
+   | |     where
+   | |         E: Send + 'static,
+   | |         C: Send + 'static,
+   | |         D: Send + 'static,
+   | |         F: Fn(E) -> C + Send + Sync + 'static,
+   | |______________________________________________- private method defined here

@@ -8,7 +8,6 @@ use agentview::agent::DefaultContextState;
 use agentview::prelude::*;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -16,13 +15,14 @@ use tokio::time::timeout;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-#[path = "../../examples/chess_engine_agent/support.rs"]
-mod chess_support;
+// The demo daemon intentionally reuses the mounted external chess host. The
+// interactive example keeps its own entrypoint, so some example-only helpers
+// are unused through this module path.
+#[allow(dead_code)]
+#[path = "../../examples/chess_engine_mounted_external.rs"]
+mod mounted_external_chess;
 
-use chess_support::{
-    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessViewModel,
-    StockfishEngine,
-};
+use mounted_external_chess::{MountedChessCliSnapshot, MountedExternalChessCli};
 
 const INTERNAL_DAEMON_ARG: &str = "--__agentview-daemon";
 const INTERNAL_SHUTDOWN_ARG: &str = "--__agentview-shutdown";
@@ -101,7 +101,7 @@ enum CliCommand {
     Observe,
     Act { text: String },
     ChessObserve,
-    ChessAct { uci: String },
+    ChessAct { command: String },
     ChessHook { epoch: ViewEpoch },
     InternalDaemon,
     InternalShutdown,
@@ -113,7 +113,7 @@ enum DaemonRequest {
     Observe,
     Act { text: String },
     ChessObserve,
-    ChessAct { uci: String },
+    ChessAct { command: String },
     ChessHook { epoch: ViewEpoch },
     Shutdown,
 }
@@ -137,7 +137,6 @@ enum DaemonResponse {
 type HelloViewModel =
     DefaultAgentViewModel<HelloViewBuilder, HelloSystemDocument, IdentityTransform>;
 type HelloApp = AgentViewApp<HelloViewModel, Turn, ()>;
-type ChessApp = AgentViewApp<ChessViewModel, Turn, ()>;
 
 struct DaemonState {
     hello: HelloApp,
@@ -145,10 +144,7 @@ struct DaemonState {
 }
 
 struct ChessRuntime {
-    app: ChessApp,
-    source: ChessGameSource,
-    awake: ViewAwakeHandle,
-    engine: StockfishEngine,
+    mounted: MountedExternalChessCli,
 }
 
 #[tokio::main]
@@ -189,8 +185,8 @@ async fn run() -> anyhow::Result<()> {
             let response = request_with_autostart(&DaemonRequest::ChessObserve).await?;
             print_response(response)
         }
-        CliCommand::ChessAct { uci } => {
-            let response = request_with_autostart(&DaemonRequest::ChessAct { uci }).await?;
+        CliCommand::ChessAct { command } => {
+            let response = request_with_autostart(&DaemonRequest::ChessAct { command }).await?;
             print_response(response)
         }
         CliCommand::ChessHook { epoch } => {
@@ -219,7 +215,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> anyhow::Result<CliComman
         }
         [scope, cmd, rest @ ..] if scope == "chess" && cmd == "act" && !rest.is_empty() => {
             Ok(CliCommand::ChessAct {
-                uci: parse_chess_act_uci(rest)?,
+                command: MountedExternalChessCli::command_from_cli_args(rest)?,
             })
         }
         [scope, cmd, arg] if scope == "chess" && cmd == "hook" && is_help_arg(arg) => {
@@ -244,84 +240,6 @@ fn is_help_arg(arg: &str) -> bool {
     arg == "--help" || arg == "-h" || arg == "help"
 }
 
-fn parse_chess_act_uci(args: &[String]) -> anyhow::Result<String> {
-    let mut uci = None;
-    let mut positional = None;
-    let mut saw_context_flag = false;
-    let mut i = 0;
-
-    while i < args.len() {
-        let arg = &args[i];
-        if let Some(value) = arg.strip_prefix("--uci=") {
-            set_once(&mut uci, "uci", value.to_owned())?;
-        } else if arg == "--uci" {
-            i += 1;
-            let value = args
-                .get(i)
-                .with_context(|| "missing value after --uci")?
-                .to_owned();
-            set_once(&mut uci, "uci", value)?;
-        } else if let Some(flag) = context_chess_act_flag(arg) {
-            saw_context_flag = true;
-            i += 1;
-            args.get(i)
-                .with_context(|| format!("missing value after --{flag}"))?;
-        } else if let Some(flag) = context_chess_act_assignment(arg) {
-            saw_context_flag = true;
-            if arg.ends_with('=') {
-                anyhow::bail!("expected non-empty value for --{flag}");
-            }
-        } else if arg.starts_with("--") {
-            anyhow::bail!("unknown chess act option `{arg}`");
-        } else {
-            set_once(&mut positional, "positional uci", arg.clone())?;
-        }
-
-        i += 1;
-    }
-
-    match (uci, positional, saw_context_flag) {
-        (Some(uci), None, _) if !uci.trim().is_empty() => Ok(uci),
-        (Some(_), Some(_), _) => {
-            anyhow::bail!("pass the chess move once, either as --uci <uci> or positional <uci>")
-        }
-        (None, Some(uci), false) if !uci.trim().is_empty() => Ok(uci),
-        (None, Some(_), true) => {
-            anyhow::bail!("when passing chess context flags, include the move as --uci <uci>")
-        }
-        _ => anyhow::bail!("usage: agentview chess act [--piece <piece>] [--from <square>] [--to <square>] [--promotion <piece>] --uci <uci>\n\n{}", help_text()),
-    }
-}
-
-fn context_chess_act_flag(arg: &str) -> Option<&'static str> {
-    match arg {
-        "--piece" => Some("piece"),
-        "--from" => Some("from"),
-        "--to" => Some("to"),
-        "--promotion" => Some("promotion"),
-        _ => None,
-    }
-}
-
-fn context_chess_act_assignment(arg: &str) -> Option<&'static str> {
-    for flag in ["piece", "from", "to", "promotion"] {
-        if arg.starts_with(&format!("--{flag}=")) {
-            return Some(flag);
-        }
-    }
-    None
-}
-
-fn set_once(slot: &mut Option<String>, label: &str, value: String) -> anyhow::Result<()> {
-    if value.trim().is_empty() {
-        anyhow::bail!("expected non-empty {label}");
-    }
-    if slot.replace(value).is_some() {
-        anyhow::bail!("duplicate {label}");
-    }
-    Ok(())
-}
-
 fn help_text() -> &'static str {
     concat!(
         "agentview\n",
@@ -330,7 +248,7 @@ fn help_text() -> &'static str {
         "  agentview observe\n",
         "  agentview act <text>\n",
         "  agentview chess observe\n",
-        "  agentview chess act [--piece <piece>] [--from <square>] [--to <square>] [--promotion <piece>] --uci <uci>\n",
+        "  agentview chess act --piece <piece> --from <square> --to <square> [--promotion <piece>] --uci <uci>\n",
         "  agentview chess hook <epoch>\n",
         "\n",
         "COMMANDS:\n",
@@ -350,7 +268,7 @@ fn chess_help_text() -> &'static str {
         "\n",
         "USAGE:\n",
         "  agentview chess observe\n",
-        "  agentview chess act [--piece <piece>] [--from <square>] [--to <square>] [--promotion <piece>] --uci <uci>\n",
+        "  agentview chess act --piece <piece> --from <square> --to <square> [--promotion <piece>] --uci <uci>\n",
         "  agentview chess hook <epoch>\n",
         "\n",
         "COMMANDS:\n",
@@ -366,8 +284,7 @@ fn chess_act_help_text() -> &'static str {
         "agentview chess act\n",
         "\n",
         "USAGE:\n",
-        "  agentview chess act <uci>\n",
-        "  agentview chess act [--piece <piece>] [--from <square>] [--to <square>] [--promotion <piece>] --uci <uci>\n",
+        "  agentview chess act --piece <piece> --from <square> --to <square> [--promotion <piece>] --uci <uci>\n",
         "\n",
         "OPTIONS:\n",
         "  --uci <uci>              UCI move, such as e2e4 or e7e8q\n",
@@ -377,9 +294,8 @@ fn chess_act_help_text() -> &'static str {
         "  --promotion <piece>      Context flag for promotion piece\n",
         "\n",
         "NOTES:\n",
-        "  Context flags are prompt context only; the submitted move is --uci <uci>.\n",
-        "  When passing context flags, include the move as --uci <uci>.\n",
-        "  Without context flags, positional <uci> is accepted.\n",
+        "  This host-owned CLI envelope is translated to the shared move contract.\n",
+        "  The submitted values must agree with the canonical UCI move.\n",
     )
 }
 
@@ -507,7 +423,7 @@ fn print_block(label: &str, text: &str) {
 
 async fn run_daemon(addr: SocketAddr) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    let mut state = new_daemon_state();
+    let mut state = new_daemon_state().await?;
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -519,11 +435,11 @@ async fn run_daemon(addr: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn new_daemon_state() -> DaemonState {
-    DaemonState {
+async fn new_daemon_state() -> anyhow::Result<DaemonState> {
+    Ok(DaemonState {
         hello: new_hello_app(),
-        chess: new_chess_runtime(),
-    }
+        chess: new_chess_runtime().await?,
+    })
 }
 
 fn new_hello_app() -> HelloApp {
@@ -548,20 +464,10 @@ fn new_hello_app() -> HelloApp {
     app
 }
 
-fn new_chess_runtime() -> ChessRuntime {
-    let source = ChessGameSource::new();
-    let (app, awake) = AgentViewApp::new(
-        ChessViewModel,
-        source.clone(),
-        PromptContext::<Turn, ()>::without_system(),
-    );
-
-    ChessRuntime {
-        app,
-        source,
-        awake,
-        engine: StockfishEngine::new(stockfish_command()),
-    }
+async fn new_chess_runtime() -> anyhow::Result<ChessRuntime> {
+    Ok(ChessRuntime {
+        mounted: MountedExternalChessCli::open(stockfish_command()).await?,
+    })
 }
 
 fn stockfish_command() -> String {
@@ -597,6 +503,16 @@ where
     }
 }
 
+fn render_mounted_chess_response(event: &str, snapshot: MountedChessCliSnapshot) -> DaemonResponse {
+    DaemonResponse::Snapshot {
+        event: event.to_owned(),
+        epoch: snapshot.epoch,
+        turn_id: snapshot.turn_id,
+        view: snapshot.view,
+        prompt: snapshot.prompt,
+    }
+}
+
 async fn handle_connection(state: &mut DaemonState, stream: TcpStream) -> anyhow::Result<bool> {
     let mut reader = BufReader::new(stream);
     let mut request = String::new();
@@ -606,9 +522,10 @@ async fn handle_connection(state: &mut DaemonState, stream: TcpStream) -> anyhow
         Ok(DaemonRequest::Observe) => observe_hello(&mut state.hello).await,
         Ok(DaemonRequest::Act { text }) => act_hello(&mut state.hello, text).await,
         Ok(DaemonRequest::ChessObserve) => observe_chess(&mut state.chess).await,
-        Ok(DaemonRequest::ChessAct { uci }) => act_chess(&mut state.chess, uci).await,
+        Ok(DaemonRequest::ChessAct { command }) => act_chess(&mut state.chess, command).await,
         Ok(DaemonRequest::ChessHook { epoch }) => hook_chess(&mut state.chess, epoch).await,
         Ok(DaemonRequest::Shutdown) => {
+            state.chess.mounted.close().await;
             write_response(reader.into_inner(), &DaemonResponse::Ok).await?;
             return Ok(true);
         }
@@ -666,43 +583,17 @@ async fn act_hello(app: &mut HelloApp, text: String) -> DaemonResponse {
 }
 
 async fn observe_chess(runtime: &mut ChessRuntime) -> DaemonResponse {
-    match runtime.app.observe("Choose white's next move.").await {
-        Ok(snapshot) => render_snapshot_response("observe", &snapshot),
+    match runtime.mounted.observe().await {
+        Ok(snapshot) => render_mounted_chess_response("observe", snapshot),
         Err(err) => DaemonResponse::Error {
             message: err.to_string(),
         },
     }
 }
 
-async fn act_chess(runtime: &mut ChessRuntime, uci: String) -> DaemonResponse {
-    let Some(turn_id) = runtime.app.latest_turn_id().map(ToOwned::to_owned) else {
-        return DaemonResponse::Error {
-            message: "no active chess turn; run `agentview chess observe` first".to_owned(),
-        };
-    };
-
-    match runtime
-        .app
-        .act_with_sink(
-            &turn_id,
-            ControlReply::structured(json!({ "uci": uci })),
-            ChessMoveSink::from_source(&runtime.source),
-            apply_player_move,
-            "Wait for the engine reply.",
-        )
-        .await
-    {
-        Ok(update) => match update.snapshot() {
-            Some(snapshot) => {
-                if snapshot.view.engine_pending() {
-                    schedule_chess_engine(runtime);
-                }
-                render_snapshot_response("act", snapshot)
-            }
-            None => DaemonResponse::Error {
-                message: "expected a full chess view update".to_owned(),
-            },
-        },
+async fn act_chess(runtime: &mut ChessRuntime, command: String) -> DaemonResponse {
+    match runtime.mounted.act(command).await {
+        Ok(snapshot) => render_mounted_chess_response("act", snapshot),
         Err(err) => DaemonResponse::Error {
             message: err.to_string(),
         },
@@ -710,13 +601,8 @@ async fn act_chess(runtime: &mut ChessRuntime, uci: String) -> DaemonResponse {
 }
 
 async fn hook_chess(runtime: &mut ChessRuntime, epoch: ViewEpoch) -> DaemonResponse {
-    match timeout(
-        Duration::from_secs(5),
-        runtime.app.hook(epoch, "Choose white's next move."),
-    )
-    .await
-    {
-        Ok(Ok(snapshot)) => render_snapshot_response("hook", &snapshot),
+    match timeout(Duration::from_secs(5), runtime.mounted.hook(epoch)).await {
+        Ok(Ok(snapshot)) => render_mounted_chess_response("hook", snapshot),
         Ok(Err(err)) => DaemonResponse::Error {
             message: err.to_string(),
         },
@@ -724,17 +610,6 @@ async fn hook_chess(runtime: &mut ChessRuntime, epoch: ViewEpoch) -> DaemonRespo
             message: format!("timed out waiting for chess view epoch after {epoch}"),
         },
     }
-}
-
-fn schedule_chess_engine(runtime: &ChessRuntime) {
-    let source = runtime.source.clone();
-    let awake = runtime.awake.clone();
-    let engine = runtime.engine.clone();
-
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let _ = apply_engine_move(&source, &awake, &engine).await;
-    });
 }
 
 async fn write_response(mut stream: TcpStream, response: &DaemonResponse) -> anyhow::Result<()> {
@@ -775,12 +650,7 @@ mod tests {
             parse_cli(["chess".to_owned(), "observe".to_owned()]).unwrap(),
             CliCommand::ChessObserve
         );
-        assert_eq!(
-            parse_cli(["chess".to_owned(), "act".to_owned(), "e2e4".to_owned()]).unwrap(),
-            CliCommand::ChessAct {
-                uci: "e2e4".to_owned()
-            }
-        );
+        assert!(parse_cli(["chess".to_owned(), "act".to_owned(), "e2e4".to_owned()]).is_err());
         assert_eq!(
             parse_cli([
                 "chess".to_owned(),
@@ -796,24 +666,19 @@ mod tests {
             ])
             .unwrap(),
             CliCommand::ChessAct {
-                uci: "e2e4".to_owned()
+                command: "<move uci=\"e2e4\" />".to_owned()
             }
         );
-        assert_eq!(
-            parse_cli([
-                "chess".to_owned(),
-                "act".to_owned(),
-                "--piece=P".to_owned(),
-                "--from=e7".to_owned(),
-                "--to=e8".to_owned(),
-                "--promotion=q".to_owned(),
-                "--uci=e7e8q".to_owned()
-            ])
-            .unwrap(),
-            CliCommand::ChessAct {
-                uci: "e7e8q".to_owned()
-            }
-        );
+        assert!(parse_cli([
+            "chess".to_owned(),
+            "act".to_owned(),
+            "--piece=P".to_owned(),
+            "--from=e7".to_owned(),
+            "--to=e8".to_owned(),
+            "--promotion=q".to_owned(),
+            "--uci=e7e8q".to_owned()
+        ])
+        .is_err());
         assert_eq!(
             parse_cli(["chess".to_owned(), "hook".to_owned(), "1".to_owned()]).unwrap(),
             CliCommand::ChessHook { epoch: 1 }

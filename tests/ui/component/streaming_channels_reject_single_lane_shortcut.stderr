@@ -1,0 +1,16 @@
+error[E0599]: no method named `map_output` found for enum `Result<T, E>` in the current scope
+  --> tests/ui/component/streaming_channels_reject_single_lane_shortcut.rs:24:22
+   |
+24 |     let _ = raw_view.map_output::<LocalChannels>(|_| 1);
+   |                      ^^^^^^^^^^
+   |
+help: there is a method `map_or` with a similar name, but with different arguments
+  --> $RUST/core/src/result.rs
+   |
+   | /     pub const fn map_or<U, F>(self, default: U, f: F) -> U
+   | |     where
+   | |         F: [const] FnOnce(T) -> U + [const] Destruct,
+   | |         T: [const] Destruct,
+   | |         E: [const] Destruct,
+   | |         U: [const] Destruct,
+   | |____________________________^

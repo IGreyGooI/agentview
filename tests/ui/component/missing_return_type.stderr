@@ -1,0 +1,5 @@
+error: component functions need an explicit component view return type
+ --> tests/ui/component/missing_return_type.rs:4:4
+  |
+4 | fn invalid_component() {}
+  |    ^^^^^^^^^^^^^^^^^

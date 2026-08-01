@@ -18,7 +18,7 @@ use tokio::sync::Mutex as TokioMutex;
 // ── Default text transcript item ──────────────────────────────────────────────
 
 /// Default text-only transcript item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Turn {
     pub role: Role,
     pub text: StorageString,
@@ -77,7 +77,7 @@ impl TurnTransform for IdentityTransform {}
 ///
 /// `I` is the app/provider-defined transcript item type. The default `I = Turn`
 /// preserves the text-only behavior.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptContext<I = Turn, CS = ()> {
     system: Option<StorageString>,
     history: Vec<I>,

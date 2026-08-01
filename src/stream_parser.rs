@@ -42,9 +42,7 @@
 //! });
 //! ```
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
+use std::{collections::HashMap, convert::Infallible, fmt, future::Future, pin::Pin};
 
 use nom::{
     branch::alt,
@@ -61,6 +59,55 @@ use nom::{
 pub enum ParseError {
     #[error("Recognition error: {0}")]
     Recognition(String),
+}
+
+/// Lifecycle point at which a registered parser callback failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HermesCallbackPhase {
+    Open,
+    Stream,
+    Complete,
+}
+
+/// A terminal parser error from a fallible callback or strict finalization.
+#[derive(Debug)]
+pub enum HermesParserError<E> {
+    /// A registered callback returned an error.
+    Callback {
+        tag: String,
+        phase: HermesCallbackPhase,
+        source: E,
+    },
+    /// A registered element was still open when strict finalization was requested.
+    IncompleteRegisteredTag { tag: String },
+    /// The parser has already returned a terminal error and cannot be reused.
+    Terminal,
+}
+
+impl<E: fmt::Display> fmt::Display for HermesParserError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Callback { tag, phase, source } => {
+                write!(f, "{phase:?} callback for <{tag}> failed: {source}")
+            }
+            Self::IncompleteRegisteredTag { tag } => {
+                write!(f, "stream ended with incomplete registered tag <{tag}>")
+            }
+            Self::Terminal => f.write_str("Hermes parser is terminal after a prior error"),
+        }
+    }
+}
+
+impl<E> std::error::Error for HermesParserError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Callback { source, .. } => Some(source),
+            Self::IncompleteRegisteredTag { .. } | Self::Terminal => None,
+        }
+    }
 }
 
 // ── XmlElement ────────────────────────────────────────────────────────────────
@@ -88,9 +135,15 @@ impl XmlElement {
 // ── Callback types ────────────────────────────────────────────────────────────
 
 /// Async callback for a complete, streaming, or opening element.
-pub type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-pub type ElementCallback = Box<dyn Fn(XmlElement) -> BoxedFuture + Send + Sync + 'static>;
+pub type BoxedFuture<E = Infallible> =
+    Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'static>>;
+pub type ElementCallback<E = Infallible> =
+    Box<dyn Fn(XmlElement) -> BoxedFuture<E> + Send + Sync + 'static>;
 // ── Parser internals ──────────────────────────────────────────────────────────
+
+fn is_xml_name_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '-' | '.')
+}
 
 fn parse_attribute_value(input: &str) -> IResult<&str, &str> {
     alt((
@@ -101,7 +154,7 @@ fn parse_attribute_value(input: &str) -> IResult<&str, &str> {
 }
 
 fn parse_attribute(input: &str) -> IResult<&str, (String, String)> {
-    let (input, key) = take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '-')(input)?;
+    let (input, key) = take_while1(is_xml_name_char)(input)?;
     let (input, _) = space0(input)?;
     let (input, _) = char('=')(input)?;
     let (input, _) = space0(input)?;
@@ -116,7 +169,7 @@ fn parse_attributes(input: &str) -> IResult<&str, HashMap<String, String>> {
 
 fn parse_opening_tag(input: &str) -> IResult<&str, (String, HashMap<String, String>)> {
     let (input, _) = char('<')(input)?;
-    let (input, name) = take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '-')(input)?;
+    let (input, name) = take_while1(is_xml_name_char)(input)?;
     let (input, _) = space0(input)?;
     let (input, attrs) = parse_attributes(input)?;
     let (input, _) = space0(input)?;
@@ -127,7 +180,7 @@ fn parse_opening_tag(input: &str) -> IResult<&str, (String, HashMap<String, Stri
 fn parse_closing_tag(input: &str) -> IResult<&str, String> {
     let (input, _) = char('<')(input)?;
     let (input, _) = char('/')(input)?;
-    let (input, name) = take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '-')(input)?;
+    let (input, name) = take_while1(is_xml_name_char)(input)?;
     let (input, _) = space0(input)?;
     let (input, _) = char('>')(input)?;
     Ok((input, name.to_string()))
@@ -136,7 +189,7 @@ fn parse_closing_tag(input: &str) -> IResult<&str, String> {
 /// Parse a self-closing `<tag attrs.../>` element (no content).
 fn parse_self_closing_element(input: &str) -> IResult<&str, XmlElement> {
     let (input, _) = char('<')(input)?;
-    let (input, name) = take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '-')(input)?;
+    let (input, name) = take_while1(is_xml_name_char)(input)?;
     let (input, _) = space0(input)?;
     let (input, attrs) = parse_attributes(input)?;
     let (input, _) = space0(input)?;
@@ -154,7 +207,7 @@ fn parse_self_closing_element(input: &str) -> IResult<&str, XmlElement> {
 /// Parse a complete `<tag ...>content</tag>` element.
 fn parse_complete_element(input: &str) -> IResult<&str, XmlElement> {
     let (input, _) = char('<')(input)?;
-    let (input, name) = take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '-')(input)?;
+    let (input, name) = take_while1(is_xml_name_char)(input)?;
     let (input, _) = space0(input)?;
     let (input, attrs) = parse_attributes(input)?;
     let (input, _) = space0(input)?;
@@ -230,11 +283,7 @@ enum FindResult {
         consumed: usize,
     },
     /// The opening tag was parsed but no closing tag found yet.
-    /// `open_consumed` = bytes up to and including the `>`.
-    Incomplete {
-        element: XmlElement,
-        open_consumed: usize,
-    },
+    Incomplete { element: XmlElement },
 }
 
 /// Find the next XML element in `input`.
@@ -264,16 +313,7 @@ fn find_next_element(input: &str) -> Option<FindResult> {
         }
 
         if let Some(elem) = parse_incomplete_element(slice) {
-            // Calculate how many bytes the opening tag occupied.
-            let open_consumed = if let Ok((after_open, _)) = parse_opening_tag(slice) {
-                byte_pos + (slice.len() - after_open.len())
-            } else {
-                0
-            };
-            return Some(FindResult::Incomplete {
-                element: elem,
-                open_consumed,
-            });
+            return Some(FindResult::Incomplete { element: elem });
         }
     }
     None
@@ -295,13 +335,13 @@ fn find_next_element(input: &str) -> Option<FindResult> {
 /// Use `on_open` for attribute-only tags like:
 /// `<update_relationship target="player" trust_delta="5" suspicion_delta="-2">`
 /// where you want to react immediately to the attributes.
-pub struct HermesParser {
+pub struct HermesParser<E = Infallible> {
     /// Callbacks for complete elements, keyed by tag name.
-    on_complete: HashMap<String, ElementCallback>,
+    on_complete: HashMap<String, ElementCallback<E>>,
     /// Callbacks for streaming (incomplete) elements, keyed by tag name.
-    on_stream: HashMap<String, ElementCallback>,
+    on_stream: HashMap<String, ElementCallback<E>>,
     /// Callbacks fired immediately when an opening tag is parsed (attributes available).
-    on_open: HashMap<String, ElementCallback>,
+    on_open: HashMap<String, ElementCallback<E>>,
 
     buffer: String,
     /// Byte position in `buffer` up to which we've processed complete elements.
@@ -310,9 +350,11 @@ pub struct HermesParser {
     current_incomplete_tag: Option<String>,
     /// Whether `on_open` has already fired for the current incomplete element.
     open_fired: bool,
+    /// A callback or strict-finalization failure makes the parser non-reusable.
+    terminal: bool,
 }
 
-impl HermesParser {
+impl<E> HermesParser<E> {
     pub fn new() -> Self {
         Self {
             on_complete: HashMap::new(),
@@ -322,26 +364,27 @@ impl HermesParser {
             cursor: 0,
             current_incomplete_tag: None,
             open_fired: false,
+            terminal: false,
         }
     }
 
-    /// Register a callback for complete elements of the given tag.
+    /// Register a fallible callback for complete elements of the given tag.
     /// Called once when `</tag>` is received.
-    pub fn on_complete<F, Fut>(&mut self, tag: impl Into<String>, cb: F)
+    pub fn try_on_complete<F, Fut>(&mut self, tag: impl Into<String>, cb: F)
     where
         F: Fn(XmlElement) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
     {
         self.on_complete
             .insert(tag.into(), Box::new(move |elem| Box::pin(cb(elem))));
     }
 
-    /// Register a callback for streaming (incomplete) elements of the given tag.
+    /// Register a fallible callback for streaming (incomplete) elements of the given tag.
     /// Called on every chunk while the tag is still open.
-    pub fn on_stream<F, Fut>(&mut self, tag: impl Into<String>, cb: F)
+    pub fn try_on_stream<F, Fut>(&mut self, tag: impl Into<String>, cb: F)
     where
         F: Fn(XmlElement) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
     {
         self.on_stream
             .insert(tag.into(), Box::new(move |elem| Box::pin(cb(elem))));
@@ -352,108 +395,276 @@ impl HermesParser {
     /// Attributes are fully available.
     ///
     /// Useful for tags like `<update_relationship target="x" trust_delta="5">`.
-    pub fn on_open<F, Fut>(&mut self, tag: impl Into<String>, cb: F)
+    pub fn try_on_open<F, Fut>(&mut self, tag: impl Into<String>, cb: F)
     where
         F: Fn(XmlElement) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
     {
         self.on_open
             .insert(tag.into(), Box::new(move |elem| Box::pin(cb(elem))));
     }
 
-    /// Feed a streaming chunk.
-    pub async fn feed(&mut self, chunk: &str) {
+    /// Feed a streaming chunk and surface the first callback failure.
+    ///
+    /// A failure is terminal: no subsequent callback is invoked, and later calls
+    /// return [`HermesParserError::Terminal`].
+    pub async fn try_feed(&mut self, chunk: &str) -> Result<(), HermesParserError<E>> {
+        self.ensure_active()?;
         self.buffer.push_str(chunk);
-        self.process().await;
+        self.process().await?;
         // Prune the processed prefix to keep the buffer small.
         if self.cursor > 4096 {
             self.buffer.drain(..self.cursor);
             self.cursor = 0;
         }
+        Ok(())
     }
 
-    /// Call at stream end. Processes any remaining content.
-    pub async fn finalize(&mut self) {
-        self.process().await;
+    /// Process the remaining stream and discard any incomplete input.
+    ///
+    /// This is the fallible counterpart of the legacy lax `finalize` behavior.
+    pub async fn try_finalize(&mut self) -> Result<(), HermesParserError<E>> {
+        self.ensure_active()?;
+        self.process().await?;
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    /// Process the remaining stream, rejecting an incomplete registered element.
+    ///
+    /// The strict EOF error is terminal and deliberately leaves the parser's
+    /// buffered input and incomplete-element state intact for diagnostics.
+    pub async fn try_finalize_strict(&mut self) -> Result<(), HermesParserError<E>> {
+        self.ensure_active()?;
+        self.process().await?;
+
+        if let Some(tag) = self.incomplete_registered_tag() {
+            self.terminal = true;
+            return Err(HermesParserError::IncompleteRegisteredTag { tag });
+        }
+
+        self.clear_stream_state();
+        Ok(())
+    }
+
+    fn ensure_active(&self) -> Result<(), HermesParserError<E>> {
+        if self.terminal {
+            Err(HermesParserError::Terminal)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn is_registered(&self, tag: &str) -> bool {
+        self.on_open.contains_key(tag)
+            || self.on_stream.contains_key(tag)
+            || self.on_complete.contains_key(tag)
+    }
+
+    fn incomplete_registered_tag(&self) -> Option<String> {
+        if let Some(tag) = &self.current_incomplete_tag {
+            if self.is_registered(tag) {
+                return Some(tag.clone());
+            }
+        }
+
+        let remaining = &self.buffer[self.cursor..];
+        self.on_open
+            .keys()
+            .chain(self.on_stream.keys())
+            .chain(self.on_complete.keys())
+            .find(|tag| {
+                let prefix = format!("<{tag}");
+                remaining.match_indices(&prefix).any(|(offset, _)| {
+                    remaining[offset + prefix.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|character| {
+                            character.is_whitespace() || matches!(character, '>' | '/')
+                        })
+                })
+            })
+            .cloned()
+    }
+
+    fn clear_stream_state(&mut self) {
         self.buffer.clear();
         self.cursor = 0;
         self.current_incomplete_tag = None;
         self.open_fired = false;
     }
 
-    async fn process(&mut self) {
+    async fn invoke_callback(
+        &mut self,
+        tag: &str,
+        phase: HermesCallbackPhase,
+        element: XmlElement,
+    ) -> Result<(), HermesParserError<E>> {
+        let callback_future = {
+            let callback = match phase {
+                HermesCallbackPhase::Open => self.on_open.get(tag),
+                HermesCallbackPhase::Stream => self.on_stream.get(tag),
+                HermesCallbackPhase::Complete => self.on_complete.get(tag),
+            };
+            callback.map(|callback| callback(element))
+        };
+
+        let Some(callback_future) = callback_future else {
+            return Ok(());
+        };
+
+        match callback_future.await {
+            Ok(()) => Ok(()),
+            Err(source) => {
+                self.terminal = true;
+                Err(HermesParserError::Callback {
+                    tag: tag.to_owned(),
+                    phase,
+                    source,
+                })
+            }
+        }
+    }
+
+    async fn process(&mut self) -> Result<(), HermesParserError<E>> {
         loop {
             if self.cursor >= self.buffer.len() {
                 break;
             }
-            let slice = &self.buffer[self.cursor..];
+            let next = {
+                let slice = &self.buffer[self.cursor..];
+                find_next_element(slice)
+            };
 
-            match find_next_element(slice) {
+            match next {
                 None => break,
 
                 Some(FindResult::Complete { element, consumed }) => {
+                    let tag = element.tag_name.clone();
                     // If we were tracking an incomplete element for this tag,
                     // fire on_open now if it hasn't fired yet (edge case: element
                     // arrived complete on the first look).
                     if !self.open_fired
-                        || self.current_incomplete_tag.as_deref() != Some(&element.tag_name)
+                        || self.current_incomplete_tag.as_deref() != Some(tag.as_str())
                     {
                         // Fire on_open with empty content (attributes available).
-                        if let Some(cb) = self.on_open.get(&element.tag_name) {
-                            let open_elem = XmlElement {
-                                tag_name: element.tag_name.clone(),
-                                attributes: element.attributes.clone(),
-                                content: String::new(),
-                            };
-                            cb(open_elem).await;
-                        }
+                        let open_elem = XmlElement {
+                            tag_name: tag.clone(),
+                            attributes: element.attributes.clone(),
+                            content: String::new(),
+                        };
+                        self.invoke_callback(&tag, HermesCallbackPhase::Open, open_elem)
+                            .await?;
                     }
+                    self.invoke_callback(&tag, HermesCallbackPhase::Complete, element)
+                        .await?;
                     self.current_incomplete_tag = None;
                     self.open_fired = false;
                     self.cursor += consumed;
-                    if let Some(cb) = self.on_complete.get(&element.tag_name) {
-                        cb(element).await;
-                    }
                 }
 
-                Some(FindResult::Incomplete {
-                    element,
-                    open_consumed,
-                }) => {
+                Some(FindResult::Incomplete { element }) => {
+                    let tag = element.tag_name.clone();
                     // Fire on_open the first time we see this element.
                     if !self.open_fired
-                        || self.current_incomplete_tag.as_deref() != Some(&element.tag_name)
+                        || self.current_incomplete_tag.as_deref() != Some(tag.as_str())
                     {
-                        self.current_incomplete_tag = Some(element.tag_name.clone());
+                        let open_elem = XmlElement {
+                            tag_name: tag.clone(),
+                            attributes: element.attributes.clone(),
+                            content: String::new(),
+                        };
+                        self.invoke_callback(&tag, HermesCallbackPhase::Open, open_elem)
+                            .await?;
+                        self.current_incomplete_tag = Some(tag.clone());
                         self.open_fired = true;
-                        if let Some(cb) = self.on_open.get(&element.tag_name) {
-                            let open_elem = XmlElement {
-                                tag_name: element.tag_name.clone(),
-                                attributes: element.attributes.clone(),
-                                content: String::new(),
-                            };
-                            cb(open_elem).await;
-                        }
-                        // Advance cursor past the opening tag so we don't re-fire on_open.
-                        if open_consumed > 0 {
-                            // Note: we can't advance cursor past the element start
-                            // because we need to re-parse for complete detection.
-                            // Instead, we track open_fired per tag.
-                            let _ = open_consumed; // tracked via open_fired flag
-                        }
                     }
-                    if let Some(cb) = self.on_stream.get(&element.tag_name) {
-                        cb(element).await;
-                    }
+                    self.invoke_callback(&tag, HermesCallbackPhase::Stream, element)
+                        .await?;
                     // Don't advance cursor; wait for more data.
                     break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HermesParser<Infallible> {
+    /// Register an infallible callback for complete elements of the given tag.
+    /// Called once when `</tag>` is received.
+    pub fn on_complete<F, Fut>(&mut self, tag: impl Into<String>, cb: F)
+    where
+        F: Fn(XmlElement) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.try_on_complete(tag, move |element| {
+            let future = cb(element);
+            async move {
+                future.await;
+                Ok::<(), Infallible>(())
+            }
+        });
+    }
+
+    /// Register an infallible callback for streaming (incomplete) elements of
+    /// the given tag. Called on every chunk while the tag is still open.
+    pub fn on_stream<F, Fut>(&mut self, tag: impl Into<String>, cb: F)
+    where
+        F: Fn(XmlElement) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.try_on_stream(tag, move |element| {
+            let future = cb(element);
+            async move {
+                future.await;
+                Ok::<(), Infallible>(())
+            }
+        });
+    }
+
+    /// Register an infallible callback fired as soon as `<tag attrs...>` is
+    /// parsed. The element's `content` is empty and attributes are available.
+    pub fn on_open<F, Fut>(&mut self, tag: impl Into<String>, cb: F)
+    where
+        F: Fn(XmlElement) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.try_on_open(tag, move |element| {
+            let future = cb(element);
+            async move {
+                future.await;
+                Ok::<(), Infallible>(())
+            }
+        });
+    }
+
+    /// Feed a streaming chunk using the legacy infallible API.
+    pub async fn feed(&mut self, chunk: &str) {
+        if let Err(error) = self.try_feed(chunk).await {
+            match error {
+                HermesParserError::Callback { source, .. } => match source {},
+                HermesParserError::IncompleteRegisteredTag { .. } | HermesParserError::Terminal => {
+                    unreachable!("infallible parser entered terminal state")
+                }
+            }
+        }
+    }
+
+    /// Call at stream end using the legacy lax EOF behavior.
+    pub async fn finalize(&mut self) {
+        if let Err(error) = self.try_finalize().await {
+            match error {
+                HermesParserError::Callback { source, .. } => match source {},
+                HermesParserError::IncompleteRegisteredTag { .. } | HermesParserError::Terminal => {
+                    unreachable!("infallible parser entered terminal state")
                 }
             }
         }
     }
 }
 
-impl Default for HermesParser {
+impl<E> Default for HermesParser<E> {
     fn default() -> Self {
         Self::new()
     }
@@ -464,7 +675,24 @@ impl Default for HermesParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        fmt,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+    };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestError(&'static str);
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for TestError {}
 
     fn collect_complete(tag: &str) -> (HermesParser, Arc<Mutex<Vec<String>>>) {
         let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -490,6 +718,134 @@ mod tests {
             }
         });
         (p, collected)
+    }
+
+    #[tokio::test]
+    async fn try_complete_error_identifies_the_callback_and_stops_the_chunk() {
+        let second_callback_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::clone(&second_callback_calls);
+        let mut parser = HermesParser::<TestError>::new();
+        parser.try_on_complete("first", |_| async {
+            Err::<(), _>(TestError("complete failed"))
+        });
+        parser.try_on_complete("second", move |_| {
+            let second_calls = Arc::clone(&second_calls);
+            async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), TestError>(())
+            }
+        });
+
+        let error = parser
+            .try_feed("<first /><second />")
+            .await
+            .expect_err("the first complete callback should fail");
+
+        match error {
+            HermesParserError::Callback { tag, phase, source } => {
+                assert_eq!(tag, "first");
+                assert_eq!(phase, HermesCallbackPhase::Complete);
+                assert_eq!(source, TestError("complete failed"));
+            }
+            other => panic!("unexpected parser error: {other:?}"),
+        }
+        assert_eq!(second_callback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn try_open_error_stops_before_the_stream_callback() {
+        let stream_callback_calls = Arc::new(AtomicUsize::new(0));
+        let stream_calls = Arc::clone(&stream_callback_calls);
+        let mut parser = HermesParser::<TestError>::new();
+        parser.try_on_open("tag", |_| async { Err::<(), _>(TestError("open failed")) });
+        parser.try_on_stream("tag", move |_| {
+            let stream_calls = Arc::clone(&stream_calls);
+            async move {
+                stream_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), TestError>(())
+            }
+        });
+
+        let error = parser
+            .try_feed("<tag>partial")
+            .await
+            .expect_err("the open callback should fail");
+
+        match error {
+            HermesParserError::Callback { tag, phase, source } => {
+                assert_eq!(tag, "tag");
+                assert_eq!(phase, HermesCallbackPhase::Open);
+                assert_eq!(source, TestError("open failed"));
+            }
+            other => panic!("unexpected parser error: {other:?}"),
+        }
+        assert_eq!(stream_callback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn try_stream_error_identifies_the_stream_phase() {
+        let mut parser = HermesParser::<TestError>::new();
+        parser.try_on_stream("tag", |_| async {
+            Err::<(), _>(TestError("stream failed"))
+        });
+
+        let error = parser
+            .try_feed("<tag>partial")
+            .await
+            .expect_err("the stream callback should fail");
+
+        match error {
+            HermesParserError::Callback { tag, phase, source } => {
+                assert_eq!(tag, "tag");
+                assert_eq!(phase, HermesCallbackPhase::Stream);
+                assert_eq!(source, TestError("stream failed"));
+            }
+            other => panic!("unexpected parser error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_finalize_preserves_an_incomplete_registered_tag_for_diagnostics() {
+        let mut parser = HermesParser::<TestError>::new();
+        parser.try_on_complete("registered", |_| async { Ok::<(), TestError>(()) });
+        parser.try_feed("<registered>partial").await.unwrap();
+
+        let error = parser
+            .try_finalize_strict()
+            .await
+            .expect_err("strict finalization should reject an incomplete registered tag");
+
+        match error {
+            HermesParserError::IncompleteRegisteredTag { tag } => assert_eq!(tag, "registered"),
+            other => panic!("unexpected parser error: {other:?}"),
+        }
+        assert_eq!(parser.buffer, "<registered>partial");
+        assert_eq!(parser.current_incomplete_tag.as_deref(), Some("registered"));
+        assert!(parser.open_fired);
+        assert!(parser.terminal);
+    }
+
+    #[tokio::test]
+    async fn strict_finalize_rejects_a_malformed_registered_opening_tag() {
+        let mut parser = HermesParser::<TestError>::new();
+        parser.try_on_complete("registered", |_| async { Ok::<(), TestError>(()) });
+        parser
+            .try_feed("<registered value=\"unterminated")
+            .await
+            .unwrap();
+
+        let error = parser
+            .try_finalize_strict()
+            .await
+            .expect_err("strict finalization should reject registered malformed input");
+
+        match error {
+            HermesParserError::IncompleteRegisteredTag { tag } => assert_eq!(tag, "registered"),
+            other => panic!("unexpected parser error: {other:?}"),
+        }
+        assert_eq!(parser.buffer, "<registered value=\"unterminated");
+        assert!(parser.current_incomplete_tag.is_none());
+        assert!(parser.terminal);
     }
 
     #[tokio::test]
@@ -557,9 +913,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_callback_receives_partial_content() {
+    async fn dotted_pom_names_are_valid_streaming_names() {
+        let element: Arc<Mutex<Option<XmlElement>>> = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&element);
+        let mut parser = HermesParser::new();
+        parser.on_complete("tool.select", move |element| {
+            let captured = Arc::clone(&captured);
+            async move {
+                *captured.lock().unwrap() = Some(element);
+            }
+        });
+
+        parser
+            .feed(r#"<tool.select intent.id="7">ok</tool.select>"#)
+            .await;
+        parser.finalize().await;
+
+        let element = element.lock().unwrap().clone().unwrap();
+        assert_eq!(element.tag_name, "tool.select");
+        assert_eq!(element.attr("intent.id"), Some("7"));
+        assert_eq!(element.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn streaming_callback_receives_growing_snapshots_before_the_closing_chunk() {
         let stream_snapshots: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let complete_snapshots: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let s = Arc::clone(&stream_snapshots);
+        let c = Arc::clone(&complete_snapshots);
         let mut p = HermesParser::new();
         p.on_stream("speak", move |e| {
             let s = Arc::clone(&s);
@@ -567,25 +948,28 @@ mod tests {
                 s.lock().unwrap().push(e.content);
             }
         });
+        p.on_complete("speak", move |e| {
+            let c = Arc::clone(&c);
+            async move {
+                c.lock().unwrap().push(e.content);
+            }
+        });
 
-        // Each feed should trigger the stream callback with growing content.
+        // Incomplete callbacks carry cumulative snapshots. The chunk that
+        // contains the closing tag goes directly to `on_complete`.
         p.feed("<speak>chunk1").await;
         p.feed(" chunk2").await;
         p.feed(" chunk3</speak>").await;
         p.finalize().await;
 
-        let snaps = stream_snapshots.lock().unwrap().clone();
-        // At minimum we should have gotten updates while incomplete.
-        assert!(!snaps.is_empty(), "stream callback should have been called");
-        // Content should grow monotonically.
-        for w in snaps.windows(2) {
-            assert!(
-                w[1].len() >= w[0].len(),
-                "content should only grow: {:?} -> {:?}",
-                w[0],
-                w[1]
-            );
-        }
+        assert_eq!(
+            *stream_snapshots.lock().unwrap(),
+            vec!["chunk1", "chunk1 chunk2"]
+        );
+        assert_eq!(
+            *complete_snapshots.lock().unwrap(),
+            vec!["chunk1 chunk2 chunk3"]
+        );
     }
 
     #[tokio::test]

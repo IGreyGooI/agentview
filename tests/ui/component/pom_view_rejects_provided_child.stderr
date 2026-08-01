@@ -1,0 +1,19 @@
+error[E0277]: the trait bound `Result<ComponentNode<u8>, ComponentError>: PomChildren` is not satisfied
+ --> tests/ui/component/pom_view_rejects_provided_child.rs:9:15
+  |
+9 |     pom_view((provided_child(),))
+  |     --------  ^^^^^^^^^^^^^^^^ the trait `PomChildren` is not implemented for `Result<ComponentNode<u8>, ComponentError>`
+  |     |
+  |     required by a bound introduced by this call
+  |
+help: the trait `PomChildren` is implemented for `Result<ComponentNode<NoBindings>, ComponentError>`
+ --> src/component/mod.rs
+  |
+  | impl PomChildren for experimental::View<NoBindings> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: required for `(Result<ComponentNode<u8>, ComponentError>,)` to implement `PomChildren`
+note: required by a bound in `pom_view`
+ --> src/component/mod.rs
+  |
+  | pub fn pom_view(children: impl PomChildren) -> PomView {
+  |                                ^^^^^^^^^^^ required by this bound in `pom_view`

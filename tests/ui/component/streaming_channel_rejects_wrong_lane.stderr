@@ -1,0 +1,11 @@
+error[E0271]: type mismatch resolving `<RootChannels as TurnChannels>::Live == RootOutput`
+  --> tests/ui/component/streaming_channel_rejects_wrong_lane.rs:35:10
+   |
+35 |         .map_live(RootOutput::Value)
+   |          ^^^^^^^^ type mismatch resolving `<RootChannels as TurnChannels>::Live == RootOutput`
+   |
+note: expected this to be `RootOutput`
+  --> tests/ui/component/streaming_channel_rejects_wrong_lane.rs:20:17
+   |
+20 |     type Live = RootLive;
+   |                 ^^^^^^^^

@@ -1,0 +1,5 @@
+error[E0599]: no method named `task` found for struct `SystemMountContext<'a, Props>` in the current scope
+  --> tests/ui/component/system_mount_context_rejects_turn_data.rs:19:16
+   |
+19 |     let _ = cx.task();
+   |                ^^^^ method not found in `SystemMountContext<'_, ()>`

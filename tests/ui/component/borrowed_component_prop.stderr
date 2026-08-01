@@ -1,0 +1,5 @@
+error: component props must be owned or shared with `Arc`; borrowed props cannot outlive a deferred component call
+ --> tests/ui/component/borrowed_component_prop.rs:6:29
+  |
+6 | fn borrowed_contract(value: &str) -> PomView {
+  |                             ^^^^

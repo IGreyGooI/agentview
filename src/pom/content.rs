@@ -5,7 +5,7 @@ use super::{
     MarkdownKind, MarkdownNode, ParagraphNode, PomError, StrongNode, TextNode, XmlNode,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContentNode {
     Markdown(MarkdownNode),
     Xml(XmlNode),
@@ -36,7 +36,7 @@ impl MarkdownNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum ContentEdge {
     Node(ContentNode),
     Diff(DiffSlot),
@@ -117,6 +117,18 @@ impl BlockContent {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for BlockContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match <ContentEdge as serde::Deserialize>::deserialize(deserializer)? {
+            ContentEdge::Node(node) => Self::try_from_node(node).map_err(serde::de::Error::custom),
+            ContentEdge::Diff(slot) => Ok(Self(ContentEdge::Diff(slot))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct InlineContent(pub(super) ContentEdge);
 
@@ -179,7 +191,19 @@ impl InlineContent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+impl<'de> serde::Deserialize<'de> for InlineContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match <ContentEdge as serde::Deserialize>::deserialize(deserializer)? {
+            ContentEdge::Node(node) => Self::try_from_node(node).map_err(serde::de::Error::custom),
+            ContentEdge::Diff(slot) => Ok(Self(ContentEdge::Diff(slot))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MixedContent(pub(super) ContentEdge);
 
 impl MixedContent {

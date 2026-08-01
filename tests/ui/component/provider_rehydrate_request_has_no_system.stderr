@@ -1,0 +1,5 @@
+error[E0599]: no method named `system` found for struct `ProviderEpochRehydrateRequest<'a>` in the current scope
+ --> tests/ui/component/provider_rehydrate_request_has_no_system.rs:4:21
+  |
+4 |     let _ = request.system();
+  |                     ^^^^^^ method not found in `ProviderEpochRehydrateRequest<'_>`

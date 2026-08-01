@@ -1,0 +1,22 @@
+error[E0432]: unresolved imports `agentview::prelude::LiveEffectRuntime`, `agentview::prelude::MountedAgent`, `agentview::prelude::MountedCall`, `agentview::prelude::MountedTurnCapture`, `agentview::prelude::TurnCaptureContext`
+ --> tests/ui/component_public/root_prelude_does_not_export_mounted_host.rs:2:5
+  |
+2 |     LiveEffectRuntime, MountedAgent, MountedCall, MountedTurnCapture, TurnCaptureContext,
+  |     ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^ no `TurnCaptureContext` in `prelude`
+  |     |                  |             |            |
+  |     |                  |             |            no `MountedTurnCapture` in `prelude`
+  |     |                  |             |            help: a similar name exists in the module: `MountedFeature`
+  |     |                  |             no `MountedCall` in `prelude`
+  |     |                  no `MountedAgent` in `prelude`
+  |     no `LiveEffectRuntime` in `prelude`
+  |
+  = help: consider importing this trait instead:
+          agentview::component::LiveEffectRuntime
+  = help: consider importing this struct instead:
+          agentview::component::MountedAgent
+  = help: consider importing this struct instead:
+          agentview::component::MountedCall
+  = help: consider importing this trait instead:
+          agentview::component::MountedTurnCapture
+  = help: consider importing this struct instead:
+          agentview::component::TurnCaptureContext

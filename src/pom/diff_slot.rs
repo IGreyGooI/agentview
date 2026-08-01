@@ -1,6 +1,6 @@
 use super::{XmlName, XmlNode};
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffStrategy {
     Recursive,
     Replace,
@@ -15,6 +15,34 @@ pub struct DiffSlot {
     role: XmlName,
     strategy: DiffStrategy,
     value: Option<XmlNode>,
+}
+
+impl<'de> serde::Deserialize<'de> for DiffSlot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct RawDiffSlot {
+            role: XmlName,
+            strategy: DiffStrategy,
+            value: Option<XmlNode>,
+        }
+
+        let raw = RawDiffSlot::deserialize(deserializer)?;
+        if let Some(value) = raw.value {
+            if raw.role != *value.name() {
+                return Err(serde::de::Error::custom(format!(
+                    "diff slot role `{}` does not match value root `{}`",
+                    raw.role,
+                    value.name()
+                )));
+            }
+            Ok(Self::present(raw.strategy, value))
+        } else {
+            Ok(Self::absent(raw.role, raw.strategy))
+        }
+    }
 }
 
 impl DiffSlot {

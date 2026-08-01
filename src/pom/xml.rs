@@ -45,7 +45,17 @@ impl TryFrom<&str> for XmlName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+impl<'de> serde::Deserialize<'de> for XmlName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <StorageString as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct XmlAttribute {
     name: XmlName,
     value: StorageString,
@@ -130,19 +140,36 @@ impl PartialEq for XmlAttributes {
 
 impl Eq for XmlAttributes {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+impl<'de> serde::Deserialize<'de> for XmlAttributes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let attributes = <Vec<XmlAttribute> as serde::Deserialize>::deserialize(deserializer)?;
+        let mut validated = Self::new();
+        for attribute in attributes {
+            let (name, value) = attribute.into_parts();
+            validated
+                .insert(name, value)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(validated)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct XmlMetadata {
     collection_kind: Option<IntrinsicCollectionKind>,
     identity: Option<Box<ContentNode>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub(crate) enum IntrinsicCollectionKind {
     Map,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct XmlNode {
     name: XmlName,
     attributes: XmlAttributes,

@@ -4,11 +4,89 @@
 
 It is for cases where an agent should act on structured application state, keep turn history, and see either a full view or a delta between turns.
 
-Start here:
+For new POM component authoring, start here:
 
 ```rust
-use agentview::prelude::*;
+use agentview::component::prelude::*;
 ```
+
+Run the prompt-only mounted example first:
+
+```bash
+cargo run --example hello_world
+```
+
+The compatibility `Agent` / `ContextViewBuilder` runtime documented later uses
+`agentview::prelude::*`. Do not mix its authoring types into a new mounted POM
+component.
+
+## POM Component Runtime Status
+
+The `Agent` / `ContextViewBuilder` flow documented below is the current
+compatibility runtime. The mounted runtime now has opaque public
+`MountedAgent`/`MountedCall` handles and an AgentView-owned
+`InMemoryMountedAgentFactory`. Its external lifecycle test executes two calls,
+replay, reload, drop/reopen, awaited Live effects, and joined cancellation while
+rendering and attaching one retained `DurableSystem` exactly once.
+
+`InMemoryMountedAgentFactory` is deliberately a process-local lifecycle host,
+not production persistence. Clones and repeated opens of the same factory share
+one store and System epoch. Separately constructed factories are independent,
+even when given the same `DurableSessionId`. The host currently requires
+`Commit = Never` and does not expose durable reconfiguration, cross-process
+recovery, or an outbox worker. Initial sessions should use
+`PromptContext::without_system()`; an existing different System is rejected.
+
+Forgotten City's real AgentLoop still uses the compatibility executor, so the
+mounted API remains unfrozen. `DurableSystem::into_one_shot_component` is
+compatibility behavior rather than a durable reopen API.
+
+For the mounted direction, examples, current guarantees, and remaining host
+work, see [POM component authoring](docs/pom-component-authoring-examples.md)
+and the [implementation roadmap](kanban.md).
+
+Use the mounted examples in this order:
+
+- `cargo run --example hello_world` for the minimal
+  `PromptComponent<Props>` shape: one durable System POM and a fresh User POM
+  per turn, with no runtime channels;
+- `cargo run --example chess_agent_mounted_turn` for a typed streaming
+  component whose split XML chunks produce awaited Live effects and typed
+  Output through the public mounted host;
+- `cargo run --example chess_engine_mounted` for exact chess prompt migration
+  using the same prompt-only authoring shape with a fallible User builder;
+- `cargo run --example chess_engine_mounted_external` for the advanced,
+  host-owned external reply controller shape: the port receives the one
+  System render, persists an explicit delivery receipt/outbox identity, then
+  enables typed chess actions, atomic-shaped domain/state/outbox commits, and
+  wake-driven fresh User renders. It now directly reproduces the legacy
+  example's initial view, post-`e2e4` waiting view, asynchronous real Stockfish
+  move, and final hook. `ExternalReply<ChessReplyContract>` binds the
+  System-visible reply grammar and pure decoder before the host opens that
+  controller. Its in-memory host is a local demonstration, not a durable
+  transport or production persistence adapter. Actionable and Passive are now
+  distinct frame types: Passive has no action token and never advances the
+  baseline. Acknowledged Actionable frames produce real User POM deltas;
+- `cargo run --example chess_engine_mounted_agentloop` for the provider-driven
+  counterpart: one System attachment, full then delta User POM, real-time
+  typed Live preview, strict semantic publication gate, typed Commit/outbox
+  replay, and a real Stockfish move between two scripted provider turns.
+
+In each example, the POM types and `#[view(component)]` functions form the
+authoring boundary. The referenced shared `support` module is deliberately
+example-only host wiring: it captures turn props, runs a scripted provider, and
+records lifecycle facts. An application host owns those effects; a component
+stays pure.
+
+The first three examples isolate authoring, prompt, and streaming concepts. The
+repository CLI and Chess skill now run `observe -> act -> hook` through the
+mounted external controller, including acknowledged delta and multiple real
+Stockfish rounds. That is still a local proof: a production transactional
+`MountedExternalPort`, daemon restart persistence, replacement-consumer resync,
+and a real remote provider remain open. The controller never returns raw System
+text to an AgentLoop: `MountedExternalPort::complete_epoch` owns delivery and
+must retain a durable `ExternalSystemDeliveryReceipt` before an epoch may reopen
+as active.
 
 ## Core Idea
 
@@ -146,7 +224,12 @@ Avoid putting provider networking into `Agent`, history mutation into `TurnSink`
 
 ## Best Reference
 
-Read [examples/agent_streaming_tool_loop.rs](/home/greygoo/runtime/agentview/examples/agent_streaming_tool_loop.rs) for the clearest end-to-end example.
+For mounted authoring, start with
+[examples/hello_world.rs](/home/greygoo/runtime/agentview/examples/hello_world.rs),
+then read
+[examples/chess_agent_mounted_turn.rs](/home/greygoo/runtime/agentview/examples/chess_agent_mounted_turn.rs).
+The legacy end-to-end compatibility path remains in
+[examples/agent_streaming_tool_loop.rs](/home/greygoo/runtime/agentview/examples/agent_streaming_tool_loop.rs).
 
 Useful source files:
 

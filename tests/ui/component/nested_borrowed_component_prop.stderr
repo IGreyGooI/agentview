@@ -1,0 +1,13 @@
+error[E0521]: borrowed data escapes outside of function
+  --> tests/ui/component/nested_borrowed_component_prop.rs:9:1
+   |
+ 9 | #[agentview::view(component)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   | |
+   | `__agentview_component_prop_0` is a reference that is only valid in the function body
+   | `__agentview_component_prop_0` escapes the function body here
+   | argument requires that `'a` must outlive `'static`
+10 | fn nested_borrowed_contract<'a>(props: BorrowedProps<'a>) -> PomView {
+   |                             -- lifetime `'a` defined here
+   |
+   = note: this error originates in the attribute macro `agentview::view` (in Nightly builds, run with -Z macro-backtrace for more info)

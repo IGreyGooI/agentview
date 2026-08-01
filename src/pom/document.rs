@@ -1,6 +1,6 @@
 use super::{BlockBuilder, BlockChildren, BlockContent, PomError, XmlNode};
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Document {
     children: BlockChildren,
 }
@@ -48,6 +48,16 @@ impl Document {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ResolvedDocument {
     children: BlockChildren,
+}
+
+impl<'de> serde::Deserialize<'de> for ResolvedDocument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let document = Document::deserialize(deserializer)?;
+        crate::pom_resolution::resolve_artifact_document(document).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ResolvedDocument {

@@ -1,0 +1,24 @@
+error[E0277]: the trait bound `agentview::component::Component<RootChannels>: PomChildren` is not satisfied
+  --> tests/ui/component/pom_view_rejects_mount_provided_child.rs:28:15
+   |
+28 |     pom_view((provided_child(),))
+   |     --------  ^^^^^^^^^^^^^^^^ the trait `PomChildren` is not implemented for `agentview::component::Component<RootChannels>`
+   |     |
+   |     required by a bound introduced by this call
+   |
+   = help: the following other types implement trait `PomChildren`:
+             ()
+             (A, B)
+             (A, B, C)
+             (A, B, C, D)
+             (A, B, C, D, E)
+             (A, B, C, D, E, F)
+             (A, B, C, D, E, F, G)
+             (A, B, C, D, E, F, G, H)
+           and $N others
+   = note: required for `(agentview::component::Component<RootChannels>,)` to implement `PomChildren`
+note: required by a bound in `agentview::component::pom_view`
+  --> src/component/mod.rs
+   |
+   | pub fn pom_view(children: impl PomChildren) -> PomView {
+   |                                ^^^^^^^^^^^ required by this bound in `pom_view`

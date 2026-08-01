@@ -1,0 +1,473 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "AgentView POM Component Runtime",
+    "subtitle": "Mounted System/User POM, real-time provided components, and durable publication",
+    "output": "pom-component-runtime.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "mounted-system",
+        "label": "One System epoch",
+        "focus": ["mount-config", "system-view", "mount-compiler", "mounted-epoch", "provider-catalog"],
+        "note": "One explicit mount renders System once and stores its POM, factories, contracts, and immutable provider catalog as one epoch bundle."
+      },
+      {
+        "id": "dynamic-user",
+        "label": "Dynamic User turn",
+        "focus": ["turn-input", "user-view", "turn-plan", "prepare-gate"],
+        "note": "User POM is application-defined and rerendered for each preparation; only the final Ready plan starts an attempt."
+      },
+      {
+        "id": "realtime-provider",
+        "label": "Real-time provider path",
+        "focus": ["prepare-gate", "attempt-owner", "provider-adapter", "combined-attempt", "live-runtime", "finished-attempt"],
+        "note": "Text and native tool calls enter one ordered fallible wire. Pure reducers emit typed values; Live effects are awaited before the next event."
+      },
+      {
+        "id": "durable-publication",
+        "label": "Durable publication",
+        "focus": ["finished-attempt", "commit-stager", "session-mutation", "publication-owner", "publication-store"],
+        "note": "Mounted owner resolves uncertainty, then writes session and receipt revision before Wait or same-epoch Continue."
+      },
+      {
+        "id": "outbox-delivery",
+        "label": "External delivery target",
+        "focus": ["publication-store", "outbox-worker", "effect-receiver"],
+        "note": "Published means durably queued. A future recovery worker delivers at least once by stable OutboxItemId."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "mount-config",
+      "type": "external",
+      "label": "Host Mount Config",
+      "sublabel": "policy + capabilities",
+      "pos": [40, 150],
+      "size": [150, 68],
+      "tag": "new epoch only"
+    },
+    {
+      "id": "system-view",
+      "type": "frontend",
+      "label": "System View",
+      "sublabel": "stable POM + contracts",
+      "pos": [240, 150],
+      "size": [150, 68],
+      "tag": "once per mount call"
+    },
+    {
+      "id": "mount-compiler",
+      "type": "backend",
+      "label": "Mount Compiler",
+      "sublabel": "validate one bundle",
+      "pos": [440, 150],
+      "size": [150, 68]
+    },
+    {
+      "id": "mounted-epoch",
+      "type": "database",
+      "label": "MountedEpoch",
+      "sublabel": "System + factories + types",
+      "pos": [640, 150],
+      "size": [190, 68],
+      "tag": "immutable epoch"
+    },
+    {
+      "id": "provider-catalog",
+      "type": "messagebus",
+      "label": "ProviderToolCatalog",
+      "sublabel": "ordered schema snapshot",
+      "pos": [880, 150],
+      "size": [180, 68],
+      "tag": "request-facing only"
+    },
+    {
+      "id": "turn-input",
+      "type": "external",
+      "label": "Turn Input",
+      "sublabel": "context + artifacts + task",
+      "pos": [40, 430],
+      "size": [150, 68],
+      "tag": "application-defined"
+    },
+    {
+      "id": "user-view",
+      "type": "frontend",
+      "label": "User View",
+      "sublabel": "POM + explicit DiffSlot",
+      "pos": [240, 430],
+      "size": [150, 68],
+      "tag": "per preparation"
+    },
+    {
+      "id": "turn-plan",
+      "type": "messagebus",
+      "label": "PreparedUserTurn",
+      "sublabel": "UserDocument + factories",
+      "pos": [440, 430],
+      "size": [160, 68],
+      "tag": "discardable candidate"
+    },
+    {
+      "id": "prepare-gate",
+      "type": "security",
+      "label": "Preparation Gate",
+      "sublabel": "Ready / ReplaceHistory",
+      "pos": [650, 430],
+      "size": [160, 68],
+      "tag": "final Ready only"
+    },
+    {
+      "id": "attempt-owner",
+      "type": "messagebus",
+      "label": "Managed Attempt",
+      "sublabel": "actor + erased typestate",
+      "pos": [860, 430],
+      "size": [160, 68],
+      "tag": "crate-private proof"
+    },
+    {
+      "id": "provider-adapter",
+      "type": "cloud",
+      "label": "Mounted Provider",
+      "sublabel": "catalog + fallible wire",
+      "pos": [1070, 430],
+      "size": [170, 68],
+      "tag": "adapter pending"
+    },
+    {
+      "id": "combined-attempt",
+      "type": "backend",
+      "label": "Combined Attempt",
+      "sublabel": "XML parser + native tools",
+      "pos": [1290, 430],
+      "size": [170, 68],
+      "tag": "one identity + Live scope"
+    },
+    {
+      "id": "finished-attempt",
+      "type": "messagebus",
+      "label": "Finished Attempt",
+      "sublabel": "Output + Diagnostic + Commit",
+      "pos": [1510, 430],
+      "size": [180, 68],
+      "tag": "Commit still private"
+    },
+    {
+      "id": "commit-stager",
+      "type": "backend",
+      "label": "CommitStager<C>",
+      "sublabel": "pure typed encoding",
+      "pos": [1740, 430],
+      "size": [170, 68],
+      "tag": "one Commit : one item"
+    },
+    {
+      "id": "publication-owner",
+      "type": "messagebus",
+      "label": "Publication Actor",
+      "sublabel": "Ready / Resolving / Published",
+      "pos": [1960, 430],
+      "size": [190, 68],
+      "tag": "caller-cancellation safe"
+    },
+    {
+      "id": "publication-store",
+      "type": "database",
+      "label": "PublicationStore",
+      "sublabel": "CAS session + outbox",
+      "pos": [2200, 430],
+      "size": [180, 68],
+      "tag": "concrete store pending"
+    },
+    {
+      "id": "live-runtime",
+      "type": "external",
+      "label": "LiveEffectRuntime",
+      "sublabel": "apply / compensate",
+      "pos": [1290, 650],
+      "size": [170, 68],
+      "tag": "during provider stream"
+    },
+    {
+      "id": "session-mutation",
+      "type": "backend",
+      "label": "Mounted Session Owner",
+      "sublabel": "pure mutation + writeback",
+      "pos": [1740, 650],
+      "size": [170, 68],
+      "tag": "crate-private complete"
+    },
+    {
+      "id": "outbox-worker",
+      "type": "backend",
+      "label": "Outbox Worker",
+      "sublabel": "scan + lease + retry",
+      "pos": [2200, 650],
+      "size": [180, 68],
+      "tag": "target work"
+    },
+    {
+      "id": "effect-receiver",
+      "type": "external",
+      "label": "Effect Receiver",
+      "sublabel": "dedupe by OutboxItemId",
+      "pos": [2430, 650],
+      "size": [190, 68],
+      "tag": "at-least-once"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "ONE EXPLICIT SYSTEM MOUNT",
+      "wraps": ["mount-config", "system-view", "mount-compiler", "mounted-epoch", "provider-catalog"]
+    },
+    {
+      "kind": "region",
+      "label": "PER-PREPARATION USER AUTHORING",
+      "wraps": ["turn-input", "user-view", "turn-plan"]
+    },
+    {
+      "kind": "region",
+      "label": "ISOLATED RUNTIME CONTRACTS; REAL AGENTLOOP INTEGRATION PENDING",
+      "wraps": ["prepare-gate", "attempt-owner", "provider-adapter", "combined-attempt", "finished-attempt", "commit-stager", "publication-owner", "publication-store", "session-mutation"]
+    },
+    {
+      "kind": "security-group",
+      "label": "LIVE HOST I/O",
+      "wraps": ["live-runtime"]
+    },
+    {
+      "kind": "security-group",
+      "label": "TARGET DURABLE DELIVERY",
+      "wraps": ["outbox-worker", "effect-receiver"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "config-to-system-view",
+      "from": "mount-config",
+      "to": "system-view",
+      "variant": "emphasis"
+    },
+    {
+      "id": "system-view-to-compiler",
+      "from": "system-view",
+      "to": "mount-compiler",
+      "variant": "emphasis"
+    },
+    {
+      "id": "compiler-to-epoch",
+      "from": "mount-compiler",
+      "to": "mounted-epoch",
+      "label": "atomic bundle",
+      "labelAt": [615, 232],
+      "variant": "emphasis"
+    },
+    {
+      "id": "epoch-to-catalog",
+      "from": "mounted-epoch",
+      "to": "provider-catalog",
+      "label": "schema snapshot",
+      "labelAt": [855, 232],
+      "variant": "emphasis"
+    },
+    {
+      "id": "turn-input-to-user-view",
+      "from": "turn-input",
+      "to": "user-view",
+      "variant": "emphasis"
+    },
+    {
+      "id": "user-view-to-turn-plan",
+      "from": "user-view",
+      "to": "turn-plan",
+      "variant": "emphasis"
+    },
+    {
+      "id": "turn-plan-to-prepare",
+      "from": "turn-plan",
+      "to": "prepare-gate",
+      "variant": "emphasis"
+    },
+    {
+      "id": "prepare-to-attempt",
+      "from": "prepare-gate",
+      "to": "attempt-owner",
+      "label": "final Ready",
+      "labelAt": [835, 512],
+      "variant": "emphasis"
+    },
+    {
+      "id": "attempt-to-provider",
+      "from": "attempt-owner",
+      "to": "provider-adapter",
+      "variant": "emphasis"
+    },
+    {
+      "id": "provider-to-runtime",
+      "from": "provider-adapter",
+      "to": "combined-attempt",
+      "label": "Text / Tool",
+      "labelAt": [1265, 512],
+      "variant": "emphasis"
+    },
+    {
+      "id": "runtime-to-finished",
+      "from": "combined-attempt",
+      "to": "finished-attempt",
+      "label": "finish",
+      "variant": "emphasis"
+    },
+    {
+      "id": "finished-to-stager",
+      "from": "finished-attempt",
+      "to": "commit-stager",
+      "label": "typed Commit",
+      "labelAt": [1715, 512],
+      "variant": "emphasis"
+    },
+    {
+      "id": "stager-to-publication-owner",
+      "from": "commit-stager",
+      "to": "publication-owner",
+      "label": "ordered outbox",
+      "labelAt": [1935, 512],
+      "variant": "emphasis"
+    },
+    {
+      "id": "publication-owner-to-store",
+      "from": "publication-owner",
+      "to": "publication-store",
+      "label": "publish / resolve",
+      "labelAt": [2175, 512],
+      "variant": "emphasis"
+    },
+    {
+      "id": "epoch-to-user-view",
+      "from": "mounted-epoch",
+      "to": "user-view",
+      "label": "User factory",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[735, 330], [315, 330]]
+    },
+    {
+      "id": "epoch-to-attempt",
+      "from": "mounted-epoch",
+      "to": "attempt-owner",
+      "label": "factories + types",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[780, 360], [940, 360]]
+    },
+    {
+      "id": "catalog-to-provider",
+      "from": "provider-catalog",
+      "to": "provider-adapter",
+      "label": "request metadata",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[970, 390], [1155, 390]]
+    },
+    {
+      "id": "replace-history",
+      "from": "prepare-gate",
+      "to": "user-view",
+      "label": "ReplaceHistory",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [[730, 570], [315, 570]]
+    },
+    {
+      "id": "runtime-to-live",
+      "from": "combined-attempt",
+      "to": "live-runtime",
+      "label": "await Live",
+      "labelAt": [1375, 620],
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight"
+    },
+    {
+      "id": "tool-result-to-provider",
+      "from": "combined-attempt",
+      "to": "provider-adapter",
+      "label": "ack + result",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [[1375, 590], [1155, 590]]
+    },
+    {
+      "id": "finished-to-mutation",
+      "from": "finished-attempt",
+      "to": "session-mutation",
+      "label": "turn outcome",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "left",
+      "via": [[1600, 684]]
+    },
+    {
+      "id": "mutation-to-publication-owner",
+      "from": "session-mutation",
+      "to": "publication-owner",
+      "label": "complete mutation",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "bottom",
+      "via": [[2055, 684]]
+    },
+    {
+      "id": "store-to-worker",
+      "from": "publication-store",
+      "to": "outbox-worker",
+      "label": "scan + lease",
+      "labelAt": [2290, 512],
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight"
+    },
+    {
+      "id": "worker-to-receiver",
+      "from": "outbox-worker",
+      "to": "effect-receiver",
+      "label": "OutboxItemId",
+      "labelAt": [2405, 732],
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Stable System",
+      "items": ["One render per explicit mount call", "System POM, contracts, factories, and tool catalog form one epoch", "Private MountedAgent reuses one epoch; public loop integration remains"]
+    },
+    {
+      "dot": "emerald",
+      "title": "Dynamic User",
+      "items": ["Application owns context, artifacts, and task ordering", "Only explicit DiffSlot emits full, delta, or omitted", "Preparation may rerender User without rerendering System"]
+    },
+    {
+      "dot": "rose",
+      "title": "Publication semantics",
+      "items": ["Commit staging is synchronous and pure", "Published means session plus outbox are durable", "External delivery remains at-least-once"]
+    },
+    {
+      "dot": "amber",
+      "title": "Remaining integration",
+      "items": ["Mount-time reducer/persistence contract and public call builder", "Real AgentLoop, mounted provider adapter, and concrete CAS store", "Restart recovery plus lease/backoff/dead-letter worker"]
+    }
+  ]
+}

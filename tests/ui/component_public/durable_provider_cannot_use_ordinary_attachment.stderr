@@ -1,0 +1,15 @@
+error[E0599]: no method named `attach_epoch` found for reference `&P` in the current scope
+ --> tests/ui/component_public/durable_provider_cannot_use_ordinary_attachment.rs:9:22
+  |
+9 |     let _ = provider.attach_epoch(epoch);
+  |                      ^^^^^^^^^^^^
+  |
+  = help: items from traits can only be used if the type parameter is bounded by the trait
+help: the following trait defines an item `attach_epoch`, perhaps you need to restrict type parameter `P` with it:
+  |
+7 |     P: DurableMountedProviderExecutor<String> + MountedProviderEpochAttacher</* I */>,
+  |                                               +++++++++++++++++++++++++++++++++++++++
+help: there is a method `attach_durable_epoch` with a similar name
+  |
+9 |     let _ = provider.attach_durable_epoch(epoch);
+  |                             ++++++++

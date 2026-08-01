@@ -2,9 +2,10 @@ use agentview::pom::{
     BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentContext, ContentKind,
     ContentNode, ContentRef, DiffSlot, DiffStrategy, Document, HeadingLevel, HeadingNode,
     InlineChildren, InlineContent, ListItem, ListKind, ListNode, MarkdownKind, MarkdownNode,
-    MixedChildren, MixedContent, ParagraphNode, PomError, StrongNode, TextNode, XmlAttributes,
-    XmlName, XmlNode,
+    MixedChildren, MixedContent, ParagraphNode, PomError, ResolvedDocument, StrongNode, TextNode,
+    XmlAttributes, XmlName, XmlNode,
 };
+use agentview::pom_resolution::resolve_system_document;
 
 #[test]
 fn closure_and_compositional_builders_are_equivalent() {
@@ -721,4 +722,114 @@ fn diagnostic_serialization_preserves_order_and_diff_metadata() {
         find_keyed_payload(&value),
         Some(&serde_json::Value::String("id".into()))
     );
+}
+
+#[test]
+fn authored_and_resolved_documents_round_trip_through_json() {
+    let document = Document::try_build(|blocks| {
+        blocks.try_paragraph(|inline| {
+            inline.try_text("before")?;
+            inline.xml_slot(DiffSlot::present(
+                DiffStrategy::Recursive,
+                XmlNode::new(XmlName::try_from("agent_context")?),
+            ));
+            inline.try_text("after")?;
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .unwrap();
+
+    let authored_json = serde_json::to_string(&document).unwrap();
+    let restored_document: Document = serde_json::from_str(&authored_json).unwrap();
+    assert_eq!(restored_document, document);
+
+    let resolved = resolve_system_document(document);
+    let resolved_json = serde_json::to_string(&resolved).unwrap();
+    let restored_resolved: ResolvedDocument = serde_json::from_str(&resolved_json).unwrap();
+    assert_eq!(restored_resolved, resolved);
+}
+
+#[test]
+fn document_deserialization_revalidates_pom_invariants() {
+    fn replace_string(value: &mut serde_json::Value, from: &str, to: &str) -> bool {
+        match value {
+            serde_json::Value::String(value) if value == from => {
+                *value = to.to_owned();
+                true
+            }
+            serde_json::Value::Array(values) => values
+                .iter_mut()
+                .any(|value| replace_string(value, from, to)),
+            serde_json::Value::Object(fields) => fields
+                .values_mut()
+                .any(|value| replace_string(value, from, to)),
+            _ => false,
+        }
+    }
+
+    fn rename_variant(value: &mut serde_json::Value, from: &str, to: &str) -> bool {
+        match value {
+            serde_json::Value::Array(values) => values
+                .iter_mut()
+                .any(|value| rename_variant(value, from, to)),
+            serde_json::Value::Object(fields) => {
+                if let Some(payload) = fields.remove(from) {
+                    fields.insert(to.to_owned(), payload);
+                    true
+                } else {
+                    fields
+                        .values_mut()
+                        .any(|value| rename_variant(value, from, to))
+                }
+            }
+            _ => false,
+        }
+    }
+
+    let xml = Document::from_xml(XmlNode::new(XmlName::try_from("valid_root").unwrap()));
+    let mut invalid_name = serde_json::to_value(&xml).unwrap();
+    assert!(replace_string(
+        &mut invalid_name,
+        "valid_root",
+        "invalid:name"
+    ));
+    assert!(serde_json::from_value::<Document>(invalid_name).is_err());
+
+    let mut attributed = XmlNode::new(XmlName::try_from("attributed").unwrap());
+    attributed
+        .push_attribute(XmlName::try_from("a").unwrap(), "one")
+        .unwrap();
+    attributed
+        .push_attribute(XmlName::try_from("b").unwrap(), "two")
+        .unwrap();
+    let mut duplicate_attribute = serde_json::to_value(Document::from_xml(attributed)).unwrap();
+    assert!(replace_string(&mut duplicate_attribute, "b", "a"));
+    assert!(serde_json::from_value::<Document>(duplicate_attribute).is_err());
+
+    let paragraph = Document::build(|blocks| {
+        blocks.paragraph(|inline| inline.try_text("body").unwrap());
+    });
+    let mut wrong_context = serde_json::to_value(&paragraph).unwrap();
+    assert!(rename_variant(&mut wrong_context, "Paragraph", "Strong"));
+    assert!(serde_json::from_value::<Document>(wrong_context).is_err());
+
+    let with_slot = Document::try_build(|blocks| {
+        blocks.xml_slot(DiffSlot::present(
+            DiffStrategy::Recursive,
+            XmlNode::new(XmlName::try_from("agent_context")?),
+        ));
+        Ok(())
+    })
+    .unwrap();
+    let slot_json = serde_json::to_value(&with_slot).unwrap();
+    assert!(serde_json::from_value::<ResolvedDocument>(slot_json.clone()).is_err());
+
+    let mut mismatched_role = slot_json;
+    assert!(replace_string(
+        &mut mismatched_role,
+        "agent_context",
+        "other_context"
+    ));
+    assert!(serde_json::from_value::<Document>(mismatched_role).is_err());
 }

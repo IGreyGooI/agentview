@@ -75,16 +75,8 @@ async fn chess_system_prompt_is_authored_as_pom_markdown_and_xml() {
             "You are choosing legal chess moves from the rendered board.\n\n",
             "## Reasoning policy\n\n",
             "- Think privately about candidate moves before acting.\n",
-            "- Do not print chain-of-thought; call the CLI only after deciding.\n\n",
-            "<reply_contract transport=\"cli\">\n",
-            "  <command>`agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; ",
-            "--to &lt;to&gt; [--promotion &lt;promotion&gt;] --uci &lt;uci&gt;`</command>",
-            "\n  <example>`agentview chess act --piece P --from e2 --to e4 --uci e2e4`</example>",
-            "\n  <promotion_example>`agentview chess act --piece P --from e7 --to e8 ",
-            "--promotion q --uci e7e8q`</promotion_example>",
-            "\n  <instruction>Choose one legal UCI move from the current view, include the move ",
-            "context flags first, then pass the canonical UCI move with --uci.</instruction>",
-            "\n</reply_contract>"
+            "- Do not print chain-of-thought; return only the XML move after deciding.\n\n",
+            "<move uci=\"...\" />"
         )
     );
 }
@@ -252,19 +244,8 @@ async fn observe_renders_starting_board_and_move_contract() {
         "{rendered_prompt}"
     );
     assert!(rendered_prompt.contains("<active_turn_id>turn-1</active_turn_id>"));
-    assert!(rendered_prompt.contains("<reasoning_policy>"));
-    assert!(rendered_prompt.contains("Think privately about candidate moves before acting."));
-    assert!(rendered_prompt
-        .contains("Do not print chain-of-thought; call the CLI only after deciding."));
-    assert!(rendered_prompt.contains("<reply_contract transport=\"cli\">"));
-    assert!(rendered_prompt.contains(
-        "<command>agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; --to &lt;to&gt; \\[--promotion &lt;promotion&gt;\\] --uci &lt;uci&gt;</command>"
-    ));
-    assert!(rendered_prompt
-        .contains("<example>agentview chess act --piece P --from e2 --to e4 --uci e2e4</example>"));
-    assert!(rendered_prompt.contains(
-        "<promotion_example>agentview chess act --piece P --from e7 --to e8 --promotion q --uci e7e8q</promotion_example>"
-    ));
+    assert!(!rendered_prompt.contains("<reasoning_policy>"));
+    assert!(!rendered_prompt.contains("<reply_contract"));
     assert!(!rendered_prompt.contains("<reply_schema>"));
     assert!(!rendered_prompt.contains("<chess_turn_prompt>"));
 }

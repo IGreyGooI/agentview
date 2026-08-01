@@ -1,0 +1,24 @@
+error[E0308]: mismatched types
+  --> tests/ui/component/system_mount_rejects_capturing_closure.rs:17:37
+   |
+17 |       let _ = mount_system_epoch(&(), move |_| {
+   |  _____________------------------______^
+   | |             |
+   | |             arguments to this function are incorrect
+18 | |         let _ = &turn_data;
+19 | |         system_view::<RootChannels, ()>(component(()))
+20 | |     });
+   | |_____^ expected fn pointer, found closure
+   |
+   = note: expected fn pointer `for<'a> fn(SystemMountContext<'a, ()>) -> SystemView<RootChannels>`
+                 found closure `{closure@$DIR/tests/ui/component/system_mount_rejects_capturing_closure.rs:17:37: 17:45}`
+note: closures can only be coerced to `fn` types if they do not capture any variables
+  --> tests/ui/component/system_mount_rejects_capturing_closure.rs:18:18
+   |
+18 |         let _ = &turn_data;
+   |                  ^^^^^^^^^ `turn_data` captured here
+note: function defined here
+  --> src/component/lifecycle.rs
+   |
+   | pub fn mount_system_epoch<MountProps, C, TurnProps>(
+   |        ^^^^^^^^^^^^^^^^^^

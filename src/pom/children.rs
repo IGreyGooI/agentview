@@ -32,7 +32,7 @@ fn normalize_text_edge(
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockChildren(Vec<BlockContent>);
 
 impl BlockChildren {
@@ -177,6 +177,20 @@ impl InlineChildren {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for InlineChildren {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let children = <Vec<InlineContent> as serde::Deserialize>::deserialize(deserializer)?;
+        let mut normalized = Self::new();
+        for child in children {
+            normalized.push(child);
+        }
+        Ok(normalized)
+    }
+}
+
 pub struct InlineBuilder<'a> {
     children: &'a mut InlineChildren,
 }
@@ -257,6 +271,20 @@ impl MixedChildren {
         for child in children.0 {
             self.push(child);
         }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MixedChildren {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let children = <Vec<MixedContent> as serde::Deserialize>::deserialize(deserializer)?;
+        let mut normalized = Self::new();
+        for child in children {
+            normalized.push(child);
+        }
+        Ok(normalized)
     }
 }
 

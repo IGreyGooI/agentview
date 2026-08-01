@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/component/system_view_rejects_raw_runtime.rs:22:17
+   |
+22 |     system_view(binding("legacy-runtime", LegacyRuntime))
+   |     ----------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Component<RootChannels>`, found `Result<ComponentNode<...>, ...>`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected struct `agentview::component::Component<RootChannels>`
+                found enum `Result<ComponentNode<LegacyRuntime>, ComponentError>`
+note: function defined here
+  --> src/component/lifecycle.rs
+   |
+   | pub fn system_view<C, TurnProps>(root: Component<C, TurnProps>) -> SystemView<C, TurnProps>
+   |        ^^^^^^^^^^^

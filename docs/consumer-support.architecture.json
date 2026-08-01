@@ -1,0 +1,323 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "AgentView Consumer Readiness",
+    "subtitle": "Current public paths, reusable runtime contracts, and remaining integration work",
+    "output": "consumer-support.html",
+    "quality_profile": "standard",
+    "views": [
+      {
+        "id": "cube-stage",
+        "label": "Cube Stage target path",
+        "focus": ["cube-stage", "mounted-facade", "component-pom", "streaming-tools", "durable-owner", "provider-adapter", "production-store"],
+        "note": "The mounted path has the required primitives, but Cube Stage still needs POM migration plus provider, persistence, and compatibility wiring."
+      },
+      {
+        "id": "forgotten-agents",
+        "label": "Forgotten City agents",
+        "focus": ["forgotten-agents", "compat-runtime", "mounted-facade", "component-pom", "streaming-tools", "durable-owner", "provider-adapter", "production-store"],
+        "note": "The compatibility runtime builds today; SelectIntent and Phrase still need mounted Live, cancellation, provider, and persistence adapters."
+      },
+      {
+        "id": "semantic-graph",
+        "label": "Semantic graph current path",
+        "focus": ["semantic-graph", "compat-runtime", "pom-cursor", "graph-tools", "graph-postgres"],
+        "note": "AgentViewApp, transactional POM cursors, and the graph tool loop pass local tests; PostgreSQL commit and resume remain environment-gated."
+      },
+      {
+        "id": "release-gaps",
+        "label": "Release gaps",
+        "focus": ["provider-adapter", "production-store", "graph-postgres", "golden-harness"],
+        "note": "Production adapters and cross-runtime golden traces are required before declaring mounted consumer support."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "cube-stage",
+      "type": "external",
+      "label": "Cube Stage",
+      "sublabel": "Director + Script Writer",
+      "pos": [40, 150],
+      "size": [170, 68],
+      "tag": "migration blocked"
+    },
+    {
+      "id": "forgotten-agents",
+      "type": "external",
+      "label": "Forgotten City Agents",
+      "sublabel": "player + NPC + GM",
+      "pos": [40, 320],
+      "size": [170, 68],
+      "tag": "compat passes"
+    },
+    {
+      "id": "semantic-graph",
+      "type": "external",
+      "label": "Semantic Graph",
+      "sublabel": "ingest + query runtime",
+      "pos": [40, 520],
+      "size": [170, 68],
+      "tag": "local suite passes"
+    },
+    {
+      "id": "mounted-facade",
+      "type": "frontend",
+      "label": "MountedAgent Facade",
+      "sublabel": "open / start / wait / cancel / reload",
+      "pos": [300, 210],
+      "size": [190, 68],
+      "tag": "public in-memory proof"
+    },
+    {
+      "id": "component-pom",
+      "type": "frontend",
+      "label": "Component + POM",
+      "sublabel": "System once, User per preparation",
+      "pos": [550, 210],
+      "size": [190, 68],
+      "tag": "supported"
+    },
+    {
+      "id": "streaming-tools",
+      "type": "backend",
+      "label": "Streaming Runtime",
+      "sublabel": "XML + Live + provider tools",
+      "pos": [800, 210],
+      "size": [190, 68],
+      "tag": "contract proof"
+    },
+    {
+      "id": "durable-owner",
+      "type": "messagebus",
+      "label": "Durable Owner",
+      "sublabel": "call ledger + publication + recovery",
+      "pos": [1050, 210],
+      "size": [190, 68],
+      "tag": "in-memory proof"
+    },
+    {
+      "id": "provider-adapter",
+      "type": "cloud",
+      "label": "Provider Adapter",
+      "sublabel": "attach + POM-free rehydrate",
+      "pos": [1300, 120],
+      "size": [190, 68],
+      "tag": "consumer adapter required"
+    },
+    {
+      "id": "production-store",
+      "type": "database",
+      "label": "Production Store",
+      "sublabel": "session CAS + outbox worker",
+      "pos": [1300, 300],
+      "size": [190, 68],
+      "tag": "missing"
+    },
+    {
+      "id": "compat-runtime",
+      "type": "frontend",
+      "label": "Compatibility Runtime",
+      "sublabel": "Agent + AgentViewApp",
+      "pos": [300, 520],
+      "size": [190, 68],
+      "tag": "supported path"
+    },
+    {
+      "id": "pom-cursor",
+      "type": "messagebus",
+      "label": "Transactional View",
+      "sublabel": "full/delta cursor + epoch fence",
+      "pos": [550, 520],
+      "size": [190, 68],
+      "tag": "supported"
+    },
+    {
+      "id": "graph-tools",
+      "type": "backend",
+      "label": "Graph Tool Loop",
+      "sublabel": "read + mutate + commit",
+      "pos": [800, 520],
+      "size": [190, 68],
+      "tag": "210 local tests pass"
+    },
+    {
+      "id": "graph-postgres",
+      "type": "database",
+      "label": "Graph PostgreSQL",
+      "sublabel": "snapshot commit + resume",
+      "pos": [1050, 520],
+      "size": [190, 68],
+      "tag": "environment gate"
+    },
+    {
+      "id": "golden-harness",
+      "type": "security",
+      "label": "Golden Trace Harness",
+      "sublabel": "prompt + tools + effects + storage",
+      "pos": [1300, 520],
+      "size": [190, 68],
+      "tag": "missing"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "PUBLIC MOUNTED TARGET",
+      "wraps": ["mounted-facade", "component-pom"]
+    },
+    {
+      "kind": "region",
+      "label": "SHARED MOUNTED CONTRACTS",
+      "wraps": ["streaming-tools", "durable-owner"]
+    },
+    {
+      "kind": "region",
+      "label": "CURRENT COMPATIBILITY PATH",
+      "wraps": ["compat-runtime", "pom-cursor", "graph-tools"]
+    },
+    {
+      "kind": "security-group",
+      "label": "PROVIDER AND STORE BINDINGS",
+      "wraps": ["provider-adapter", "production-store"]
+    },
+    {
+      "kind": "security-group",
+      "label": "DATABASE-GATED PROOF",
+      "wraps": ["graph-postgres"]
+    },
+    {
+      "kind": "security-group",
+      "label": "MIGRATION EQUIVALENCE",
+      "wraps": ["golden-harness"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "cube-to-mounted",
+      "from": "cube-stage",
+      "to": "mounted-facade",
+      "label": "target",
+      "variant": "dashed"
+    },
+    {
+      "id": "forgotten-to-mounted",
+      "from": "forgotten-agents",
+      "to": "mounted-facade",
+      "label": "target",
+      "variant": "dashed"
+    },
+    {
+      "id": "forgotten-to-compat",
+      "from": "forgotten-agents",
+      "to": "compat-runtime",
+      "label": "current",
+      "variant": "emphasis"
+    },
+    {
+      "id": "graph-to-compat",
+      "from": "semantic-graph",
+      "to": "compat-runtime",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "orthogonal-h"
+    },
+    {
+      "id": "mounted-to-components",
+      "from": "mounted-facade",
+      "to": "component-pom",
+      "variant": "emphasis"
+    },
+    {
+      "id": "components-to-streaming",
+      "from": "component-pom",
+      "to": "streaming-tools",
+      "variant": "emphasis"
+    },
+    {
+      "id": "streaming-to-owner",
+      "from": "streaming-tools",
+      "to": "durable-owner",
+      "variant": "emphasis"
+    },
+    {
+      "id": "owner-to-provider",
+      "from": "durable-owner",
+      "to": "provider-adapter",
+      "label": "attach / rehydrate",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [[1250, 244], [1250, 154]],
+      "labelAt": [1190, 160]
+    },
+    {
+      "id": "owner-to-store",
+      "from": "durable-owner",
+      "to": "production-store",
+      "label": "CAS + outbox",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [[1250, 244], [1250, 334]],
+      "labelAt": [1200, 332]
+    },
+    {
+      "id": "compat-to-cursor",
+      "from": "compat-runtime",
+      "to": "pom-cursor",
+      "variant": "emphasis"
+    },
+    {
+      "id": "cursor-to-tools",
+      "from": "pom-cursor",
+      "to": "graph-tools",
+      "variant": "emphasis"
+    },
+    {
+      "id": "tools-to-postgres",
+      "from": "graph-tools",
+      "to": "graph-postgres",
+      "label": "commit / resume",
+      "variant": "emphasis",
+      "labelAt": [1020, 602]
+    },
+    {
+      "id": "store-to-golden",
+      "from": "production-store",
+      "to": "golden-harness",
+      "label": "consumer trace",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight",
+      "labelAt": [1395, 430]
+    },
+    {
+      "id": "postgres-to-golden",
+      "from": "graph-postgres",
+      "to": "golden-harness",
+      "label": "graph trace",
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Current evidence",
+      "items": ["AgentView contract tests pass through the public in-memory mounted lifecycle", "Forgotten City engine build and 21 local tests pass on the compatibility path", "Semantic graph all-target build and 210 database-free tests pass"]
+    },
+    {
+      "dot": "rose",
+      "title": "Current blockers",
+      "items": ["Cube Stage Director still targets the removed raw prompt API", "Forgotten City SelectIntent and Phrase have no mounted consumer adapter or compensation trace", "PostgreSQL tests require TEST_DATABASE_URL or DATABASE_URL"]
+    },
+    {
+      "dot": "amber",
+      "title": "Release claim boundary",
+      "items": ["Internal runtime proof is not consumer support", "Production provider and persistence adapters remain consumer-owned work", "Golden traces must compare prompts, tools, events, effects, and durable mutations"]
+    }
+  ]
+}

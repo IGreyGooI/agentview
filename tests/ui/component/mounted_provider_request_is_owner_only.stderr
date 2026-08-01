@@ -1,0 +1,45 @@
+error[E0624]: associated function `new` is private
+ --> tests/ui/component/mounted_provider_request_is_owner_only.rs:4:47
+  |
+4 |       let _ = MountedProviderRequest::<String>::new(
+  |                                                 ^^^ private associated function
+  |
+ ::: src/component/provider_wire.rs
+  |
+  | /     pub(crate) fn new(
+  | |         call_label: impl Into<StorageString>,
+  | |         history: Vec<I>,
+  | |         user: String,
+  | |         model: impl Into<StorageString>,
+  | |         max_tokens: u64,
+  | |     ) -> Self {
+  | |_____________- private associated function defined here
+
+error: cannot construct `MountedProviderRequest<_>` with struct literal syntax due to private fields
+  --> tests/ui/component/mounted_provider_request_is_owner_only.rs:11:13
+   |
+11 |     let _ = MountedProviderRequest {
+   |             ^^^^^^^^^^^^^^^^^^^^^^
+12 |         call_label: "call-1".into(),
+   |         --------------------------- private field
+13 |         history: Vec::<String>::new(),
+   |         ----------------------------- private field
+14 |         user: "user prompt".to_owned(),
+   |         ------------------------------ private field
+15 |         model: "test-model".into(),
+   |         -------------------------- private field
+16 |         max_tokens: 128,
+   |         --------------- private field
+   |
+   = note: ...and other private fields `provider_cursor` and `provider_operation` that were not provided
+help: you might have meant to use the `new` associated function
+   |
+11 -     let _ = MountedProviderRequest {
+12 -         call_label: "call-1".into(),
+13 -         history: Vec::<String>::new(),
+14 -         user: "user prompt".to_owned(),
+15 -         model: "test-model".into(),
+16 -         max_tokens: 128,
+17 -     };
+11 +     let _ = MountedProviderRequest::new(_, _, _, _, _);
+   |

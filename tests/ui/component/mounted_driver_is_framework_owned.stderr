@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `agentview::component::advanced::mounted`
+ --> tests/ui/component/mounted_driver_is_framework_owned.rs:1:37
+  |
+1 | use agentview::component::advanced::mounted::MountedAgentFactory;
+  |                                     ^^^^^^^ could not find `mounted` in `advanced`

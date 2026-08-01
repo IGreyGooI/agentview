@@ -1,0 +1,29 @@
+error[E0277]: the trait bound `DurableComponent<RootChannels, _>: PomChildren` is not satisfied
+  --> tests/ui/component/user_view_rejects_durable_component.rs:18:15
+   |
+18 |       user_view(durable_binding_factory(
+   |  _____---------_^
+   | |     |
+   | |     required by a bound introduced by this call
+19 | |         RuntimeContract::new("test.selection", "v1").unwrap(),
+20 | |         Document::from_xml(XmlNode::new(XmlName::try_from("selection").unwrap())),
+21 | |         RuntimeRoute::xml("selection").unwrap(),
+22 | |         || Runtime,
+23 | |     ))
+   | |_____^ the trait `PomChildren` is not implemented for `DurableComponent<RootChannels, _>`
+   |
+   = help: the following other types implement trait `PomChildren`:
+             ()
+             (A, B)
+             (A, B, C)
+             (A, B, C, D)
+             (A, B, C, D, E)
+             (A, B, C, D, E, F)
+             (A, B, C, D, E, F, G)
+             (A, B, C, D, E, F, G, H)
+           and $N others
+note: required by a bound in `agentview::component::user_view`
+  --> src/component/lifecycle.rs
+   |
+   | pub fn user_view(children: impl PomChildren) -> UserView {
+   |                                 ^^^^^^^^^^^ required by this bound in `user_view`

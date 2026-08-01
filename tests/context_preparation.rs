@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 
 use agentview::prelude::*;
 use tokio::sync::{Mutex, Notify};
@@ -182,6 +185,55 @@ impl LLMExecutor<Turn, TextTurnEvent> for ReplacingExecutor {
     }
 }
 
+#[derive(Debug, Default)]
+struct ResyncingExecutorState {
+    preparations: Vec<AgentTurnRequest<Turn>>,
+    executed_requests: Vec<AgentTurnRequest<Turn>>,
+}
+
+/// A stateful-provider-shaped executor that can ask AgentView to resend a
+/// full User document without rewriting durable history.
+#[derive(Clone, Default)]
+struct ResyncingExecutor {
+    state: Arc<Mutex<ResyncingExecutorState>>,
+    resync_next: Arc<AtomicBool>,
+}
+
+impl ResyncingExecutor {
+    fn request_user_resync(&self) {
+        self.resync_next.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl LLMExecutor<Turn, TextTurnEvent> for ResyncingExecutor {
+    async fn prepare_context(
+        &self,
+        request: &AgentTurnRequest<Turn>,
+        _budget: ContextPreparationBudget,
+    ) -> anyhow::Result<ContextPreparation<Turn>> {
+        self.state.lock().await.preparations.push(request.clone());
+        Ok(if self.resync_next.swap(false, Ordering::SeqCst) {
+            ContextPreparation::ResyncUserDocument
+        } else {
+            ContextPreparation::Ready
+        })
+    }
+
+    async fn execute_llm<S>(
+        &self,
+        request: AgentTurnRequest<Turn>,
+        _sink: &mut S,
+        _side_sinks: &mut Vec<Box<dyn TurnSink<TextTurnEvent, Output = ()>>>,
+    ) -> anyhow::Result<ExecutorCommit<Turn>>
+    where
+        S: TurnSink<TextTurnEvent> + Send,
+    {
+        self.state.lock().await.executed_requests.push(request);
+        Ok(ExecutorCommit::text("done"))
+    }
+}
+
 fn test_agent<E>() -> Agent<TestViewModel, E, Turn, TextTurnEvent, ()>
 where
     E: LLMExecutor<Turn, TextTurnEvent> + Clone,
@@ -243,6 +295,56 @@ async fn replacement_reprepares_same_turn_with_full_view() {
 }
 
 #[tokio::test]
+async fn sink_factory_runs_once_after_the_final_context_preparation() {
+    let executor = ReplacingExecutor::replace_once();
+    let agent = test_agent::<ReplacingExecutor>();
+    agent.call("seed").execute(&1, &executor).await.unwrap();
+    *executor.state.lock().await = ExecutorState::default();
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+
+    agent
+        .call("test")
+        .with_user("continue")
+        .execute_with_sink_factory(&1, &executor, {
+            let factory_calls = Arc::clone(&factory_calls);
+            move |()| {
+                factory_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(NoopTurnSink)
+            }
+        })
+        .await
+        .unwrap();
+
+    let state = executor.state.lock().await;
+    assert_eq!(state.prepare_calls, 2);
+    assert_eq!(state.execute_calls, 1);
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn sink_factory_is_not_called_when_context_preparation_fails() {
+    let executor = ReplacingExecutor::always_replace();
+    let agent = test_agent::<ReplacingExecutor>();
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+
+    let error = agent
+        .call("test")
+        .execute_with_sink_factory(&1, &executor, {
+            let factory_calls = Arc::clone(&factory_calls);
+            move |()| {
+                factory_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(NoopTurnSink)
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("replacement limit"));
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.state.lock().await.execute_calls, 0);
+}
+
+#[tokio::test]
 async fn unchanged_slot_is_omitted_while_current_task_is_still_sent() {
     let executor = ReplacingExecutor::replace_once();
     let agent = test_agent::<ReplacingExecutor>();
@@ -260,6 +362,51 @@ async fn unchanged_slot_is_omitted_while_current_task_is_still_sent() {
     let state = executor.state.lock().await;
     assert_eq!(state.executed_requests.len(), 1);
     assert_eq!(state.executed_requests[0].user, "continue");
+    drop(state);
+
+    let session = agent.session().await;
+    assert!(committed_context_xml(&session).contains("<value>1</value>"));
+}
+
+#[tokio::test]
+async fn provider_can_resync_user_document_without_replacing_history() {
+    let executor = ResyncingExecutor::default();
+    let agent = test_agent::<ResyncingExecutor>();
+
+    // Seed the durable User baseline. The provider does not request a resync
+    // until the following logical turn.
+    agent.call("seed").execute(&1, &executor).await.unwrap();
+    *executor.state.lock().await = ResyncingExecutorState::default();
+    executor.request_user_resync();
+
+    agent
+        .call("resync")
+        .with_user("continue")
+        .with_max_context_preparations(1)
+        .execute(&1, &executor)
+        .await
+        .unwrap();
+
+    let state = executor.state.lock().await;
+    assert_eq!(state.preparations.len(), 2);
+    assert_eq!(state.executed_requests.len(), 1);
+    let preparation_history = state
+        .preparations
+        .iter()
+        .map(|request| {
+            request
+                .history
+                .iter()
+                .map(|turn| turn.text.as_ref())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(preparation_history[0], preparation_history[1]);
+    assert_eq!(state.preparations[0].system, state.preparations[1].system);
+    assert_eq!(state.preparations[0].user, "continue");
+    assert!(state.preparations[1].user.contains("<agent_context"));
+    assert!(state.preparations[1].user.contains("<value>1</value>"));
+    assert!(state.executed_requests[0].user.contains("<agent_context"));
     drop(state);
 
     let session = agent.session().await;

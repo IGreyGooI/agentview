@@ -1,0 +1,19 @@
+error[E0432]: unresolved imports `agentview::component::prelude::DurableMountedAgentFactory`, `agentview::component::prelude::MountedHostRuntime`, `agentview::component::prelude::MountedTurnCapture`, `agentview::component::prelude::SessionReducer`
+ --> tests/ui/component_public/host_integration_is_not_in_component_author_prelude.rs:2:5
+  |
+2 |     DurableMountedAgentFactory, MountedHostRuntime, MountedTurnCapture, SessionReducer,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^ no `SessionReducer` in `component::prelude`
+  |     |                           |                   |
+  |     |                           |                   no `MountedTurnCapture` in `component::prelude`
+  |     |                           |                   help: a similar name exists in the module: `MountedFeature`
+  |     |                           no `MountedHostRuntime` in `component::prelude`
+  |     no `DurableMountedAgentFactory` in `component::prelude`
+  |
+  = help: consider importing this struct instead:
+          agentview::component::advanced::persistence::DurableMountedAgentFactory
+  = help: consider importing this struct instead:
+          agentview::component::host::prelude::MountedHostRuntime
+  = help: consider importing this trait instead:
+          agentview::component::MountedTurnCapture
+  = help: consider importing this trait instead:
+          agentview::component::SessionReducer

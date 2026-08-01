@@ -898,10 +898,14 @@ User resolution is stateful:
 
 The returned cursor is a candidate. `Agent` commits it only after provider
 execution and `commit_turn` both succeed. History replacement clears the draft
-cursor and rebuilds the request in full. Provider/commit failure and
-cancellation keep the old cursor. `AgentViewApp` uses the same rule across
-epoch retries: a candidate built for an unstable epoch is discarded. It also
-validates canonical rendering before publishing a stable snapshot/cursor.
+cursor and rebuilds the request in full. A stateful provider may instead return
+`ContextPreparation::ResyncUserDocument`: this clears only the draft User
+baseline and rebuilds the same logical turn in full, without changing System,
+history, or working state. Both rewrites are bounded by the preparation budget.
+Provider/commit failure and cancellation keep the old cursor. `AgentViewApp`
+uses the same rule across epoch retries: a candidate built for an unstable epoch
+is discarded. It also validates canonical rendering before publishing a stable
+snapshot/cursor.
 `act_with_sink` consumes the accepted turn id before applying external side
 effects, so a later snapshot failure cannot replay the same action.
 
@@ -958,7 +962,9 @@ struct DemoUserDocument {
 ```
 
 Chess uses the same pattern for its board context and typed `ChessTaskView`.
-Its keyed square diff, legal-move set diff, move-history sequence diff, and
-replace fields all run through the POM cursor path. The hello/default model
-uses a derived system Document and the framework's derived default user
+`ChessTaskView` contains only changing turn data; its policy and reply grammar
+belong to the one-shot System document rather than being copied into every
+User turn. Its keyed square diff, legal-move set diff, move-history sequence
+diff, and replace fields all run through the POM cursor path. The hello/default
+model uses a derived system Document and the framework's derived default user
 Document. None of these business paths manually render prompt markup.

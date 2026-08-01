@@ -25,6 +25,10 @@
 //! code blocks, thematic breaks, and multi-block list items are typed POM
 //! primitives that do not yet have derive field modes. It builds AST nodes; it
 //! never serializes prompt markup by hand.
+//!
+//! The `StreamingToolRunner` section is retained as the legacy parser/runtime
+//! reference. It is not the final POM Component authoring API; see
+//! `pom_streaming_channels` and `pom_mount_plan` for the isolated P3 spikes.
 
 use std::collections::BTreeMap;
 use std::fmt;

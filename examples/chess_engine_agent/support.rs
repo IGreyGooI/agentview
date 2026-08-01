@@ -8,7 +8,10 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentview::prelude::*;
+use agentview::{
+    component::{ExternalActionRoute, ExternalReplyContract, ExternalReplyContractId},
+    prelude::*,
+};
 use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square, ALL_FILES, ALL_RANKS};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -18,15 +21,434 @@ use tokio::time::timeout;
 const CHESS_SYSTEM_TASK: &str = "You are choosing legal chess moves from the rendered board.";
 const CHESS_REASONING_PRIVATE: &str = "Think privately about candidate moves before acting.";
 const CHESS_REASONING_NO_COT: &str =
-    "Do not print chain-of-thought; call the CLI only after deciding.";
-const CHESS_REPLY_COMMAND: &str =
-    "agentview chess act --piece <piece> --from <from> --to <to> [--promotion <promotion>] --uci <uci>";
-const CHESS_REPLY_EXAMPLE: &str = "agentview chess act --piece P --from e2 --to e4 --uci e2e4";
-const CHESS_REPLY_PROMOTION_EXAMPLE: &str =
-    "agentview chess act --piece P --from e7 --to e8 --promotion q --uci e7e8q";
-const CHESS_REPLY_INSTRUCTION: &str = "Choose one legal UCI move from the current view, include the move context flags first, then pass the canonical UCI move with --uci.";
+    "Do not print chain-of-thought; return only the XML move after deciding.";
 
-/// Shared chess game source used by `AgentViewApp`.
+/// Typed semantic result shared by the CLI and provider bindings.
+///
+/// The action is syntactically canonical UCI only. The host must still check
+/// turn phase, source revision, authorization, and board legality in its
+/// commit transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChessAction {
+    pub uci: String,
+}
+
+impl ChessAction {
+    pub fn from_uci(uci: impl AsRef<str>) -> Result<Self, ChessDiagnostic> {
+        let uci = uci.as_ref().trim();
+        let chess_move = ChessMove::from_str(uci).map_err(|error| ChessDiagnostic::InvalidUci {
+            uci: uci.to_owned(),
+            message: error.to_string(),
+        })?;
+        Ok(Self {
+            uci: chess_move.to_string(),
+        })
+    }
+
+    pub fn uci(&self) -> &str {
+        &self.uci
+    }
+}
+
+/// Typed, non-terminal diagnostics emitted by the shared chess reply
+/// contract. They describe syntax/contract failures only, never a domain
+/// authorization decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum ChessDiagnostic {
+    #[error("expected a text XML chess move reply")]
+    ExpectedTextReply,
+
+    #[error("expected exactly one `<move uci=\"...\" />` reply")]
+    InvalidXmlEnvelope,
+
+    #[error("expected `<move>`, got `<{tag}>")]
+    UnexpectedTag { tag: String },
+
+    #[error("move is missing a `uci` attribute")]
+    MissingUci,
+
+    #[error("move has unexpected attribute `{attribute}`")]
+    UnexpectedAttribute { attribute: String },
+
+    #[error("move must not contain text content")]
+    UnexpectedContent,
+
+    #[error("invalid UCI move `{uci}`: {message}")]
+    InvalidUci { uci: String, message: String },
+
+    #[error("no move was selected")]
+    NoMoveSelected,
+
+    #[error("invalid chess CLI command: {message}")]
+    InvalidCliCommand { message: String },
+}
+
+/// The single reply contract for the chess examples.
+///
+/// Its POM projection, external text decoder, and provider streaming reducer
+/// all use the same tag, attribute, action, and diagnostic definitions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChessMoveContract;
+
+#[allow(dead_code)]
+impl ChessMoveContract {
+    pub const TAG: &'static str = "move";
+    pub const UCI_ATTRIBUTE: &'static str = "uci";
+    pub const UCI_PLACEHOLDER: &'static str = "...";
+
+    pub fn encode_reply(&self, action: &ChessAction) -> String {
+        format!(
+            "<{} {}=\"{}\" />",
+            Self::TAG,
+            Self::UCI_ATTRIBUTE,
+            action.uci()
+        )
+    }
+
+    /// Decode a parsed provider element. This is deliberately pure so a
+    /// streaming reducer can emit a preview immediately and leave all host
+    /// mutation to its effect/commit boundary.
+    pub fn decode_element(
+        &self,
+        element: &agentview::stream_parser::XmlElement,
+    ) -> Result<ChessAction, ChessDiagnostic> {
+        self.decode_parts(
+            &element.tag_name,
+            &element.content,
+            element
+                .attributes
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
+    }
+
+    /// Decode the XML reply delivered by an external controller.
+    ///
+    /// This accepts the same empty `<move>` element as the streaming parser:
+    /// either self-closing or an explicit empty close tag. It intentionally
+    /// rejects prose, multiple elements, and non-contract attributes.
+    pub fn decode_reply(&self, reply: &str) -> Result<ChessAction, ChessDiagnostic> {
+        let reply = reply.trim();
+        let after_open = reply
+            .strip_prefix('<')
+            .ok_or(ChessDiagnostic::InvalidXmlEnvelope)?;
+        let after_tag = after_open
+            .strip_prefix(Self::TAG)
+            .ok_or(ChessDiagnostic::InvalidXmlEnvelope)?;
+        if !matches!(
+            after_tag.as_bytes().first(),
+            Some(b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>')
+        ) {
+            return Err(ChessDiagnostic::InvalidXmlEnvelope);
+        }
+
+        let opening_end = find_xml_tag_end(after_tag).ok_or(ChessDiagnostic::InvalidXmlEnvelope)?;
+        let opening = &after_tag[..opening_end];
+        let tail = &after_tag[opening_end + 1..];
+        let opening = opening.trim_end();
+        let (attributes, self_closing) = match opening.strip_suffix('/') {
+            Some(attributes) => (attributes, true),
+            None => (opening, false),
+        };
+
+        if self_closing {
+            if !tail.trim().is_empty() {
+                return Err(ChessDiagnostic::InvalidXmlEnvelope);
+            }
+        } else if tail.trim() != format!("</{}>", Self::TAG) {
+            return Err(ChessDiagnostic::InvalidXmlEnvelope);
+        }
+
+        self.decode_parts(
+            Self::TAG,
+            "",
+            parse_xml_attributes(attributes)?
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
+    }
+
+    fn decode_parts<'a>(
+        &self,
+        tag: &str,
+        content: &str,
+        attributes: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> Result<ChessAction, ChessDiagnostic> {
+        if tag != Self::TAG {
+            return Err(ChessDiagnostic::UnexpectedTag {
+                tag: tag.to_owned(),
+            });
+        }
+        if !content.trim().is_empty() {
+            return Err(ChessDiagnostic::UnexpectedContent);
+        }
+
+        let attributes = attributes.collect::<Vec<_>>();
+        let Some((name, uci)) = attributes.first().copied() else {
+            return Err(ChessDiagnostic::MissingUci);
+        };
+        if name != Self::UCI_ATTRIBUTE {
+            return Err(ChessDiagnostic::UnexpectedAttribute {
+                attribute: name.to_owned(),
+            });
+        }
+        if attributes.len() != 1 {
+            return Err(ChessDiagnostic::UnexpectedAttribute {
+                attribute: attributes[1].0.to_owned(),
+            });
+        }
+
+        ChessAction::from_uci(uci)
+    }
+}
+
+impl AgentView for ChessMoveContract {
+    type Root = XmlNode;
+
+    fn build_root(&self) -> Result<Self::Root, PomError> {
+        let mut node = XmlNode::new(XmlName::try_from(Self::TAG)?);
+        node.push_attribute(
+            XmlName::try_from(Self::UCI_ATTRIBUTE)?,
+            Self::UCI_PLACEHOLDER,
+        )?;
+        Ok(node)
+    }
+}
+
+/// System-only typed POM contribution for the shared semantic reply contract.
+#[derive(Debug, Clone, PartialEq, Eq, AgentView)]
+#[agent_view(document)]
+#[allow(dead_code)]
+pub struct ChessReplyContractDocument {
+    #[view(xml)]
+    reply_contract: ChessMoveContract,
+}
+
+impl Default for ChessReplyContractDocument {
+    fn default() -> Self {
+        Self {
+            reply_contract: ChessMoveContract,
+        }
+    }
+}
+
+/// Binds the shared XML semantics to the external-controller reply ingress.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct ChessReplyContract {
+    semantic: ChessMoveContract,
+    route: ExternalActionRoute,
+    id: ExternalReplyContractId,
+}
+
+#[allow(dead_code)]
+impl ChessReplyContract {
+    pub fn new() -> Self {
+        Self {
+            semantic: ChessMoveContract,
+            route: ExternalActionRoute::new("chess.player_move").unwrap(),
+            id: ExternalReplyContractId::new("chess.player_move.reply/v2").unwrap(),
+        }
+    }
+}
+
+impl Default for ChessReplyContract {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExternalReplyContract for ChessReplyContract {
+    type Action = ChessAction;
+    type Diagnostic = ChessDiagnostic;
+    type System = ChessReplyContractDocument;
+
+    fn system(&self) -> Self::System {
+        ChessReplyContractDocument::default()
+    }
+
+    fn route(&self) -> &ExternalActionRoute {
+        &self.route
+    }
+
+    fn contract_id(&self) -> &ExternalReplyContractId {
+        &self.id
+    }
+
+    fn decode(&self, reply: &ControlReply) -> Result<Self::Action, Self::Diagnostic> {
+        match reply {
+            ControlReply::Text(reply) => self.semantic.decode_reply(reply),
+            ControlReply::Structured(_) => Err(ChessDiagnostic::ExpectedTextReply),
+        }
+    }
+}
+
+/// Host-side CLI envelope for the chess skill.
+///
+/// This is not a prompt grammar. It validates a user-facing command and
+/// translates it to the shared semantic action before an external controller
+/// sees the canonical `<move uci="..." />` reply.
+#[allow(dead_code)]
+pub struct ChessCliTransport;
+
+#[allow(dead_code)]
+impl ChessCliTransport {
+    pub fn decode(command: &str) -> Result<ChessAction, ChessDiagnostic> {
+        let tokens = command.split_whitespace().collect::<Vec<_>>();
+        if tokens.get(..3) != Some(["agentview", "chess", "act"].as_slice()) {
+            return Err(Self::invalid(
+                "expected `agentview chess act` command prefix",
+            ));
+        }
+
+        let mut cursor = 3;
+        let piece = Self::command_value(&tokens, &mut cursor, "--piece")?;
+        let from = Self::command_value(&tokens, &mut cursor, "--from")?;
+        let to = Self::command_value(&tokens, &mut cursor, "--to")?;
+        let promotion = if tokens.get(cursor) == Some(&"--promotion") {
+            Some(Self::command_value(&tokens, &mut cursor, "--promotion")?)
+        } else {
+            None
+        };
+        let uci = Self::command_value(&tokens, &mut cursor, "--uci")?;
+        if cursor != tokens.len() {
+            return Err(Self::invalid(format!(
+                "unexpected argument `{}` after `--uci <uci>`",
+                tokens[cursor]
+            )));
+        }
+        if !matches!(piece, "P" | "N" | "B" | "R" | "Q" | "K") {
+            return Err(Self::invalid(format!(
+                "expected `--piece` to be one of P, N, B, R, Q, or K; got `{piece}`"
+            )));
+        }
+
+        let action = ChessAction::from_uci(uci)?;
+        let canonical_from = &action.uci[..2];
+        let canonical_to = &action.uci[2..4];
+        if from != canonical_from {
+            return Err(Self::invalid(format!(
+                "`--from {from}` does not match UCI source `{canonical_from}`"
+            )));
+        }
+        if to != canonical_to {
+            return Err(Self::invalid(format!(
+                "`--to {to}` does not match UCI target `{canonical_to}`"
+            )));
+        }
+
+        match (promotion, action.uci.as_bytes().get(4).copied()) {
+            (None, None) => {}
+            (Some(promotion), Some(uci_promotion)) if promotion.as_bytes() == [uci_promotion] => {}
+            (None, Some(uci_promotion)) => {
+                return Err(Self::invalid(format!(
+                    "promotion UCI `{}` requires `--promotion {}`",
+                    action.uci,
+                    char::from(uci_promotion)
+                )));
+            }
+            (Some(promotion), None) => {
+                return Err(Self::invalid(format!(
+                    "`--promotion {promotion}` requires a promotion UCI move"
+                )));
+            }
+            (Some(promotion), Some(uci_promotion)) => {
+                return Err(Self::invalid(format!(
+                    "`--promotion {promotion}` does not match UCI promotion `{}`",
+                    char::from(uci_promotion)
+                )));
+            }
+        }
+
+        Ok(action)
+    }
+
+    fn command_value<'a>(
+        tokens: &'a [&'a str],
+        cursor: &mut usize,
+        expected_flag: &str,
+    ) -> Result<&'a str, ChessDiagnostic> {
+        let flag = tokens
+            .get(*cursor)
+            .ok_or_else(|| Self::invalid(format!("expected `{expected_flag} <value>`")))?;
+        if *flag != expected_flag {
+            return Err(Self::invalid(format!(
+                "expected `{expected_flag}`, got `{flag}`"
+            )));
+        }
+        *cursor += 1;
+        let value = tokens
+            .get(*cursor)
+            .ok_or_else(|| Self::invalid(format!("missing value after `{expected_flag}`")))?;
+        if value.is_empty() || value.starts_with("--") {
+            return Err(Self::invalid(format!(
+                "expected a value after `{expected_flag}`"
+            )));
+        }
+        *cursor += 1;
+        Ok(value)
+    }
+
+    fn invalid(message: impl Into<String>) -> ChessDiagnostic {
+        ChessDiagnostic::InvalidCliCommand {
+            message: message.into(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn find_xml_tag_end(input: &str) -> Option<usize> {
+    let mut quote = None;
+    for (index, character) in input.char_indices() {
+        match (quote, character) {
+            (Some(active), character) if character == active => quote = None,
+            (Some(_), _) => {}
+            (None, '\"' | '\'') => quote = Some(character),
+            (None, '>') => return Some(index),
+            (None, _) => {}
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+fn parse_xml_attributes(input: &str) -> Result<Vec<(String, String)>, ChessDiagnostic> {
+    let mut input = input.trim();
+    let mut attributes = Vec::new();
+    while !input.is_empty() {
+        let name_length = input
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            .count();
+        if name_length == 0 {
+            return Err(ChessDiagnostic::InvalidXmlEnvelope);
+        }
+        let name = &input[..name_length];
+        input = input[name_length..].trim_start();
+        input = input
+            .strip_prefix('=')
+            .ok_or(ChessDiagnostic::InvalidXmlEnvelope)?
+            .trim_start();
+        let quote = input
+            .chars()
+            .next()
+            .filter(|quote| matches!(quote, '\"' | '\''))
+            .ok_or(ChessDiagnostic::InvalidXmlEnvelope)?;
+        input = &input[quote.len_utf8()..];
+        let end = input
+            .find(quote)
+            .ok_or(ChessDiagnostic::InvalidXmlEnvelope)?;
+        let value = &input[..end];
+        input = input[end + quote.len_utf8()..].trim_start();
+        if attributes.iter().any(|(existing, _)| existing == name) {
+            return Err(ChessDiagnostic::InvalidXmlEnvelope);
+        }
+        attributes.push((name.to_owned(), value.to_owned()));
+    }
+    Ok(attributes)
+}
+
+/// Shared chess game source used by the example applications.
 #[derive(Debug, Clone)]
 pub struct ChessGameSource {
     inner: Arc<Mutex<ChessGameState>>,
@@ -41,6 +463,73 @@ impl ChessGameSource {
 
     pub fn snapshot(&self) -> ChessGameState {
         self.inner.lock().unwrap().clone()
+    }
+
+    /// Validate one player move against the current authoritative board
+    /// without mutating it. External hosts use this during reply preparation
+    /// before they persist a commit candidate.
+    pub fn validate_legal_uci(&self, uci: &str) -> anyhow::Result<()> {
+        let chess_move = ChessMove::from_str(uci)
+            .map_err(|error| anyhow::anyhow!("invalid UCI move `{uci}`: {error}"))?;
+        if !self.inner.lock().unwrap().board.legal(chess_move) {
+            anyhow::bail!("illegal chess move `{uci}` for current board");
+        }
+        Ok(())
+    }
+
+    /// Apply a legal UCI move as an example-domain action.
+    ///
+    /// The mounted prompt example uses this to create its next captured board
+    /// snapshot. A real host receives a typed agent result, validates it at
+    /// its own action boundary, and performs the same kind of domain update.
+    #[allow(dead_code)] // Used by the separately compiled mounted example.
+    pub fn apply_legal_uci(&self, uci: &str) -> anyhow::Result<()> {
+        self.validate_legal_uci(uci)?;
+        let chess_move = ChessMove::from_str(uci)
+            .map_err(|error| anyhow::anyhow!("invalid UCI move `{uci}`: {error}"))?;
+        self.with_state(|state| {
+            if !state.board.legal(chess_move) {
+                anyhow::bail!("illegal chess move `{uci}` for current board");
+            }
+            state.board = state.board.make_move_new(chess_move);
+            state.move_history.push(uci.to_owned());
+            state.engine_pending = state.board.status() == BoardStatus::Ongoing;
+            state.last_error = None;
+            Ok(())
+        })
+    }
+
+    /// Apply one already-selected engine move and retain engine-specific view
+    /// state. This is used by mounted external-control examples whose host
+    /// publishes its own durable wake rather than the legacy `ViewAwake`.
+    #[allow(dead_code)]
+    pub fn apply_engine_uci(&self, uci: &str) -> anyhow::Result<()> {
+        let chess_move = ChessMove::from_str(uci)
+            .map_err(|error| anyhow::anyhow!("invalid UCI move `{uci}`: {error}"))?;
+        self.with_state(|state| {
+            if !state.board.legal(chess_move) {
+                anyhow::bail!("illegal engine move `{uci}` for current board");
+            }
+            state.board = state.board.make_move_new(chess_move);
+            state.move_history.push(uci.to_owned());
+            state.engine_pending = false;
+            state.last_engine_move = Some(uci.to_owned());
+            state.last_error = None;
+            Ok(())
+        })
+    }
+
+    /// Record an engine failure without choosing a wake mechanism.
+    ///
+    /// Legacy `AgentViewApp` wakes through `ViewAwakeHandle`; mounted hosts
+    /// publish their own durable wake cursor. The chess domain owns the state
+    /// transition, while each runtime owns notification and persistence.
+    #[allow(dead_code)]
+    pub fn record_engine_failure(&self, message: impl Into<String>) {
+        self.with_state(|state| {
+            state.engine_pending = false;
+            state.last_error = Some(message.into());
+        });
     }
 
     fn with_state<R>(&self, f: impl FnOnce(&mut ChessGameState) -> R) -> R {
@@ -195,61 +684,11 @@ struct ChessLastErrorPromptView {
     message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
-#[agent_view(kind = "instruction")]
-struct ChessTaskInstructionPromptView {
-    #[view(text)]
-    text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
-#[agent_view(kind = "reasoning_policy")]
-struct ChessReasoningPolicyPromptView {
-    #[view(flatten)]
-    instructions: Vec<ChessTaskInstructionPromptView>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AgentView)]
-#[agent_view(kind = "reply_contract")]
-struct ChessTaskReplyContractPromptView {
-    transport: String,
-
-    #[view(element)]
-    command: String,
-
-    #[view(element)]
-    example: String,
-
-    #[view(element)]
-    promotion_example: String,
-
-    #[view(element)]
-    instruction: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, AgentView)]
 #[agent_view(markdown = "paragraph")]
 struct ChessReasoningPolicyItemPromptView {
     #[view(text)]
     text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, AgentView)]
-#[agent_view(kind = "reply_contract")]
-struct ChessReplyContractPromptView {
-    transport: String,
-
-    #[view(code_span)]
-    command: String,
-
-    #[view(code_span)]
-    example: String,
-
-    #[view(code_span)]
-    promotion_example: String,
-
-    #[view(element)]
-    instruction: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, AgentView)]
@@ -268,7 +707,29 @@ pub struct ChessSystemPromptView {
     reasoning_policy: Vec<ChessReasoningPolicyItemPromptView>,
 
     #[view(xml)]
-    reply_contract: ChessReplyContractPromptView,
+    reply_contract: ChessMoveContract,
+}
+
+/// The stable chess policy POM without the reply contract.
+///
+/// External reply components append the shared semantic contract after this
+/// contribution. CLI syntax stays outside this POM as a host transport
+/// envelope, so it cannot drift into a second model-facing grammar.
+#[derive(Debug, Clone, PartialEq, Eq, AgentView)]
+#[agent_view(document)]
+#[allow(dead_code)]
+pub struct ChessSystemPolicyPromptView {
+    #[view(heading = 1)]
+    title: String,
+
+    #[view(paragraph)]
+    task: String,
+
+    #[view(heading = 2)]
+    reasoning_policy_title: String,
+
+    #[view(unordered_list)]
+    reasoning_policy: Vec<ChessReasoningPolicyItemPromptView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,21 +875,6 @@ impl AgentViewCollect<ChessGameState> for ChessView {
     }
 }
 
-fn chess_task_instruction_prompt_view(text: &str) -> ChessTaskInstructionPromptView {
-    ChessTaskInstructionPromptView {
-        text: text.to_owned(),
-    }
-}
-
-fn chess_reasoning_policy_prompt_view() -> ChessReasoningPolicyPromptView {
-    ChessReasoningPolicyPromptView {
-        instructions: vec![
-            chess_task_instruction_prompt_view(CHESS_REASONING_PRIVATE),
-            chess_task_instruction_prompt_view(CHESS_REASONING_NO_COT),
-        ],
-    }
-}
-
 fn chess_system_reasoning_policy_prompt_view() -> Vec<ChessReasoningPolicyItemPromptView> {
     [CHESS_REASONING_PRIVATE, CHESS_REASONING_NO_COT]
         .into_iter()
@@ -438,26 +884,6 @@ fn chess_system_reasoning_policy_prompt_view() -> Vec<ChessReasoningPolicyItemPr
         .collect()
 }
 
-fn chess_reply_contract_prompt_view() -> ChessReplyContractPromptView {
-    ChessReplyContractPromptView {
-        transport: "cli".to_owned(),
-        command: CHESS_REPLY_COMMAND.to_owned(),
-        example: CHESS_REPLY_EXAMPLE.to_owned(),
-        promotion_example: CHESS_REPLY_PROMOTION_EXAMPLE.to_owned(),
-        instruction: CHESS_REPLY_INSTRUCTION.to_owned(),
-    }
-}
-
-fn chess_task_reply_contract_prompt_view() -> ChessTaskReplyContractPromptView {
-    ChessTaskReplyContractPromptView {
-        transport: "cli".to_owned(),
-        command: CHESS_REPLY_COMMAND.to_owned(),
-        example: CHESS_REPLY_EXAMPLE.to_owned(),
-        promotion_example: CHESS_REPLY_PROMOTION_EXAMPLE.to_owned(),
-        instruction: CHESS_REPLY_INSTRUCTION.to_owned(),
-    }
-}
-
 impl Default for ChessSystemPromptView {
     fn default() -> Self {
         Self {
@@ -465,7 +891,18 @@ impl Default for ChessSystemPromptView {
             task: CHESS_SYSTEM_TASK.to_owned(),
             reasoning_policy_title: "Reasoning policy".to_owned(),
             reasoning_policy: chess_system_reasoning_policy_prompt_view(),
-            reply_contract: chess_reply_contract_prompt_view(),
+            reply_contract: ChessMoveContract,
+        }
+    }
+}
+
+impl Default for ChessSystemPolicyPromptView {
+    fn default() -> Self {
+        Self {
+            title: "Chess move agent".to_owned(),
+            task: CHESS_SYSTEM_TASK.to_owned(),
+            reasoning_policy_title: "Reasoning policy".to_owned(),
+            reasoning_policy: chess_system_reasoning_policy_prompt_view(),
         }
     }
 }
@@ -488,16 +925,8 @@ fn chess_system_prompt_view_produces_the_exact_pom_document() {
             "You are choosing legal chess moves from the rendered board.\n\n",
             "## Reasoning policy\n\n",
             "- Think privately about candidate moves before acting.\n",
-            "- Do not print chain-of-thought; call the CLI only after deciding.\n\n",
-            "<reply_contract transport=\"cli\">\n",
-            "  <command>`agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; ",
-            "--to &lt;to&gt; [--promotion &lt;promotion&gt;] --uci &lt;uci&gt;`</command>",
-            "\n  <example>`agentview chess act --piece P --from e2 --to e4 --uci e2e4`</example>",
-            "\n  <promotion_example>`agentview chess act --piece P --from e7 --to e8 ",
-            "--promotion q --uci e7e8q`</promotion_example>",
-            "\n  <instruction>Choose one legal UCI move from the current view, include the move ",
-            "context flags first, then pass the canonical UCI move with --uci.</instruction>",
-            "\n</reply_contract>"
+            "- Do not print chain-of-thought; return only the XML move after deciding.\n\n",
+            "<move uci=\"...\" />"
         )
     );
 }
@@ -613,7 +1042,10 @@ impl ChessView {
     }
 }
 
-/// Agent-facing task/contract for the next chess move.
+/// Per-turn task data for the next chess move.
+///
+/// Stable policy and reply grammar live in the System document. This User POM
+/// carries only data that can change with the turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, AgentView)]
 #[agent_view(kind = "chess_task")]
 pub struct ChessTaskView {
@@ -622,12 +1054,6 @@ pub struct ChessTaskView {
 
     #[view(element)]
     pub active_turn_id: String,
-
-    #[view(flatten)]
-    reasoning_policy: ChessReasoningPolicyPromptView,
-
-    #[view(flatten)]
-    reply_contract: ChessTaskReplyContractPromptView,
 }
 
 impl ChessTaskView {
@@ -635,8 +1061,6 @@ impl ChessTaskView {
         Self {
             instruction: instruction.into(),
             active_turn_id: active_turn_id.into(),
-            reasoning_policy: chess_reasoning_policy_prompt_view(),
-            reply_contract: chess_task_reply_contract_prompt_view(),
         }
     }
 }
@@ -649,6 +1073,22 @@ struct ChessUserDocumentView {
 
     #[view(xml)]
     task: ChessTaskView,
+}
+
+/// Build the per-turn chess User POM without selecting a runtime owner.
+///
+/// Both the legacy external-control example and the mounted lifecycle golden
+/// example use this pure authoring function.
+pub fn chess_user_document(
+    context: ChessView,
+    instruction: impl Into<String>,
+    active_turn_id: impl Into<String>,
+) -> Result<Document, PomError> {
+    ChessUserDocumentView {
+        context,
+        task: ChessTaskView::new(instruction, active_turn_id),
+    }
+    .build_root()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -680,11 +1120,7 @@ impl AgentViewModel<Turn, ()> for ChessViewModel {
         task: StorageString,
         current_view: &Self::View,
     ) -> anyhow::Result<Document> {
-        Ok(ChessUserDocumentView {
-            context: current_view.clone(),
-            task: ChessTaskView::new(task, call_id),
-        }
-        .build_root()?)
+        Ok(chess_user_document(current_view.clone(), task, call_id)?)
     }
 
     async fn commit_turn(
@@ -724,8 +1160,8 @@ impl ChessMoveSink {
         }
     }
 
-    fn parse_reply(reply: ControlReply) -> Result<String, String> {
-        match reply {
+    fn parse_reply(reply: ControlReply) -> Result<ChessAction, String> {
+        let uci = match reply {
             ControlReply::Text(text) => Ok(text.trim().to_owned()),
             ControlReply::Structured(value) => value
                 .get("uci")
@@ -734,7 +1170,8 @@ impl ChessMoveSink {
                 .filter(|uci| !uci.is_empty())
                 .map(ToOwned::to_owned)
                 .ok_or_else(|| "expected structured reply with non-empty `uci`".to_owned()),
-        }
+        }?;
+        ChessAction::from_uci(uci).map_err(|diagnostic| diagnostic.to_string())
     }
 
     fn reject(&mut self, message: impl Into<String>) {
@@ -749,33 +1186,27 @@ impl TurnSink<ControlReply> for ChessMoveSink {
     type Output = ChessMoveOutput;
 
     async fn on_event(&mut self, reply: ControlReply) {
-        let uci = match Self::parse_reply(reply) {
-            Ok(uci) if !uci.is_empty() => uci,
-            Ok(_) => {
-                self.reject("expected non-empty chess move");
-                return;
-            }
+        let action = match Self::parse_reply(reply) {
+            Ok(action) => action,
             Err(message) => {
                 self.reject(message);
                 return;
             }
         };
 
-        let chess_move = match ChessMove::from_str(&uci) {
-            Ok(chess_move) => chess_move,
-            Err(err) => {
-                self.reject(format!("invalid UCI chess move `{uci}`: {err}"));
-                return;
-            }
-        };
+        let chess_move =
+            ChessMove::from_str(action.uci()).expect("a ChessAction always has UCI syntax");
 
         if !self.board.legal(chess_move) {
-            self.reject(format!("illegal chess move `{uci}` for current board"));
+            self.reject(format!(
+                "illegal chess move `{}` for current board",
+                action.uci()
+            ));
             return;
         }
 
         self.output = Some(ChessMoveOutput::Accepted(PlayerMove {
-            uci: uci.into(),
+            uci: action.uci.into(),
             chess_move,
         }));
     }

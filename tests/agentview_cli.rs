@@ -101,8 +101,8 @@ fn chess_act_help_describes_uci_and_context_flags() {
     assert!(stdout.contains("agentview chess act"), "{stdout}");
     assert!(stdout.contains("--uci <uci>"), "{stdout}");
     assert!(stdout.contains("--piece <piece>"), "{stdout}");
-    assert!(stdout.contains("context flags"), "{stdout}");
-    assert!(stdout.contains("positional <uci>"), "{stdout}");
+    assert!(stdout.contains("host-owned CLI envelope"), "{stdout}");
+    assert!(!stdout.contains("positional <uci>"), "{stdout}");
 }
 
 #[test]
@@ -151,11 +151,22 @@ fn chess_commands_share_an_implicit_server_session() {
     assert!(observe_stdout.contains("<board_state kind=\"board_state\">"));
     assert!(observe_stdout.contains("<board_squares>"));
     assert!(!observe_stdout.contains("<board_squares kind="));
-    assert!(observe_stdout.contains(
-        "<command>agentview chess act --piece &lt;piece&gt; --from &lt;from&gt; --to &lt;to&gt; \\[--promotion &lt;promotion&gt;\\] --uci &lt;uci&gt;</command>"
-    ));
-    assert!(observe_stdout
-        .contains("<example>agentview chess act --piece P --from e2 --to e4 --uci e2e4</example>"));
+    // `observe` exposes a freshly rendered User document. The stable CLI
+    // grammar is System POM and must not be repeated in every observation.
+    assert!(
+        !observe_stdout.contains("<reply_contract"),
+        "{observe_stdout}"
+    );
+    assert!(
+        !observe_stdout.contains("agentview chess act --piece"),
+        "{observe_stdout}"
+    );
+
+    // Retrying delivery before an action returns the same durable Actionable
+    // frame; it does not make a new prompt or advance the delta cursor.
+    let observe_replay = run_cli_with_env(&addr, &["chess", "observe"], &envs);
+    assert!(observe_replay.status.success(), "{observe_replay:?}");
+    assert_eq!(observe_replay.stdout, observe.stdout);
 
     let act = run_cli_with_env(
         &addr,
@@ -171,28 +182,30 @@ fn chess_commands_share_an_implicit_server_session() {
         .split_once("prompt:\n")
         .expect("act response should contain a prompt")
         .1;
-    assert!(act_prompt.contains("<agent_context rendering_mode=\"delta\" kind=\"prompt_board\">"));
-    assert!(!act_prompt.contains("<prompt_board_update>"));
-    assert!(act_prompt.contains("<board_state rendering_mode=\"delta\">"));
-    assert!(act_prompt.contains("<board_squares rendering_mode=\"delta\">"));
-    assert!(act_prompt.contains("<update>"));
+    // The player reply acknowledges the prior Actionable prompt. Its successor
+    // is a Passive Stockfish presentation, which is deliberately full and
+    // cursor-neutral rather than a delta against that prompt.
+    assert!(act_prompt.contains("<agent_context kind=\"prompt_board\">"));
+    assert!(!act_prompt.contains("rendering_mode=\"delta\""));
+    assert!(act_prompt.contains("<board_state kind=\"board_state\">"));
+    assert!(act_prompt.contains("<square id=\"a8\" file=\"a\" rank=\"8\">r</square>"));
     assert!(act_prompt.contains("<square id=\"e2\" file=\"e\" rank=\"2\">.</square>"));
     assert!(act_prompt.contains("<square id=\"e4\" file=\"e\" rank=\"4\">P</square>"));
-    assert!(!act_prompt.contains("<square id=\"a8\""));
-    assert!(!act_prompt.contains("<rank n="));
-    assert!(!act_prompt.contains("<changed_sections>"));
-    assert!(act_prompt.contains("<legal_moves rendering_mode=\"delta\">"));
-    assert!(act_prompt.contains("<insert>"));
-    assert!(act_prompt.contains("<remove>"));
-    assert!(act_prompt.contains("<move_history rendering_mode=\"delta\">"));
     assert!(act_prompt.contains("<move>e2e4</move>"));
-    assert!(act_prompt.contains("<move>e7e5</move>"));
-    assert!(act_prompt.contains("<engine rendering_mode=\"delta\">"));
-    assert!(act_prompt.contains("<replace>"));
     assert!(act_prompt.contains("<pending>true</pending>"));
-    assert!(!act_prompt.contains("render_mode="));
-    assert!(!act_prompt.contains("<added>"));
-    assert!(!act_prompt.contains("<removed>"));
+    assert!(act_prompt.contains("Wait for the engine reply."));
+
+    // The same canonical reply id is replayable while the waiting
+    // presentation is current; it does not make a second domain move.
+    let replay = run_cli_with_env(
+        &addr,
+        &[
+            "chess", "act", "--piece", "P", "--from", "e2", "--to", "e4", "--uci", "e2e4",
+        ],
+        &envs,
+    );
+    assert!(replay.status.success(), "{replay:?}");
+    assert_eq!(replay.stdout, act.stdout);
 
     let hook = run_cli_with_env(&addr, &["chess", "hook", "1"], &envs);
 

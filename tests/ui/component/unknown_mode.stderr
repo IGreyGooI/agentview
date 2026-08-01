@@ -1,0 +1,5 @@
+error: unsupported view attribute; expected `#[view(component)]`
+ --> tests/ui/component/unknown_mode.rs:3:8
+  |
+3 | #[view(widget)]
+  |        ^^^^^^

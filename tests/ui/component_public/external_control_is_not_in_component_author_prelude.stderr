@@ -1,0 +1,15 @@
+error[E0432]: unresolved imports `agentview::component::prelude::ExternalObservation`, `agentview::component::prelude::MountedExternalController`, `agentview::component::prelude::MountedExternalPort`
+ --> tests/ui/component_public/external_control_is_not_in_component_author_prelude.rs:2:5
+  |
+2 |     ExternalObservation, MountedExternalController, MountedExternalPort,
+  |     ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^ no `MountedExternalPort` in `component::prelude`
+  |     |                    |
+  |     |                    no `MountedExternalController` in `component::prelude`
+  |     no `ExternalObservation` in `component::prelude`
+  |
+  = help: consider importing this struct instead:
+          agentview::component::advanced::external::ExternalObservation
+  = help: consider importing this struct instead:
+          agentview::component::advanced::external::MountedExternalController
+  = help: consider importing this trait instead:
+          agentview::component::advanced::external::MountedExternalPort

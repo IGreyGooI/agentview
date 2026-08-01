@@ -2,7 +2,7 @@ use crate::StorageString;
 
 use super::{BlockBuilder, BlockChildren, InlineChildren, PomError, TextNode};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HeadingLevel {
     H1,
     H2,
@@ -41,7 +41,7 @@ impl TryFrom<u8> for HeadingLevel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MarkdownNode {
     Heading(HeadingNode),
     Paragraph(ParagraphNode),
@@ -76,7 +76,7 @@ impl MarkdownNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeadingNode {
     level: HeadingLevel,
     children: InlineChildren,
@@ -96,7 +96,7 @@ impl HeadingNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ParagraphNode {
     children: InlineChildren,
 }
@@ -111,7 +111,7 @@ impl ParagraphNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StrongNode {
     children: InlineChildren,
 }
@@ -126,7 +126,7 @@ impl StrongNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ListNode {
     kind: ListKind,
     items: Vec<ListItem>,
@@ -146,13 +146,13 @@ impl ListNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ListKind {
     Unordered,
     Ordered { start: u64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ListItem {
     children: BlockChildren,
 }
@@ -197,7 +197,7 @@ impl ListBuilder {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodeBlockNode {
     language: Option<StorageString>,
     body: TextNode,
@@ -217,7 +217,7 @@ impl CodeBlockNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodeSpanNode {
     body: TextNode,
 }

@@ -1,0 +1,14 @@
+error[E0432]: unresolved imports `agentview::prelude::durable_provider_tool`, `agentview::prelude::provider_tool`, `agentview::prelude::ProviderDispatchContext`, `agentview::prelude::ProviderDispatcher`
+ --> tests/ui/component_public/root_prelude_does_not_export_provider_dispatcher.rs:2:5
+  |
+2 |     durable_provider_tool, provider_tool, ProviderDispatchContext, ProviderDispatcher,
+  |     ^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^ no `ProviderDispatcher` in `prelude`
+  |     |                      |              |
+  |     |                      |              no `ProviderDispatchContext` in `prelude`
+  |     |                      no `provider_tool` in `prelude`
+  |     no `durable_provider_tool` in `prelude`
+  |
+  = help: consider importing this struct instead:
+          agentview::component::ProviderDispatchContext
+  = help: consider importing this trait instead:
+          agentview::component::ProviderDispatcher

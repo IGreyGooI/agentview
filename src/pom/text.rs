@@ -1,6 +1,6 @@
 use crate::StorageString;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TextNode {
     value: StorageString,
 }

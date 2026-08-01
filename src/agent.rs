@@ -107,7 +107,7 @@ pub trait AgentViewModel<I = Turn, TurnOutput = ()>: Send + Sync {
     /// Build the complete user-role POM document.
     ///
     /// This method owns section order and explicitly decides where the current
-    /// view participates as a [`DiffSlot`]. The runtime does not inject a
+    /// view participates as a [`crate::pom::DiffSlot`]. The runtime does not inject a
     /// context or turn-prompt envelope around the returned document.
     async fn build_user_document(
         &self,
@@ -126,6 +126,180 @@ pub trait AgentViewModel<I = Turn, TurnOutput = ()>: Send + Sync {
     ) -> anyhow::Result<TurnFlow>
     where
         TurnOutput: Send + Sync;
+}
+
+/// Compatibility result used by the legacy `Agent` execution bridge.
+///
+/// Mounted components deliberately do not use this type: a mounted epoch
+/// attaches System separately and owns its per-turn bindings through the
+/// mounted runtime. It remains public only because it occurs in the public
+/// bounds of the legacy generic `Agent` API.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PreparedTurn<B> {
+    system: Document,
+    user: Document,
+    binding: B,
+}
+
+impl<B> PreparedTurn<B> {
+    pub fn new(system: Document, user: Document, binding: B) -> Self {
+        Self {
+            system,
+            user,
+            binding,
+        }
+    }
+
+    pub fn system_document(&self) -> &Document {
+        &self.system
+    }
+
+    pub fn user_document(&self) -> &Document {
+        &self.user
+    }
+
+    pub fn binding(&self) -> &B {
+        &self.binding
+    }
+
+    pub fn into_parts(self) -> (Document, Document, B) {
+        (self.system, self.user, self.binding)
+    }
+}
+
+/// Default authoring mode for legacy split-document view models.
+///
+/// The mode exists only to keep the compatibility blanket implementation
+/// disjoint from native component authoring at Rust's trait-coherence boundary.
+#[derive(Debug, Clone, Copy, Default)]
+#[doc(hidden)]
+pub struct LegacyAuthoring;
+
+/// Legacy extension point for the combined per-turn `Agent` execution path.
+///
+/// Existing [`AgentViewModel`] implementations receive a blanket implementation
+/// with `Binding = ()`. Raw compatibility component runtimes implement this
+/// trait directly so a discarded context-preparation attempt also discards its
+/// hook plan.
+///
+/// This is not a mounted-component authoring contract. It stays public solely
+/// because the legacy generic `Agent` types name it in their public bounds;
+/// ordinary authors should use the mounted component API instead.
+#[doc(hidden)]
+#[async_trait::async_trait]
+pub trait AgentTurnAuthor<I = Turn, TurnOutput = (), Authoring = LegacyAuthoring>:
+    Send + Sync
+{
+    type Source: Sync;
+    type View: PomAgentView<Root = XmlNode>
+        + crate::agent_view::AgentViewValue
+        + Clone
+        + Send
+        + Sync
+        + 'static;
+    type ContextState: Default + Clone + Send + Sync + 'static;
+    /// Ephemeral typed input owned by one [`AgentTurnBuilder`].
+    ///
+    /// Call props are borrowed by every preparation attempt for the logical
+    /// call, including context replacement and loop continuation. They are not
+    /// stored in [`PromptContext`] or the user-document cursor.
+    type CallProps: Send + Sync + 'static;
+    type Binding: Send + 'static;
+
+    fn history(&self, ctx: &PromptContext<I, Self::ContextState>) -> Vec<I>
+    where
+        I: Clone;
+
+    async fn capture_view(&self, source: &Self::Source) -> Self::View;
+
+    async fn prepare_turn(
+        &self,
+        ctx: &PromptContext<I, Self::ContextState>,
+        source: &Self::Source,
+        call_id: &str,
+        task: StorageString,
+        call_props: Option<&Self::CallProps>,
+        current_view: &Self::View,
+    ) -> anyhow::Result<PreparedTurn<Self::Binding>>;
+
+    async fn commit_turn(
+        &self,
+        ctx: &mut PromptContext<I, Self::ContextState>,
+        request: &AgentTurnRequest<I>,
+        executor_commit: ExecutorCommit<I>,
+        sink_output: &mut TurnOutput,
+    ) -> anyhow::Result<TurnFlow>
+    where
+        TurnOutput: Send + Sync;
+}
+
+#[async_trait::async_trait]
+impl<I, TurnOutput, VM> AgentTurnAuthor<I, TurnOutput, LegacyAuthoring> for VM
+where
+    I: Clone + Send + Sync + 'static,
+    TurnOutput: Send + Sync + 'static,
+    VM: AgentViewModel<I, TurnOutput>,
+    VM::ContextState: Sync,
+{
+    type Source = VM::Source;
+    type View = VM::View;
+    type ContextState = VM::ContextState;
+    type CallProps = ();
+    type Binding = ();
+
+    fn history(&self, ctx: &PromptContext<I, Self::ContextState>) -> Vec<I>
+    where
+        I: Clone,
+    {
+        <VM as AgentViewModel<I, TurnOutput>>::history(self, ctx)
+    }
+
+    async fn capture_view(&self, source: &Self::Source) -> Self::View {
+        <VM as AgentViewModel<I, TurnOutput>>::capture_view(self, source).await
+    }
+
+    async fn prepare_turn(
+        &self,
+        ctx: &PromptContext<I, Self::ContextState>,
+        source: &Self::Source,
+        call_id: &str,
+        task: StorageString,
+        _call_props: Option<&Self::CallProps>,
+        current_view: &Self::View,
+    ) -> anyhow::Result<PreparedTurn<Self::Binding>> {
+        let system =
+            <VM as AgentViewModel<I, TurnOutput>>::build_system_document(self, ctx, source).await?;
+        let user = <VM as AgentViewModel<I, TurnOutput>>::build_user_document(
+            self,
+            ctx,
+            call_id,
+            task,
+            current_view,
+        )
+        .await?;
+        Ok(PreparedTurn::new(system, user, ()))
+    }
+
+    async fn commit_turn(
+        &self,
+        ctx: &mut PromptContext<I, Self::ContextState>,
+        request: &AgentTurnRequest<I>,
+        executor_commit: ExecutorCommit<I>,
+        sink_output: &mut TurnOutput,
+    ) -> anyhow::Result<TurnFlow>
+    where
+        TurnOutput: Send + Sync,
+    {
+        <VM as AgentViewModel<I, TurnOutput>>::commit_turn(
+            self,
+            ctx,
+            request,
+            executor_commit,
+            sink_output,
+        )
+        .await
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -349,9 +523,15 @@ pub type TextAgent<B, S, E, T, EV = TextTurnEvent, TurnOutput = ()> =
     Agent<DefaultAgentViewModel<B, S, T>, E, Turn, EV, TurnOutput>;
 
 /// Read-only session configuration shared across forks of an agent.
-pub struct AgentConfig<VM, E, I = Turn, EV = TextTurnEvent, TurnOutput = ()>
-where
-    VM: AgentViewModel<I, TurnOutput>,
+pub struct AgentConfig<
+    VM,
+    E,
+    I = Turn,
+    EV = TextTurnEvent,
+    TurnOutput = (),
+    Authoring = LegacyAuthoring,
+> where
+    VM: AgentTurnAuthor<I, TurnOutput, Authoring>,
     E: LLMExecutor<I, EV>,
 {
     /// Captures and renders what the language agent sees.
@@ -363,12 +543,13 @@ where
     /// Maximum output tokens per call.
     pub max_tokens: u64,
 
-    pub executor: std::marker::PhantomData<(E, I, EV, TurnOutput)>,
+    pub executor: std::marker::PhantomData<(E, I, EV, TurnOutput, Authoring)>,
 }
 
-impl<VM, E, I, EV, TurnOutput> fmt::Debug for AgentConfig<VM, E, I, EV, TurnOutput>
+impl<VM, E, I, EV, TurnOutput, Authoring> fmt::Debug
+    for AgentConfig<VM, E, I, EV, TurnOutput, Authoring>
 where
-    VM: AgentViewModel<I, TurnOutput> + fmt::Debug,
+    VM: AgentTurnAuthor<I, TurnOutput, Authoring> + fmt::Debug,
     E: LLMExecutor<I, EV>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -389,13 +570,13 @@ type SharedAgentSession<I, CS> = Arc<RwLock<AgentSession<I, CS>>>;
 /// Read-only config lives in [`AgentConfig`] (behind `Arc`). Mutable prompt
 /// state lives in one [`AgentSession`] so context and view cursor are always
 /// snapshotted and committed together.
-pub struct Agent<VM, E, I = Turn, EV = TextTurnEvent, TurnOutput = ()>
+pub struct Agent<VM, E, I = Turn, EV = TextTurnEvent, TurnOutput = (), Authoring = LegacyAuthoring>
 where
-    VM: AgentViewModel<I, TurnOutput>,
+    VM: AgentTurnAuthor<I, TurnOutput, Authoring>,
     E: LLMExecutor<I, EV>,
 {
     /// Read-only configuration shared with forks.
-    pub config: Arc<AgentConfig<VM, E, I, EV, TurnOutput>>,
+    pub config: Arc<AgentConfig<VM, E, I, EV, TurnOutput, Authoring>>,
 
     session: SharedAgentSession<I, VM::ContextState>,
 
@@ -403,9 +584,9 @@ where
     observers: Vec<AgentTurnObserverHandle>,
 }
 
-impl<VM, E, I, EV, TurnOutput> fmt::Debug for Agent<VM, E, I, EV, TurnOutput>
+impl<VM, E, I, EV, TurnOutput, Authoring> fmt::Debug for Agent<VM, E, I, EV, TurnOutput, Authoring>
 where
-    VM: AgentViewModel<I, TurnOutput> + fmt::Debug,
+    VM: AgentTurnAuthor<I, TurnOutput, Authoring> + fmt::Debug,
     E: LLMExecutor<I, EV>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -493,9 +674,9 @@ where
     }
 }
 
-impl<VM, E, I, EV, TurnOutput> Agent<VM, E, I, EV, TurnOutput>
+impl<VM, E, I, EV, TurnOutput, Authoring> Agent<VM, E, I, EV, TurnOutput, Authoring>
 where
-    VM: AgentViewModel<I, TurnOutput> + Clone,
+    VM: AgentTurnAuthor<I, TurnOutput, Authoring> + Clone,
     E: LLMExecutor<I, EV> + Clone,
     I: Clone + Send + 'static,
     EV: Send + 'static,
@@ -577,7 +758,10 @@ where
     ///
     /// Takes `&self` (shared reference); successful turns atomically replace
     /// the committed session.
-    pub fn call<'a>(&'a self, call_id: &'a str) -> AgentTurnBuilder<'a, VM, E, I, EV, TurnOutput> {
+    pub fn call<'a>(
+        &'a self,
+        call_id: &'a str,
+    ) -> AgentTurnBuilder<'a, VM, E, I, EV, TurnOutput, Authoring> {
         tracing::debug!(
             target: "agentview::agent",
             call_id,
@@ -589,6 +773,7 @@ where
             agent: self,
             call_id,
             task: String::new(),
+            call_props: None,
             side_sinks: Vec::new(),
             observers: self.observers.clone(),
             max_loops: 4,
@@ -603,23 +788,32 @@ where
 ///
 /// Created by [`Agent::call`]. Configure with `.with_user`, then
 /// `.execute(&source, &executor).await`.
-pub struct AgentTurnBuilder<'a, VM, E, I, EV = TextTurnEvent, TurnOutput = ()>
-where
-    VM: AgentViewModel<I, TurnOutput>,
+pub struct AgentTurnBuilder<
+    'a,
+    VM,
+    E,
+    I,
+    EV = TextTurnEvent,
+    TurnOutput = (),
+    Authoring = LegacyAuthoring,
+> where
+    VM: AgentTurnAuthor<I, TurnOutput, Authoring>,
     E: LLMExecutor<I, EV>,
 {
-    agent: &'a Agent<VM, E, I, EV, TurnOutput>,
+    agent: &'a Agent<VM, E, I, EV, TurnOutput, Authoring>,
     call_id: &'a str,
     task: String,
+    call_props: Option<VM::CallProps>,
     side_sinks: Vec<Box<dyn TurnSink<EV, Output = ()>>>,
     observers: Vec<AgentTurnObserverHandle>,
     max_loops: usize,
     max_context_preparations: usize,
 }
 
-impl<'a, VM, E, I, EV, TurnOutput> AgentTurnBuilder<'a, VM, E, I, EV, TurnOutput>
+impl<'a, VM, E, I, EV, TurnOutput, Authoring>
+    AgentTurnBuilder<'a, VM, E, I, EV, TurnOutput, Authoring>
 where
-    VM: AgentViewModel<I, TurnOutput>,
+    VM: AgentTurnAuthor<I, TurnOutput, Authoring>,
     E: LLMExecutor<I, EV> + Clone + Send + Sync + 'static,
     I: Clone + Send + 'static,
     EV: Send + 'static,
@@ -638,6 +832,22 @@ where
             call_id = self.call_id,
             task_len = self.task.len(),
             "configured agent turn task"
+        );
+        self
+    }
+
+    /// Set typed input for this logical call.
+    ///
+    /// The value remains private to this builder. Component renders borrow it
+    /// again when context preparation retries or an agent loop continues, but
+    /// it is never copied into persistent prompt context or diff state.
+    pub fn with_props(mut self, props: VM::CallProps) -> Self {
+        self.call_props = Some(props);
+        tracing::debug!(
+            target: "agentview::agent",
+            call_id = self.call_id,
+            props_type = type_name::<VM::CallProps>(),
+            "configured typed agent call props"
         );
         self
     }
@@ -670,19 +880,26 @@ where
         self
     }
 
-    pub async fn execute_with_sink<S>(
+    /// Execute with a sink created only after final context preparation.
+    ///
+    /// Component runtimes use this boundary to keep a prompt contract and its
+    /// runtime binding on the same final preparation attempt. The factory is
+    /// not called for discarded history replacements or preparation failures.
+    pub async fn execute_with_sink_factory<S, BuildSink>(
         self,
         source: &VM::Source,
         executor: &E,
-        sink: S,
+        build_sink: BuildSink,
     ) -> anyhow::Result<TurnOutput>
     where
         S: TurnSink<EV, Output = TurnOutput> + Send + 'static,
+        BuildSink: FnOnce(VM::Binding) -> anyhow::Result<S> + Send,
     {
         let AgentTurnBuilder {
             agent,
             call_id,
             task,
+            call_props,
             side_sinks,
             observers,
             max_loops: _,
@@ -696,7 +913,8 @@ where
                 source,
                 executor,
                 task,
-                sink,
+                call_props: call_props.as_ref(),
+                build_sink,
                 side_sinks,
                 observers,
                 max_context_preparations,
@@ -706,7 +924,7 @@ where
         .map(|outcome| outcome.sink_output)
     }
 
-    pub async fn execute_loop_with<S, BuildSink>(
+    pub async fn execute_loop_with_sink_factory<S, BuildSink>(
         self,
         source: &VM::Source,
         executor: &E,
@@ -714,12 +932,13 @@ where
     ) -> anyhow::Result<()>
     where
         S: TurnSink<EV, Output = TurnOutput> + Send + 'static,
-        BuildSink: FnMut() -> S,
+        BuildSink: FnMut(VM::Binding) -> anyhow::Result<S> + Send,
     {
         let AgentTurnBuilder {
             agent,
             call_id,
             mut task,
+            call_props,
             mut side_sinks,
             observers,
             max_loops,
@@ -750,7 +969,8 @@ where
                     source,
                     executor,
                     task,
-                    sink: build_sink(),
+                    call_props: call_props.as_ref(),
+                    build_sink: &mut build_sink,
                     side_sinks,
                     observers: observers.clone(),
                     max_context_preparations,
@@ -789,9 +1009,48 @@ where
     }
 }
 
-impl<'a, VM, E, I, EV> AgentTurnBuilder<'a, VM, E, I, EV, ()>
+impl<'a, VM, E, I, EV, TurnOutput, Authoring>
+    AgentTurnBuilder<'a, VM, E, I, EV, TurnOutput, Authoring>
 where
-    VM: AgentViewModel<I, ()>,
+    VM: AgentTurnAuthor<I, TurnOutput, Authoring, Binding = ()>,
+    E: LLMExecutor<I, EV> + Clone + Send + Sync + 'static,
+    I: Clone + Send + 'static,
+    EV: Send + 'static,
+    TurnOutput: Send + Sync + 'static,
+{
+    /// Execute a legacy empty-binding turn with an explicitly supplied sink.
+    pub async fn execute_with_sink<S>(
+        self,
+        source: &VM::Source,
+        executor: &E,
+        sink: S,
+    ) -> anyhow::Result<TurnOutput>
+    where
+        S: TurnSink<EV, Output = TurnOutput> + Send + 'static,
+    {
+        self.execute_with_sink_factory(source, executor, move |()| Ok(sink))
+            .await
+    }
+
+    /// Execute a legacy empty-binding control loop with a fresh sink per turn.
+    pub async fn execute_loop_with<S, BuildSink>(
+        self,
+        source: &VM::Source,
+        executor: &E,
+        mut build_sink: BuildSink,
+    ) -> anyhow::Result<()>
+    where
+        S: TurnSink<EV, Output = TurnOutput> + Send + 'static,
+        BuildSink: FnMut() -> S + Send,
+    {
+        self.execute_loop_with_sink_factory(source, executor, move |()| Ok(build_sink()))
+            .await
+    }
+}
+
+impl<'a, VM, E, I, EV, Authoring> AgentTurnBuilder<'a, VM, E, I, EV, (), Authoring>
+where
+    VM: AgentTurnAuthor<I, (), Authoring, Binding = ()>,
     E: LLMExecutor<I, EV> + Clone + Send + Sync + 'static,
     I: Clone + Send + 'static,
     EV: Send + 'static,
@@ -811,6 +1070,7 @@ where
             agent,
             call_id,
             task,
+            call_props,
             side_sinks,
             observers,
             max_loops: _,
@@ -824,7 +1084,8 @@ where
                 source,
                 executor,
                 task,
-                sink: NoopTurnSink,
+                call_props: call_props.as_ref(),
+                build_sink: |_| Ok(NoopTurnSink),
                 side_sinks,
                 observers,
                 max_context_preparations,
@@ -835,12 +1096,13 @@ where
     }
 }
 
-struct AgentTurnExecution<'a, Source, E, S, EV> {
+struct AgentTurnExecution<'a, Source, E, BuildSink, EV, CallProps> {
     call_id: &'a str,
     source: &'a Source,
     executor: &'a E,
     task: String,
-    sink: S,
+    call_props: Option<&'a CallProps>,
+    build_sink: BuildSink,
     side_sinks: Vec<Box<dyn TurnSink<EV, Output = ()>>>,
     observers: Vec<AgentTurnObserverHandle>,
     max_context_preparations: usize,
@@ -879,15 +1141,16 @@ fn notify_committed_turn_observers(
     }));
 }
 
-async fn execute_agent_turn_with_sink<VM, E, I, S, EV, TurnOutput>(
-    agent: &Agent<VM, E, I, EV, TurnOutput>,
-    execution: AgentTurnExecution<'_, VM::Source, E, S, EV>,
+async fn execute_agent_turn_with_sink<VM, E, I, S, BuildSink, EV, TurnOutput, Authoring>(
+    agent: &Agent<VM, E, I, EV, TurnOutput, Authoring>,
+    execution: AgentTurnExecution<'_, VM::Source, E, BuildSink, EV, VM::CallProps>,
 ) -> anyhow::Result<CommittedAgentTurn<TurnOutput>>
 where
-    VM: AgentViewModel<I, TurnOutput>,
+    VM: AgentTurnAuthor<I, TurnOutput, Authoring>,
     E: LLMExecutor<I, EV> + Clone + Send + Sync + 'static,
     I: Clone + Send + 'static,
     S: TurnSink<EV, Output = TurnOutput> + Send + 'static,
+    BuildSink: FnOnce(VM::Binding) -> anyhow::Result<S> + Send,
     TurnOutput: Send + Sync + 'static,
     EV: Send + 'static,
 {
@@ -896,7 +1159,8 @@ where
         source,
         executor,
         task,
-        sink,
+        call_props,
+        build_sink,
         side_sinks,
         observers,
         max_context_preparations,
@@ -911,23 +1175,26 @@ where
 
     let mut draft_session = { agent.session.read().await.clone() };
     let mut preparation_replacements = 0;
-    let (request, next_user_document_cursor) = loop {
+    let (request, next_user_document_cursor, binding) = loop {
         // ── Build request against the private turn draft ──────────────────
         let ctx_for_request = draft_session.context();
         let committed_history_len = ctx_for_request.history().len();
         let current_view = agent.config.view.capture_view(source).await;
-        let system_document = agent
+        let prepared = agent
             .config
             .view
-            .build_system_document(ctx_for_request, source)
+            .prepare_turn(
+                ctx_for_request,
+                source,
+                call_id,
+                task.clone().into(),
+                call_props,
+                &current_view,
+            )
             .await?;
+        let (system_document, user_document, binding) = prepared.into_parts();
         let system = render_pom_document(&resolve_system_document(system_document))?;
         let history = agent.config.view.history(ctx_for_request);
-        let user_document = agent
-            .config
-            .view
-            .build_user_document(ctx_for_request, call_id, task.clone().into(), &current_view)
-            .await?;
         let (resolved_user_document, next_user_document_cursor) =
             resolve_user_document(user_document, draft_session.user_document_cursor())?;
         let user = render_pom_document(&resolved_user_document)?;
@@ -950,7 +1217,7 @@ where
             .await?
         {
             ContextPreparation::Ready => {
-                break (request, next_user_document_cursor);
+                break (request, next_user_document_cursor, binding);
             }
             ContextPreparation::ReplaceHistory { history } => {
                 if preparation_replacements >= max_context_preparations {
@@ -968,8 +1235,26 @@ where
                     "replaced history during context preparation"
                 );
             }
+            ContextPreparation::ResyncUserDocument => {
+                if preparation_replacements >= max_context_preparations {
+                    anyhow::bail!(
+                        "agent turn `{call_id}` exceeded context preparation replacement limit {max_context_preparations}"
+                    );
+                }
+                preparation_replacements += 1;
+
+                draft_session.reset_user_document_cursor();
+                tracing::debug!(
+                    target: "agentview::agent",
+                    call_id,
+                    preparation_replacements,
+                    "reset User document baseline during context preparation"
+                );
+            }
         }
     };
+    let sink = build_sink(binding)?;
+
     notify_observers(
         &observers,
         AgentTurnEvent::SystemPromptRendered {
