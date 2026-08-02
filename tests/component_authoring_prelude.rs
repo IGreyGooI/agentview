@@ -1,6 +1,12 @@
 //! External-consumer proof for the narrow component-authoring import surface.
 
-use agentview::component::prelude::*;
+use agentview::component::{
+    advanced::external::{
+        ExternalActionRoute, ExternalReply, ExternalReplyContract, ExternalReplyContractId,
+        MountedExternalHarnessDefinition,
+    },
+    prelude::*,
+};
 use agentview::control::ControlReply;
 
 #[derive(Clone)]
@@ -116,20 +122,6 @@ fn simple_greeting() -> PromptComponent<GreetingProps> {
     )
 }
 
-#[view(component)]
-fn external_greeting() -> ExternalPromptComponent<GreetingProps> {
-    try_external_prompt_component(
-        GreetingSystem {
-            policy: "Reply with one short greeting.",
-        },
-        |props: &GreetingProps| {
-            ExternalUserView::actionable(GreetingUser {
-                request: format!("Greet {}.", props.recipient),
-            })
-        },
-    )
-}
-
 fn assert_prompt_only<C>()
 where
     C: TurnChannels<Output = Never, Live = Never, Commit = Never, Diagnostic = Never>,
@@ -147,8 +139,9 @@ fn narrow_prelude_builds_a_prompt_only_mounted_component() {
         .into_harness(EpochContractId::new("test/simple-prompt-component/v1").unwrap());
     let _ = definition;
 
-    let external = ExternalReply::new(GreetingReply::new()).into_harness(
-        external_greeting(),
+    let external = MountedExternalHarnessDefinition::new(
+        simple_greeting(),
+        ExternalReply::new(GreetingReply::new()),
         EpochContractId::new("test/external-reply-authoring/v1").unwrap(),
     );
     assert_eq!(

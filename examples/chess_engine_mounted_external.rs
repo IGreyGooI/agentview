@@ -14,7 +14,9 @@
 //! `target/debug/agentview chess --help`
 //!
 //! Run `cargo run --example chess_engine_mounted_external` for the direct
-//! single-process teaching trace.
+//! single-process teaching trace. It prints the current action handle and
+//! accepts the same explicit `agentview chess ack <handle>` followed by
+//! `agentview chess act <handle> '<move uci="..." />'` protocol.
 
 use std::{
     collections::BTreeMap,
@@ -30,18 +32,19 @@ use agentview::{
                 ExternalActionTicket, ExternalCommitIdentity, ExternalCommitResolution,
                 ExternalEpochAcquireRequest, ExternalEpochActivation, ExternalEpochAdmission,
                 ExternalEpochArtifact, ExternalEpochComplete, ExternalEpochLease,
-                ExternalFingerprint, ExternalObservation, ExternalObserveOutcome, ExternalReplyId,
-                ExternalSourceRevision, ExternalStateMutation, ExternalStateSnapshot,
-                ExternalStateWrite, ExternalStateWriteOutcome, ExternalSystemDeliveryReceipt,
-                ExternalUserDeliveryAckOutcome, ExternalUserDeliveryCandidate,
-                ExternalUserDeliveryLane, ExternalUserDeliveryReceipt, ExternalUserFrame,
-                ExternalUserResyncOutcome, ExternalWakeCursor, MountedExternalController,
+                ExternalFingerprint, ExternalObservation, ExternalObserveOutcome, ExternalReply,
+                ExternalReplyId, ExternalSourceRevision, ExternalStateMutation,
+                ExternalStateSnapshot, ExternalStateWrite, ExternalStateWriteOutcome,
+                ExternalSystemDeliveryReceipt, ExternalUserDeliveryAckOutcome,
+                ExternalUserDeliveryCandidate, ExternalUserDeliveryLane,
+                ExternalUserDeliveryReceipt, ExternalUserFrame, ExternalUserResyncOutcome,
+                ExternalWakeCursor, MountedExternalController, MountedExternalHarnessDefinition,
                 MountedExternalPort,
             },
             persistence::{MountedStateBlob, MountedStateGeneration},
         },
         prelude::*,
-        DurableCallId, DurableCallInputId, DurableSessionId, MountedExternalHarnessDefinition,
+        DurableCallId, DurableCallInputId, DurableSessionId,
     },
     control::ControlReply,
     semantic_view::AgentViewCollect,
@@ -53,44 +56,39 @@ use tokio::{
 };
 
 #[allow(dead_code)]
-#[path = "chess_engine_agent/support.rs"]
+#[path = "chess/mod.rs"]
 mod chess_support;
 
 use chess_support::{
-    chess_user_document, ChessAction, ChessCliTransport, ChessGameSource, ChessMoveContract,
-    ChessReplyContract, ChessSystemPolicyPromptView, ChessView, StockfishEngine,
+    chess_user_document, ChessAction, ChessGameSource, ChessReplyContract,
+    ChessSystemPolicyPromptView, ChessView, StockfishEngine,
 };
 
 #[derive(Debug, Clone)]
 struct ChessTurnProps {
     context: ChessView,
-    player_action_available: bool,
     task: String,
     turn_id: String,
 }
 
 #[view(component)]
-fn chess_agent() -> ExternalPromptComponent<ChessTurnProps> {
-    try_external_prompt_component(
+fn chess_agent() -> PromptComponent<ChessTurnProps> {
+    try_prompt_component(
         ChessSystemPolicyPromptView::default(),
         |props: &ChessTurnProps| {
-            let user = chess_user_document(
+            chess_user_document(
                 props.context.clone(),
                 props.task.clone(),
                 props.turn_id.clone(),
-            )?;
-            Ok::<_, agentview::pom::PomError>(if props.player_action_available {
-                ExternalUserView::actionable_pom(user)
-            } else {
-                ExternalUserView::passive_presentation_pom(user)
-            })
+            )
         },
     )
 }
 
 fn chess_definition() -> MountedExternalHarnessDefinition<ChessTurnProps, ChessReplyContract> {
-    ExternalReply::new(ChessReplyContract::new()).into_harness(
+    MountedExternalHarnessDefinition::new(
         chess_agent(),
+        ExternalReply::new(ChessReplyContract::new()),
         EpochContractId::new("example/chess-external/v2").unwrap(),
     )
 }
@@ -335,15 +333,16 @@ impl InMemoryChessHost {
         let state = self.state.lock().unwrap();
         let revision = state.source_revision();
         let context = ChessView::collect(&self.source.snapshot());
-        ExternalObservation::from_props(
-            revision,
-            ChessTurnProps {
-                context,
-                player_action_available: state.player_action_available,
-                task: task.into(),
-                turn_id: turn_id.into(),
-            },
-        )
+        let props = ChessTurnProps {
+            context,
+            task: task.into(),
+            turn_id: turn_id.into(),
+        };
+        if state.player_action_available {
+            ExternalObservation::actionable_from_props(revision, props)
+        } else {
+            ExternalObservation::passive_from_props(revision, props)
+        }
     }
 
     fn delivered_system(&self) -> Option<String> {
@@ -807,18 +806,6 @@ impl MountedExternalChessCli {
         Ok(())
     }
 
-    /// Legacy adapter retained by the interactive example below. The daemon
-    /// CLI accepts the raw XML reply directly.
-    pub fn command_from_cli_args(args: &[String]) -> anyhow::Result<String> {
-        anyhow::ensure!(
-            !args.is_empty(),
-            "usage: chess_engine_mounted_external --piece <piece> --from <square> --to <square> [--promotion <piece>] --uci <uci>"
-        );
-        let command = format!("agentview chess act {}", args.join(" "));
-        let action = ChessCliTransport::decode(&command).map_err(anyhow::Error::msg)?;
-        Ok(ChessMoveContract.encode_reply(&action))
-    }
-
     pub async fn observe(&mut self) -> anyhow::Result<MountedChessCliSnapshot> {
         self.ensure_system_acknowledged()?;
         if let Some(current) = self.current.as_ref() {
@@ -1156,6 +1143,40 @@ where
     }
 }
 
+fn parse_ack_command(command: &str, expected_handle: &str) -> anyhow::Result<()> {
+    let expected = format!("agentview chess ack {expected_handle}");
+    anyhow::ensure!(command == expected, "expected `{expected}`");
+    Ok(())
+}
+
+fn parse_act_command(command: &str, expected_handle: &str) -> anyhow::Result<String> {
+    let arguments = command
+        .strip_prefix("agentview chess act ")
+        .ok_or_else(|| anyhow::anyhow!("expected `agentview chess act <handle> <raw-xml>`"))?;
+    let split = arguments
+        .find(char::is_whitespace)
+        .ok_or_else(|| anyhow::anyhow!("missing raw XML reply after the action handle"))?;
+    let handle = &arguments[..split];
+    anyhow::ensure!(
+        handle == expected_handle,
+        "stale Chess action handle `{handle}`; current handle is `{expected_handle}`"
+    );
+
+    let raw_reply = arguments[split..].trim();
+    let raw_reply = if let Some(inner) = raw_reply
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+    {
+        inner
+    } else if raw_reply.starts_with('\'') || raw_reply.ends_with('\'') {
+        anyhow::bail!("raw XML must be unquoted or enclosed by matching single quotes");
+    } else {
+        raw_reply
+    };
+    anyhow::ensure!(!raw_reply.is_empty(), "raw XML reply must not be empty");
+    Ok(raw_reply.to_owned())
+}
+
 fn max_player_moves() -> anyhow::Result<Option<usize>> {
     let Some(value) = std::env::var_os("AGENTVIEW_CHESS_MAX_PLAYER_MOVES") else {
         return Ok(None);
@@ -1211,9 +1232,24 @@ async fn main() -> anyhow::Result<()> {
             ExternalUserFrame::Passive(_) => break,
             _ => anyhow::bail!("unsupported external chess frame"),
         };
+        let action_handle = action.delivery_receipt().as_str();
+        println!("\nACTION HANDLE {action_handle}");
+        println!("ACK WITH: agentview chess ack {action_handle}");
+        loop {
+            let Some(command) = next_cli_command(&mut lines).await? else {
+                controller.cancel(action.token()).await?;
+                println!("\nCLI CLOSED");
+                return Ok(());
+            };
+            match parse_ack_command(&command, action_handle) {
+                Ok(()) => break,
+                Err(error) => eprintln!("CLI REJECTED: {error}"),
+            }
+        }
         controller
             .acknowledge_user_delivery(action.delivery_receipt())
             .await?;
+        println!("ACT WITH: agentview chess act {action_handle} '<move uci=\"e2e4\" />'");
 
         let mut reply_attempt = 0_u64;
         let committed = loop {
@@ -1222,10 +1258,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("\nCLI CLOSED");
                 return Ok(());
             };
-            let cli_action = match ChessCliTransport::decode(&command) {
-                Ok(action) => action,
-                Err(diagnostic) => {
-                    eprintln!("CLI REJECTED: {diagnostic}");
+            let raw_reply = match parse_act_command(&command, action_handle) {
+                Ok(raw_reply) => raw_reply,
+                Err(error) => {
+                    eprintln!("CLI REJECTED: {error}");
                     continue;
                 }
             };
@@ -1234,7 +1270,7 @@ async fn main() -> anyhow::Result<()> {
                 .act(
                     action.token(),
                     ExternalReplyId::new(format!("chess-reply-{user_index}-{reply_attempt}"))?,
-                    ControlReply::text(ChessMoveContract.encode_reply(&cli_action)),
+                    ControlReply::text(raw_reply),
                 )
                 .await;
             match result {
@@ -1340,9 +1376,6 @@ async fn main() -> anyhow::Result<()> {
 
         if move_limit.is_some_and(|limit| completed_player_moves >= limit) {
             if let ExternalUserFrame::Actionable(ticket) = &next {
-                controller
-                    .acknowledge_user_delivery(ticket.delivery_receipt())
-                    .await?;
                 controller.cancel(ticket.token()).await?;
             }
             break;
@@ -1357,7 +1390,8 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use agentview::{
-        pom_renderer::render_pom_document, pom_resolution::resolve_system_document, AgentView,
+        component::advanced::external::ExternalReplyContract, pom_renderer::render_pom_document,
+        pom_resolution::resolve_system_document, AgentView,
     };
     #[cfg(unix)]
     use std::{
@@ -1428,7 +1462,7 @@ done
     }
 
     #[tokio::test]
-    async fn external_reply_component_preserves_the_shared_system_bytes() {
+    async fn external_harness_binding_preserves_the_shared_system_bytes() {
         let expected = render_pom_document(&resolve_system_document(
             chess_support::ChessSystemPromptView::default()
                 .build_root()
@@ -1448,6 +1482,39 @@ done
             "chess-system-delivery/1"
         );
         assert_eq!(host.delivered_system().as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn direct_runner_uses_canonical_handle_and_raw_xml_commands() {
+        let handle = "sha256:v1:test-action-handle";
+        assert!(parse_ack_command(&format!("agentview chess ack {handle}"), handle).is_ok());
+        assert!(parse_ack_command("agentview chess ack stale", handle).is_err());
+
+        assert_eq!(
+            parse_act_command(
+                &format!("agentview chess act {handle} '<move uci=\"e2e4\" />'"),
+                handle,
+            )
+            .unwrap(),
+            "<move uci=\"e2e4\" />"
+        );
+        assert_eq!(
+            parse_act_command(
+                &format!("agentview chess act {handle} <move uci=\"d2d4\" />"),
+                handle,
+            )
+            .unwrap(),
+            "<move uci=\"d2d4\" />"
+        );
+        assert!(
+            parse_act_command("agentview chess act stale '<move uci=\"e2e4\" />'", handle,)
+                .is_err()
+        );
+        assert!(parse_act_command(
+            "agentview chess act --piece P --from e2 --to e4 --uci e2e4",
+            handle,
+        )
+        .is_err());
     }
 
     #[test]

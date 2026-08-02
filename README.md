@@ -61,12 +61,15 @@ Use the mounted examples in this order:
   enables typed chess actions, atomic-shaped domain/state/outbox commits, and
   wake-driven fresh User renders. It now directly reproduces the legacy
   example's initial view, post-`e2e4` waiting view, asynchronous real Stockfish
-  move, and final hook. `ExternalReply<ChessReplyContract>` binds the
-  System-visible reply grammar and pure decoder before the host opens that
-  controller. Its in-memory host is a local demonstration, not a durable
-  transport or production persistence adapter. Actionable and Passive are now
-  distinct frame types: Passive has no action token and never advances the
-  baseline. Acknowledged Actionable frames produce real User POM deltas;
+  move, and final hook. The component remains an ordinary
+  `PromptComponent<ChessTurnProps>`; only the advanced
+  `MountedExternalHarnessDefinition::new(root, ExternalReply<...>, epoch_id)`
+  boundary selects external control, binding the System-visible reply grammar
+  and pure decoder before the epoch is finalized. Its in-memory host is a local demonstration, not a durable
+  transport or production persistence adapter. The host captures Actionable or
+  Passive together with props and source revision: Passive has no action token
+  and never advances the baseline. Acknowledged Actionable frames produce real
+  User POM deltas;
 - `cargo run --example chess_engine_mounted_agentloop` for the provider-driven
   counterpart: one System attachment, full then delta User POM, real-time
   typed Live preview, strict semantic publication gate, typed Commit/outbox

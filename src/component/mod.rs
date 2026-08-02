@@ -55,10 +55,7 @@ pub mod advanced {
     /// domain transaction and must atomically persist it with AgentView state.
     pub mod external {
         pub use super::super::external::*;
-        pub use super::super::external_reply::{
-            external_prompt_component, try_external_prompt_component, ExternalPromptComponent,
-            ExternalReply, ExternalUserView, MountedExternalHarnessDefinition,
-        };
+        pub use super::super::external_reply::{ExternalReply, MountedExternalHarnessDefinition};
     }
 
     /// Host-owned per-attempt runtime binding contracts.
@@ -218,15 +215,13 @@ pub mod prelude {
     pub use super::{
         binding_factory, binding_factory_with_context, component, durable_binding_factory,
         durable_binding_factory_with_context, durable_binding_factory_with_context_key,
-        durable_binding_factory_with_key, durable_provider_contract, durable_system,
-        external_prompt_component, pom_view, prompt_component, try_external_prompt_component,
-        try_prompt_component, user_view, view, BindingKey, ChannelMap, Component, ComponentError,
-        ComponentKey, DurableComponent, DurableSystem, EpochContractId, ExternalActionRoute,
-        ExternalPromptComponent, ExternalReply, ExternalReplyContract, ExternalReplyContractId,
-        ExternalUserView, MountedFeature, MountedHarnessDefinition, Never, NoTurnChannels, PomView,
-        PromptComponent, ProviderCapabilityContract, ProviderToolSpec, RuntimeContract,
-        StreamUpdate, StreamingXml, TurnChannelMap, TurnChannelMapBuilder, TurnChannels,
-        TurnEmission, TurnLoopPolicy, UserTurnContext, UserView,
+        durable_binding_factory_with_key, durable_provider_contract, durable_system, pom_view,
+        prompt_component, try_prompt_component, user_view, view, BindingKey, ChannelMap, Component,
+        ComponentError, ComponentKey, DurableComponent, DurableSystem, EpochContractId,
+        MountedFeature, MountedHarnessDefinition, Never, NoTurnChannels, PomView, PromptComponent,
+        ProviderCapabilityContract, ProviderToolSpec, RuntimeContract, StreamUpdate, StreamingXml,
+        TurnChannelMap, TurnChannelMapBuilder, TurnChannels, TurnEmission, TurnLoopPolicy,
+        UserTurnContext, UserView,
     };
     pub use crate::agent_view::AgentView;
     pub use crate::pom::{
@@ -251,10 +246,7 @@ pub(crate) use durable_epoch::{
 #[allow(unused_imports)]
 pub(crate) use erasure::{ChannelTypeField, ChannelTypeInfo, ChannelTypeMismatch, TypeSlot};
 pub use external::{ExternalActionRoute, ExternalReplyContract, ExternalReplyContractId};
-pub use external_reply::{
-    external_prompt_component, try_external_prompt_component, ExternalPromptComponent,
-    ExternalReply, ExternalUserView, MountedExternalHarnessDefinition,
-};
+pub use external_reply::{ExternalReply, MountedExternalHarnessDefinition};
 pub use identity::{
     BindingId, BindingKey, ComponentId, ComponentKey, HarnessEpochId, LiveScopeId,
     ProviderAttemptId, TurnInstanceId,
@@ -1070,9 +1062,8 @@ pub fn pom_view(children: impl PomChildren) -> PomView {
 #[doc(hidden)]
 pub mod __private {
     use super::{
-        Component, ComponentError, ComponentNode, DurableComponent, DurableSystem,
-        ExternalPromptComponent, MountedFeature, NoBindings, PomView, StreamingChannelsView,
-        StreamingValueView, TurnChannels, View,
+        Component, ComponentError, ComponentNode, DurableComponent, DurableSystem, MountedFeature,
+        NoBindings, PomView, StreamingChannelsView, StreamingValueView, TurnChannels, View,
     };
     pub trait DeferComponentBody<Body>: Sized {
         fn defer_component(
@@ -1293,23 +1284,6 @@ pub mod __private {
                     MountedFeature::system_only(DurableSystem::from_error(error))
                         .with_component_scope(name)
                 })
-        }
-    }
-
-    impl<Props> DeferFallibleComponentBody<ExternalPromptComponent<Props>>
-        for ExternalPromptComponent<Props>
-    where
-        Props: ?Sized + 'static,
-    {
-        fn defer_fallible_component(
-            name: &'static str,
-            render: impl FnOnce() -> Result<ExternalPromptComponent<Props>, ComponentError>
-                + Send
-                + 'static,
-        ) -> Self {
-            render()
-                .map(|component| component.with_component_scope(name))
-                .unwrap_or_else(ExternalPromptComponent::from_error)
         }
     }
 

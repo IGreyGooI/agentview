@@ -24,7 +24,7 @@ use support::StreamingTraceEvent;
 mod support;
 
 #[allow(dead_code)]
-#[path = "chess_engine_agent/support.rs"]
+#[path = "chess/mod.rs"]
 mod chess_contract;
 
 #[derive(Clone)]

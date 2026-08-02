@@ -16,7 +16,7 @@ use chess_support::{chess_user_document, ChessGameSource, ChessSystemPromptView,
 use mounted_support::mount;
 
 #[allow(dead_code)]
-#[path = "chess_engine_agent/support.rs"]
+#[path = "chess/mod.rs"]
 mod chess_support;
 #[cfg_attr(not(test), allow(dead_code))]
 #[path = "support/mounted_prompt_trace.rs"]
@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
 mod compatibility {
     use super::*;
     use agentview::prelude::*;
-    use chess_support::ChessViewModel;
+    use chess_support::legacy_agentview_app::ChessViewModel;
     use mounted_support::run_turns;
 
     async fn render_legacy(

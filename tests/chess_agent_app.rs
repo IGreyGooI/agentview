@@ -4,14 +4,14 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[path = "../examples/chess_engine_agent/support.rs"]
+#[path = "../examples/chess/mod.rs"]
 mod chess_support;
 
 use agentview::prelude::*;
-use chess_support::{
-    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessTaskView, ChessView,
-    ChessViewModel, StockfishEngine,
+use chess_support::legacy_agentview_app::{
+    apply_engine_move, apply_player_move, ChessMoveSink, ChessViewModel,
 };
+use chess_support::{ChessGameSource, ChessTaskView, ChessView, StockfishEngine};
 use serde_json::json;
 use tokio::time::timeout;
 

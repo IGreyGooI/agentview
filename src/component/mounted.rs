@@ -456,6 +456,16 @@ where
         self
     }
 
+    /// Append a harness-binding-owned System contribution before finalization.
+    ///
+    /// Ordinary component composition uses [`Self::compose`]. A runtime binding
+    /// uses this crate-private path only while consuming the complete root, so
+    /// its stable System contract is covered by the same epoch definition.
+    pub(crate) fn append_harness_system(mut self, system: DurableSystem<C, Props>) -> Self {
+        self.durable_system = self.durable_system.append(system);
+        self
+    }
+
     /// Attach a stable parent-provided key to this component invocation.
     ///
     /// Keys belong to an outer `#[view(component)]` result. A manually

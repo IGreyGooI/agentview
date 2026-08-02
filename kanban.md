@@ -1588,7 +1588,7 @@ isolated unit test is not a production claim.
 | `AV-F06` Structured Streaming | `local-proof` | Strict incremental parser and fresh reducers; Forgotten City mounted SelectIntent focused suite is 21/21, including legacy-equivalent initial/retry User POM, accepted-stream callback ordering, mounted loop policy, drop/reopen no-second-System and runtime-drop joined cancellation. | Production selector install and Phrase migration. |
 | `AV-F07` Provider-native Tools | `local-proof` | Pure `ProviderCapabilityContract`, versioned host `ProviderDispatcherRegistry`, generic `MountedHostBindings`, Create/reopen manifest preflight, grouped ordered dispatch, correlation, result routing, attempt replay, and collision tests. | Real Provider/Cube/Forgotten City adapters, legacy builder quarantine, and durable cross-attempt replay policy. |
 | `AV-F08` Effect Lifecycle | `partial` | Typed lanes, awaited Live, compensation, private Commit staging; selector proves ordered/revocable Live delivery. Forgotten City's SQLite host now supports stable-id player Commit dedup, atomic board/job transaction, fenced Stockfish completion, expiry reclaim, retry/dead-letter, and capture admission across pending/delivering/dead-letter states. | Recovery-scanned supervisor, passive engine-failure observer, child scopes, and authoritative production effect adapter. |
-| `AV-F09` Reactive Observe/Act | `partial` | Public legacy observe/hook/act has epoch and stale-turn fencing. The advanced mounted external controller adds typed Actionable/Passive frames, stable action/reply/wake/source and User-delivery identities, host-owned System/User outbox publication, ack-before-act, acknowledged cursor delta, exact replay, safe cancellation/full-resync, typed decode, hook and recovery fencing. AgentView's canonical `agentview chess` CLI/skill provides the daemon-backed in-memory external reference with System attach/ack, nested `chess_frame` output, exact action handles/raw XML and full/delta/resync; it spans client subprocesses but not daemon loss. Forgotten City's SQLite facade is the durable consumer integration proof, not the example entrypoint. | Managed remote/server transport, bounded durable receipt/reply retention, process-kill recovery, replacement-consumer/cross-transport handoff, and production supervision/migration. |
+| `AV-F09` Reactive Observe/Act | `partial` | Public legacy observe/hook/act has epoch and stale-turn fencing. The advanced mounted external controller consumes an ordinary `PromptComponent` only at `MountedExternalHarnessDefinition::new`; no external-specific component type or method remains on ordinary component authoring. Host capture owns Actionable/Passive together with props/revision. The controller adds stable action/reply/wake/source and User-delivery identities, host-owned System/User outbox publication, ack-before-act, acknowledged cursor delta, exact replay, safe cancellation/full-resync, typed decode, hook and recovery fencing. AgentView's canonical `agentview chess` CLI/skill provides the daemon-backed in-memory external reference with System attach/ack, nested `chess_frame` output, exact action handles/raw XML and full/delta/resync; it spans client subprocesses but not daemon loss. Forgotten City's SQLite facade is the durable consumer integration proof, not the example entrypoint. | Managed remote/server transport, bounded durable receipt/reply retention, process-kill recovery, replacement-consumer/cross-transport handoff, production supervision/migration, and one generic provided-reply runtime contract executable by both AgentLoop and external bindings. |
 | `AV-F10` Model Turn Loop | `implemented` | Compatibility transactional loop and public local mounted Continue recapture are executable. `TurnLoopPolicy` fixes the mounted loop bound at the durable harness; call inputs can only lower it, same-id policy drift is rejected, and the selector preserves its three-turn migration budget. | Production mounted loop and durable continuation ownership. |
 | `AV-F11` Session/Fork/Isolation | `partial` | Compatibility fork/cursor and factory-scoped mounted isolation are tested. | Durable child sessions, scope ownership, and production registry. |
 | `AV-F12` Safe Call Lifecycle | `local-proof` | Admission/replay/collision, start-future guards, dropped wait, joined cancel, Live cleanup, and FC stale-delivery withdrawal are covered. Exact-fence owner and actual process-local store tests prove all cursor dispositions, reason mismatch, timeout, revision/publication/epoch/stored-or-replacement-cursor/lease recovery, foreign-fence rejection, and same-fence recovery retry without another revision. The internal reconciliation controller now claims a persisted recovery fence, reconstructs the exact remote operation, restores only a live-fenced `NeverAccepted` checkpoint, and retains recovery for every other status; stale-fence and durable-backend reload tests cover this transition without provider/tool/Live replay. Public `MountedAgent::lookup` projects a lease-free durable call snapshot before and after reopen and reports admitted progress from the same owner instance without waiting behind an active call. That owner can restore one attached handle after handle loss; overlapping or cross-owner reattach remains read-only. Borrowed raw execution is test-only/module-private, so production entry always has a detached owner. | Bind observation into a production supervisor; add fenced cross-owner/process control and recovery, production lease policy, a concrete durable store/transport adapter, and a real provider operation ledger. |
@@ -2369,7 +2369,7 @@ turn abort.
       ticket identity across durable session, epoch generation, call/input,
       turn, action route, source revision, User fingerprint and reply
       fingerprint; ambiguous apply/commit remains fenced in
-  `RecoveryRequired`. `tests/component_external.rs` is a 9/9 black-box
+  `RecoveryRequired`. `tests/component_external.rs` is a 10/10 black-box
       local proof for System-once/reopen, typed reply validation, atomic fake
       domain/state/outbox mutation, replay/collision, hook, source staleness,
       `NotCommitted` retry, `Unknown` fencing, decoder contract drift, a
@@ -2378,7 +2378,7 @@ turn abort.
       that source revision and props are captured together. Schema v5 now
       persists `AwaitingDelivery`, the acknowledged User cursor, and a
       full-resync fence; it rejects schema v4 rather than inventing historical
-      User receipts. The ninth test proves User-only full resync after a consumer
+      User receipts. A dedicated test proves User-only full resync after a consumer
       loses an undelivered delta, with System still delivered once and delta
       resuming only after the replacement acknowledgement. This AgentView
       black-box port remains fake; Forgotten City's SQLite facade is the real
@@ -2393,17 +2393,20 @@ turn abort.
       `RecoveryRequired`, never `Existing`. The local test port records the
       one System delivery internally and reopens with the same receipt. This is
       an API/black-box contract, not a real database or transport proof.
-- [x] Bind prompt-facing external reply grammar and typed decoder in one pure
-      `ExternalReply<Contract>` provided component. It appends its grammar to
-      the retained System POM and consumes into `MountedExternalHarnessDefinition`;
-      `MountedExternalController::open` no longer accepts a separately chosen
-      decoder or separately chosen grammar. `ExternalReplyContract` owns its
-      `type System` and `system()` contribution, so the binding site is only
-      `ExternalReply::new(contract)`. `ExternalReply` and its synchronous pure
-      contract are available to component authors, while observation,
-      controller, port, domain mutation, and outbox remain advanced host
-      concerns. The public compile-fail boundary locks that split. The mounted
-      chess proof now decodes only the exact CLI form shown in its System
+- [x] Make external control a root-harness binding rather than a component
+      authoring type. A normal `PromptComponent<Props>` owns the retained
+      System and fresh User POM; the advanced
+      `MountedExternalHarnessDefinition::new(root, reply, epoch_id)` boundary
+      consumes the complete root and appends the reply grammar before the one
+      `DurableEpochDefinition` is finalized.
+      There is no `ExternalPromptComponent` or `ExternalUserView` parallel
+      authoring model. `MountedExternalController::open` no longer accepts a
+      separately chosen decoder or grammar. `ExternalReplyContract` owns its
+      `type System` and `system()` contribution, so grammar, route, contract id,
+      and pure decoder remain one binding value. The external controller
+      rejects event bindings and provider capabilities on both Create and
+      reopen until it can actually execute those provided runtimes. The mounted
+      chess proof decodes only the exact CLI form shown in its System
       grammar and rejects JSON, bare UCI, omitted required context, and context
       that disagrees with UCI. This is an executable semantic coupling test for
       that component; POM text and a handwritten parser are not generically
@@ -2411,8 +2414,10 @@ turn abort.
 - [ ] Close the external-control API gates before treating
       `MountedExternalController` as a migration surface:
       - [x] one nominal captured-observation value carries the exact immutable
-        props together with its source revision, rather than letting hosts pair
-        parallel arguments accidentally;
+        props, source revision, and Actionable/Passive disposition together,
+        rather than letting a POM renderer select a runtime delivery lane or
+        letting hosts pair parallel arguments accidentally. Reusing the same
+        call/input/revision with a different disposition fails closed;
       - [ ] production ports must implement the durable System-delivery
         receipt/outbox contract against their actual transport. The local
         receipt proof prevents raw-System leakage, but is not evidence of one
@@ -2433,10 +2438,12 @@ turn abort.
       canonical daemon-backed interactive CLI/skill: separate client processes
       can share one live daemon, but daemon loss resets the entire reference
       session. Neither form claims a durable database or managed transport.
-- [x] Add a non-actionable external User publication contract.
-      `ExternalUserView` compiles pure props into either Actionable Prompt or
-      Passive Presentation; only the former creates an `ExternalActionToken`.
-      Passive frames are durable, replayable, and supersedable without cancel.
+- [x] Add a non-actionable external User publication contract. The host captures
+      either `ExternalObservation::actionable(...)` or `::passive(...)` from the
+      same authoritative snapshot as props and source revision. The ordinary
+      component renders only User POM. Only Actionable creates an
+      `ExternalActionToken`; Passive frames are durable, replayable,
+      self-contained, cursor-neutral, and supersedable without cancel.
 - [x] Move external User delivery behind the host port. Publish CAS mutations
       carry an immutable `ExternalUserDeliveryCandidate` ordered after the
       retained System receipt. Public frames expose only the resulting User

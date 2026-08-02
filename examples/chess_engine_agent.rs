@@ -6,13 +6,13 @@
 use std::time::Duration;
 
 use agentview::prelude::*;
-use chess_support::{
-    apply_engine_move, apply_player_move, ChessGameSource, ChessMoveSink, ChessView,
-    ChessViewModel, StockfishEngine,
+use chess_support::legacy_agentview_app::{
+    apply_engine_move, apply_player_move, ChessMoveSink, ChessViewModel,
 };
+use chess_support::{ChessGameSource, ChessView, StockfishEngine};
 use serde_json::json;
 
-#[path = "chess_engine_agent/support.rs"]
+#[path = "chess/mod.rs"]
 mod chess_support;
 
 #[tokio::main]

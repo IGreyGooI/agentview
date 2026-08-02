@@ -40,6 +40,12 @@ fn external_control_is_not_part_of_component_author_prelude() {
 }
 
 #[test]
+fn prompt_components_have_no_external_finalizer() {
+    let tests = trybuild::TestCases::new();
+    tests.compile_fail("tests/ui/component_public/prompt_component_has_no_external_finalizer.rs");
+}
+
+#[test]
 fn provider_dispatcher_binding_is_not_part_of_component_author_prelude() {
     let tests = trybuild::TestCases::new();
     tests.compile_fail(

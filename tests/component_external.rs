@@ -19,20 +19,21 @@ use agentview::{
                 ExternalActionToken, ExternalCommitIdentity, ExternalCommitResolution,
                 ExternalEpochAcquireRequest, ExternalEpochActivation, ExternalEpochAdmission,
                 ExternalEpochArtifact, ExternalEpochComplete, ExternalEpochLease,
-                ExternalFingerprint, ExternalObservation, ExternalObserveOutcome,
-                ExternalRecoveryOutcome, ExternalReplyContract, ExternalReplyContractId,
-                ExternalReplyId, ExternalSourceRevision, ExternalStateMutation,
-                ExternalStateSnapshot, ExternalStateWrite, ExternalStateWriteOutcome,
-                ExternalSystemDeliveryReceipt, ExternalUserDeliveryAckOutcome,
-                ExternalUserDeliveryCandidate, ExternalUserDeliveryLane,
-                ExternalUserDeliveryReceipt, ExternalUserFrame, ExternalUserResyncOutcome,
-                ExternalWakeCursor, MountedExternalController, MountedExternalControllerError,
+                ExternalFingerprint, ExternalFrameKind, ExternalObservation,
+                ExternalObserveOutcome, ExternalRecoveryOutcome, ExternalReply,
+                ExternalReplyContract, ExternalReplyContractId, ExternalReplyId,
+                ExternalSourceRevision, ExternalStateMutation, ExternalStateSnapshot,
+                ExternalStateWrite, ExternalStateWriteOutcome, ExternalSystemDeliveryReceipt,
+                ExternalUserDeliveryAckOutcome, ExternalUserDeliveryCandidate,
+                ExternalUserDeliveryLane, ExternalUserDeliveryReceipt, ExternalUserFrame,
+                ExternalUserResyncOutcome, ExternalWakeCursor, MountedExternalController,
+                MountedExternalControllerError, MountedExternalHarnessDefinition,
                 MountedExternalPort,
             },
             persistence::{MountedStateBlob, MountedStateGeneration},
         },
         prelude::*,
-        DurableCallId, DurableCallInputId, DurableSessionId, MountedExternalHarnessDefinition,
+        DurableCallId, DurableCallInputId, DurableSessionId,
     },
     control::ControlReply,
     AgentView,
@@ -44,7 +45,6 @@ use tokio::sync::Notify;
 #[derive(Clone)]
 struct ExternalProps {
     value: String,
-    passive: bool,
 }
 
 #[derive(AgentView)]
@@ -76,22 +76,15 @@ struct ExternalUser {
 }
 
 #[view(component)]
-fn external_harness() -> ExternalPromptComponent<ExternalProps> {
-    try_external_prompt_component(
+fn external_harness() -> PromptComponent<ExternalProps> {
+    prompt_component(
         ExternalSystem {
             instruction: "Apply one typed external action.",
         },
-        |props: &ExternalProps| {
-            let user = ExternalUser {
-                context: ExternalContext {
-                    value: props.value.clone(),
-                },
-            };
-            if props.passive {
-                ExternalUserView::passive_presentation(user)
-            } else {
-                ExternalUserView::actionable(user)
-            }
+        |props: &ExternalProps| ExternalUser {
+            context: ExternalContext {
+                value: props.value.clone(),
+            },
         },
     )
 }
@@ -99,9 +92,37 @@ fn external_harness() -> ExternalPromptComponent<ExternalProps> {
 fn definition(
     contract: TestContract,
 ) -> MountedExternalHarnessDefinition<ExternalProps, TestContract> {
-    ExternalReply::new(contract).into_harness(
+    MountedExternalHarnessDefinition::new(
         external_harness(),
+        ExternalReply::new(contract),
         EpochContractId::new("test/external/v1").unwrap(),
+    )
+}
+
+#[view(component)]
+fn unsupported_provider_runtime() -> DurableComponent<NoTurnChannels, ExternalProps> {
+    let contract = ProviderCapabilityContract::new(
+        "test.external.unsupported-provider",
+        "v1",
+        [ProviderToolSpec::new(
+            "lookup",
+            "A provider capability the external controller cannot execute",
+            serde_json::json!({ "type": "object", "properties": {} }),
+        )?],
+    )?;
+    durable_provider_contract(contract, ())
+}
+
+fn definition_with_unsupported_runtime(
+    epoch_contract_id: &str,
+) -> MountedExternalHarnessDefinition<ExternalProps, TestContract> {
+    let feature = external_harness().compose(MountedFeature::system_only(durable_system(
+        unsupported_provider_runtime(),
+    )));
+    MountedExternalHarnessDefinition::new(
+        feature,
+        ExternalReply::new(TestContract::v1()),
+        EpochContractId::new(epoch_contract_id).unwrap(),
     )
 }
 
@@ -455,6 +476,10 @@ impl TestPort {
             .cloned()
     }
 
+    fn user_delivery_count(&self) -> usize {
+        self.state.lock().unwrap().user_outbox.len()
+    }
+
     fn force_state_schema_version(&self, schema_version: u32) {
         let mut state = self.state.lock().unwrap();
         let current = state
@@ -702,11 +727,10 @@ fn source(value: &str) -> ExternalSourceRevision {
 }
 
 fn observation(revision: &str, value: impl Into<String>) -> ExternalObservation<ExternalProps> {
-    ExternalObservation::from_props(
+    ExternalObservation::actionable_from_props(
         source(revision),
         ExternalProps {
             value: value.into(),
-            passive: false,
         },
     )
 }
@@ -715,11 +739,10 @@ fn passive_observation(
     revision: &str,
     value: impl Into<String>,
 ) -> ExternalObservation<ExternalProps> {
-    ExternalObservation::from_props(
+    ExternalObservation::passive_from_props(
         source(revision),
         ExternalProps {
             value: value.into(),
-            passive: true,
         },
     )
 }
@@ -800,6 +823,57 @@ async fn mounted_external_requires_acknowledged_user_delivery_before_act() {
 }
 
 #[tokio::test]
+async fn mounted_external_rejects_unbound_component_runtime_declarations() {
+    let port = Arc::new(TestPort::new());
+    let error = match MountedExternalController::open(
+        definition_with_unsupported_runtime("test/external/unsupported-runtime/v1"),
+        Arc::clone(&port),
+        session(),
+    )
+    .await
+    {
+        Ok(_) => panic!("external binding must not silently drop component runtime declarations"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        MountedExternalControllerError::UnsupportedHarnessRuntime {
+            binding_factories: 0,
+            provider_capabilities: 1,
+        }
+    ));
+    assert_eq!(port.system_installs(), 0);
+    assert!(port.delivered_system().is_none());
+
+    let active_port = Arc::new(TestPort::new());
+    MountedExternalController::open(
+        definition(TestContract::v1()),
+        Arc::clone(&active_port),
+        session(),
+    )
+    .await
+    .unwrap();
+    let reopen_error = match MountedExternalController::open(
+        definition_with_unsupported_runtime("test/external/v1"),
+        Arc::clone(&active_port),
+        session(),
+    )
+    .await
+    {
+        Ok(_) => panic!("reopen must validate the POM-free component runtime projection"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        reopen_error,
+        MountedExternalControllerError::UnsupportedHarnessRuntime {
+            binding_factories: 0,
+            provider_capabilities: 1,
+        }
+    ));
+    assert_eq!(active_port.system_installs(), 1);
+}
+
+#[tokio::test]
 async fn mounted_external_preserves_system_user_replay_hook_and_source_boundaries() {
     let port = Arc::new(TestPort::new());
     let opened = MountedExternalController::open(
@@ -866,6 +940,22 @@ async fn mounted_external_preserves_system_user_replay_hook_and_source_boundarie
         .unwrap(),
     );
     assert_eq!(same_active_ticket, first);
+    let delivery_count = port.user_delivery_count();
+    let kind_mismatch = peer
+        .observe(
+            DurableCallId::new("call-1").unwrap(),
+            DurableCallInputId::new("input-1").unwrap(),
+            passive_observation("source-1", "must not replace an active action"),
+        )
+        .await;
+    assert!(matches!(
+        kind_mismatch,
+        Err(MountedExternalControllerError::ObservationKindMismatch {
+            current: ExternalFrameKind::Actionable,
+            requested: ExternalFrameKind::Passive,
+        })
+    ));
+    assert_eq!(port.user_delivery_count(), delivery_count);
     let replayed_delivery = port
         .user_delivery(same_active_ticket.delivery_receipt())
         .unwrap();
@@ -1043,12 +1133,33 @@ async fn mounted_external_passive_frame_has_no_action_token_and_is_superseded_wi
             if current == &passive
     ));
 
+    let delivery_count = port.user_delivery_count();
+    let mismatch = replacement
+        .observe(
+            DurableCallId::new("passive-call").unwrap(),
+            DurableCallInputId::new("passive-input").unwrap(),
+            observation(
+                "source-1",
+                "must not mint an action for the same observation",
+            ),
+        )
+        .await;
+    assert!(matches!(
+        mismatch,
+        Err(MountedExternalControllerError::ObservationKindMismatch {
+            current: ExternalFrameKind::Passive,
+            requested: ExternalFrameKind::Actionable,
+        })
+    ));
+    assert_eq!(port.user_delivery_count(), delivery_count);
+
+    port.set_source_revision("source-2");
     let actionable = ticket(
         replacement
             .observe(
                 DurableCallId::new("after-passive-call").unwrap(),
                 DurableCallInputId::new("after-passive-input").unwrap(),
-                observation("source-1", "act after the wake"),
+                observation("source-2", "act after the wake"),
             )
             .await
             .unwrap(),

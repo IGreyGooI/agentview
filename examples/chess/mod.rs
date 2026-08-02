@@ -1,7 +1,8 @@
-//! Example-only chess AgentView support.
+//! Shared domain, POM, reply-contract, and Stockfish support for Chess examples.
 //!
-//! This is deliberately not part of the `agentview` library API. It is a demo
-//! VM that exercises observe/act/hook against a Stockfish-compatible UCI engine.
+//! This remains example-only code, not part of the `agentview` library API.
+//! The historical `AgentViewApp` bridge lives in [`legacy_agentview_app`]; the
+//! mounted examples consume the shared POM and contract directly.
 
 use std::process::Stdio;
 use std::str::FromStr;
@@ -17,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
+
+pub mod legacy_agentview_app;
 
 const CHESS_SYSTEM_TASK: &str = "You are choosing legal chess moves from the rendered board.";
 const CHESS_REASONING_PRIVATE: &str = "Think privately about candidate moves before acting.";
@@ -78,9 +81,6 @@ pub enum ChessDiagnostic {
 
     #[error("no move was selected")]
     NoMoveSelected,
-
-    #[error("invalid chess CLI command: {message}")]
-    InvalidCliCommand { message: String },
 }
 
 /// The single reply contract for the chess examples.
@@ -279,119 +279,6 @@ impl ExternalReplyContract for ChessReplyContract {
         match reply {
             ControlReply::Text(reply) => self.semantic.decode_reply(reply),
             ControlReply::Structured(_) => Err(ChessDiagnostic::ExpectedTextReply),
-        }
-    }
-}
-
-/// Host-side CLI envelope for the chess skill.
-///
-/// This is not a prompt grammar. It validates a user-facing command and
-/// translates it to the shared semantic action before an external controller
-/// sees the canonical `<move uci="..." />` reply.
-#[allow(dead_code)]
-pub struct ChessCliTransport;
-
-#[allow(dead_code)]
-impl ChessCliTransport {
-    pub fn decode(command: &str) -> Result<ChessAction, ChessDiagnostic> {
-        let tokens = command.split_whitespace().collect::<Vec<_>>();
-        if tokens.get(..3) != Some(["agentview", "chess", "act"].as_slice()) {
-            return Err(Self::invalid(
-                "expected `agentview chess act` command prefix",
-            ));
-        }
-
-        let mut cursor = 3;
-        let piece = Self::command_value(&tokens, &mut cursor, "--piece")?;
-        let from = Self::command_value(&tokens, &mut cursor, "--from")?;
-        let to = Self::command_value(&tokens, &mut cursor, "--to")?;
-        let promotion = if tokens.get(cursor) == Some(&"--promotion") {
-            Some(Self::command_value(&tokens, &mut cursor, "--promotion")?)
-        } else {
-            None
-        };
-        let uci = Self::command_value(&tokens, &mut cursor, "--uci")?;
-        if cursor != tokens.len() {
-            return Err(Self::invalid(format!(
-                "unexpected argument `{}` after `--uci <uci>`",
-                tokens[cursor]
-            )));
-        }
-        if !matches!(piece, "P" | "N" | "B" | "R" | "Q" | "K") {
-            return Err(Self::invalid(format!(
-                "expected `--piece` to be one of P, N, B, R, Q, or K; got `{piece}`"
-            )));
-        }
-
-        let action = ChessAction::from_uci(uci)?;
-        let canonical_from = &action.uci[..2];
-        let canonical_to = &action.uci[2..4];
-        if from != canonical_from {
-            return Err(Self::invalid(format!(
-                "`--from {from}` does not match UCI source `{canonical_from}`"
-            )));
-        }
-        if to != canonical_to {
-            return Err(Self::invalid(format!(
-                "`--to {to}` does not match UCI target `{canonical_to}`"
-            )));
-        }
-
-        match (promotion, action.uci.as_bytes().get(4).copied()) {
-            (None, None) => {}
-            (Some(promotion), Some(uci_promotion)) if promotion.as_bytes() == [uci_promotion] => {}
-            (None, Some(uci_promotion)) => {
-                return Err(Self::invalid(format!(
-                    "promotion UCI `{}` requires `--promotion {}`",
-                    action.uci,
-                    char::from(uci_promotion)
-                )));
-            }
-            (Some(promotion), None) => {
-                return Err(Self::invalid(format!(
-                    "`--promotion {promotion}` requires a promotion UCI move"
-                )));
-            }
-            (Some(promotion), Some(uci_promotion)) => {
-                return Err(Self::invalid(format!(
-                    "`--promotion {promotion}` does not match UCI promotion `{}`",
-                    char::from(uci_promotion)
-                )));
-            }
-        }
-
-        Ok(action)
-    }
-
-    fn command_value<'a>(
-        tokens: &'a [&'a str],
-        cursor: &mut usize,
-        expected_flag: &str,
-    ) -> Result<&'a str, ChessDiagnostic> {
-        let flag = tokens
-            .get(*cursor)
-            .ok_or_else(|| Self::invalid(format!("expected `{expected_flag} <value>`")))?;
-        if *flag != expected_flag {
-            return Err(Self::invalid(format!(
-                "expected `{expected_flag}`, got `{flag}`"
-            )));
-        }
-        *cursor += 1;
-        let value = tokens
-            .get(*cursor)
-            .ok_or_else(|| Self::invalid(format!("missing value after `{expected_flag}`")))?;
-        if value.is_empty() || value.starts_with("--") {
-            return Err(Self::invalid(format!(
-                "expected a value after `{expected_flag}`"
-            )));
-        }
-        *cursor += 1;
-        Ok(value)
-    }
-
-    fn invalid(message: impl Into<String>) -> ChessDiagnostic {
-        ChessDiagnostic::InvalidCliCommand {
-            message: message.into(),
         }
     }
 }
@@ -1091,159 +978,6 @@ pub fn chess_user_document(
     .build_root()
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ChessViewModel;
-
-#[async_trait::async_trait]
-impl AgentViewModel<Turn, ()> for ChessViewModel {
-    type Source = ChessGameSource;
-    type View = ChessView;
-    type ContextState = ();
-
-    async fn build_system_document(
-        &self,
-        _ctx: &PromptContext<Turn, Self::ContextState>,
-        _source: &Self::Source,
-    ) -> anyhow::Result<Document> {
-        let prompt = ChessSystemPromptView::default();
-        Ok(prompt.build_root()?)
-    }
-
-    async fn capture_view(&self, source: &Self::Source) -> Self::View {
-        ChessView::collect(&source.snapshot())
-    }
-
-    async fn build_user_document(
-        &self,
-        _ctx: &PromptContext<Turn, Self::ContextState>,
-        call_id: &str,
-        task: StorageString,
-        current_view: &Self::View,
-    ) -> anyhow::Result<Document> {
-        Ok(chess_user_document(current_view.clone(), task, call_id)?)
-    }
-
-    async fn commit_turn(
-        &self,
-        _ctx: &mut PromptContext<Turn, Self::ContextState>,
-        _request: &AgentTurnRequest<Turn>,
-        _executor_commit: ExecutorCommit<Turn>,
-        _sink_output: &mut (),
-    ) -> anyhow::Result<TurnFlow> {
-        Ok(TurnFlow::Wait)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlayerMove {
-    pub uci: StorageString,
-    chess_move: ChessMove,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChessMoveOutput {
-    Accepted(PlayerMove),
-    Rejected { message: String },
-}
-
-/// Parses and validates a move supplied by an external caller.
-pub struct ChessMoveSink {
-    board: Board,
-    output: Option<ChessMoveOutput>,
-}
-
-impl ChessMoveSink {
-    pub fn from_source(source: &ChessGameSource) -> Self {
-        Self {
-            board: source.snapshot().board,
-            output: None,
-        }
-    }
-
-    fn parse_reply(reply: ControlReply) -> Result<ChessAction, String> {
-        let uci = match reply {
-            ControlReply::Text(text) => Ok(text.trim().to_owned()),
-            ControlReply::Structured(value) => value
-                .get("uci")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|uci| !uci.is_empty())
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| "expected structured reply with non-empty `uci`".to_owned()),
-        }?;
-        ChessAction::from_uci(uci).map_err(|diagnostic| diagnostic.to_string())
-    }
-
-    fn reject(&mut self, message: impl Into<String>) {
-        self.output = Some(ChessMoveOutput::Rejected {
-            message: message.into(),
-        });
-    }
-}
-
-#[async_trait::async_trait]
-impl TurnSink<ControlReply> for ChessMoveSink {
-    type Output = ChessMoveOutput;
-
-    async fn on_event(&mut self, reply: ControlReply) {
-        let action = match Self::parse_reply(reply) {
-            Ok(action) => action,
-            Err(message) => {
-                self.reject(message);
-                return;
-            }
-        };
-
-        let chess_move =
-            ChessMove::from_str(action.uci()).expect("a ChessAction always has UCI syntax");
-
-        if !self.board.legal(chess_move) {
-            self.reject(format!(
-                "illegal chess move `{}` for current board",
-                action.uci()
-            ));
-            return;
-        }
-
-        self.output = Some(ChessMoveOutput::Accepted(PlayerMove {
-            uci: action.uci.into(),
-            chess_move,
-        }));
-    }
-
-    async fn finish(self: Box<Self>) -> Self::Output {
-        self.output.unwrap_or_else(|| ChessMoveOutput::Rejected {
-            message: "no chess move reply was provided".to_owned(),
-        })
-    }
-}
-
-pub fn apply_player_move(
-    session: &mut AgentSession<Turn, ()>,
-    source: &ChessGameSource,
-    output: ChessMoveOutput,
-) -> anyhow::Result<()> {
-    match output {
-        ChessMoveOutput::Accepted(player_move) => {
-            source.with_state(|state| {
-                state.board = state.board.make_move_new(player_move.chess_move);
-                state.move_history.push(player_move.uci.to_string());
-                state.engine_pending = state.board.status() == BoardStatus::Ongoing;
-                state.last_error = None;
-            });
-            session.push_history(Turn::user(format!("player_move = {}", player_move.uci)));
-        }
-        ChessMoveOutput::Rejected { message } => {
-            source.with_state(|state| {
-                state.engine_pending = false;
-                state.last_error = Some(message.clone());
-            });
-            session.push_history(Turn::user(format!("rejected_player_move = {message}")));
-        }
-    }
-    Ok(())
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct StockfishEngine {
@@ -1346,70 +1080,6 @@ async fn wait_for_bestmove(
     })
     .await
     .map_err(|_| anyhow::anyhow!("timed out waiting for stockfish bestmove"))?
-}
-
-#[allow(dead_code)]
-pub async fn apply_engine_move(
-    source: &ChessGameSource,
-    awake: &ViewAwakeHandle,
-    engine: &StockfishEngine,
-) -> anyhow::Result<String> {
-    let engine_move = match engine.best_move(&source.snapshot()).await {
-        Ok(engine_move) => engine_move,
-        Err(err) => {
-            let message = format!("stockfish failed: {err}");
-            source.with_state(|state| {
-                state.last_error = Some(message);
-                state.engine_pending = false;
-            });
-            awake.awake();
-            return Err(err);
-        }
-    };
-
-    commit_engine_move(source, awake, "stockfish", engine_move)
-}
-
-fn commit_engine_move(
-    source: &ChessGameSource,
-    awake: &ViewAwakeHandle,
-    engine_name: &str,
-    engine_move: String,
-) -> anyhow::Result<String> {
-    let chess_move = match ChessMove::from_str(&engine_move) {
-        Ok(chess_move) => chess_move,
-        Err(err) => {
-            let message = format!("{engine_name} produced invalid move `{engine_move}`: {err}");
-            source.with_state(|state| {
-                state.last_error = Some(message.clone());
-                state.engine_pending = false;
-            });
-            awake.awake();
-            anyhow::bail!(message);
-        }
-    };
-
-    let legal = source.with_state(|state| {
-        if !state.board.legal(chess_move) {
-            state.last_error = Some(format!(
-                "{engine_name} produced illegal move `{engine_move}`"
-            ));
-            state.engine_pending = false;
-            return false;
-        }
-
-        state.board = state.board.make_move_new(chess_move);
-        state.move_history.push(engine_move.clone());
-        state.last_engine_move = Some(engine_move.clone());
-        state.engine_pending = false;
-        state.last_error = None;
-        true
-    });
-    awake.awake();
-    if !legal {
-        anyhow::bail!("{engine_name} produced illegal move `{engine_move}`");
-    }
-    Ok(engine_move)
 }
 
 fn legal_uci_moves(board: &Board) -> Vec<String> {

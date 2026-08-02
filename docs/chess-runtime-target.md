@@ -1,20 +1,21 @@
 # AgentView Chess Runtime Target
 
-Last reviewed: 2026-08-01
+Last reviewed: 2026-08-02
 
 ## Outcome
 
-The target is one retained Chess component definition driving three
-deliberately different surfaces:
+The target is one shared Chess domain/POM/reply-contract substrate driving
+three deliberately different surfaces:
 
 - AgentView's runnable external reference: `target/debug/agentview chess ...`;
 - AgentView's scripted provider-backed AgentLoop reference;
 - Forgotten City's SQLite-backed consumer integration and durability tests.
 
-All three already share the System/User POM, XML move contract, domain-phase
-authorization, legal-move validation, Actionable/Passive distinction, and delta
-rules. Their top-level external and provider bindings are still separate, and
-they do not make the same persistence claim.
+All three already share the System/User POM types, XML move semantics,
+domain-phase authorization, legal-move validation, Actionable/Passive
+distinction, and delta rules. Their top-level external and provider components
+and bindings are still separate, and they do not make the same persistence
+claim.
 
 The canonical playable entrypoint is AgentView's own CLI and repository skill.
 Forgotten City validates the consumer-shaped SQLite integration; it is not the
@@ -89,29 +90,35 @@ the two drivers.
 
 ## Runtime Boundaries
 
-The POM AST remains unchanged. Actionability belongs to the compiled/mounted
-frame, not to `UserDocument` nodes.
+The POM AST remains unchanged. A component always renders ordinary System/User
+POM. External control is selected for the complete root harness, and
+Actionability belongs to the host's captured observation, not to the component
+return type or `UserDocument` nodes.
 
 ```text
-pure component render
+host authoritative capture
+  - Actionable or Passive
+  - source revision
+  - immutable props
         |
         v
-compiled frame
-  - Actionable: User document plus typed reply channel
-  - Passive: presentation/update with no action handle
+pure PromptComponent User render
         |
         v
-host publication
+external harness publication
+  - Actionable: Prompt delivery plus typed reply handle
+  - Passive: self-contained Presentation with no action handle
   - System/User delivery identity
   - acknowledgement state
   - optional acknowledged delta baseline
-  - actionable reservation, when present
 ```
 
-The component declares content and typed behavior. The host owns I/O,
-publication, acknowledgement, wake, supersession, and replay. AgentView's CLI
-reference keeps that host state in daemon memory; Forgotten City's consumer
-port persists it in SQLite.
+The component declares content. The root harness binds the external reply
+grammar/decoder before its epoch contract is finalized. The host owns frame
+disposition, I/O, publication, acknowledgement, wake, supersession, and replay.
+AgentView's CLI reference keeps that host state in daemon memory; Forgotten
+City's consumer port persists it in SQLite. Reusing one observation identity
+with a different disposition fails closed.
 
 ## Delta Invariants
 

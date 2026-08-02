@@ -24,10 +24,10 @@ use crate::{
 
 use super::{
     durable_host::{MountedStateBlob, MountedStateGeneration},
-    external_reply::{ExternalHarnessRuntime, MountedExternalHarnessDefinition},
+    external_reply::MountedExternalHarnessDefinition,
     lifecycle::{compile_user_view, mount_system_component_with_contract, SystemMountError},
     ComponentError, DurableCallId, DurableCallInputId, DurableSessionId, EpochContractId,
-    UserTurnContext,
+    MountedHarnessDefinition, NoTurnChannels, UserTurnContext,
 };
 
 // Schema v5 moves User publication behind the host port and advances the POM
@@ -147,26 +147,48 @@ pub enum ExternalFrameKind {
 /// One immutable domain snapshot selected by a host for a fresh external User
 /// document or passive presentation.
 ///
-/// The source revision and props intentionally travel together. A host must
-/// capture both from the same authoritative snapshot, then pass this value to
-/// [`MountedExternalController::observe`] or return it from
+/// The frame kind, source revision, and props intentionally travel together. A
+/// host must capture all three from the same authoritative snapshot, then pass
+/// this value to [`MountedExternalController::observe`] or return it from
 /// [`MountedExternalController::hook`]. The port still revalidates the
 /// revision inside its commit transaction; this type prevents an accidental
 /// API-level pairing of a new revision with stale prompt props.
 #[derive(Clone)]
 #[must_use]
 pub struct ExternalObservation<Props: ?Sized + 'static> {
+    kind: ExternalFrameKind,
     source_revision: ExternalSourceRevision,
     props: Arc<Props>,
 }
 
 impl<Props: ?Sized + 'static> ExternalObservation<Props> {
-    /// Construct an observation from one host-owned immutable snapshot.
-    pub fn new(source_revision: ExternalSourceRevision, props: Arc<Props>) -> Self {
+    /// Construct an observation from one host-owned immutable snapshot and its
+    /// host-selected delivery disposition.
+    pub fn new(
+        kind: ExternalFrameKind,
+        source_revision: ExternalSourceRevision,
+        props: Arc<Props>,
+    ) -> Self {
         Self {
+            kind,
             source_revision,
             props,
         }
+    }
+
+    /// Construct a reply-bearing Prompt observation.
+    pub fn actionable(source_revision: ExternalSourceRevision, props: Arc<Props>) -> Self {
+        Self::new(ExternalFrameKind::Actionable, source_revision, props)
+    }
+
+    /// Construct a self-contained Presentation observation with no reply token.
+    pub fn passive(source_revision: ExternalSourceRevision, props: Arc<Props>) -> Self {
+        Self::new(ExternalFrameKind::Passive, source_revision, props)
+    }
+
+    /// Host-selected scheduling metadata for this exact snapshot.
+    pub fn kind(&self) -> ExternalFrameKind {
+        self.kind
     }
 
     /// Revision the host must revalidate if this observation becomes an
@@ -180,18 +202,22 @@ impl<Props: ?Sized + 'static> ExternalObservation<Props> {
         self.props.as_ref()
     }
 
-    /// Consume the observation while retaining both parts for host code that
-    /// needs to hand the owned snapshot to another boundary.
-    pub fn into_parts(self) -> (ExternalSourceRevision, Arc<Props>) {
-        (self.source_revision, self.props)
+    /// Consume the observation while retaining the disposition, revision, and
+    /// owned snapshot for another host boundary.
+    pub fn into_parts(self) -> (ExternalFrameKind, ExternalSourceRevision, Arc<Props>) {
+        (self.kind, self.source_revision, self.props)
     }
 }
 
 impl<Props: 'static> ExternalObservation<Props> {
-    /// Construct an observation from owned props when the host does not already
-    /// retain its snapshot in an [`Arc`].
-    pub fn from_props(source_revision: ExternalSourceRevision, props: Props) -> Self {
-        Self::new(source_revision, Arc::new(props))
+    /// Construct an actionable observation from owned props.
+    pub fn actionable_from_props(source_revision: ExternalSourceRevision, props: Props) -> Self {
+        Self::actionable(source_revision, Arc::new(props))
+    }
+
+    /// Construct a passive observation from owned props.
+    pub fn passive_from_props(source_revision: ExternalSourceRevision, props: Props) -> Self {
+        Self::passive(source_revision, Arc::new(props))
     }
 }
 
@@ -1573,6 +1599,14 @@ where
     #[error("external action `{active:?}` is still active")]
     ActionAlreadyActive { active: ExternalActionToken },
 
+    #[error(
+        "external observation kind changed from {current:?} to {requested:?} without changing the observation identity"
+    )]
+    ObservationKindMismatch {
+        current: ExternalFrameKind,
+        requested: ExternalFrameKind,
+    },
+
     #[error("User delivery `{receipt}` must be acknowledged before its action can run")]
     UserDeliveryNotAcknowledged {
         receipt: ExternalUserDeliveryReceipt,
@@ -1665,6 +1699,17 @@ where
 
     #[error("external action token `{token:?}` is not known to this controller")]
     UnknownToken { token: ExternalActionToken },
+
+    #[error(
+        "external harness contains {binding_factories} event binding(s) and {provider_capabilities} provider capability declaration(s), but this external controller executes only POM and its one external reply ingress"
+    )]
+    UnsupportedHarnessRuntime {
+        binding_factories: usize,
+        provider_capabilities: usize,
+    },
+
+    #[error("external harness runtime projection is invalid: {message}")]
+    HarnessRuntimeProjection { message: String },
 
     #[error("System compilation failed and the host could not abandon the Create lease")]
     SystemMountAbandonFailed {
@@ -1806,7 +1851,7 @@ where
     Contract: ExternalReplyContract,
     Port: MountedExternalPort<Contract::Action>,
 {
-    definition: Arc<ExternalHarnessRuntime<Props>>,
+    definition: Arc<MountedHarnessDefinition<NoTurnChannels, Props>>,
     contract: Arc<Contract>,
     port: Arc<Port>,
     session_id: DurableSessionId,
@@ -1885,6 +1930,23 @@ where
         let (definition, contract) = harness.into_parts();
         let contract = Arc::new(contract);
         let epoch_contract_id = definition.epoch().epoch_contract_id().clone();
+        let runtime = definition
+            .epoch()
+            .durable_system()
+            .runtime_projection()
+            .map_err(
+                |error| MountedExternalControllerError::HarnessRuntimeProjection {
+                    message: error.to_string(),
+                },
+            )?;
+        let binding_factories = runtime.binding_factories().len();
+        let provider_capabilities = runtime.provider_capabilities().len();
+        if binding_factories != 0 || provider_capabilities != 0 {
+            return Err(MountedExternalControllerError::UnsupportedHarnessRuntime {
+                binding_factories,
+                provider_capabilities,
+            });
+        }
         let admission = port
             .acquire_epoch(ExternalEpochAcquireRequest::new(
                 &session_id,
@@ -1977,7 +2039,7 @@ where
     }
 
     fn new(
-        definition: Arc<ExternalHarnessRuntime<Props>>,
+        definition: Arc<MountedHarnessDefinition<NoTurnChannels, Props>>,
         contract: Arc<Contract>,
         port: Arc<Port>,
         session_id: DurableSessionId,
@@ -2344,7 +2406,7 @@ where
         input_id: DurableCallInputId,
         observation: ExternalObservation<Props>,
     ) -> Result<ExternalObserveOutcome, MountedExternalControllerError<Port::Error>> {
-        let (source_revision, props) = observation.into_parts();
+        let (kind, source_revision, props) = observation.into_parts();
         let _local_operation = self.operation_lock.lock().await;
         let mut authored_user = None;
         for _attempt in 1..=MAX_EXTERNAL_STATE_RETRIES {
@@ -2363,6 +2425,12 @@ where
                             &source_revision,
                         ) =>
                     {
+                        if kind != ExternalFrameKind::Actionable {
+                            return Err(MountedExternalControllerError::ObservationKindMismatch {
+                                current: ExternalFrameKind::Actionable,
+                                requested: kind,
+                            });
+                        }
                         return Ok(ExternalObserveOutcome::Frame(
                             ExternalUserFrame::Actionable(ticket.clone()),
                         ));
@@ -2386,6 +2454,12 @@ where
                         &source_revision,
                     ) =>
                 {
+                    if kind != ExternalFrameKind::Passive {
+                        return Err(MountedExternalControllerError::ObservationKindMismatch {
+                            current: ExternalFrameKind::Passive,
+                            requested: kind,
+                        });
+                    }
                     return Ok(ExternalObserveOutcome::Frame(ExternalUserFrame::Passive(
                         presentation.clone(),
                     )));
@@ -2394,20 +2468,19 @@ where
                 None => None,
             };
 
-            let (kind, user) = match authored_user.as_ref() {
+            let user = match authored_user.as_ref() {
                 Some(authored) => authored,
                 None => {
-                    let external_user = self
+                    let user_view = self
                         .definition
-                        .render_user(UserTurnContext::new(props.as_ref()))?;
-                    let (kind, user) = external_user.into_parts();
-                    let user = compile_user_view(user)?.into_document();
-                    authored_user.insert((kind, user))
+                        .render_user(UserTurnContext::new(props.as_ref()));
+                    let user = compile_user_view(user_view)?.into_document();
+                    authored_user.insert(user)
                 }
             };
 
             let may_use_acknowledged_baseline =
-                *kind == ExternalFrameKind::Actionable && !loaded.state.force_full_next_prompt;
+                kind == ExternalFrameKind::Actionable && !loaded.state.force_full_next_prompt;
             let previous_cursor = if may_use_acknowledged_baseline {
                 loaded
                     .state

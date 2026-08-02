@@ -46,7 +46,7 @@ use agentview::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-#[path = "chess_engine_agent/support.rs"]
+#[path = "chess/mod.rs"]
 #[allow(dead_code)]
 mod chess_support;
 
