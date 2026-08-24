@@ -1,0 +1,5 @@
+error: formatted text slot is missing a closing brace
+ --> tests/ui/component_target/fail_unclosed_text_slot.rs:4:21
+  |
+4 |     let _ = view! { "value {missing" };
+  |                     ^^^^^^^^^^^^^^^^

@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 
 use crate::pom::{DiffStrategy, XmlName, XmlNode};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UserDocumentCursor {
     slots: BTreeMap<XmlName, SlotBaseline>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct SlotBaseline {
     strategy: DiffStrategy,
     value: XmlNode,

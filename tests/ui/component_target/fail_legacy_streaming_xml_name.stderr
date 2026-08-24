@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `agentview::component::prelude::StreamingXml`
+ --> tests/ui/component_target/fail_legacy_streaming_xml_name.rs:1:5
+  |
+1 | use agentview::component::prelude::StreamingXml;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `StreamingXml` in `component::prelude`

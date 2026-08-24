@@ -1,0 +1,8 @@
+error[E0432]: unresolved import `agentview::component::authoring::StreamingXml`
+ --> tests/ui/component_target/fail_legacy_streaming_xml_authoring_name.rs:1:5
+  |
+1 | use agentview::component::authoring::StreamingXml;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^------------
+  |     |                                |
+  |     |                                help: a similar name exists in the module: `streaming_xml`
+  |     no `StreamingXml` in `component::authoring`

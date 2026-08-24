@@ -1,5 +1,11 @@
 # AgentView Derive: POM Documents And Stateful XML Diff
 
+> Status: current POM derive, AST, diff, and rendering subsystem documentation.
+> It does not own the replacement Component author contract, canonical
+> transcript, or Provider HTTP oracle. Final Component syntax is owned by the
+> target fixture and the long-term plan in
+> [`provider-port-application-host-boundary.md`](provider-port-application-host-boundary.md).
+
 This document describes the current `AgentView` derive syntax. The derive now
 builds a typed Prompt Object Model (POM) AST. `Agent` and `AgentViewApp` use
 that AST for both complete system documents and stateful user documents.
@@ -898,14 +904,11 @@ User resolution is stateful:
 
 The returned cursor is a candidate. `Agent` commits it only after provider
 execution and `commit_turn` both succeed. History replacement clears the draft
-cursor and rebuilds the request in full. A stateful provider may instead return
-`ContextPreparation::ResyncUserDocument`: this clears only the draft User
-baseline and rebuilds the same logical turn in full, without changing System,
-history, or working state. Both rewrites are bounded by the preparation budget.
-Provider/commit failure and cancellation keep the old cursor. `AgentViewApp`
-uses the same rule across epoch retries: a candidate built for an unstable epoch
-is discarded. It also validates canonical rendering before publishing a stable
-snapshot/cursor.
+cursor and rebuilds the request in full. History replacement is bounded by the
+preparation budget. Provider/commit failure and cancellation keep the old
+cursor. `AgentViewApp` uses the same rule across epoch retries: a candidate
+built for an unstable epoch is discarded. It also validates canonical rendering
+before publishing a stable snapshot/cursor.
 `act_with_sink` consumes the accepted turn id before applying external side
 effects, so a later snapshot failure cannot replay the same action.
 

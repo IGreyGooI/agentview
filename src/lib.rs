@@ -10,10 +10,8 @@
 //!
 //! - [`component::prelude`] is the recommended import path for authoring POM
 //!   components.
-//! - [`component::host::prelude`] contains mounted owner, call, capture,
-//!   reducer, cancellation, and Live-runtime contracts for application hosts.
-//! - [`prelude`] remains the compatibility import path for the legacy
-//!   ViewModel runtime.
+//! - [`component::execution`] contains the Host-owned application lifecycle.
+//! - [`prelude`] contains the original ViewModel runtime.
 //! - Module paths such as [`agent`], [`llm_call`], [`templates`], and
 //!   [`streaming_tool`] remain public as advanced APIs and escape hatches while
 //!   the crate is still evolving.
@@ -47,11 +45,14 @@ mod pom_diff;
 pub mod pom_renderer;
 pub mod pom_resolution;
 pub mod prompt_context;
+pub mod provider;
+pub mod record_store;
 mod semantic_diff;
 pub mod semantic_view;
 pub mod stream_parser;
 pub mod streaming_tool;
 pub mod templates;
+pub mod transcript;
 pub mod view_app;
 pub mod view_awake;
 pub mod view_state;
@@ -59,7 +60,7 @@ pub mod view_state;
 pub type StorageString = ecow::EcoString;
 
 pub use agent_view::AgentView;
-pub use agentview_derive::{view, AgentView};
+pub use agentview_derive::AgentView;
 
 /// Common imports for building an agent-facing ViewModel runtime.
 pub mod prelude {
@@ -68,18 +69,6 @@ pub mod prelude {
     };
     pub use crate::agent_session::AgentSession;
     pub use crate::agent_view::AgentView;
-    pub use crate::component::{
-        binding_factory, binding_factory_with_context, component, durable_binding_factory,
-        durable_binding_factory_with_context, durable_binding_factory_with_context_key,
-        durable_binding_factory_with_key, durable_system, pom_view, prompt_component, system_view,
-        try_prompt_component, user_view, view, BindingAbortAck, BindingAbortReason, BindingFailure,
-        BindingInstance, CapturedMountedHarnessDefinition, ChannelMap, Component, ComponentError,
-        DurableComponent, DurableEpochDefinition, DurableSystem, EpochContractId, MountedFeature,
-        MountedHarnessDefinition, Never, NoTurnChannels, PomView, PromptComponent,
-        ProviderToolSpec, RuntimeContract, RuntimeRoute, StreamUpdate, StreamingXml, TurnBindingCx,
-        TurnChannelMap, TurnChannelMapBuilder, TurnChannels, TurnEmission, TurnLoopPolicy,
-        UserTurnContext, UserTurnRenderer, UserView,
-    };
     pub use crate::control::ControlReply;
     pub use crate::llm_call::{
         AgentTurnEvent, AgentTurnObserver, AgentTurnObserverHandle, AgentTurnOutcome,
@@ -118,5 +107,5 @@ pub mod prelude {
     pub use crate::view_awake::{ViewAwake, ViewAwakeHandle, ViewAwakeSubscription, ViewEpoch};
     pub use crate::view_state::{ViewPatch, ViewSnapshot, ViewTurnId, ViewUpdate, ViewUpdateBody};
     pub use crate::StorageString;
-    pub use agentview_derive::{view, AgentView};
+    pub use agentview_derive::AgentView;
 }

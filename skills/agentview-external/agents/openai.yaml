@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentView External"
+  short_description: "Drive ExternalApplication through the CLI"
+  default_prompt: "Use $agentview-external to observe and act through AgentView's external CLI protocol."

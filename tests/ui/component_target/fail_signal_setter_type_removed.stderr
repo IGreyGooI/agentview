@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `agentview::component::prelude::SignalSetter`
+ --> tests/ui/component_target/fail_signal_setter_type_removed.rs:1:5
+  |
+1 | use agentview::component::prelude::SignalSetter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `SignalSetter` in `component::prelude`

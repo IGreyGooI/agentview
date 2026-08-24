@@ -1,0 +1,5 @@
+error: expected string literal
+ --> tests/ui/component_target/fail_diff_nonliteral_slot.rs:5:23
+  |
+5 |         #[diff(slot = String::from("context"))]
+  |                       ^^^^^^

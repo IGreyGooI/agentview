@@ -1,0 +1,11 @@
+error[E0599]: no method named `setter` found for struct `agentview::component::authoring::Signal<T>` in the current scope
+ --> tests/ui/component_target/fail_signal_setter_method_removed.rs:4:20
+  |
+4 |     let _ = signal.setter();
+  |                    ^^^^^^
+  |
+help: there is a method `set` with a similar name, but with different arguments
+ --> src/component/signal.rs
+  |
+  |     pub fn set(&self, next: T) -> Result<(), SignalAccessError> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

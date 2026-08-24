@@ -1,0 +1,5 @@
+error: Component render functions must use the ordinary Rust ABI
+ --> tests/ui/component_target/fail_non_rust_abi_component.rs:4:1
+  |
+4 | extern "C" fn invalid() -> Component {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

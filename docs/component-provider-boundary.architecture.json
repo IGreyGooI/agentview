@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "ComponentHost / ApplicationHost / ProviderPort",
+    "subtitle": "Frozen ownership, one-reaction flow, and ordering boundary",
+    "output": "component-provider-boundary.html",
+    "animation": "none",
+    "visual_preset": "classic",
+    "quality_profile": "showcase",
+    "viewBox": [1260, 760]
+  },
+  "components": [
+    {
+      "id": "component-host",
+      "type": "backend",
+      "label": "ComponentHost",
+      "sublabel": "props | Signals | current Component output",
+      "tag": "business authority | Signal updates",
+      "pos": [60, 270],
+      "size": [220, 82]
+    },
+    {
+      "id": "rendered-projection",
+      "type": "messagebus",
+      "label": "RenderedProjection",
+      "sublabel": "ordered Vec<RenderedProjectionNode>",
+      "tag": "stable runtime id | node-local item order",
+      "pos": [330, 270],
+      "size": [250, 82]
+    },
+    {
+      "id": "application-host",
+      "type": "backend",
+      "label": "ApplicationHost",
+      "sublabel": "one reaction | reaction-local consumers",
+      "tag": "render once | drain events in Provider order",
+      "pos": [650, 270],
+      "size": [220, 82]
+    },
+    {
+      "id": "provider-port",
+      "type": "cloud",
+      "label": "ProviderPort",
+      "sublabel": "sole Provider boundary",
+      "tag": "&mut disposable runtime context",
+      "pos": [970, 270],
+      "size": [220, 82]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "ComponentHost ownership | business state + current output",
+      "wraps": ["component-host", "rendered-projection"]
+    },
+    {
+      "kind": "security-group",
+      "label": "ProviderPort | sole Provider boundary",
+      "wraps": ["provider-port"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "render-to-projection",
+      "from": "component-host",
+      "to": "rendered-projection",
+      "label": "ordered nodes",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [305, 366]
+    },
+    {
+      "id": "projection-to-application",
+      "from": "rendered-projection",
+      "to": "application-host",
+      "label": "complete projection",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [615, 266]
+    },
+    {
+      "id": "application-to-provider",
+      "from": "application-host",
+      "to": "provider-port",
+      "label": "execute(&mut state)",
+      "variant": "emphasis",
+      "route": "straight"
+    },
+    {
+      "id": "provider-events",
+      "from": "provider-port",
+      "to": "application-host",
+      "label": "ProviderEvent stream",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [[1080, 150], [760, 150]],
+      "labelAt": [920, 136]
+    },
+    {
+      "id": "reaction-cycle",
+      "from": "application-host",
+      "to": "component-host",
+      "label": "render + ordered consumer dispatch",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [[760, 450], [170, 450]],
+      "labelAt": [465, 466]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Ordering split",
+      "items": [
+        "ComponentHost: current node + node-local order",
+        "ProviderPort: submitted history across reactions",
+        "[A,O] + [[A,B],[O,P]] -> [A,O,B,P]"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Below one ProviderPort boundary",
+      "items": [
+        "prompt cache/session + continuation + compaction",
+        "provider artifacts + provider-private outputs",
+        "all context is a disposable optimization"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Fresh recovery",
+      "items": [
+        "no context -> Fresh from complete projection",
+        "Component business state remains correct",
+        "later reaction rerenders after Signal updates"
+      ]
+    }
+  ]
+}

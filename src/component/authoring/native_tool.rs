@@ -1,0 +1,100 @@
+use std::{fmt, future::Future, pin::Pin};
+
+use futures::FutureExt;
+
+use crate::component::execution::{ToolCall, ToolOutput};
+
+use super::{
+    declaration::{Component, ComponentNode},
+    handler::panic_message,
+};
+
+type ToolFuture = Pin<Box<dyn Future<Output = Result<ToolOutput, String>> + Send + 'static>>;
+
+/// Declares one native provider tool and its reaction-local handler.
+pub struct NativeToolCall;
+
+impl NativeToolCall {
+    pub fn named(name: &'static str) -> NativeToolCallNamed {
+        NativeToolCallNamed { name }
+    }
+}
+
+pub struct NativeToolCallNamed {
+    name: &'static str,
+}
+
+impl NativeToolCallNamed {
+    pub fn on_call<Handler, HandlerFuture, Error>(self, mut handler: Handler) -> Component
+    where
+        Handler: FnMut(ToolCall) -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<ToolOutput, Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        Component::from_node(ComponentNode::NativeToolCall(Box::new(
+            NativeToolCallDeclaration {
+                name: self.name,
+                invoke: Box::new(move |call| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(call)))
+                        .map(|future| {
+                            Box::pin(async move { future.await.map_err(|error| error.to_string()) })
+                                as ToolFuture
+                        })
+                        .map_err(|panic| panic_message(&*panic))
+                }),
+            },
+        )))
+    }
+}
+
+pub(crate) struct NativeToolCallDeclaration {
+    name: &'static str,
+    invoke: Box<dyn FnMut(ToolCall) -> Result<ToolFuture, String> + Send + 'static>,
+}
+
+impl NativeToolCallDeclaration {
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) fn start(&mut self, call: ToolCall) -> Result<ToolFuture, NativeToolDispatchFault> {
+        let call_id = call.call_id().to_owned();
+        if call.name() != self.name {
+            return Err(NativeToolDispatchFault::WrongTool {
+                call_id,
+                name: call.name().to_owned(),
+            });
+        }
+        (self.invoke)(call)
+            .map_err(|message| NativeToolDispatchFault::Invocation { call_id, message })
+    }
+}
+
+pub(crate) async fn await_output(
+    call_id: String,
+    future: ToolFuture,
+) -> Result<ToolOutput, NativeToolDispatchFault> {
+    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+        Ok(Ok(output)) if output.call_id() == call_id => Ok(output),
+        Ok(Ok(_)) => Err(NativeToolDispatchFault::OutputCallIdMismatch { call_id }),
+        Ok(Err(message)) => Err(NativeToolDispatchFault::Handler { call_id, message }),
+        Err(panic) => Err(NativeToolDispatchFault::Panic {
+            call_id,
+            message: panic_message(&*panic),
+        }),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum NativeToolDispatchFault {
+    #[error("unsupported tool `{name}` for call `{call_id}`")]
+    WrongTool { call_id: String, name: String },
+    #[error("tool call `{call_id}` invocation failed: {message}")]
+    Invocation { call_id: String, message: String },
+    #[error("tool call `{call_id}` handler failed: {message}")]
+    Handler { call_id: String, message: String },
+    #[error("tool call `{call_id}` handler panicked: {message}")]
+    Panic { call_id: String, message: String },
+    #[error("tool handler returned output for a different call than `{call_id}`")]
+    OutputCallIdMismatch { call_id: String },
+}

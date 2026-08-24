@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/component_target/fail_event_selector_wrong_parent.rs:15:27
+   |
+15 |     let _ = events.select(SecondEvent::CLOCK);
+   |                    ------ ^^^^^^^^^^^^^^^^^^ expected `EventSelector<FirstEvent, _>`, found `EventSelector<SecondEvent, u64>`
+   |                    |
+   |                    arguments to this method are incorrect
+   |
+   = note: expected struct `EventSelector<FirstEvent, _>`
+              found struct `EventSelector<SecondEvent, u64>`
+note: method defined here
+  --> src/component/authoring/event_input.rs
+   |
+   |     pub fn select<Selected>(&self, selector: EventSelector<E, Selected>) -> EventInput<Selected>
+   |            ^^^^^^

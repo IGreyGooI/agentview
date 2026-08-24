@@ -1,0 +1,5 @@
+error: Component render functions cannot be const
+ --> tests/ui/component_target/fail_const_component.rs:4:1
+  |
+4 | const fn invalid() -> Component {
+  | ^^^^^

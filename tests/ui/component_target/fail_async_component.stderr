@@ -1,0 +1,5 @@
+error: Component render functions must be synchronous
+ --> tests/ui/component_target/fail_async_component.rs:4:1
+  |
+4 | async fn invalid() -> Component {
+  | ^^^^^

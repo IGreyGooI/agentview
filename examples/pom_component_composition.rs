@@ -1,115 +1,123 @@
-//! Isolated, non-durable component composition with two local typed streaming
-//! contracts.
-//!
-//! This compatibility mount executes its System root once per function call.
-//! It does not demonstrate cross-process durable reopen; use
-//! `pom_durable_authoring` for the nominal durable authoring boundary.
+//! Ordered canonical input contributed by several business Components.
 
 use agentview::{
-    component::{
-        advanced::lifecycle::{mount_system_epoch, SystemMountContext, SystemView},
-        system_view,
-    },
-    prelude::*,
+    component::{execution::RenderedProjection, prelude::*, ComponentHost},
+    pom_renderer::render_pom_document,
+    transcript::CanonicalInputItem,
 };
 
-struct IntentChannels;
-
-impl TurnChannels for IntentChannels {
-    type Output = u32;
-    type Live = Never;
-    type Commit = Never;
-    type Diagnostic = String;
+#[derive(Clone)]
+struct SupportCase {
+    account_id: String,
+    plan: String,
+    request: String,
 }
 
-struct PhraseChannels;
-
-impl TurnChannels for PhraseChannels {
-    type Output = String;
-    type Live = Never;
-    type Commit = Never;
-    type Diagnostic = String;
+#[component]
+fn support_policy() -> Component {
+    view! {
+        #[system_once]
+        support_policy { "Resolve the request using only the supplied account context." }
+    }
 }
 
-struct PlayerChannels;
-
-#[derive(Debug)]
-enum PlayerOutput {
-    Intent { _value: u32 },
-    Phrase { _value: String },
+#[component]
+fn account_context(account_id: String, plan: String) -> Component {
+    view! {
+        #[developer]
+        account_context {
+            account_id { "{account_id}" }
+            plan { "{plan}" }
+        }
+    }
 }
 
-#[derive(Debug)]
-enum PlayerDiagnostic {
-    Intent { _message: String },
-    Phrase { _message: String },
+#[component]
+fn customer_request(request: String) -> Component {
+    view! {
+        customer_request { "{request}" }
+    }
 }
 
-impl TurnChannels for PlayerChannels {
-    type Output = PlayerOutput;
-    type Live = Never;
-    type Commit = Never;
-    type Diagnostic = PlayerDiagnostic;
+#[component]
+fn response_requirements() -> Component {
+    view! {
+        response_requirements { "Return a concise answer and the next action." }
+    }
 }
 
-fn contract(name: &str) -> XmlNode {
-    XmlNode::new(XmlName::try_from(name).expect("static example tag is valid"))
+#[component]
+fn support_application(props: SupportCase, _events: EventInput<ProviderEvent>) -> Component {
+    view! {
+        support_policy()
+        account_context(props.account_id, props.plan)
+        customer_request(props.request)
+        response_requirements()
+    }
 }
 
-#[agentview::view(component)]
-fn player_rules() -> PomView {
-    view(Document::from_xml(contract("player_rules")))
+fn render_support_case() -> anyhow::Result<RenderedProjection> {
+    let props = SupportCase {
+        account_id: "acct-1042".to_owned(),
+        plan: "team".to_owned(),
+        request: "Explain why yesterday's export is unavailable.".to_owned(),
+    };
+    let mut components = ComponentHost::new(support_application, props);
+    Ok(components.render()?.projection().clone())
 }
 
-#[agentview::view(component)]
-fn select_intent() -> Component<IntentChannels> {
-    StreamingXml::<TurnEmission<IntentChannels>, String>::new(contract("select_intent"))
-        .state_with(|| 0_u32)
-        .on_complete(|selected, _| vec![TurnEmission::Output(*selected)])
-        .into_component()
-}
-
-#[agentview::view(component)]
-fn phrase() -> Component<PhraseChannels> {
-    StreamingXml::<TurnEmission<PhraseChannels>, String>::new(contract("phrase"))
-        .state_with(String::new)
-        .on_complete(|value, element| {
-            value.clone_from(&element.content);
-            vec![TurnEmission::Output(value.clone())]
-        })
-        .into_component()
-}
-
-#[agentview::view(component)]
-fn player_system_component() -> Component<PlayerChannels> {
-    component((
-        player_rules(),
-        select_intent().map_channels(
-            TurnChannelMap::<IntentChannels, PlayerChannels>::builder()
-                .output(|value| PlayerOutput::Intent { _value: value })
-                .live(Never::absurd)
-                .commit(Never::absurd)
-                .diagnostic(|message| PlayerDiagnostic::Intent { _message: message })
-                .build(),
-        ),
-        phrase().map_channels(
-            TurnChannelMap::<PhraseChannels, PlayerChannels>::builder()
-                .output(|value| PlayerOutput::Phrase { _value: value })
-                .live(Never::absurd)
-                .commit(Never::absurd)
-                .diagnostic(|message| PlayerDiagnostic::Phrase { _message: message })
-                .build(),
-        ),
-    ))
-}
-
-fn player_system(_: SystemMountContext<'_, ()>) -> SystemView<PlayerChannels> {
-    system_view(player_system_component())
+fn rendered_item(item: &CanonicalInputItem) -> anyhow::Result<Option<String>> {
+    match item {
+        CanonicalInputItem::Instruction { pom, .. } | CanonicalInputItem::Message { pom, .. } => {
+            Ok(Some(render_pom_document(pom)?))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
-    let epoch = mount_system_epoch(&(), player_system)?;
-    println!("SYSTEM\n{}", epoch.rendered_system());
-    println!("bindings={}", epoch.binding_factories().len());
+    let projection = render_support_case()?;
+    for node in projection.nodes() {
+        println!("COMPONENT {}", node.identity());
+        for item in node.items() {
+            if let Some(rendered) = rendered_item(item)? {
+                println!("{rendered}");
+            }
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use agentview::{pom_renderer::render_pom_document, transcript::CanonicalInputItem};
+
+    use super::*;
+
+    #[test]
+    fn preserves_component_and_canonical_input_order() {
+        let projection = render_support_case().expect("support projection renders");
+        let rendered = projection
+            .nodes()
+            .iter()
+            .flat_map(|node| node.items())
+            .filter_map(|item| match item {
+                CanonicalInputItem::Instruction { pom, .. }
+                | CanonicalInputItem::Message { pom, .. } => {
+                    Some(render_pom_document(pom).expect("POM renders"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let account = rendered.find("<account_context>").expect("account context");
+        let request = rendered
+            .find("<customer_request>")
+            .expect("customer request");
+        let format = rendered
+            .find("<response_requirements>")
+            .expect("response format");
+        assert!(account < request && request < format);
+    }
 }

@@ -1,0 +1,5 @@
+error: Component render functions must return non-generic Component
+ --> tests/ui/component_target/fail_wrong_component_return.rs:4:17
+  |
+4 | fn invalid() -> String {
+  |                 ^^^^^^

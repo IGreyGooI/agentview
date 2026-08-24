@@ -1,0 +1,5 @@
+error: formatted text slots require a captured Rust identifier
+ --> tests/ui/component_target/fail_positional_text_slot.rs:4:21
+  |
+4 |     let _ = view! { "value {}" };
+  |                     ^^^^^^^^^^

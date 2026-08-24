@@ -1,0 +1,5 @@
+error: Component props need a concrete owned type
+ --> tests/ui/component_target/fail_impl_trait_component_prop.rs:4:20
+  |
+4 | fn invalid(_props: impl Clone) -> Component {
+  |                    ^^^^^^^^^^

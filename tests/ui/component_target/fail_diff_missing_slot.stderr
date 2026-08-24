@@ -1,0 +1,5 @@
+error: expected attribute arguments in parentheses: #[diff(...)]
+ --> tests/ui/component_target/fail_diff_missing_slot.rs:5:11
+  |
+5 |         #[diff]
+  |           ^^^^

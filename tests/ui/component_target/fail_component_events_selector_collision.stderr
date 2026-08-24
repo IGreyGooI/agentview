@@ -1,0 +1,11 @@
+error: ComponentEvents variants `HttpRequest` and `HTTPRequest` both generate selector `HTTP_REQUEST`
+ --> tests/ui/component_target/fail_component_events_selector_collision.rs:6:5
+  |
+6 |     HTTPRequest(String),
+  |     ^^^^^^^^^^^
+
+error: first `HTTP_REQUEST` selector generated here
+ --> tests/ui/component_target/fail_component_events_selector_collision.rs:5:5
+  |
+5 |     HttpRequest(String),
+  |     ^^^^^^^^^^^

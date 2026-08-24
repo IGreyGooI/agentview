@@ -1,0 +1,5 @@
+error: a view root accepts at most one placement directive
+ --> tests/ui/component_target/fail_duplicate_placement.rs:6:9
+  |
+6 |         #[developer]
+  |         ^^^^^^^^^^^^

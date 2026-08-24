@@ -1,0 +1,15 @@
+{
+  "profile": "codex-http-v1",
+  "codex_revision": "4f1992732c832fe125608980a03ec2b66710c4e4",
+  "codex_revision_scope": "base Responses request field order; context_management is a later confirmed wire requirement",
+  "oracle_source": "src/provider/codex_http_v1.rs",
+  "request_path": "/responses",
+  "body_scope": "uncompressed HTTP JSON body",
+  "body_generator": "agentview::provider::codex_http_v1::CodexHttpV1Request serialized with serde_json::to_vec",
+  "context_management": "confirmed Responses create wire: compaction with compact_threshold 200000",
+  "body_bytes": 1395,
+  "body_sha256": "a8da4cc8b1870f6fc2c2b199d977e1e240b4dd1b483b29e795156eb8377ed421",
+  "transport": "direct reqwest POST; no automatic retry",
+  "sse_parser": "adapter-owned eventsource-stream + serde_json",
+  "async_openai": "0.41.3 OpenAIConfig/config boundary only"
+}

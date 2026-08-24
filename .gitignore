@@ -1,5 +1,7 @@
 /target
+*.profraw
 /.superpowers/
+/docs/superpowers/
 /.env
 /.env.*
 !/examples/.env.example

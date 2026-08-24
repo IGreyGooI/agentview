@@ -1,0 +1,11 @@
+error: #[diff] can only annotate a POM root
+  --> tests/ui/component_target/fail_diff_on_component_call.rs:8:13
+   |
+ 8 |       let _ = view! {
+   |  _____________^
+ 9 | |         #[diff(slot = "context")]
+10 | |         child()
+11 | |     };
+   | |_____^
+   |
+   = note: this error originates in the macro `view` (in Nightly builds, run with -Z macro-backtrace for more info)

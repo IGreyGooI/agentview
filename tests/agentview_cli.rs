@@ -1,14 +1,22 @@
-use std::net::TcpListener;
-use std::process::{Command, Output};
+use std::{
+    collections::HashSet,
+    io::{BufRead, Read, Write},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    process::{Command, Output, Stdio},
+    sync::{mpsc, Mutex, OnceLock},
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-#[cfg(unix)]
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    time::{SystemTime, UNIX_EPOCH},
-};
+const EXTERNAL_SKILL: &str = include_str!("../skills/agentview-external/SKILL.md");
+const TEST_TOKEN: &str = "agentview-external-test-token-0001";
+const SERVER_PROOF_LABEL: &[u8] = b"agentview-daemon-server-v1";
+const CLIENT_AUTH_LABEL: &[u8] = b"agentview-daemon-client-auth-v1";
+const CLIENT_PROOF_LABEL: &[u8] = b"agentview-daemon-client-v1";
+static CLAIMED_TEST_ADDRS: OnceLock<Mutex<HashSet<SocketAddr>>> = OnceLock::new();
 
 fn agentview_bin() -> std::path::PathBuf {
     std::env::var_os("CARGO_BIN_EXE_agentview")
@@ -16,19 +24,75 @@ fn agentview_bin() -> std::path::PathBuf {
         .into()
 }
 
-fn unused_loopback_addr() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test should bind an ephemeral port");
-    listener
-        .local_addr()
-        .expect("test listener should have a local address")
-        .to_string()
+struct ReservedLoopbackAddr {
+    addr: String,
+    listener: Option<TcpListener>,
+}
+
+impl ReservedLoopbackAddr {
+    fn as_str(&self) -> &str {
+        &self.addr
+    }
+
+    fn release_for_handoff(&mut self) {
+        drop(
+            self.listener
+                .take()
+                .expect("loopback address reservation should be held"),
+        );
+    }
+
+    fn into_listener(mut self) -> TcpListener {
+        self.listener
+            .take()
+            .expect("loopback address reservation should be held")
+    }
+
+    fn was_released(&self) -> bool {
+        self.listener.is_none()
+    }
+}
+
+fn unused_loopback_addr() -> ReservedLoopbackAddr {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        if let Some(reserved) = claim_test_listener(listener) {
+            return reserved;
+        }
+    }
+}
+
+fn claim_test_listener(listener: TcpListener) -> Option<ReservedLoopbackAddr> {
+    let addr = listener.local_addr().expect("read ephemeral port");
+    let claimed = CLAIMED_TEST_ADDRS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("lock claimed test addresses")
+        .insert(addr);
+    if claimed {
+        Some(ReservedLoopbackAddr {
+            addr: addr.to_string(),
+            listener: Some(listener),
+        })
+    } else {
+        None
+    }
 }
 
 fn run_cli_with_env(addr: &str, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut command = Command::new(agentview_bin());
     command
         .env("AGENTVIEW_ADDR", addr)
+        .env("AGENTVIEW_TOKEN", TEST_TOKEN)
         .env("AGENTVIEW_SOCKET", "/dev/null/agentview.sock")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_ADMIN_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_API_BASE")
+        .env_remove("OPENAI_ORG_ID")
+        .env_remove("OPENAI_PROJECT_ID")
+        .env_remove("AGENTVIEW_MODEL")
+        .env_remove("AGENTVIEW_STOCKFISH_BIN")
         .args(args);
     for (key, value) in envs {
         command.env(key, value);
@@ -40,454 +104,758 @@ fn run_cli(addr: &str, args: &[&str]) -> Output {
     run_cli_with_env(addr, args, &[])
 }
 
-#[cfg(unix)]
-fn mock_stockfish_script(moves: &[&str]) -> (std::path::PathBuf, String) {
-    assert!(!moves.is_empty(), "the mock engine needs at least one move");
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "agentview-cli-mock-stockfish-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    let script = dir.join("stockfish");
-    let moves_file = dir.join("stockfish.moves");
-    fs::write(&moves_file, format!("{}\n", moves.join("\n"))).unwrap();
-    fs::write(
-        &script,
-        r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    uci) echo "id name mockfish"; echo "uciok" ;;
-    isready) echo "readyok" ;;
-    go*)
-      state="$0.count"
-      moves="$0.moves"
-      index=0
-      if [ -f "$state" ]; then index=$(cat "$state"); fi
-      line_number=$((index + 1))
-      move=$(sed -n "${line_number}p" "$moves")
-      if [ -z "$move" ]; then move=$(tail -n 1 "$moves"); fi
-      printf '%s\n' "$line_number" > "$state"
-      echo "bestmove $move"
-      exit 0 ;;
-    quit) exit 0 ;;
-  esac
-done
-"#,
+fn run_cli_with_input(addr: &str, args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(agentview_bin())
+        .env("AGENTVIEW_ADDR", addr)
+        .env("AGENTVIEW_TOKEN", TEST_TOKEN)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("agentview command should start");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes())
+        .expect("protocol input should be written");
+    child
+        .wait_with_output()
+        .expect("agentview command should finish")
+}
+
+fn run_cli_until_exit_with_input_still_open(addr: &str, args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(agentview_bin())
+        .env("AGENTVIEW_ADDR", addr)
+        .env("AGENTVIEW_TOKEN", TEST_TOKEN)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("agentview command should start");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin
+        .write_all(input.as_bytes())
+        .expect("protocol input should be written");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if child.try_wait().expect("poll agentview command").is_some() {
+            drop(stdin);
+            return child
+                .wait_with_output()
+                .expect("agentview command should finish");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    child.kill().expect("kill blocked agentview command");
+    drop(stdin);
+    let output = child.wait_with_output().expect("collect blocked command");
+    panic!("agentview kept polling after explicit complete: {output:?}");
+}
+
+fn run_cli_with_token(addr: &str, token: &str, args: &[&str]) -> Output {
+    Command::new(agentview_bin())
+        .env("AGENTVIEW_ADDR", addr)
+        .env("AGENTVIEW_TOKEN", token)
+        .args(args)
+        .output()
+        .expect("agentview command should run")
+}
+
+fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    const BLOCK_BYTES: usize = 64;
+    let mut padded_key = [0_u8; BLOCK_BYTES];
+    padded_key[..key.len()].copy_from_slice(key);
+    let mut inner_pad = [0x36_u8; BLOCK_BYTES];
+    let mut outer_pad = [0x5c_u8; BLOCK_BYTES];
+    for index in 0..BLOCK_BYTES {
+        inner_pad[index] ^= padded_key[index];
+        outer_pad[index] ^= padded_key[index];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    for part in parts {
+        inner.update(part);
+    }
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn authenticated_connection(addr: &str, request_json: &str) -> TcpStream {
+    let mut connection = TcpStream::connect(addr).expect("connect authenticated client");
+    let client_nonce = [7_u8; 32];
+    let hello = serde_json::json!({
+        "kind": "client_hello",
+        "nonce": client_nonce,
+    });
+    writeln!(connection, "{hello}").expect("write client hello");
+
+    let mut reader = std::io::BufReader::new(
+        connection
+            .try_clone()
+            .expect("clone authenticated connection"),
+    );
+    let mut proof_line = String::new();
+    reader
+        .read_line(&mut proof_line)
+        .expect("read daemon identity proof");
+    let proof: Value = serde_json::from_str(&proof_line).expect("parse daemon identity proof");
+    assert_eq!(proof["kind"], "server_hello");
+    let challenge = serde_json::from_value::<[u8; 32]>(proof["challenge"].clone())
+        .expect("fixed daemon challenge");
+    let actual_proof =
+        serde_json::from_value::<[u8; 32]>(proof["proof"].clone()).expect("fixed daemon proof");
+    let session_key: [u8; 32] = Sha256::digest(TEST_TOKEN.as_bytes()).into();
+    let expected_proof = hmac_sha256(
+        &session_key,
+        &[SERVER_PROOF_LABEL, &client_nonce, &challenge],
+    );
+    assert_eq!(actual_proof, expected_proof, "daemon identity proof");
+
+    let client_proof = hmac_sha256(
+        &session_key,
+        &[CLIENT_AUTH_LABEL, &challenge, &client_nonce],
+    );
+    let client_authentication = serde_json::json!({
+        "kind": "client_proof",
+        "proof": client_proof,
+    });
+    writeln!(connection, "{client_authentication}").expect("write client identity proof");
+
+    let authentication = hmac_sha256(
+        &session_key,
+        &[CLIENT_PROOF_LABEL, &challenge, request_json.as_bytes()],
+    );
+    let request_fields = request_json.strip_prefix('{').expect("request JSON object");
+    writeln!(
+        connection,
+        "{{\"authentication\":{},{request_fields}",
+        serde_json::to_string(&authentication).unwrap()
     )
-    .unwrap();
-    let mut perms = fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script, perms).unwrap();
-    let script_string = script.to_string_lossy().into_owned();
-    (dir, script_string)
+    .expect("write authenticated request");
+    connection
 }
 
-fn shutdown(addr: &str) {
-    let _ = run_cli(addr, &["--__agentview-shutdown"]);
-}
-
-struct DaemonGuard(String);
-
-impl DaemonGuard {
-    fn new(addr: String) -> Self {
-        Self(addr)
-    }
-
-    fn addr(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Drop for DaemonGuard {
-    fn drop(&mut self) {
-        shutdown(&self.0);
-    }
-}
-
-fn json_response(output: Output) -> Value {
+fn json_output(output: &Output) -> Value {
     assert!(output.status.success(), "{output:?}");
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|fault| {
         panic!(
-            "Chess CLI must emit one structured JSON response: {error}; stdout={:?}; stderr={:?}",
+            "agentview must emit one JSON response: {fault}; stdout={:?}; stderr={:?}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         )
     })
 }
 
-fn chess_json(addr: &str, envs: &[(&str, &str)], args: &[&str]) -> Value {
-    json_response(run_cli_with_env(addr, args, envs))
+fn shutdown(addr: &str) {
+    let _ = run_cli(addr, &["--__agentview-shutdown"]);
 }
 
-fn chess_error(addr: &str, envs: &[(&str, &str)], args: &[&str]) -> String {
-    let output = run_cli_with_env(addr, args, envs);
-    assert!(!output.status.success(), "{output:?}");
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
+struct DaemonGuard(ReservedLoopbackAddr);
+
+impl DaemonGuard {
+    fn new(addr: ReservedLoopbackAddr) -> Self {
+        Self(addr)
+    }
+
+    fn addr(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn start(&mut self) -> Output {
+        self.0.release_for_handoff();
+        run_cli(self.addr(), &["observe"])
+    }
 }
 
-fn required_string<'a>(value: &'a Value, path: &str) -> &'a str {
-    value
-        .pointer(path)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("expected string at {path} in {value}"))
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if self.0.was_released() {
+            shutdown(self.0.as_str());
+        }
+    }
 }
 
-fn chess_frame<'a>(response: &'a Value, event: &str) -> &'a Value {
-    assert_eq!(
-        required_string(response, "/kind"),
-        "chess_frame",
-        "{response}"
-    );
-    assert_eq!(required_string(response, "/event"), event, "{response}");
-    response
-        .pointer("/frame")
-        .unwrap_or_else(|| panic!("expected Chess frame in {response}"))
-}
+#[test]
+fn daemon_test_address_remains_reserved_before_handoff() {
+    let mut addr = unused_loopback_addr();
 
-fn resync_frame(response: &Value) -> &Value {
-    assert_eq!(
-        required_string(response, "/kind"),
-        "user_resync",
-        "{response}"
-    );
-    assert_eq!(
-        required_string(response, "/status"),
-        "requested",
-        "{response}"
-    );
-    response
-        .pointer("/frame")
-        .unwrap_or_else(|| panic!("expected resync replacement frame in {response}"))
-}
+    let duplicate = TcpListener::bind(addr.as_str());
 
-fn assert_chess_frame(frame: &Value, actionable: bool) {
     assert!(
-        frame
-            .pointer("/delivery_receipt")
-            .and_then(Value::as_str)
-            .is_some(),
-        "{frame}"
+        duplicate.is_err(),
+        "daemon test address was reusable before daemon handoff"
     );
-    assert_eq!(
-        frame
-            .pointer("/action_handle")
-            .and_then(Value::as_str)
-            .is_some(),
-        actionable,
-        "{frame}"
-    );
-    assert_eq!(
-        frame
-            .pointer("/prompt_mode")
-            .and_then(Value::as_object)
-            .is_some(),
-        actionable,
-        "{frame}"
-    );
-}
 
-fn assert_system_gate(error: &str) {
+    addr.release_for_handoff();
+    let duplicate = TcpListener::bind(addr.as_str()).expect("bind released daemon address");
     assert!(
-        error.contains("System must be acknowledged"),
-        "expected System attachment gate, got: {error}"
+        claim_test_listener(duplicate).is_none(),
+        "daemon test address claim was reusable during daemon handoff"
     );
 }
 
 #[test]
 fn help_hides_internal_daemon_mode() {
     let addr = unused_loopback_addr();
-
-    let output = run_cli(&addr, &["--help"]);
+    let output = run_cli(addr.as_str(), &["--help"]);
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("observe"), "{stdout}");
     assert!(stdout.contains("act"), "{stdout}");
+    assert!(stdout.contains("--full-re-render"), "{stdout}");
+    assert!(stdout.contains("--protocol"), "{stdout}");
     assert!(stdout.contains("AGENTVIEW_ADDR"), "{stdout}");
+    assert!(stdout.contains("AGENTVIEW_TOKEN"), "{stdout}");
     assert!(!stdout.to_ascii_lowercase().contains("daemon"), "{stdout}");
     assert!(!stdout.contains("__agentview"), "{stdout}");
 }
 
 #[test]
-fn chess_help_describes_the_exact_handle_and_raw_xml_protocol() {
+fn observe_requires_an_explicit_session_token() {
     let addr = unused_loopback_addr();
+    let output = Command::new(agentview_bin())
+        .env("AGENTVIEW_ADDR", addr.as_str())
+        .env_remove("AGENTVIEW_TOKEN")
+        .arg("observe")
+        .output()
+        .expect("agentview command should run");
 
-    let output = run_cli(&addr, &["chess", "--help"]);
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("agentview chess attach"), "{stdout}");
+    assert!(!output.status.success(), "{output:?}");
     assert!(
-        stdout.contains("attach-ack <system-delivery-id>"),
-        "{stdout}"
+        String::from_utf8_lossy(&output.stderr).contains("AGENTVIEW_TOKEN"),
+        "{output:?}"
     );
-    assert!(stdout.contains("ack <action-handle>"), "{stdout}");
-    assert!(
-        stdout.contains("act <action-handle> '<move uci=\"...\" />'"),
-        "{stdout}"
-    );
-    assert!(stdout.contains("agentview chess hook\n"), "{stdout}");
-    assert!(stdout.contains("agentview chess resync"), "{stdout}");
-    assert!(!stdout.contains("--piece"), "{stdout}");
-    assert!(!stdout.contains("hook <epoch>"), "{stdout}");
 }
 
 #[test]
-fn observe_then_act_share_an_implicit_server_session() {
+fn observe_rejects_an_invalid_session_token_before_connecting() {
     let addr = unused_loopback_addr();
 
-    let observe = run_cli(&addr, &["observe"]);
-
-    assert!(observe.status.success(), "{observe:?}");
-    let observe_stdout = String::from_utf8_lossy(&observe.stdout);
-    assert!(observe_stdout.contains("observe epoch=0 turn=turn-1"));
-    assert!(observe_stdout.contains(r#"view: <hello greeting="Hello" />"#));
-    assert!(observe_stdout.contains("prompt:\n<agent_context kind=\"hello\" greeting=\"Hello\" />"));
-    assert!(observe_stdout.contains("\n\nAsk the caller for their name."));
-
-    let act = run_cli(&addr, &["act", "world"]);
-
-    shutdown(&addr);
-
-    assert!(act.status.success(), "{act:?}");
-    let act_stdout = String::from_utf8_lossy(&act.stdout);
-    assert!(act_stdout.contains("update epoch=1 turn=turn-2"));
-    assert!(
-        act_stdout.contains("view:\n<hello greeting=\"Hello\">\n  <name>world</name>\n</hello>"),
-        "{act_stdout}"
-    );
-    assert!(act_stdout.contains(
-        "prompt:\n<agent_context rendering_mode=\"delta\" kind=\"hello\">\n  <name>world</name>\n</agent_context>"
-    ));
-    assert!(act_stdout.contains("\n\nSay hello to the named caller."));
+    for token in ["too-short", "agentview-external-token-with-control\n"] {
+        let output = run_cli_with_token(addr.as_str(), token, &["observe"]);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("AGENTVIEW_TOKEN"),
+            "{output:?}"
+        );
+    }
 }
 
-#[cfg(unix)]
 #[test]
-fn chess_external_cli_enforces_system_receipts_handles_and_delta_lineage() {
-    let daemon = DaemonGuard::new(unused_loopback_addr());
-    let (dir, script) = mock_stockfish_script(&["e7e5", "b8c6"]);
-    let envs = [("AGENTVIEW_STOCKFISH_BIN", script.as_str())];
+fn wrong_session_token_cannot_observe_act_or_shutdown_the_application() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    let first = json_output(&daemon.start());
 
-    // Every User operation is fenced until the exact System attachment is
-    // acknowledged. The client never receives a second System after that ack.
     for args in [
-        &["chess", "observe"][..],
-        &["chess", "ack", "missing-handle"][..],
-        &["chess", "act", "missing-handle", "<move uci=\"e2e4\" />"][..],
-        &["chess", "hook"][..],
-        &["chess", "resync"][..],
+        vec!["observe"],
+        vec!["act", "must-not-be-injected"],
+        vec!["--__agentview-shutdown"],
     ] {
-        assert_system_gate(&chess_error(daemon.addr(), &envs, args));
+        let rejected =
+            run_cli_with_token(daemon.addr(), "wrong-agentview-external-token-0002", &args);
+        assert!(!rejected.status.success(), "{rejected:?}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("not authorized"),
+            "{rejected:?}"
+        );
     }
 
-    let attachment = chess_json(daemon.addr(), &envs, &["chess", "attach"]);
-    assert_eq!(required_string(&attachment, "/kind"), "system_attachment");
-    assert_eq!(
-        required_string(&attachment, "/attachment/status"),
-        "install_system_once"
-    );
-    let system_delivery_id = required_string(&attachment, "/attachment/delivery_id").to_owned();
-    let system_document = required_string(&attachment, "/attachment/document").to_owned();
-    assert!(
-        system_document.contains("# Chess move agent"),
-        "{system_document}"
-    );
-    assert!(
-        system_document.contains("<move uci=\"...\" />"),
-        "{system_document}"
-    );
+    let next = json_output(&run_cli(daemon.addr(), &["observe"]));
+    assert_eq!(next["base_generation"], first["generation"]);
+    assert!(!next["content"]
+        .as_str()
+        .unwrap()
+        .contains("must-not-be-injected"));
+}
 
-    let attachment_replay = chess_json(daemon.addr(), &envs, &["chess", "attach"]);
-    assert_eq!(
-        required_string(&attachment_replay, "/attachment/delivery_id"),
-        system_delivery_id
-    );
-    assert_eq!(
-        required_string(&attachment_replay, "/attachment/document"),
-        system_document
-    );
+#[test]
+fn external_skill_documents_the_verified_cli_protocol() {
+    for command in [
+        "target/debug/agentview observe",
+        "target/debug/agentview observe --full-re-render",
+        "target/debug/agentview act --protocol",
+    ] {
+        assert!(EXTERNAL_SKILL.contains(command), "missing {command}");
+    }
+    for frame in ["text_delta", "text_complete", "disconnect"] {
+        assert!(EXTERNAL_SKILL.contains(frame), "missing {frame}");
+    }
+    assert!(EXTERNAL_SKILL.contains("AGENTVIEW_TOKEN"));
+    assert!(!EXTERNAL_SKILL.contains("observation_id"));
+    assert!(!EXTERNAL_SKILL.contains("action_handle"));
+}
 
-    let attached = chess_json(
+#[test]
+fn malformed_connection_does_not_restart_or_lose_the_external_application() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    let first = json_output(&daemon.start());
+
+    let mut connection = TcpStream::connect(daemon.addr()).expect("connect to running daemon");
+    connection
+        .write_all(&[0xff, b'\n'])
+        .expect("write malformed UTF-8 request");
+    connection
+        .shutdown(Shutdown::Both)
+        .expect("close malformed connection");
+
+    let next = json_output(&run_cli(daemon.addr(), &["observe"]));
+    assert_eq!(next["mode"], "delta");
+    assert_eq!(next["base_generation"], first["generation"]);
+    assert_ne!(next["generation"], first["generation"]);
+}
+
+#[test]
+fn concurrent_incomplete_requests_do_not_starve_the_daemon() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    let first = json_output(&daemon.start());
+    let mut stalled = Vec::new();
+    for _ in 0..6 {
+        let mut connection = TcpStream::connect(daemon.addr()).expect("connect stalled client");
+        connection
+            .write_all(b"{")
+            .expect("write incomplete request");
+        stalled.push(connection);
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    let addr = daemon.addr().to_owned();
+    thread::spawn(move || {
+        sender
+            .send(run_cli(&addr, &["observe"]))
+            .expect("send observe output");
+    });
+
+    let output = receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("concurrent stalled requests should not starve valid clients");
+    let next = json_output(&output);
+    assert_eq!(next["base_generation"], first["generation"]);
+}
+
+#[test]
+fn server_identity_is_verified_before_sending_a_stateful_request() {
+    let listener = unused_loopback_addr().into_listener();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = thread::spawn(move || {
+        let (mut connection, _) = listener.accept().expect("accept first request");
+        let mut reader = std::io::BufReader::new(
+            connection
+                .try_clone()
+                .expect("clone fake daemon connection"),
+        );
+        let mut hello = String::new();
+        reader.read_line(&mut hello).expect("read client hello");
+        let hello: Value = serde_json::from_str(&hello).expect("parse client hello");
+        assert_eq!(hello["kind"], "client_hello");
+        assert!(hello.get("token").is_none(), "{hello}");
+        assert!(hello.get("op").is_none(), "{hello}");
+
+        let false_proof = serde_json::json!({
+            "kind": "server_hello",
+            "challenge": vec![0_u8; 32],
+            "proof": vec![0_u8; 32],
+        });
+        writeln!(connection, "{false_proof}").expect("write false daemon proof");
+        connection
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("bound fake daemon read");
+        let mut stateful_request = String::new();
+        reader
+            .read_to_string(&mut stateful_request)
+            .expect("client should close after false proof");
+        assert!(stateful_request.is_empty(), "{stateful_request}");
+        drop(connection);
+
+        listener
+            .set_nonblocking(true)
+            .expect("make replay detector nonblocking");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut connections = 1;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((connection, _)) => {
+                    connections += 1;
+                    drop(connection);
+                }
+                Err(fault) if fault.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(fault) => panic!("replay detector failed: {fault}"),
+            }
+        }
+        connections
+    });
+
+    let output = run_cli(&addr, &["observe"]);
+    let connections = server.join().expect("fake daemon should finish");
+
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(connections, 1, "failed authentication was retried");
+}
+
+#[test]
+fn response_loss_after_a_stateful_request_is_not_replayed() {
+    let listener = unused_loopback_addr().into_listener();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = thread::spawn(move || {
+        let (mut connection, _) = listener.accept().expect("accept stateful request");
+        let mut reader = std::io::BufReader::new(
+            connection
+                .try_clone()
+                .expect("clone response-loss connection"),
+        );
+        let mut hello_line = String::new();
+        reader
+            .read_line(&mut hello_line)
+            .expect("read client hello");
+        let hello: Value = serde_json::from_str(&hello_line).expect("parse client hello");
+        let client_nonce =
+            serde_json::from_value::<[u8; 32]>(hello["nonce"].clone()).expect("fixed client nonce");
+        let challenge = [11_u8; 32];
+        let session_key: [u8; 32] = Sha256::digest(TEST_TOKEN.as_bytes()).into();
+        let proof = hmac_sha256(
+            &session_key,
+            &[SERVER_PROOF_LABEL, &client_nonce, &challenge],
+        );
+        writeln!(
+            connection,
+            "{}",
+            serde_json::json!({
+                "kind": "server_hello",
+                "challenge": challenge,
+                "proof": proof,
+            })
+        )
+        .expect("write valid daemon proof");
+
+        let mut client_proof_line = String::new();
+        reader
+            .read_line(&mut client_proof_line)
+            .expect("read client proof");
+        let client_proof: Value =
+            serde_json::from_str(&client_proof_line).expect("parse client proof");
+        let expected_client_proof = hmac_sha256(
+            &session_key,
+            &[CLIENT_AUTH_LABEL, &challenge, &client_nonce],
+        );
+        assert_eq!(client_proof["kind"], "client_proof");
+        assert_eq!(
+            serde_json::from_value::<[u8; 32]>(client_proof["proof"].clone()).unwrap(),
+            expected_client_proof
+        );
+
+        let mut request = String::new();
+        reader
+            .read_line(&mut request)
+            .expect("read stateful request");
+        assert!(request.contains(r#""op":"observe""#), "{request}");
+        drop(connection);
+
+        listener
+            .set_nonblocking(true)
+            .expect("make replay detector nonblocking");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut connections = 1;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((connection, _)) => {
+                    connections += 1;
+                    drop(connection);
+                }
+                Err(fault) if fault.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(fault) => panic!("replay detector failed: {fault}"),
+            }
+        }
+        connections
+    });
+
+    let output = run_cli(&addr, &["observe"]);
+    let connections = server.join().expect("response-loss daemon should finish");
+
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(connections, 1, "stateful request was replayed");
+}
+
+#[test]
+fn slow_response_reader_does_not_block_the_daemon() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    json_output(&daemon.start());
+    let large_delta = "x".repeat(4 * 1024 * 1024 - 4096);
+    let protocol = format!("{{\"type\":\"text_delta\",\"text\":\"{large_delta}\"}}\n");
+    json_output(&run_cli_with_input(
         daemon.addr(),
-        &envs,
-        &["chess", "attach-ack", &system_delivery_id],
-    );
-    assert_eq!(required_string(&attached, "/kind"), "system_attachment");
-    assert_eq!(required_string(&attached, "/attachment/status"), "attached");
-    assert_eq!(
-        required_string(&attached, "/attachment/delivery_id"),
-        system_delivery_id
-    );
-    assert!(
-        attached.pointer("/attachment/document").is_none(),
-        "{attached}"
-    );
+        &["act", "--protocol"],
+        &protocol,
+    ));
 
-    let attached_reopen = chess_json(daemon.addr(), &envs, &["chess", "attach"]);
-    assert_eq!(
-        required_string(&attached_reopen, "/attachment/status"),
-        "attached"
-    );
-    assert_eq!(
-        required_string(&attached_reopen, "/attachment/delivery_id"),
-        system_delivery_id
-    );
-    assert!(
-        attached_reopen.pointer("/attachment/document").is_none(),
-        "System must not be returned after attachment: {attached_reopen}"
-    );
+    let stalled =
+        authenticated_connection(daemon.addr(), r#"{"op":"observe","full_re_render":true}"#);
+    thread::sleep(Duration::from_millis(50));
 
-    let first_response = chess_json(daemon.addr(), &envs, &["chess", "observe"]);
-    let first = chess_frame(&first_response, "observe");
-    assert_chess_frame(first, true);
-    let first_delivery = required_string(first, "/delivery_receipt").to_owned();
-    let first_handle = required_string(first, "/action_handle").to_owned();
-    assert_eq!(first_handle, first_delivery);
-    assert_eq!(required_string(first, "/prompt_mode/mode"), "full");
-    assert!(
-        first.pointer("/prompt_mode/base_delivery").is_none(),
-        "{first}"
-    );
-    assert!(
-        !required_string(first, "/prompt").contains("rendering_mode=\"delta\""),
-        "{first}"
-    );
-    assert!(
-        !required_string(first, "/prompt").contains("<reply_contract"),
-        "User must not repeat the System contract: {first}"
-    );
+    let (sender, receiver) = mpsc::channel();
+    let addr = daemon.addr().to_owned();
+    thread::spawn(move || {
+        sender
+            .send(run_cli(&addr, &["observe"]))
+            .expect("send observe output");
+    });
 
-    let before_ack = chess_error(
+    let output = receiver
+        .recv_timeout(Duration::from_secs(7))
+        .expect("slow response reader should be evicted");
+    drop(stalled);
+    let next = json_output(&output);
+    assert_eq!(next["mode"], "delta", "daemon state was restarted: {next}");
+}
+
+#[test]
+#[ignore = "maximum-size external observe/act behavior is deferred with the CLI contract"]
+fn repeated_maximum_escaped_acts_keep_observations_bounded() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    json_output(&daemon.start());
+    let large_delta = "&".repeat(4 * 1024 * 1024 - 4096);
+    let protocol = format!("{{\"type\":\"text_delta\",\"text\":\"{large_delta}\"}}\n");
+
+    for _ in 0..3 {
+        json_output(&run_cli_with_input(
+            daemon.addr(),
+            &["act", "--protocol"],
+            &protocol,
+        ));
+    }
+
+    json_output(&run_cli(daemon.addr(), &["observe", "--full-re-render"]));
+}
+
+#[test]
+fn protocol_frame_limit_is_enforced_before_daemon_dispatch() {
+    const MAX_PROTOCOL_FRAMES: usize = 65_536;
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    let first = json_output(&daemon.start());
+    let frame = r#"{"type":"text_delta","text":""}
+"#;
+    let protocol = frame.repeat(MAX_PROTOCOL_FRAMES + 1);
+
+    let rejected = run_cli_with_input(daemon.addr(), &["act", "--protocol"], &protocol);
+
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("external text protocol exceeded configured frame limit"),
+        "{rejected:?}"
+    );
+    let next = json_output(&run_cli(daemon.addr(), &["observe"]));
+    assert_eq!(next["base_generation"], first["generation"]);
+}
+
+#[test]
+fn observe_then_protocol_act_share_one_external_application() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    let observe = daemon.start();
+
+    let observe = json_output(&observe);
+    assert_eq!(observe["kind"], "observation");
+    assert_eq!(observe["event"], "observe");
+    assert_eq!(observe["mode"], "full");
+    assert!(observe["base_generation"].is_null());
+    let first_generation = observe["generation"].as_str().unwrap().to_owned();
+    assert!(observe["content"]
+        .as_str()
+        .unwrap()
+        .contains("External CLI protocol"));
+
+    let normal_eof = run_cli_with_input(
         daemon.addr(),
-        &envs,
-        &["chess", "act", &first_handle, "<move uci=\"e2e4\" />"],
+        &["act", "--protocol"],
+        concat!(
+            r#"{"type":"text_delta","text":"left"}"#,
+            "\n",
+            r#"{"type":"text_delta","text":"right"}"#,
+            "\n",
+        ),
     );
-    assert!(
-        before_ack.contains("acknowledged"),
-        "act must require the explicit User delivery acknowledgement: {before_ack}"
-    );
+    let normal_eof = json_output(&normal_eof);
+    assert_eq!(normal_eof["event"], "act");
+    assert_eq!(normal_eof["mode"], "delta");
+    assert_eq!(normal_eof["base_generation"], first_generation);
+    let normal_eof_content = normal_eof["content"].as_str().unwrap();
+    let left = normal_eof_content.find("delta:left").unwrap();
+    let right = normal_eof_content.find("delta:right").unwrap();
+    let complete = normal_eof_content.find("complete:leftright").unwrap();
+    assert!(left < right && right < complete, "{normal_eof_content}");
 
-    let ack = chess_json(daemon.addr(), &envs, &["chess", "ack", &first_handle]);
-    assert_eq!(required_string(&ack, "/kind"), "user_acknowledgement");
-    assert_eq!(required_string(&ack, "/action_handle"), first_handle);
-    assert_eq!(required_string(&ack, "/status"), "acknowledged");
-    let repeated_ack = chess_json(daemon.addr(), &envs, &["chess", "ack", &first_handle]);
-    assert_eq!(
-        required_string(&repeated_ack, "/status"),
-        "already_acknowledged"
-    );
-
-    let bare_uci = chess_error(
+    let explicit_complete = run_cli_with_input(
         daemon.addr(),
-        &envs,
-        &["chess", "act", &first_handle, "e2e4"],
+        &["act", "--protocol"],
+        concat!(
+            r#"{"type":"text_delta","text":"done"}"#,
+            "\n",
+            r#"{"type":"text_complete","text":"done"}"#,
+            "\n",
+            r#"{"type":"disconnect"}"#,
+            "\n",
+        ),
+    );
+    let explicit_complete = json_output(&explicit_complete);
+    let explicit_content = explicit_complete["content"].as_str().unwrap();
+    assert!(
+        explicit_content.contains("delta:done"),
+        "{explicit_content}"
     );
     assert!(
-        bare_uci.contains("reply rejected"),
-        "raw replies must be parsed through the System XML contract: {bare_uci}"
+        explicit_content.contains("complete:done"),
+        "{explicit_content}"
     );
+}
 
-    let waiting_response = chess_json(
+#[test]
+fn explicit_complete_stops_live_cli_stdin_polling() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    json_output(&daemon.start());
+
+    let output = run_cli_until_exit_with_input_still_open(
         daemon.addr(),
-        &envs,
-        &["chess", "act", &first_handle, "<move uci=\"e2e4\" />"],
-    );
-    let waiting = chess_frame(&waiting_response, "act");
-    assert_chess_frame(waiting, false);
-    assert!(
-        waiting.pointer("/action_handle").unwrap().is_null(),
-        "{waiting}"
-    );
-    assert!(
-        waiting.pointer("/prompt_mode").unwrap().is_null(),
-        "{waiting}"
-    );
-    assert!(
-        !required_string(&waiting, "/prompt").contains("rendering_mode=\"delta\""),
-        "Passive must be self-contained: {waiting}"
-    );
-    assert!(required_string(&waiting, "/prompt").contains("<pending>true</pending>"));
-
-    let delta_response = chess_json(daemon.addr(), &envs, &["chess", "hook"]);
-    let delta = chess_frame(&delta_response, "hook");
-    assert_chess_frame(delta, true);
-    let delta_delivery = required_string(delta, "/delivery_receipt").to_owned();
-    let delta_handle = required_string(delta, "/action_handle").to_owned();
-    assert_eq!(required_string(delta, "/prompt_mode/mode"), "delta");
-    assert_eq!(
-        required_string(delta, "/prompt_mode/base_delivery"),
-        first_delivery,
-        "Passive must never become a delta baseline: {delta}"
-    );
-    assert!(
-        required_string(delta, "/prompt").contains("rendering_mode=\"delta\""),
-        "{delta}"
-    );
-    assert!(required_string(delta, "/prompt").contains("<move>e7e5</move>"));
-
-    // The delta has not been acknowledged. Resync therefore tombstones this
-    // exact delivery and makes the replacement full without reattaching System.
-    let full_resync_response = chess_json(daemon.addr(), &envs, &["chess", "resync"]);
-    let full_resync = resync_frame(&full_resync_response);
-    assert_chess_frame(full_resync, true);
-    let resync_delivery = required_string(full_resync, "/delivery_receipt").to_owned();
-    let resync_handle = required_string(full_resync, "/action_handle").to_owned();
-    assert_ne!(resync_delivery, delta_delivery);
-    assert_ne!(resync_handle, delta_handle);
-    assert_eq!(required_string(full_resync, "/prompt_mode/mode"), "full");
-    assert!(
-        full_resync.pointer("/prompt_mode/base_delivery").is_none(),
-        "{full_resync}"
-    );
-    assert!(
-        !required_string(&full_resync, "/prompt").contains("rendering_mode=\"delta\""),
-        "{full_resync}"
+        &["act", "--protocol"],
+        concat!(
+            r#"{"type":"text_delta","text":"done"}"#,
+            "\n",
+            r#"{"type":"text_complete","text":"done"}"#,
+            "\n",
+        ),
     );
 
-    let system_after_resync = chess_json(daemon.addr(), &envs, &["chess", "attach"]);
-    assert_eq!(
-        required_string(&system_after_resync, "/attachment/status"),
-        "attached"
-    );
-    assert_eq!(
-        required_string(&system_after_resync, "/attachment/delivery_id"),
-        system_delivery_id
-    );
-    assert!(system_after_resync
-        .pointer("/attachment/document")
-        .is_none());
+    let observation = json_output(&output);
+    assert!(observation["content"]
+        .as_str()
+        .unwrap()
+        .contains("complete:done"));
+}
 
-    let resync_ack = chess_json(daemon.addr(), &envs, &["chess", "ack", &resync_handle]);
-    assert_eq!(required_string(&resync_ack, "/status"), "acknowledged");
-    let second_waiting_response = chess_json(
+#[test]
+fn full_re_render_reuses_the_pending_cli_generation() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    let observe = json_output(&daemon.start());
+    let generation = observe["generation"].clone();
+    let content = observe["content"].clone();
+
+    let rerender = json_output(&run_cli(daemon.addr(), &["observe", "--full-re-render"]));
+
+    assert_eq!(rerender["event"], "observe");
+    assert_eq!(rerender["mode"], "full");
+    assert_eq!(rerender["generation"], generation);
+    assert!(rerender["base_generation"].is_null());
+    assert_eq!(rerender["content"], content);
+}
+
+#[test]
+fn ordinary_observe_rolls_over_and_reports_the_generation_lineage() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    let first = json_output(&daemon.start());
+
+    let second = json_output(&run_cli(daemon.addr(), &["observe"]));
+
+    assert_eq!(second["event"], "observe");
+    assert_eq!(second["mode"], "delta");
+    assert_eq!(second["base_generation"], first["generation"]);
+    assert_ne!(second["generation"], first["generation"]);
+}
+
+#[test]
+fn text_argument_is_a_normal_eof_convenience_path() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    json_output(&daemon.start());
+
+    let acted = json_output(&run_cli(daemon.addr(), &["act", "convenient"]));
+
+    let content = acted["content"].as_str().unwrap();
+    assert!(content.contains("delta:convenient"), "{content}");
+    assert!(content.contains("complete:convenient"), "{content}");
+}
+
+#[test]
+fn abnormal_protocol_disconnect_fails_and_the_daemon_recovers() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    json_output(&daemon.start());
+
+    let disconnected = run_cli_with_input(
         daemon.addr(),
-        &envs,
-        &["chess", "act", &resync_handle, "<move uci=\"g1f3\" />"],
-    );
-    let second_waiting = chess_frame(&second_waiting_response, "act");
-    assert_chess_frame(second_waiting, false);
-
-    let delta_after_resync_response = chess_json(daemon.addr(), &envs, &["chess", "hook"]);
-    let delta_after_resync = chess_frame(&delta_after_resync_response, "hook");
-    assert_chess_frame(delta_after_resync, true);
-    assert_eq!(
-        required_string(delta_after_resync, "/prompt_mode/mode"),
-        "delta"
-    );
-    assert_eq!(
-        required_string(delta_after_resync, "/prompt_mode/base_delivery"),
-        resync_delivery,
-        "the acknowledged full resync must restart the delta chain: {delta_after_resync}"
+        &["act", "--protocol"],
+        concat!(
+            r#"{"type":"text_delta","text":"partial"}"#,
+            "\n",
+            r#"{"type":"disconnect"}"#,
+            "\n",
+        ),
     );
 
-    let _ = fs::remove_dir_all(dir);
+    assert!(!disconnected.status.success(), "{disconnected:?}");
+    assert!(
+        String::from_utf8_lossy(&disconnected.stderr)
+            .contains("external text protocol disconnected abnormally"),
+        "{disconnected:?}"
+    );
+
+    let recovered = json_output(&run_cli(daemon.addr(), &["observe"]));
+    assert_eq!(recovered["kind"], "observation");
+    assert!(recovered["content"]
+        .as_str()
+        .unwrap()
+        .contains("delta:partial"));
+}
+
+#[test]
+fn malformed_protocol_frame_is_redacted_and_the_daemon_recovers() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    json_output(&daemon.start());
+
+    let malformed = run_cli_with_input(
+        daemon.addr(),
+        &["act", "--protocol"],
+        r#"{"type":"unknown","secret":"do-not-echo"}
+"#,
+    );
+
+    assert!(!malformed.status.success(), "{malformed:?}");
+    let stderr = String::from_utf8_lossy(&malformed.stderr);
+    assert!(
+        stderr.contains("external text protocol frame was invalid"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("do-not-echo"), "{stderr}");
+
+    let recovered = json_output(&run_cli(daemon.addr(), &["observe"]));
+    assert_eq!(recovered["kind"], "observation");
+}
+
+#[test]
+fn xml_invalid_protocol_text_is_rejected_without_poisoning_the_daemon() {
+    let mut daemon = DaemonGuard::new(unused_loopback_addr());
+    let first = json_output(&daemon.start());
+    let invalid = run_cli_with_input(
+        daemon.addr(),
+        &["act", "--protocol"],
+        "{\"type\":\"text_delta\",\"text\":\"\\u0000\"}\n",
+    );
+
+    assert!(!invalid.status.success(), "{invalid:?}");
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains("not allowed in XML content"),
+        "{invalid:?}"
+    );
+
+    let recovered = json_output(&run_cli(daemon.addr(), &["observe"]));
+    assert_eq!(recovered["base_generation"], first["generation"]);
+    assert!(!recovered["content"].as_str().unwrap().contains("\\u{0}"));
 }

@@ -1,0 +1,5 @@
+error: Component render functions cannot be unsafe
+ --> tests/ui/component_target/fail_unsafe_component.rs:4:1
+  |
+4 | unsafe fn invalid() -> Component {
+  | ^^^^^^

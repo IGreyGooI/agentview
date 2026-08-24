@@ -1,98 +1,27 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use syn::{
-    parse_macro_input, Data, DeriveInput, Fields, FnArg, ItemFn, LitInt, LitStr, ReturnType, Type,
-};
+use quote::quote;
+use syn::{parse_macro_input, Data, DeriveInput, Fields, LitInt, LitStr};
 
-/// Mark a synchronous function as a functional POM component.
-///
-/// The function keeps owned Rust arguments and an explicit component view
-/// return type. POM and ordinary component returns are deferred until their
-/// parent compiler visits the node. Durable component/System returns instead
-/// construct a pure retained definition eagerly, because reopen must retain
-/// its runtime projection independently of POM rendering.
+mod component_attr;
+mod component_events;
+mod view_macro;
+
+/// Mark a synchronous function as a retained target Component scope.
 #[proc_macro_attribute]
-pub fn view(attribute: TokenStream, item: TokenStream) -> TokenStream {
-    let mode = parse_macro_input!(attribute as syn::Ident);
-    let function = parse_macro_input!(item as ItemFn);
-    expand_component_function(mode, function)
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
+pub fn component(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    component_attr::expand(attribute, item)
 }
 
-fn expand_component_function(
-    mode: syn::Ident,
-    mut function: ItemFn,
-) -> syn::Result<proc_macro2::TokenStream> {
-    if mode != "component" {
-        return Err(syn::Error::new_spanned(
-            mode,
-            "unsupported view attribute; expected `#[view(component)]`",
-        ));
-    }
-    if let Some(asyncness) = function.sig.asyncness {
-        return Err(syn::Error::new_spanned(
-            asyncness,
-            "component render functions must be synchronous",
-        ));
-    }
-    let output = match &function.sig.output {
-        ReturnType::Default => {
-            return Err(syn::Error::new_spanned(
-                &function.sig.ident,
-                "component functions need an explicit component view return type",
-            ));
-        }
-        ReturnType::Type(_, output) => output.clone(),
-    };
-    let mut prop_bindings = Vec::new();
-    for (index, input) in function.sig.inputs.iter_mut().enumerate() {
-        let FnArg::Typed(input) = input else {
-            return Err(syn::Error::new_spanned(
-                input,
-                "component functions do not support a self receiver",
-            ));
-        };
-        if matches!(input.ty.as_ref(), Type::ImplTrait(_)) {
-            return Err(syn::Error::new_spanned(
-                &input.ty,
-                "component props need a concrete owned type",
-            ));
-        }
-        if let Type::Reference(reference) = input.ty.as_ref() {
-            let is_static = reference
-                .lifetime
-                .as_ref()
-                .is_some_and(|lifetime| lifetime.ident == "static");
-            if !is_static {
-                return Err(syn::Error::new_spanned(
-                    &input.ty,
-                    "component props must be owned or shared with `Arc`; borrowed props cannot outlive a deferred component call",
-                ));
-            }
-        }
-        let pattern = input.pat.clone();
-        let prop = format_ident!("__agentview_component_prop_{index}");
-        *input.pat = syn::parse_quote!(#prop);
-        prop_bindings.push(quote! {
-            let #pattern =
-                ::agentview::component::__private::into_component_prop(#prop);
-        });
-    }
+/// Build the target Component declaration tree.
+#[proc_macro]
+pub fn view(input: TokenStream) -> TokenStream {
+    view_macro::expand(input)
+}
 
-    let name = function.sig.ident.clone();
-    let body = function.block;
-    function.block = Box::new(syn::parse_quote!({
-        #(#prop_bindings)*
-        ::agentview::component::__private::defer_fallible_component::<#output, _>(
-            ::std::concat!(::std::module_path!(), "::", ::std::stringify!(#name)),
-            move || ::std::result::Result::<
-                _,
-                ::agentview::component::ComponentError,
-            >::Ok(#body),
-        )
-    }));
-    Ok(quote! { #function })
+/// Generate typed route selectors for a root Component event enum.
+#[proc_macro_derive(ComponentEvents)]
+pub fn derive_component_events(input: TokenStream) -> TokenStream {
+    component_events::expand(input)
 }
 
 #[proc_macro_derive(AgentView, attributes(agent_view, view))]

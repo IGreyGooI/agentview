@@ -1,0 +1,5 @@
+error: Component render functions must return Component
+ --> tests/ui/component_target/fail_missing_component_return.rs:4:4
+  |
+4 | fn invalid() {
+  |    ^^^^^^^

@@ -1,4 +1,4 @@
-//! Committed prompt state shared by provider-backed agents and external view apps.
+//! Durable prompt state shared by provider-backed agents and external view apps.
 
 use crate::pom::XmlName;
 use crate::pom_cursor::UserDocumentCursor;

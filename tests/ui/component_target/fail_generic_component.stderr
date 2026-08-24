@@ -1,0 +1,5 @@
+error: Component render functions cannot be generic
+ --> tests/ui/component_target/fail_generic_component.rs:4:11
+  |
+4 | fn invalid<T>() -> Component {
+  |           ^^^

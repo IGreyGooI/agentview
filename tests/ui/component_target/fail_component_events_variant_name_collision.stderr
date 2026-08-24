@@ -1,0 +1,5 @@
+error: generated ComponentEvents selector `TEXT` conflicts with an enum variant name
+ --> tests/ui/component_target/fail_component_events_variant_name_collision.rs:6:5
+  |
+6 |     TEXT(String),
+  |     ^^^^

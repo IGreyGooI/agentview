@@ -1,0 +1,5 @@
+error: ComponentEvents variants must be single-field tuple variants
+ --> tests/ui/component_target/fail_component_events_named_variant.rs:5:5
+  |
+5 |     Text { value: String },
+  |     ^^^^

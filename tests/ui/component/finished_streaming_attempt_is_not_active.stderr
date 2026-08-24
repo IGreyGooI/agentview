@@ -1,8 +1,0 @@
-error[E0599]: no method named `on_event` found for struct `FinishedStreamingAttempt<C>` in the current scope
-  --> tests/ui/component/finished_streaming_attempt_is_not_active.rs:17:10
-   |
-16 | /     finished
-17 | |         .on_event(TextTurnEvent::TextDelta(String::new()))
-   | |         -^^^^^^^^ method not found in `FinishedStreamingAttempt<Channels>`
-   | |_________|
-   |

@@ -1,0 +1,5 @@
+error: Component render functions do not support a self receiver
+ --> tests/ui/component_target/fail_self_receiver_component.rs:7:15
+  |
+7 |     fn render(self) -> Component {
+  |               ^^^^

@@ -1,0 +1,5 @@
+error: Component props must be owned; borrowed props cannot outlive the deferred render
+ --> tests/ui/component_target/fail_borrowed_component_prop.rs:4:23
+  |
+4 | fn invalid(_borrowed: &str) -> Component {
+  |                       ^^^^

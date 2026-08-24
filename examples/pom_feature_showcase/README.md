@@ -1,5 +1,11 @@
 # POM feature showcase
 
+> 范围说明：这是当前 POM AST/diff/renderer 的 compatibility showcase，不是
+> replacement Component authoring 或 Provider request 规格。下文的两份 System/User
+> `Document` 与 prompt golden 只验证 renderer 输出，不是 canonical transcript 或
+> Codex HTTP body oracle。当前语义边界见
+> [`../../docs/semantic-agent-view.md`](../../docs/semantic-agent-view.md)。
+
 这是一份离线、可重复运行的“typed view → POM → prompt”可执行规格。
 System 和 user 始终是两份独立的 `Document`；role 是调用哪一个 resolver
 决定的，不存放在 POM 节点里。

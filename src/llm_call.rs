@@ -65,18 +65,9 @@ pub enum ContextPreparation<I = Turn> {
     /// Replace committed history, invalidate the rendered view baseline, and
     /// prepare the same logical turn again.
     ReplaceHistory { history: Vec<I> },
-    /// Discard only the local User-document diff baseline and prepare the same
-    /// logical turn again.
-    ///
-    /// A stateful provider returns this after rehydration when its remote
-    /// session cannot safely apply the next incremental User document. The
-    /// next preparation sends a full User document, while the System epoch,
-    /// committed history, and working set remain unchanged. This counts against
-    /// the same bounded preparation-rewrite budget as [`Self::ReplaceHistory`].
-    ResyncUserDocument,
 }
 
-/// Rewrite budget for preparing one logical model turn.
+/// Replacement budget for preparing one logical model turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextPreparationBudget {
     replacements: usize,
@@ -93,7 +84,6 @@ impl ContextPreparationBudget {
         }
     }
 
-    /// Whether one more history replacement or User-document resync is allowed.
     pub fn can_replace(self) -> bool {
         self.replacements < self.max_replacements
     }
@@ -153,7 +143,7 @@ pub struct AgentTurnOutcome<I, O> {
     pub sink_output: O,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextTurnEvent {
     TextDelta(String),
     TextComplete(String),
@@ -589,8 +579,8 @@ mod tests {
 
         match prepared {
             ContextPreparation::Ready => {}
-            ContextPreparation::ReplaceHistory { .. } | ContextPreparation::ResyncUserDocument => {
-                panic!("default context preparation requested a rewrite")
+            ContextPreparation::ReplaceHistory { .. } => {
+                panic!("default context preparation replaced history")
             }
         }
     }
