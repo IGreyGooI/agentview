@@ -1,6 +1,6 @@
 use crate::{
     component::execution::{
-        RenderedProjectionDiff, RenderedProjectionError, RenderedProjectionFragment,
+        RenderedProjectionDiffMarker, RenderedProjectionError, RenderedProjectionFragment,
         RenderedProjectionItemTemplate,
     },
     pom::{BlockChildren, Document, PomError, ResolvedDocument},
@@ -29,7 +29,7 @@ pub(crate) enum ProjectionFragmentCapture {
 
 pub(crate) struct BuiltProjectionItems {
     pub(crate) items: Vec<CanonicalInputItem>,
-    pub(crate) diffs: Vec<RenderedProjectionDiff>,
+    pub(crate) diffs: Vec<RenderedProjectionDiffMarker>,
     pub(crate) diff_templates: Vec<RenderedProjectionItemTemplate>,
 }
 
@@ -74,7 +74,7 @@ pub(crate) fn build_projection_items(
             if let Some((structural_path, slot)) = address {
                 has_diff = true;
                 let diff_index = diffs.len();
-                diffs.push(RenderedProjectionDiff::new(
+                diffs.push(RenderedProjectionDiffMarker::new(
                     item_index,
                     structural_path,
                     slot,

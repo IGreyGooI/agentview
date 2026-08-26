@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     component::execution::{
-        RenderedProjection, RenderedProjectionDiff, RenderedProjectionFragment,
+        RenderedProjection, RenderedProjectionDiffMarker, RenderedProjectionFragment,
         RenderedProjectionItemTemplate, RenderedProjectionNode,
     },
     pom::{BlockChildren, ContentNode, ContentRef, Document, ResolvedDocument, XmlNode},
@@ -107,7 +107,7 @@ fn lower_node(
 
 fn lower_template_item(
     node_identity: &str,
-    diffs: &[RenderedProjectionDiff],
+    diffs: &[RenderedProjectionDiffMarker],
     template: &RenderedProjectionItemTemplate,
     complete_item: &CanonicalInputItem,
     previous: &ProjectionDiffState,
@@ -183,7 +183,7 @@ fn lower_template_item(
     ))
 }
 
-fn diff_key(node_identity: &str, diff: &RenderedProjectionDiff) -> ProjectionDiffKey {
+fn diff_key(node_identity: &str, diff: &RenderedProjectionDiffMarker) -> ProjectionDiffKey {
     ProjectionDiffKey {
         node_identity: node_identity.to_owned(),
         structural_path: diff.structural_path().to_vec(),
@@ -262,7 +262,7 @@ struct ProjectionItemKey {
 mod tests {
     use crate::{
         component::execution::{
-            RenderedProjection, RenderedProjectionDiff, RenderedProjectionFragment,
+            RenderedProjection, RenderedProjectionDiffMarker, RenderedProjectionFragment,
             RenderedProjectionItemTemplate, RenderedProjectionNode,
         },
         pom::{DiffSlot, DiffStrategy, Document, ResolvedDocument, TextNode, XmlNode},
@@ -290,7 +290,11 @@ mod tests {
         let node = RenderedProjectionNode::with_diff_templates(
             "component",
             vec![item],
-            vec![RenderedProjectionDiff::new(0, structural_path, "state")],
+            vec![RenderedProjectionDiffMarker::new(
+                0,
+                structural_path,
+                "state",
+            )],
             vec![RenderedProjectionItemTemplate::new(
                 0,
                 vec![RenderedProjectionFragment::Diff {
@@ -347,7 +351,7 @@ mod tests {
         let node = RenderedProjectionNode::with_diff_templates(
             "component",
             vec![item],
-            vec![RenderedProjectionDiff::new(0, vec![0], "agent_state")],
+            vec![RenderedProjectionDiffMarker::new(0, vec![0], "agent_state")],
             vec![RenderedProjectionItemTemplate::new(
                 0,
                 vec![RenderedProjectionFragment::Diff {
@@ -400,7 +404,7 @@ mod tests {
         let node = RenderedProjectionNode::with_diff_templates(
             "component",
             vec![item],
-            vec![RenderedProjectionDiff::new(0, vec![0], slot)],
+            vec![RenderedProjectionDiffMarker::new(0, vec![0], slot)],
             vec![RenderedProjectionItemTemplate::new(
                 0,
                 vec![RenderedProjectionFragment::Diff {

@@ -41,6 +41,6 @@ pub use port::{
     ProviderResponseReconciliationItemStatus, ProviderResponseReconciliationObservedTextState,
     ProviderResponseReconciliationPhase, ProviderResponseReconciliationResponseStatus,
     ProviderResponseReconciliationTextPresence, ProviderResponseReconciliationTextRelation,
-    RenderedProjection, RenderedProjectionDiff, RenderedProjectionError, RenderedProjectionNode,
-    ToolCall, ToolOutput,
+    RenderedProjection, RenderedProjectionDiffMarker, RenderedProjectionError,
+    RenderedProjectionNode, ToolCall, ToolOutput,
 };

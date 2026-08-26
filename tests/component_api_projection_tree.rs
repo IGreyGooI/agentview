@@ -1,5 +1,5 @@
 use agentview::component::{
-    execution::ProviderEvent,
+    execution::{ProviderEvent, RenderedProjectionDiffMarker},
     prelude::{component, view, Component, EventInput},
     ComponentHost,
 };
@@ -285,7 +285,7 @@ fn diff_root_retains_stable_item_provenance_and_complete_current_pom() {
         .unwrap();
     assert_eq!(first_node.items().len(), 1);
     assert_eq!(first_node.diffs().len(), 1);
-    let first_diff = &first_node.diffs()[0];
+    let first_diff: &RenderedProjectionDiffMarker = &first_node.diffs()[0];
     assert_eq!(first_diff.item_index(), 0);
     assert_eq!(first_diff.slot(), "state");
     let first_prompt = rendered(&first_node.items()[first_diff.item_index()]);

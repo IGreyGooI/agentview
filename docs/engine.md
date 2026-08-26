@@ -108,6 +108,11 @@ history。
 5. provider-neutral item 再编码成 Responses `instructions` 和 `input` items；
 6. 新输入与当前 wire-legal history 组成本轮不可变 request snapshot。
 
+完整 projection 中的 `RenderedProjectionDiffMarker` 只是 `#[diff]` 产生的声明元数据，不是已经
+计算出的 delta。它的 `item_index` 定位本轮完整 item；ProviderPort 再把 node identity、
+node-local structural path 和 diff slot 组成 memo key，并根据私有 baseline 计算 `full`、`delta`
+或 `omit`。
+
 这不是对渲染字符串做文本 diff。diff 的地址是：
 
 ```text
@@ -299,7 +304,225 @@ ToolCall lane 在完整 item done 后即可启动，不等待 `response.complete
 完成的工具副作用。因此普通工具语义是 at-least-once；需要 exactly-once 的业务必须使用稳定
 幂等键或 effect journal。
 
-## 7. Unsupported ToolCall
+## 7. 应用编排与 AgentLoop
+
+`ApplicationHost` 只执行一次 reaction；`AgentLoop` 是它上面的长期应用编排层。一个
+`AgentLoop` 长期持有同一组：
+
+- `ComponentHost`，包括 root Component、props 和 retained Signal state；
+- `ApplicationHost` 及其 `ProviderPort`；
+- mounted Component task registry；
+- 单调递增、不会丢通知的 wake epoch。
+
+`AgentLoop` 根据 Component 在本轮给出的 disposition，决定清理完成后立即开始下一次 reaction，
+还是等待 wake。它不包含业务 reducer，也不把自身或 `ApplicationHost` 暴露给 Component。
+
+Loop policy 的语义 owner 必须是 mounted Component tree。Component 通过 `use_loop()` 决定正常
+流程是立即继续还是等待，并通过 `use_task()` 持有的 wake capability 请求从等待中继续；
+`AgentLoop` 只机械地持有 Host、task registry 和 wake epoch，并在安全边界执行这些决定。它不得从
+Signal dirty、Provider EOF、CLI 读取或某个 command 名称自行推断下一轮 reaction。
+
+```text
+AgentLoop
+  | owns
+  +-- ComponentHost -- root Component + Signal state
+  +-- ApplicationHost -- one reaction at a time
+  |     +-- ProviderPort
+  +-- Component task registry
+  +-- wake epoch
+
+reaction:
+  render complete projection
+    -> ApplicationHost dispatch
+    -> ProviderEvents -> Component handlers
+    -> cleanup
+    -> continue_now | continue_on_wake
+```
+
+### 唯一的 Component 入口
+
+应用的前端定义只有一个普通 root Component：
+
+```rust
+#[component]
+fn chess_agent(props: ChessAgentProps) -> Component {
+    // use_signal, use_provider_event_handler, use_loop and use_task
+}
+```
+
+root 不接收 `EventInput`，不返回特殊的 completion/program 类型，也不需要
+`ChessApplication`、`ComponentAgent` 或 `ApplicationReducer` trait。业务 reducer 是应用自己的
+普通函数，由 Event handler 调用并把新状态写入 Signal。应用作者也不需要直接编排
+`ApplicationHost` 或 `ComponentReactionRuntime`；这些属于 Engine 和低层显式 reaction API。
+
+每次 reaction 面向 Provider 的结果仍然是完整 `RenderedProjection`。Engine 可以跳过 clean
+Component 的重复执行并复用 retained fragment，也可以在整棵 tree 都 clean 时复用缓存结果；这只
+是 render 优化，绝不能把 partial projection 交给 ProviderPort。Signal dirty 表示 projection 需要
+重算，不代表 AgentLoop 应该自动开始下一次 Provider reaction。
+
+### Skill / CLI frontend
+
+Skill 模式没有框架保留的 `observe` 或通用 `act` subcommand。裸调用 CLI 只返回最新 committed
+rendering；其他操作是 mounted Component 定义的 subcommands：
+
+```text
+agentview                       -> latest committed rendering
+agentview <subcommand> <args>   -> Component-defined operation, then latest committed rendering
+```
+
+读取 latest、调用 subcommand 和返回 CLI output 本身都不驱动 render 或下一次 reaction。subcommand
+handler 可以更新 Signal、提交 task 或显式使用 `use_loop()`；正常循环是否推进仍由 Component 决定。
+subcommand 的具体声明语法、参数 schema 和调度形式留到 frontend command API 单独设计。
+
+### `use_provider_event_handler()`
+
+Provider Event handler 在 `view!` 外声明。`view!` 只描述交给 ProviderPort 的完整 projection，不包含
+listener node：
+
+```rust
+#[component]
+fn chess_agent(props: ChessAgentProps) -> Component {
+    let ChessAgentProps { initial_state, board } = props;
+    let state = use_signal(move || initial_state);
+    let event_state = state.clone();
+
+    use_provider_event_handler(
+        ProviderEvent::TEXT,
+        move |event| {
+            let state = event_state.clone();
+            async move {
+                state.set(reduce(event))
+            }
+        },
+    );
+
+    view! {
+        chess_board(board)
+    }
+}
+```
+
+selector 决定 callback 接收的具体 typed Event。listener 可能收到多个 Event，因此参数不是一个已经
+创建好的 Future，而是每次调用都创建新 Future 的 callback。概念签名是：
+
+```rust
+pub fn use_provider_event_handler<Event, Handler, HandlerFuture, Error>(
+    selector: ProviderEventSelector<Event>,
+    handler: Handler,
+)
+where
+    Event: Clone + Send + Sync + 'static,
+    Handler: FnMut(Event) -> HandlerFuture + Send + 'static,
+    HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+    Error: Display + Send + 'static;
+```
+
+`Future` 是异步执行形式，`Result` 是 Future 的输出；二者不是互斥选择。Runtime 必须完整 `await`
+handler Future，并把 returned error 或 panic 作为当前 reaction 的 handler fault。
+
+handler registration 和一次 reaction 的 dispatch binding 是两层不同生命周期：
+
+```text
+MountedProviderEventHandler
+  identity = ComponentId + HookSite + MountGeneration
+  selector + current callback
+  retained across reactions
+            |
+            | bind for each render/reaction generation
+            v
+ReactionProviderEventBinding
+  dispatches only the current ProviderEvent stream
+  dropped when the reaction completes or is cancelled
+```
+
+successful rerender 原子更新 mounted slot 中的 callback capture；失败或 abandoned render 丢弃
+candidate，继续保留上一版 callback。clean Component 没有重复执行时，mounted slot 仍可为下一轮
+生成 binding。Component 从 tree 中卸载或显式 remount 时删除 slot；旧 binding 和旧 callback 不得
+进入新 mount。
+
+同一个 Provider Event 匹配的 handlers 按 Component 结构顺序和 HookSite 顺序串行 `await`。
+Provider Event 是 typed multicast，不引入 DOM `ElementId`、bubbling 或 capture。
+
+公共 authoring API 不暴露 `EventInput`、`EventListener::observe(...)`、`listen_to(...)` 或用户填写的
+listener identity/version。旧 API 可以暂时保留给 streaming XML 和低层兼容路径，等 streaming
+listener 单独设计后再移除。
+
+`#[component]` proc macro 直接识别调用并分配静态 HookSite：
+
+```text
+use_provider_event_handler(selector, callback)
+  -> HookRenderContext::use_provider_event_handler_at(site, selector, callback)
+  -> render transaction stages a mounted-slot candidate
+  -> successful commit updates the mounted handler registry
+  -> ComponentHost derives the current generation's RenderBindings
+```
+
+实现复用现有 typed `AsyncHandler` 的 Future/error/panic 擦除和 dispatch 逻辑，但不要求先公开一个
+通用 `use_hook<T>`。通用 hook kernel 可以以后与 `use_task` 一起评估，不属于本 API 的前置条件。
+
+### `use_loop()`
+
+Component 用一个窄 handle 决定当前 reaction 之后如何推进：
+
+```rust
+let loop_control = use_loop();
+
+loop_control.continue_now();
+loop_control.continue_on_wake();
+```
+
+`continue_now()` 表示当前 reaction 的 stream、handlers、ToolCall lanes 和 cleanup 全部结束后，立即
+开始下一次 reaction；它不允许在当前 handler 内重入 render 或 Provider。
+
+`continue_on_wake()` 表示 cleanup 后停止推进，直到 wake epoch 超过本轮开始时观察到的 epoch。
+Signal 写入本身不满足这个条件。Component 获得的是 decision handle，不是 `AgentLoop`、
+`ApplicationHost` 或一个可任意操作 Host 生命周期的引用。
+
+### `use_task()` 与显式 wake
+
+`use_task()` 提交由 mounted Component 拥有的后台 future。实际提交是 committed handler 中发生的
+effect，不是 render 本身的副作用：
+
+```rust
+let loop_control = use_loop();
+let task = use_task();
+
+use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    let task = task.clone();
+    let state = state.clone();
+    let loop_control = loop_control.clone();
+
+    async move {
+        task.submit(move |wake| async move {
+            let next = run_background_work(event).await;
+            state.set(next)?;
+            wake.wake();
+            Ok(())
+        })?;
+
+        loop_control.continue_on_wake();
+        Ok(())
+    }
+});
+```
+
+Runtime 为每个 submitted task 提供权限受限的 `TaskWakeHandle`。task 可以在完成前、完成时或长期
+sidecar 的多个进度点调用 `wake.wake()`。`wake()` 只推进所属 Component mount 的 wake epoch；它
+不修改 Signal、不直接 render，也不重入 Provider。task 要把业务结果写入 projection，仍然必须
+显式更新 Signal。
+
+task completion 不隐式 wake。这样，不影响 Agent 推进的 maintenance task 可以安静结束，长期
+sidecar 也能精确选择哪些状态变化需要一次新 reaction。
+
+AgentLoop 在每轮开始时记录 observed epoch。若 task 在 Loop 真正进入等待前调用 `wake()`，本轮
+结束时已经能观察到更大的 epoch，因此立即开始下一轮；若 `wake()` 发生在等待后，watch 通知唤醒
+Loop。多个尚未观察的 wake 可以合并为一次后续 reaction；wake 是状态变化通知，不是任务队列。
+
+`use_task` 的 task 属于 Component mount，而不是某一次 Provider reaction。Component 从 tree 中
+卸载、显式 remount 或 AgentLoop 停止时，Runtime 取消对应 tasks 并使旧 `TaskWakeHandle` 失效；
+旧 task 或旧 wake handle 不能唤醒新的 mount。
+
+## 8. Unsupported ToolCall
 
 正常情况下，Provider request 只暴露当前 Component tree 声明的工具能力。即使 Provider 返回了
 没有可用 Component 的 ToolCall，Engine 也不能伪造 ToolOutput，更不能发送包含裸 ToolCall 的
@@ -320,7 +543,7 @@ ToolCall lane 在完整 item done 后即可启动，不等待 `response.complete
 工具执行失败若属于可表达的业务结果，应由 ToolCall Component 产生明确的失败 ToolOutput；
 基础设施失败才中止 reaction。
 
-## 8. 取消、失败与 remount
+## 9. 取消、失败与 remount
 
 取消 reaction 时：
 
@@ -332,13 +555,15 @@ ToolCall lane 在完整 item done 后即可启动，不等待 `response.complete
 - 不自动发起重试或下一次模型调用。
 
 Provider fault、Component handler fault、lane panic 和 terminal handler fault 都必须带明确 stage 和
-reason。清理完成是终止条件的一部分，不能把仍在运行的 task 留给下一次 reaction。
+reason。清理完成是终止条件的一部分；Provider stream、handler future 和 ToolCall lane 等
+reaction-owned 工作不能遗留到下一次 reaction。`use_task` 提交的工作由 Component mount 拥有，
+不因一次 reaction 正常结束而取消；若 fault 导致 AgentLoop 停止，则随 Loop 一起取消。
 
 Component remount 会创建新的 runtime identity。旧 node 的 Provider history 不撤回；新 identity
 作为新的 projection node 参与后续 reconciliation。旧 mount 的 handler、lane 和 Signal handle
-不得写入新 mount。
+不得写入新 mount；旧 mount 的 tasks 必须取消，旧 `TaskWakeHandle` 不得唤醒新 mount。
 
-## 9. Observability
+## 10. Observability
 
 Observer 观察与 Engine 相同的因果顺序，但不拥有或修改状态。至少应能记录：
 
@@ -354,7 +579,7 @@ Event 不得先被 Observer 或 Component 看见、之后才写 local history。
 `response.completed` 只能表示 Provider terminal frame 已校验，不能把它写成整个 history 的
 commit。
 
-## 10. 必须保持的不变量
+## 11. 必须保持的不变量
 
 1. Component state 是业务权威；Provider history 是私有、可丢弃的 execution context。
 2. 公共 ProviderPort 只接收完整 projection，只输出 provider-neutral Event stream。
@@ -370,8 +595,15 @@ commit。
 11. ApplicationHost 不回滚已成功的 Component state 或外部副作用。
 12. 同一次 reaction 不自动 rerender，也不自动再次调用 Provider。
 13. Provider-specific response id、wire item 和 cache state 不得泄漏到 Component authoring API。
+14. AgentLoop 只根据 Component 显式给出的 `continue_now`，或 `continue_on_wake` 后观察到的新 wake，
+    推进下一次 reaction。
+15. Signal dirty、reaction disposition 和 wake epoch 是三个独立状态；任何一个都不能冒充另外两个。
+16. task completion 不隐式 wake；只有有效 `TaskWakeHandle::wake` 推进对应 mount 的 wake epoch。
+17. 每次交给 ProviderPort 的 projection 都是完整 projection；dirty tracking 只能用于内部 render 优化。
+18. Provider Event handler slot 属于 Component mount；每轮 dispatch binding 只属于当前 reaction generation。
+19. Skill / CLI 读取 latest 和调用 Component subcommand 都不隐式 render，也不拥有正常 loop policy。
 
-## 11. 非目标
+## 12. 非目标
 
 本文不规定：
 

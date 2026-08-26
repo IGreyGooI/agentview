@@ -95,7 +95,7 @@ impl RenderedProjection {
 pub struct RenderedProjectionNode {
     identity: String,
     items: Vec<CanonicalInputItem>,
-    diffs: Vec<RenderedProjectionDiff>,
+    diffs: Vec<RenderedProjectionDiffMarker>,
     diff_templates: Vec<RenderedProjectionItemTemplate>,
 }
 
@@ -112,7 +112,7 @@ impl RenderedProjectionNode {
     pub(crate) fn with_diff_templates(
         identity: impl Into<String>,
         items: Vec<CanonicalInputItem>,
-        diffs: Vec<RenderedProjectionDiff>,
+        diffs: Vec<RenderedProjectionDiffMarker>,
         diff_templates: Vec<RenderedProjectionItemTemplate>,
     ) -> Self {
         Self {
@@ -132,7 +132,7 @@ impl RenderedProjectionNode {
     }
 
     /// Diff-marked POM fragments owned by this Component node.
-    pub fn diffs(&self) -> &[RenderedProjectionDiff] {
+    pub fn diffs(&self) -> &[RenderedProjectionDiffMarker] {
         &self.diffs
     }
 
@@ -227,15 +227,17 @@ impl RenderedProjectionNode {
     }
 }
 
-/// Stable provenance for one `#[diff(slot = "...")]` POM fragment.
+/// Stable marker for one `#[diff(slot = "...")]` POM fragment.
+///
+/// This identifies where a Provider may compute a diff; it is not a computed delta.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RenderedProjectionDiff {
+pub struct RenderedProjectionDiffMarker {
     item_index: usize,
     structural_path: Vec<usize>,
     slot: String,
 }
 
-impl RenderedProjectionDiff {
+impl RenderedProjectionDiffMarker {
     pub(crate) fn new(
         item_index: usize,
         structural_path: Vec<usize>,
@@ -1941,7 +1943,7 @@ mod projection_validation_tests {
     };
 
     use super::{
-        RenderedProjection, RenderedProjectionDiff, RenderedProjectionFragment,
+        RenderedProjection, RenderedProjectionDiffMarker, RenderedProjectionFragment,
         RenderedProjectionItemTemplate, RenderedProjectionNode,
     };
 
@@ -1965,7 +1967,7 @@ mod projection_validation_tests {
         let out_of_bounds_template = RenderedProjectionNode::with_diff_templates(
             "component",
             vec![item()],
-            vec![RenderedProjectionDiff::new(0, vec![0], "state")],
+            vec![RenderedProjectionDiffMarker::new(0, vec![0], "state")],
             vec![RenderedProjectionItemTemplate::new(1, vec![fragment(0)])],
         );
         assert!(RenderedProjection::from_nodes(vec![out_of_bounds_template]).is_err());
@@ -1973,7 +1975,7 @@ mod projection_validation_tests {
         let duplicate_template = RenderedProjectionNode::with_diff_templates(
             "component",
             vec![item()],
-            vec![RenderedProjectionDiff::new(0, vec![0], "state")],
+            vec![RenderedProjectionDiffMarker::new(0, vec![0], "state")],
             vec![
                 RenderedProjectionItemTemplate::new(0, vec![fragment(0)]),
                 RenderedProjectionItemTemplate::new(0, vec![fragment(0)]),
@@ -1984,7 +1986,7 @@ mod projection_validation_tests {
         let out_of_bounds_fragment = RenderedProjectionNode::with_diff_templates(
             "component",
             vec![item()],
-            vec![RenderedProjectionDiff::new(0, vec![0], "state")],
+            vec![RenderedProjectionDiffMarker::new(0, vec![0], "state")],
             vec![RenderedProjectionItemTemplate::new(0, vec![fragment(1)])],
         );
         assert!(RenderedProjection::from_nodes(vec![out_of_bounds_fragment]).is_err());
@@ -1992,7 +1994,7 @@ mod projection_validation_tests {
         let mismatched_fragment_item = RenderedProjectionNode::with_diff_templates(
             "component",
             vec![item(), item()],
-            vec![RenderedProjectionDiff::new(0, vec![0], "state")],
+            vec![RenderedProjectionDiffMarker::new(0, vec![0], "state")],
             vec![RenderedProjectionItemTemplate::new(1, vec![fragment(0)])],
         );
         assert!(RenderedProjection::from_nodes(vec![mismatched_fragment_item]).is_err());
@@ -2000,7 +2002,7 @@ mod projection_validation_tests {
         let orphaned_diff = RenderedProjectionNode::with_diff_templates(
             "component",
             vec![item()],
-            vec![RenderedProjectionDiff::new(0, vec![0], "state")],
+            vec![RenderedProjectionDiffMarker::new(0, vec![0], "state")],
             Vec::new(),
         );
         assert!(RenderedProjection::from_nodes(vec![orphaned_diff]).is_err());

@@ -1,0 +1,326 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Provider 抽象与 HistoryPolicy",
+    "subtitle": "Trait 关系、协议降级，以及具体 Provider 的私有连续性状态",
+    "output": "provider-abstraction-class.html",
+    "animation": "trace",
+    "visual_preset": "classic",
+    "quality_profile": "showcase",
+    "viewBox": [1660, 980],
+    "views": [
+      {
+        "id": "runtime-contract",
+        "label": "运行时中立接口",
+        "focus": ["rendered-projection", "provider-port", "provider-events"],
+        "note": "Component 只依赖 ProviderPort，不感知具体 HTTP 协议。"
+      },
+      {
+        "id": "profile-lowering",
+        "label": "Codex HTTP v1 降级链",
+        "focus": ["canonical-transcript", "history-policy", "codex-history-policy", "codex-history", "request-encoder", "codex-encoder", "wire-request"],
+        "note": "HistoryPolicy 将规范语义投影为协议历史，不负责保存会话状态。"
+      },
+      {
+        "id": "private-state",
+        "label": "Provider 私有状态",
+        "focus": ["responses-provider", "responses-state", "chat-provider", "chat-state"],
+        "note": "连续性与 diff memo 都可丢弃；Component 投影始终是权威状态。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "rendered-projection",
+      "type": "frontend",
+      "label": "RenderedProjection",
+      "sublabel": "完整、Provider-neutral 状态",
+      "pos": [60, 115],
+      "size": [210, 72]
+    },
+    {
+      "id": "provider-port",
+      "type": "external",
+      "label": "ProviderPort",
+      "sublabel": "trait · execute(projection)",
+      "tag": "Send",
+      "pos": [365, 110],
+      "size": [230, 82]
+    },
+    {
+      "id": "provider-events",
+      "type": "messagebus",
+      "label": "ProviderEventStream",
+      "sublabel": "Text | ToolCall",
+      "pos": [690, 115],
+      "size": [220, 72]
+    },
+    {
+      "id": "responses-provider",
+      "type": "backend",
+      "label": "AsyncOpenAiResponsesProvider",
+      "sublabel": "impl ProviderPort · Responses API",
+      "pos": [90, 350],
+      "size": [270, 82]
+    },
+    {
+      "id": "responses-state",
+      "type": "database",
+      "label": "OpenAiContinuation",
+      "sublabel": "+ ProjectionDiffMemo",
+      "tag": "private / discardable",
+      "pos": [90, 530],
+      "size": [270, 82]
+    },
+    {
+      "id": "chat-provider",
+      "type": "backend",
+      "label": "AsyncOpenAiChatCompletionsProvider",
+      "sublabel": "impl ProviderPort · Chat API",
+      "pos": [90, 690],
+      "size": [270, 82]
+    },
+    {
+      "id": "chat-state",
+      "type": "database",
+      "label": "ChatHistory",
+      "sublabel": "+ ChatDiffMemo",
+      "tag": "private / discardable",
+      "pos": [90, 855],
+      "size": [270, 82]
+    },
+    {
+      "id": "canonical-transcript",
+      "type": "messagebus",
+      "label": "CanonicalTranscript",
+      "sublabel": "ordered CanonicalInputItem",
+      "pos": [500, 350],
+      "size": [245, 82]
+    },
+    {
+      "id": "history-policy",
+      "type": "external",
+      "label": "HistoryPolicy",
+      "sublabel": "trait · project_history(&transcript)",
+      "tag": "stateless lowering",
+      "pos": [835, 345],
+      "size": [270, 92]
+    },
+    {
+      "id": "codex-history-policy",
+      "type": "backend",
+      "label": "CodexHttpV1HistoryPolicy",
+      "sublabel": "impl HistoryPolicy",
+      "pos": [835, 525],
+      "size": [270, 78]
+    },
+    {
+      "id": "codex-history",
+      "type": "database",
+      "label": "CodexHttpV1History",
+      "sublabel": "instructions + input",
+      "pos": [1185, 525],
+      "size": [235, 78]
+    },
+    {
+      "id": "request-encoder",
+      "type": "external",
+      "label": "ProviderRequestEncoder",
+      "sublabel": "trait · encode_request(&transcript)",
+      "tag": "wire boundary",
+      "pos": [835, 685],
+      "size": [270, 92]
+    },
+    {
+      "id": "codex-encoder",
+      "type": "backend",
+      "label": "CodexHttpV1Encoder",
+      "sublabel": "impl ProviderRequestEncoder",
+      "pos": [1185, 690],
+      "size": [235, 82]
+    },
+    {
+      "id": "wire-request",
+      "type": "cloud",
+      "label": "CodexHttpV1Request",
+      "sublabel": "serialized wire request",
+      "pos": [1185, 855],
+      "size": [235, 76]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "运行时中立契约",
+      "wraps": ["rendered-projection", "provider-port", "provider-events"],
+      "pad": 26
+    },
+    {
+      "kind": "region",
+      "label": "具体 Provider：私有连续性与差分缓存",
+      "wraps": ["responses-provider", "responses-state", "chat-provider", "chat-state"],
+      "pad": 28
+    },
+    {
+      "kind": "region",
+      "label": "规范语义 → Provider profile → wire request",
+      "wraps": ["canonical-transcript", "history-policy", "codex-history-policy", "codex-history", "request-encoder", "codex-encoder", "wire-request"],
+      "pad": 28
+    }
+  ],
+  "connections": [
+    {
+      "id": "projection-to-port",
+      "from": "rendered-projection",
+      "to": "provider-port",
+      "label": "execute(projection)",
+      "variant": "emphasis",
+      "labelAt": [295, 206]
+    },
+    {
+      "id": "port-to-events",
+      "from": "provider-port",
+      "to": "provider-events",
+      "label": "Result<stream, fault>",
+      "variant": "emphasis",
+      "labelAt": [643, 206]
+    },
+    {
+      "id": "responses-implements-port",
+      "from": "responses-provider",
+      "to": "provider-port",
+      "label": "implements",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "chat-implements-port",
+      "from": "chat-provider",
+      "to": "provider-port",
+      "label": "implements",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [[40, 731], [40, 235], [480, 235]],
+      "labelAt": [70, 650]
+    },
+    {
+      "id": "responses-owns-state",
+      "from": "responses-provider",
+      "to": "responses-state",
+      "label": "owns",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [225, 472]
+    },
+    {
+      "id": "chat-owns-state",
+      "from": "chat-provider",
+      "to": "chat-state",
+      "label": "owns",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [225, 812]
+    },
+    {
+      "id": "provider-reconciles-transcript",
+      "from": "responses-provider",
+      "to": "canonical-transcript",
+      "label": "reconciles",
+      "variant": "emphasis"
+    },
+    {
+      "id": "transcript-to-policy",
+      "from": "canonical-transcript",
+      "to": "history-policy",
+      "label": "projects",
+      "variant": "emphasis"
+    },
+    {
+      "id": "policy-implementation",
+      "from": "codex-history-policy",
+      "to": "history-policy",
+      "label": "implements",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "policy-output",
+      "from": "codex-history-policy",
+      "to": "codex-history",
+      "label": "returns",
+      "variant": "emphasis"
+    },
+    {
+      "id": "encoder-implementation",
+      "from": "codex-encoder",
+      "to": "request-encoder",
+      "label": "implements",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "right",
+      "route": "straight",
+      "labelAt": [1145, 716]
+    },
+    {
+      "id": "encoder-owns-policy",
+      "from": "codex-encoder",
+      "to": "codex-history-policy",
+      "label": "owns / calls",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "history-to-encoder",
+      "from": "codex-history",
+      "to": "codex-encoder",
+      "label": "profile input",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight",
+      "labelAt": [1360, 646]
+    },
+    {
+      "id": "encoder-to-wire",
+      "from": "codex-encoder",
+      "to": "wire-request",
+      "label": "encodes",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [1303, 812]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "HistoryPolicy 是什么",
+      "items": [
+        "把 CanonicalTranscript 投影成某个协议 profile 的历史形状",
+        "无会话所有权；输入相同则语义结果相同",
+        "CodexHttpV1HistoryPolicy 的输出是 instructions + input"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "真正保存历史的是谁",
+      "items": [
+        "Responses Provider 私有保存 OpenAiContinuation",
+        "Chat Provider 私有保存 ChatHistory",
+        "ProjectionDiffMemo / ChatDiffMemo 只是可丢弃优化"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "权威状态",
+      "items": [
+        "RenderedProjection 是 Component 的完整当前状态",
+        "Provider 私有 continuation 可随时重建或丢弃",
+        "ProviderPort 隔离运行时与具体传输协议"
+      ]
+    }
+  ]
+}

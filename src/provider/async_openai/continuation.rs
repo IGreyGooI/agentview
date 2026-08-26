@@ -1378,7 +1378,7 @@ mod tests {
 
     use crate::{
         component::execution::{
-            ProjectionExecutionScope, RenderedProjection, RenderedProjectionDiff,
+            ProjectionExecutionScope, RenderedProjection, RenderedProjectionDiffMarker,
             RenderedProjectionFragment, RenderedProjectionItemTemplate, RenderedProjectionNode,
         },
         pom::{BlockChildren, Document, ResolvedDocument, TextNode, XmlNode},
@@ -1445,7 +1445,7 @@ mod tests {
                 ConversationRole::User,
                 ResolvedDocument::new(BlockChildren::new()),
             )],
-            vec![RenderedProjectionDiff::new(0, vec![0], "state")],
+            vec![RenderedProjectionDiffMarker::new(0, vec![0], "state")],
             vec![RenderedProjectionItemTemplate::new(
                 0,
                 vec![RenderedProjectionFragment::Diff {
