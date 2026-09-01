@@ -1,15 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
-    panic::{catch_unwind, AssertUnwindSafe},
     pin::Pin,
 };
 
-use futures::FutureExt;
-
 use crate::{
     component::{
-        execution::{RenderedProjection, RenderedProjectionNode},
-        signal::{SignalRenderError, SignalRenderTransaction, SignalRuntime},
+        execution::{DriverDemandHandle, RenderedProjection, RenderedProjectionNode},
+        signal::{
+            SignalMountTransition, SignalRenderError, SignalRenderTransaction, SignalRuntime,
+        },
+        task::MountTaskHandle,
         ComponentId,
     },
     pom::{BlockChildren, Document, ResolvedDocument},
@@ -17,6 +17,7 @@ use crate::{
 };
 
 use super::{
+    async_task::MountTaskStart,
     capture::{
         build_projection_items, ComponentCaptureError, ProjectionFragmentCapture,
         ProjectionRunCapture,
@@ -24,9 +25,8 @@ use super::{
     declaration::{ComponentNode, Placement, RepeatableRender, ScopeRender},
     event_input::EventInputOrigin,
     event_listener::EventListenerDispatchFault,
-    handler::panic_message,
     native_tool::{await_output, NativeToolCallDeclaration, NativeToolDispatchFault},
-    render_context::{HookRenderAbort, HookRenderContext},
+    render_context::HookRenderContext,
     streaming_xml::{
         MountedStreamingRoute, ParsedContractEvent, StreamingXmlDispatchFault,
         StreamingXmlMountFault,
@@ -54,32 +54,123 @@ type NativeToolFuture = Pin<
 pub(crate) struct ComponentRenderStage<Root> {
     projection: RenderedProjection,
     bindings: RenderBindings<Root>,
+    task_starts: Vec<MountTaskStart>,
+}
+
+/// One complete render candidate whose hook topology is not committed yet.
+pub(crate) struct ComponentRenderCandidate<'runtime, Root> {
+    stage: ComponentRenderStage<Root>,
+    system_candidate: Option<ResolvedDocument>,
+    signal_render: SignalRenderTransaction<'runtime>,
+}
+
+impl<Root> ComponentRenderCandidate<'_, Root>
+where
+    Root: Send + Sync + 'static,
+{
+    pub(crate) fn stage(&self) -> &ComponentRenderStage<Root> {
+        &self.stage
+    }
+
+    pub(crate) fn stage_mut(&mut self) -> &mut ComponentRenderStage<Root> {
+        &mut self.stage
+    }
+
+    pub(crate) fn has_task_starts(&self) -> bool {
+        !self.stage.task_starts.is_empty()
+    }
+
+    pub(crate) fn commit(self) -> (ComponentRenderStage<Root>, Option<ResolvedDocument>) {
+        let Self {
+            stage,
+            system_candidate,
+            signal_render,
+        } = self;
+        signal_render.commit();
+        (stage, system_candidate)
+    }
+
+    pub(crate) fn commit_deferred(
+        self,
+    ) -> (
+        ComponentRenderStage<Root>,
+        Option<ResolvedDocument>,
+        SignalMountTransition,
+    ) {
+        let Self {
+            stage,
+            system_candidate,
+            signal_render,
+        } = self;
+        let transition = signal_render.commit_deferred();
+        (stage, system_candidate, transition)
+    }
 }
 
 impl<Root> ComponentRenderStage<Root>
 where
     Root: Send + Sync + 'static,
 {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "retained for crate-internal render staging tests without a production caller"
+        )
+    )]
     pub(crate) fn prepare_complete_root_with_signals(
         root: Component,
         event_origin: EventInputOrigin,
         signals: &SignalRuntime,
     ) -> Result<(Self, Option<ResolvedDocument>), ComponentAttemptFault> {
+        Self::prepare_complete_root_with_capabilities(root, event_origin, signals, None)
+    }
+
+    pub(crate) fn prepare_complete_root_with_capabilities(
+        root: Component,
+        event_origin: EventInputOrigin,
+        signals: &SignalRuntime,
+        driver_demand: Option<&DriverDemandHandle>,
+    ) -> Result<(Self, Option<ResolvedDocument>), ComponentAttemptFault> {
+        Ok(Self::prepare_complete_root_candidate_with_capabilities(
+            root,
+            event_origin,
+            signals,
+            driver_demand,
+            None,
+        )?
+        .commit())
+    }
+
+    pub(crate) fn prepare_complete_root_candidate_with_capabilities<'runtime>(
+        root: Component,
+        event_origin: EventInputOrigin,
+        signals: &'runtime SignalRuntime,
+        driver_demand: Option<&DriverDemandHandle>,
+        tasks: Option<&MountTaskHandle>,
+    ) -> Result<ComponentRenderCandidate<'runtime, Root>, ComponentAttemptFault> {
         let mut signal_render = signals
             .begin_render()
             .map_err(ComponentAttemptFault::signal)?;
-        let prepared = Self::mount(root, event_origin, &mut signal_render)?;
-        signal_render.commit();
-        Ok(prepared)
+        let (stage, system_candidate) =
+            Self::mount(root, event_origin, &mut signal_render, driver_demand, tasks)?;
+        Ok(ComponentRenderCandidate {
+            stage,
+            system_candidate,
+            signal_render,
+        })
     }
 
     fn mount(
         root: Component,
         event_origin: EventInputOrigin,
         signal_render: &mut SignalRenderTransaction<'_>,
+        driver_demand: Option<&DriverDemandHandle>,
+        tasks: Option<&MountTaskHandle>,
     ) -> Result<(Self, Option<ResolvedDocument>), ComponentAttemptFault> {
         let mut listeners = Vec::new();
         let mut native_tools = Vec::new();
+        let mut task_starts = Vec::new();
         let root_id = ComponentId::root();
         let mut capture = RenderCapture::new(root_id.clone());
         let mut scope_cursor = 0;
@@ -93,9 +184,12 @@ where
             None,
             0,
             event_origin,
+            driver_demand,
+            tasks,
             signal_render,
             &mut listeners,
             &mut native_tools,
+            &mut task_starts,
             &mut capture,
         );
         rendered?;
@@ -124,6 +218,7 @@ where
                     faulted: false,
                     marker: std::marker::PhantomData,
                 },
+                task_starts,
             },
             system_candidate,
         ))
@@ -137,15 +232,22 @@ where
         self.projection = projection;
     }
 
+    pub(crate) fn into_execution_parts(self) -> (RenderBindings<Root>, Vec<MountTaskStart>) {
+        (self.bindings, self.task_starts)
+    }
+
+    #[cfg(test)]
     pub(crate) fn into_bindings(self) -> RenderBindings<Root> {
+        debug_assert!(self.task_starts.is_empty());
         self.bindings
     }
 }
 
 /// Generation-local event routes, streaming parsers, and async handlers.
 ///
-/// Dropping this value abandons parser accumulators and terminal handlers. Only
-/// [`finish_normal`](Self::finish_normal) performs semantic stream completion.
+/// Dropping this value abandons parser accumulators. Only
+/// [`finish_normal`](Self::finish_normal) performs semantic stream completion
+/// and dispatches diagnostics discovered at EOF.
 pub(crate) struct RenderBindings<Root> {
     listeners: Vec<MountedListener>,
     native_tools: Vec<NativeToolCallDeclaration>,
@@ -162,16 +264,9 @@ where
     /// Dispatch one immutable root event without rendering.
     pub(crate) async fn dispatch(&mut self, event: Root) -> Result<(), ComponentAttemptFault> {
         self.ensure_open()?;
-        let result = AssertUnwindSafe(self.dispatch_inner(event))
-            .catch_unwind()
-            .await;
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(fault)) => self.abort(fault),
-            Err(panic) => self.abort(ComponentAttemptFault::AttemptPanicked {
-                phase: "dispatch",
-                message: panic_message(&*panic),
-            }),
+        match self.dispatch_inner(event).await {
+            Ok(()) => Ok(()),
+            Err(fault) => self.abort(fault),
         }
     }
 
@@ -206,70 +301,49 @@ where
     }
 
     async fn dispatch_inner(&mut self, event: Root) -> Result<(), ComponentAttemptFault> {
-        let mut parsed_by_listener = (0..self.listeners.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
+        let mut parsed_events = Vec::new();
         for route in &mut self.streaming_routes {
-            let parsed = route
-                .dispatch_root(&event)
-                .map_err(ComponentAttemptFault::streaming_input)?;
-            queue_parsed_events(parsed, &mut parsed_by_listener)?;
+            parsed_events.extend(
+                route
+                    .dispatch_root(&event)
+                    .map_err(ComponentAttemptFault::streaming_input)?,
+            );
         }
 
-        for (listener_index, parsed) in parsed_by_listener.into_iter().enumerate() {
-            let listener = self.listeners.get_mut(listener_index).ok_or_else(|| {
-                ComponentAttemptFault::RuntimeInvariant {
-                    message: format!("missing listener at index {listener_index}"),
-                }
-            })?;
+        // Raw observers see the provider event before handlers for events derived from it.
+        for listener in &mut self.listeners {
             listener.dispatch_root(&event).await?;
-            for parsed in parsed {
-                dispatch_parsed(listener, parsed).await?;
-            }
+        }
+        for parsed in parsed_events {
+            dispatch_parsed_at(&mut self.listeners, parsed).await?;
         }
         Ok(())
     }
 
-    /// Finish parsers and await terminal handlers after normal Provider EOF.
+    /// Finish parsers and await diagnostics discovered at normal Provider EOF.
     pub(crate) async fn finish_normal(&mut self) -> Result<(), ComponentAttemptFault> {
         self.ensure_open()?;
-        let result = AssertUnwindSafe(self.finish_normal_inner())
-            .catch_unwind()
-            .await;
-        match result {
-            Ok(Ok(())) => {
+        match self.finish_normal_inner().await {
+            Ok(()) => {
                 self.finished = true;
                 Ok(())
             }
-            Ok(Err(fault)) => self.abort(fault),
-            Err(panic) => self.abort(ComponentAttemptFault::AttemptPanicked {
-                phase: "finish",
-                message: panic_message(&*panic),
-            }),
+            Err(fault) => self.abort(fault),
         }
     }
 
     async fn finish_normal_inner(&mut self) -> Result<(), ComponentAttemptFault> {
-        let mut parsed_by_listener = (0..self.listeners.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
+        let mut parsed_events = Vec::new();
         for route in &mut self.streaming_routes {
-            let parsed = route
-                .finish()
-                .map_err(ComponentAttemptFault::streaming_input)?;
-            queue_parsed_events(parsed, &mut parsed_by_listener)?;
+            parsed_events.extend(
+                route
+                    .finish()
+                    .map_err(ComponentAttemptFault::streaming_input)?,
+            );
         }
 
-        for (listener_index, parsed) in parsed_by_listener.into_iter().enumerate() {
-            let listener = self.listeners.get_mut(listener_index).ok_or_else(|| {
-                ComponentAttemptFault::RuntimeInvariant {
-                    message: format!("missing listener at index {listener_index}"),
-                }
-            })?;
-            for parsed in parsed {
-                dispatch_parsed(listener, parsed).await?;
-            }
-            listener.finish().await?;
+        for parsed in parsed_events {
+            dispatch_parsed_at(&mut self.listeners, parsed).await?;
         }
         Ok(())
     }
@@ -290,23 +364,21 @@ where
     }
 }
 
-fn queue_parsed_events(
-    events: Vec<ParsedContractEvent>,
-    by_listener: &mut [Vec<ParsedContractEvent>],
+async fn dispatch_parsed_at(
+    listeners: &mut [MountedListener],
+    event: ParsedContractEvent,
 ) -> Result<(), ComponentAttemptFault> {
-    for event in events {
-        let listener_index = match &event {
-            ParsedContractEvent::Decoded { listener_index, .. }
-            | ParsedContractEvent::Invalid { listener_index, .. } => *listener_index,
-        };
-        let queue = by_listener.get_mut(listener_index).ok_or_else(|| {
-            ComponentAttemptFault::RuntimeInvariant {
-                message: format!("streaming parser targeted missing listener {listener_index}"),
-            }
-        })?;
-        queue.push(event);
-    }
-    Ok(())
+    let listener_index = match &event {
+        ParsedContractEvent::Decoded { listener_index, .. }
+        | ParsedContractEvent::Invalid { listener_index, .. }
+        | ParsedContractEvent::Lifecycle { listener_index, .. } => *listener_index,
+    };
+    let listener = listeners.get_mut(listener_index).ok_or_else(|| {
+        ComponentAttemptFault::RuntimeInvariant {
+            message: format!("streaming parser targeted missing listener {listener_index}"),
+        }
+    })?;
+    dispatch_parsed(listener, event).await
 }
 
 async fn dispatch_parsed(
@@ -315,10 +387,13 @@ async fn dispatch_parsed(
 ) -> Result<(), ComponentAttemptFault> {
     match event {
         ParsedContractEvent::Decoded { value, .. } => {
-            listener.dispatch_streaming(Some(value), None).await
+            listener.dispatch_streaming_decoded(Some(value), None).await
         }
         ParsedContractEvent::Invalid { diagnostic, .. } => {
-            listener.dispatch_streaming(None, Some(diagnostic)).await
+            listener.dispatch_streaming_invalid(diagnostic).await
+        }
+        ParsedContractEvent::Lifecycle { phase, element, .. } => {
+            listener.dispatch_streaming_phase(phase, element).await
         }
     }
 }
@@ -333,9 +408,12 @@ fn visit_render(
     forced: Option<Placement>,
     depth: usize,
     event_origin: EventInputOrigin,
+    driver_demand: Option<&DriverDemandHandle>,
+    tasks: Option<&MountTaskHandle>,
     signal_render: &mut SignalRenderTransaction<'_>,
     listeners: &mut Vec<MountedListener>,
     native_tools: &mut Vec<NativeToolCallDeclaration>,
+    task_starts: &mut Vec<MountTaskStart>,
     capture: &mut RenderCapture,
 ) -> Result<(), ComponentAttemptFault> {
     ensure_depth(depth)?;
@@ -352,9 +430,12 @@ fn visit_render(
                     forced,
                     depth + 1,
                     event_origin,
+                    driver_demand,
+                    tasks,
                     signal_render,
                     listeners,
                     native_tools,
+                    task_starts,
                     capture,
                 )?;
                 structural_path.pop();
@@ -387,12 +468,19 @@ fn visit_render(
             };
             capture.register_component(component_id.clone())?;
             let rendered = match render {
-                ScopeRender::Fresh(render) => invoke_fresh(function, render)?,
+                ScopeRender::Fresh(render) => invoke_fresh(render),
                 ScopeRender::Repeatable(renderer) => invoke_repeatable(
                     signal_render,
                     component_id.clone(),
                     &renderer,
                     forced != Some(Placement::SystemOnce),
+                    HookInvocationContext {
+                        event_origin,
+                        driver_demand,
+                        tasks,
+                        listeners,
+                        task_starts,
+                    },
                 )?,
             };
             let mut child_cursor = 0;
@@ -406,9 +494,12 @@ fn visit_render(
                 forced,
                 depth + 1,
                 event_origin,
+                driver_demand,
+                tasks,
                 signal_render,
                 listeners,
                 native_tools,
+                task_starts,
                 capture,
             )?;
         }
@@ -419,7 +510,7 @@ fn visit_render(
                     function,
                     render: ScopeRender::Fresh(render),
                 } if crate::component::authoring::__private::is_system_once_boundary(function) => {
-                    invoke_fresh(function, render)?
+                    invoke_fresh(render)
                 }
                 node => Component::from_node(node),
             };
@@ -432,9 +523,12 @@ fn visit_render(
                 resolved,
                 depth + 1,
                 event_origin,
+                driver_demand,
+                tasks,
                 signal_render,
                 listeners,
                 native_tools,
+                task_starts,
                 capture,
             )?;
         }
@@ -465,13 +559,17 @@ fn visit_render(
                     forced,
                     depth + 1,
                     event_origin,
+                    driver_demand,
+                    tasks,
                     signal_render,
                     listeners,
                     native_tools,
+                    task_starts,
                     capture,
                 )?;
             }
         }
+        #[cfg(any(feature = "legacy-provider-port", test))]
         ComponentNode::EventListener(declaration) => {
             if forced == Some(Placement::SystemOnce) {
                 return Err(ComponentAttemptFault::SystemAttemptLocal {
@@ -480,6 +578,18 @@ fn visit_render(
                 });
             }
             listeners.push(MountedListener::new_event(declaration, event_origin)?);
+        }
+        ComponentNode::StreamingXmlTag(declaration) => {
+            if forced == Some(Placement::SystemOnce) {
+                return Err(ComponentAttemptFault::SystemAttemptLocal {
+                    component: owner.to_string(),
+                    capability: "StreamingXml/EventInput",
+                });
+            }
+            listeners.push(MountedListener::new_streaming_tag(
+                *declaration,
+                event_origin,
+            )?);
         }
         ComponentNode::XmlStreamingToolCall(declaration) => {
             let placement = forced.unwrap_or(Placement::User);
@@ -508,11 +618,16 @@ fn visit_render(
     Ok(())
 }
 
-fn invoke_fresh(
-    function: &'static str,
-    renderer: Box<dyn FnOnce() -> Component + Send + 'static>,
-) -> Result<Component, ComponentAttemptFault> {
-    catch_unwind(AssertUnwindSafe(renderer)).map_err(|panic| render_panic(function, &*panic))
+fn invoke_fresh(renderer: Box<dyn FnOnce() -> Component + Send + 'static>) -> Component {
+    renderer()
+}
+
+struct HookInvocationContext<'render> {
+    event_origin: EventInputOrigin,
+    driver_demand: Option<&'render DriverDemandHandle>,
+    tasks: Option<&'render MountTaskHandle>,
+    listeners: &'render mut Vec<MountedListener>,
+    task_starts: &'render mut Vec<MountTaskStart>,
 }
 
 fn invoke_repeatable(
@@ -520,40 +635,44 @@ fn invoke_repeatable(
     component: ComponentId,
     renderer: &RepeatableRender,
     attempt_local_allowed: bool,
+    context: HookInvocationContext<'_>,
 ) -> Result<Component, ComponentAttemptFault> {
-    let rendered = catch_unwind(AssertUnwindSafe(|| {
-        signals.render_component(component.clone(), |signal_scope| {
+    let HookInvocationContext {
+        event_origin,
+        driver_demand,
+        tasks,
+        listeners,
+        task_starts,
+    } = context;
+    let mut provider_handlers = Vec::new();
+    let rendered = signals
+        .render_component(component, |signal_scope| {
             let mut hooks = if attempt_local_allowed {
-                HookRenderContext::new(signal_scope)
+                HookRenderContext::new(
+                    signal_scope,
+                    event_origin,
+                    &mut provider_handlers,
+                    task_starts,
+                    driver_demand,
+                    tasks,
+                )
             } else {
-                HookRenderContext::for_system(signal_scope)
+                HookRenderContext::for_system(
+                    signal_scope,
+                    event_origin,
+                    &mut provider_handlers,
+                    task_starts,
+                    driver_demand,
+                    tasks,
+                )
             };
             Ok(renderer(&mut hooks))
         })
-    }));
-    match rendered {
-        Ok(Ok(component)) => Ok(component),
-        Ok(Err(fault)) => Err(ComponentAttemptFault::signal(fault)),
-        Err(panic) => Err(render_panic(component.as_str(), &*panic)),
+        .map_err(ComponentAttemptFault::signal)?;
+    for declaration in provider_handlers {
+        listeners.push(MountedListener::new_event(declaration, event_origin)?);
     }
-}
-
-fn render_panic(component: &str, panic: &(dyn std::any::Any + Send)) -> ComponentAttemptFault {
-    if let Some(HookRenderAbort::Signal(fault)) = panic.downcast_ref::<HookRenderAbort>() {
-        return ComponentAttemptFault::signal(fault.clone());
-    }
-    if let Some(HookRenderAbort::SystemAttemptLocal { capability }) =
-        panic.downcast_ref::<HookRenderAbort>()
-    {
-        return ComponentAttemptFault::SystemAttemptLocal {
-            component: component.to_owned(),
-            capability,
-        };
-    }
-    ComponentAttemptFault::RenderPanicked {
-        component: component.to_owned(),
-        message: panic_message(panic),
-    }
+    Ok(rendered)
 }
 
 fn ensure_depth(depth: usize) -> Result<(), ComponentAttemptFault> {
@@ -789,12 +908,10 @@ pub enum ComponentAttemptFault {
         component: String,
         capability: &'static str,
     },
-    #[error("component `{component}` panicked during render: {message}")]
-    RenderPanicked { component: String, message: String },
-    #[error("render bindings panicked during {phase}: {message}")]
-    AttemptPanicked {
-        phase: &'static str,
-        message: String,
+    #[error("component `{component}` requires unavailable runtime capability `{capability}`")]
+    HookCapabilityUnavailable {
+        component: String,
+        capability: &'static str,
     },
     #[error("signal runtime fault: {message}")]
     Signal { message: String },
@@ -836,7 +953,7 @@ impl ComponentAttemptFault {
             StreamingXmlMountFault::ForeignEventInput { identity } => {
                 Self::ForeignEventInput { identity }
             }
-            fault @ StreamingXmlMountFault::DuplicateTarget { .. } => Self::StreamingMount {
+            fault @ StreamingXmlMountFault::InvalidTag { .. } => Self::StreamingMount {
                 message: fault.to_string(),
             },
         }

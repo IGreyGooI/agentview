@@ -2,7 +2,10 @@ use std::fmt::Write as _;
 
 use crate::{
     pom_renderer::render_pom_document,
-    transcript::{AssistantPhase, CanonicalInputItem, ConversationRole, InstructionAuthority},
+    transcript::{
+        AssistantPhase, AssistantTextStatus, CanonicalInputItem, ConversationRole,
+        InstructionAuthority, ASSISTANT_OUTPUT_INTERRUPTED_MARKER,
+    },
 };
 
 use super::{ProviderFault, RenderedProjection};
@@ -40,12 +43,22 @@ fn render_prompt_item(item: &CanonicalInputItem) -> Result<String, ProviderFault
             };
             (heading.to_owned(), render_pom(pom)?)
         }
-        CanonicalInputItem::AssistantText { text, phase } => {
+        CanonicalInputItem::AssistantText {
+            text,
+            phase,
+            status,
+        } => {
             let heading = match phase {
                 Some(AssistantPhase::Commentary) => "Assistant Commentary",
                 Some(AssistantPhase::FinalAnswer) | None => "Assistant",
             };
-            (heading.to_owned(), text.clone())
+            let content = match status {
+                AssistantTextStatus::Sealed => text.clone(),
+                AssistantTextStatus::Interrupted => {
+                    format!("{text}\n\n## User\n\n{ASSISTANT_OUTPUT_INTERRUPTED_MARKER}")
+                }
+            };
+            (heading.to_owned(), content)
         }
         CanonicalInputItem::ToolCall {
             call_id,
@@ -81,4 +94,26 @@ fn render_pom(pom: &crate::pom::ResolvedDocument) -> Result<String, ProviderFaul
             "provider-neutral prompt renderer could not render canonical POM",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_prompt_item, ASSISTANT_OUTPUT_INTERRUPTED_MARKER};
+    use crate::transcript::CanonicalInputItem;
+
+    #[test]
+    fn interrupted_text_renders_with_the_standard_marker() {
+        let rendered = render_prompt_item(&CanonicalInputItem::interrupted_assistant_text(
+            "visible partial",
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            format!(
+                "## Assistant\n\nvisible partial\n\n## User\n\n{ASSISTANT_OUTPUT_INTERRUPTED_MARKER}"
+            )
+        );
+    }
 }

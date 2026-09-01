@@ -19,6 +19,7 @@ struct ServerState {
     attempts: Arc<AtomicUsize>,
     bodies: mpsc::UnboundedSender<Vec<u8>>,
     replies: &'static [&'static str],
+    failure: Option<StatusCode>,
 }
 
 pub struct ResponsesAcceptanceServer {
@@ -32,6 +33,21 @@ pub struct ResponsesAcceptanceServer {
 impl ResponsesAcceptanceServer {
     pub async fn start(replies: &'static [&'static str]) -> anyhow::Result<Self> {
         anyhow::ensure!(!replies.is_empty(), "mock Responses server needs a reply");
+        Self::start_with_mode(replies, None).await
+    }
+
+    pub async fn start_failure(status: StatusCode) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !status.is_success(),
+            "failure fixture needs a non-success status"
+        );
+        Self::start_with_mode(&["unused"], Some(status)).await
+    }
+
+    async fn start_with_mode(
+        replies: &'static [&'static str],
+        failure: Option<StatusCode>,
+    ) -> anyhow::Result<Self> {
         let (body_tx, body_rx) = mpsc::unbounded_channel();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -42,6 +58,7 @@ impl ResponsesAcceptanceServer {
                 attempts: attempts.clone(),
                 bodies: body_tx,
                 replies,
+                failure,
             });
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
@@ -87,6 +104,9 @@ async fn responses_endpoint(State(state): State<ServerState>, body: Bytes) -> Re
     let attempt = state.attempts.fetch_add(1, Ordering::SeqCst);
     if state.bodies.send(body.to_vec()).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if let Some(status) = state.failure {
+        return status.into_response();
     }
     let next = state
         .replies

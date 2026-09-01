@@ -1,10 +1,11 @@
 # AgentView Derive: POM Documents And Stateful XML Diff
 
-> Status: current POM derive, AST, diff, and rendering subsystem documentation.
-> It does not own the replacement Component author contract, canonical
-> transcript, or Provider HTTP oracle. Final Component syntax is owned by the
-> target fixture and the long-term plan in
-> [`provider-port-application-host-boundary.md`](provider-port-application-host-boundary.md).
+> **Status: current POM derive, AST, diff, and rendering subsystem documentation.** This document
+> owns only POM syntax and subsystem documentation; it does not own the current Component
+> runtime/provider boundaries, replacement Component author contract, canonical transcript, or
+> Provider HTTP oracle. Current Component runtime/provider boundaries are owned by
+> [`engine.md`](engine.md), and implementation sequencing is owned by
+> [`frame-driven-runtime-plan.md`](frame-driven-runtime-plan.md).
 
 This document describes the current `AgentView` derive syntax. The derive now
 builds a typed Prompt Object Model (POM) AST. `Agent` and `AgentViewApp` use

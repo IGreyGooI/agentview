@@ -1,10 +1,18 @@
 use std::sync::{Arc, RwLock};
 
+#[allow(
+    deprecated,
+    reason = "this feature-gated runtime retains the legacy EventInput constructor contract"
+)]
 use crate::component::{
     authoring::{Component, EventInput, Signal},
     ComponentHost, ComponentHostFault, ComponentHostId, SignalAccessError,
 };
 
+#[allow(
+    deprecated,
+    reason = "this feature-gated runtime composes retained ApplicationHost and ProviderPort APIs"
+)]
 use super::{ApplicationHost, ApplicationHostFault, ProviderEvent, ProviderPort};
 
 /// Monotonic identity of one mount in a [`ComponentReactionRuntime`].
@@ -53,8 +61,8 @@ where
     /// Select a mounted Signal as this reaction's authoritative typed output.
     ///
     /// Publication is pending until the complete Provider reaction and all
-    /// terminal handlers succeed. The runtime validates Signal provenance
-    /// before committing it as current output.
+    /// event and EOF diagnostic handlers succeed. The runtime validates Signal
+    /// provenance before committing it as current output.
     pub fn publish(&self, signal: Signal<Output>) -> Result<(), ComponentReactionOutputError> {
         self.publisher.publish(signal)
     }
@@ -193,6 +201,21 @@ where
             .ok_or(ComponentReactionOutputError::Absent { generation })
     }
 
+    fn snapshot_pending(
+        &self,
+        generation: ComponentReactionGeneration,
+    ) -> Result<Signal<Output>, ComponentReactionOutputError> {
+        let state = self.read_state();
+        Self::ensure_generation(&state, generation)?;
+        if !state.reaction_active {
+            return Err(ComponentReactionOutputError::PublicationOutsideReaction { generation });
+        }
+        state
+            .pending
+            .clone()
+            .ok_or(ComponentReactionOutputError::Absent { generation })
+    }
+
     fn commit(
         self: &Arc<Self>,
         generation: ComponentReactionGeneration,
@@ -324,6 +347,10 @@ where
         self.outputs.close(self.generation)
     }
 
+    fn snapshot_pending(&self) -> Result<Signal<Output>, ComponentReactionOutputError> {
+        self.outputs.snapshot_pending(self.generation)
+    }
+
     fn commit(
         mut self,
         signal: Signal<Output>,
@@ -393,6 +420,11 @@ impl<Output> Clone for ComponentReactionOutput<Output> {
 }
 
 /// Owns one stable Component/Application host pair for explicit single reactions.
+#[allow(
+    deprecated,
+    reason = "the compatibility runtime stores the retained deprecated ApplicationHost"
+)]
+#[deprecated(note = "use `Application<P>` as the mounted runtime owner")]
 pub struct ComponentReactionRuntime<P, Props, Output> {
     application: ApplicationHost<P>,
     components: ComponentHost<ComponentReactionProps<Props, Output>>,
@@ -401,6 +433,10 @@ pub struct ComponentReactionRuntime<P, Props, Output> {
     reaction_dispatched: bool,
 }
 
+#[allow(
+    deprecated,
+    reason = "methods implement the deprecated ComponentReactionRuntime constructor and ownership API"
+)]
 impl<P, Props, Output> ComponentReactionRuntime<P, Props, Output>
 where
     Output: Send + Sync + 'static,
@@ -478,6 +514,10 @@ where
     }
 }
 
+#[allow(
+    deprecated,
+    reason = "dispatch preserves the feature-gated ProviderPort compatibility contract"
+)]
 impl<P, Props, Output> ComponentReactionRuntime<P, Props, Output>
 where
     P: ProviderPort,
@@ -495,10 +535,13 @@ where
         }
         self.reaction_dispatched = true;
         let transaction = self.outputs.begin(self.generation)?;
-        self.application
-            .dispatch_llm_reaction(&mut self.components)
-            .await?;
-        let signal = transaction.close()?;
+        let signal = self
+            .application
+            .dispatch_llm_reaction_with_pre_reconcile_capture(&mut self.components, || {
+                transaction.snapshot_pending()
+            })
+            .await??;
+        let _post_reconcile_selection = transaction.close()?;
         if !self.components.owns_signal(&signal) {
             return Err(ComponentReactionOutputError::ForeignSignal {
                 generation: self.generation,

@@ -1,7 +1,13 @@
+#![cfg(feature = "legacy-provider-port")]
+#![allow(
+    deprecated,
+    reason = "this compatibility test intentionally exercises legacy streaming XML event routing"
+)]
+
 use std::{
     collections::VecDeque,
+    convert::Infallible,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use agentview::component::{
@@ -13,8 +19,6 @@ use agentview::component::{
     ComponentHost,
 };
 use async_trait::async_trait;
-use tokio::sync::Notify;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TestDiagnostic {
     InvalidXml(XmlContractDiagnostic),
@@ -22,25 +26,20 @@ enum TestDiagnostic {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ContractState {
-    value: Option<u32>,
+    values: Vec<u32>,
     diagnostic: Option<TestDiagnostic>,
-    finished: bool,
 }
 
 enum ContractAction {
     Decoded(u32),
     Invalid(XmlContractDiagnostic),
-    Finish,
 }
 
 fn reduce_contract(state: &mut ContractState, action: ContractAction) {
     match action {
-        ContractAction::Decoded(value) => state.value = Some(value),
+        ContractAction::Decoded(value) => state.values.push(value),
         ContractAction::Invalid(diagnostic) => {
             state.diagnostic = Some(TestDiagnostic::InvalidXml(diagnostic));
-        }
-        ContractAction::Finish => {
-            state.finished = true;
         }
     }
 }
@@ -48,14 +47,12 @@ fn reduce_contract(state: &mut ContractState, action: ContractAction) {
 #[derive(Clone)]
 struct ApplicationProps {
     state: Arc<Mutex<Option<Signal<ContractState>>>>,
-    finished: Arc<Notify>,
 }
 
 impl ApplicationProps {
     fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(None)),
-            finished: Arc::new(Notify::new()),
         }
     }
 
@@ -71,48 +68,31 @@ impl ApplicationProps {
 }
 
 #[component]
-fn response_contract(
-    state: Signal<ContractState>,
-    finished: Arc<Notify>,
-    text: EventInput<TextTurnEvent>,
-) -> Component {
+fn response_contract(state: Signal<ContractState>) -> Component {
     let decoded_state = state.clone();
     let invalid_state = state.clone();
-    let finish_state = state;
 
-    view! {
-        {
-            XmlStreamingToolCall::contract("streaming-xml.selection", "v1")
-                .empty_element("selection")
-                .required_attribute::<u32>("value")
-                .exactly_one()
-                .listen_to(text)
-                .on_decoded(move |value| {
-                    let state = decoded_state.clone();
-                    async move {
-                        state.update(|state| reduce_contract(state, ContractAction::Decoded(value)))
-                    }
+    XmlStreamingToolCall::contract("streaming-xml.selection", "v1")
+        .empty_element("selection")
+        .required_attribute::<u32>("value")
+        .on_decoded(move |value| {
+            let state = decoded_state.clone();
+            async move {
+                state.update(|state| reduce_contract(state, ContractAction::Decoded(value)))
+            }
+        })
+        .on_invalid(move |diagnostic| {
+            let state = invalid_state.clone();
+            async move {
+                state.update(|state| {
+                    reduce_contract(state, ContractAction::Invalid(diagnostic));
                 })
-                .on_invalid(move |diagnostic| {
-                    let state = invalid_state.clone();
-                    async move {
-                        state.update(|state| {
-                            reduce_contract(state, ContractAction::Invalid(diagnostic));
-                        })
-                    }
-                })
-                .on_finish(move || async move {
-                    finish_state.update(|state| reduce_contract(state, ContractAction::Finish))?;
-                    finished.notify_one();
-                    Ok::<(), agentview::component::SignalAccessError>(())
-                })
-        }
-    }
+            }
+        })
 }
 
 #[component]
-fn application_root(props: ApplicationProps, events: EventInput<ProviderEvent>) -> Component {
-    let text = events.select(ProviderEvent::TEXT);
+fn application_root(props: ApplicationProps, _events: EventInput<ProviderEvent>) -> Component {
     let state = use_signal(ContractState::default);
     *props.state.lock().expect("state exposure lock") = Some(state.clone());
 
@@ -121,7 +101,7 @@ fn application_root(props: ApplicationProps, events: EventInput<ProviderEvent>) 
         streaming_xml_protocol { "Return one typed selection." }
 
         selection_request { "Choose one unsigned integer." }
-        response_contract(state, props.finished, text)
+        response_contract(state)
     }
 }
 
@@ -159,16 +139,12 @@ impl ProviderPort for ScriptedProvider {
 
 async fn execute_script(events: Vec<ProviderEvent>) -> ContractState {
     let props = ApplicationProps::new();
-    let finished = Arc::clone(&props.finished);
     let mut components = ComponentHost::new(application_root, props.clone());
     let mut host = ApplicationHost::new(ScriptedProvider::once(events));
 
     host.dispatch_llm_reaction(&mut components)
         .await
         .expect("Provider reaction completes");
-    tokio::time::timeout(Duration::from_secs(1), finished.notified())
-        .await
-        .expect("normal Provider EOF completes generation-local processors");
     props.snapshot()
 }
 
@@ -182,8 +158,7 @@ async fn valid_stream_updates_authoritative_signal_state() {
     assert_eq!(
         state,
         ContractState {
-            value: Some(7),
-            finished: true,
+            values: vec![7],
             ..ContractState::default()
         }
     );
@@ -196,7 +171,6 @@ async fn invalid_attribute_updates_a_typed_diagnostic() {
     ))])
     .await;
 
-    assert!(state.finished);
     assert!(matches!(
         state.diagnostic,
         Some(TestDiagnostic::InvalidXml(
@@ -211,7 +185,7 @@ async fn invalid_attribute_updates_a_typed_diagnostic() {
 }
 
 #[tokio::test]
-async fn text_events_are_applied_in_stream_order_before_finish() {
+async fn text_events_are_applied_in_stream_order() {
     let state = execute_script(vec![
         ProviderEvent::Text(TextTurnEvent::TextDelta(String::from(
             r#"<selection value="9""#,
@@ -222,7 +196,119 @@ async fn text_events_are_applied_in_stream_order_before_finish() {
     ])
     .await;
 
-    assert_eq!(state.value, Some(9));
-    assert!(state.finished);
+    assert_eq!(state.values, [9]);
     assert_eq!(state.diagnostic, None);
+}
+
+#[tokio::test]
+async fn repeated_elements_are_dispatched_in_stream_order() {
+    let state = execute_script(vec![ProviderEvent::Text(TextTurnEvent::TextComplete(
+        String::from(r#"<selection value="3" /><selection value="5" />"#),
+    ))])
+    .await;
+
+    assert_eq!(state.values, [3, 5]);
+    assert_eq!(state.diagnostic, None);
+}
+
+#[derive(Clone)]
+struct SharedHubProps {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+#[component]
+fn shared_hub_application(props: SharedHubProps, _events: EventInput<ProviderEvent>) -> Component {
+    let decoded_events = Arc::clone(&props.events);
+    let open_events = Arc::clone(&props.events);
+    let complete_events = Arc::clone(&props.events);
+
+    view! {
+        {
+            XmlStreamingToolCall::contract("streaming-xml.shared-selection", "v1")
+                .empty_element("selection")
+                .required_attribute::<u32>("value")
+                .on_decoded(move |value| {
+                    let events = Arc::clone(&decoded_events);
+                    async move {
+                        events.lock().unwrap().push(format!("decoded:{value}"));
+                        Ok::<(), Infallible>(())
+                    }
+                })
+                .on_invalid(|_| async { Ok::<(), Infallible>(()) })
+        }
+        {
+            StreamingXml::tag("selection")
+                .on_open(move |element| {
+                    let events = Arc::clone(&open_events);
+                    async move {
+                        events.lock().unwrap().push(format!(
+                            "open:{}",
+                            element.attr("value").expect("selection value")
+                        ));
+                        Ok::<(), Infallible>(())
+                    }
+                })
+                .on_complete(move |element| {
+                    let events = Arc::clone(&complete_events);
+                    async move {
+                        events.lock().unwrap().push(format!(
+                            "complete:{}:{}",
+                            element.attr("value").expect("selection value"),
+                            element.content
+                        ));
+                        Ok::<(), Infallible>(())
+                    }
+                })
+        }
+    }
+}
+
+#[test]
+fn lifecycle_subscription_is_prompt_free_beside_typed_contract() {
+    let props = SharedHubProps {
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut components = ComponentHost::new(shared_hub_application, props);
+    let rendered = components.render().expect("shared XML declarations render");
+    let projected_items = rendered
+        .projection()
+        .nodes()
+        .iter()
+        .flat_map(|node| node.items())
+        .count();
+
+    assert_eq!(
+        projected_items, 1,
+        "only XmlStreamingToolCall contributes model-visible syntax"
+    );
+}
+
+#[tokio::test]
+async fn typed_contract_and_lifecycle_subscription_share_the_ordered_route_hub() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let props = SharedHubProps {
+        events: Arc::clone(&events),
+    };
+    let mut components = ComponentHost::new(shared_hub_application, props);
+    let mut host = ApplicationHost::new(ScriptedProvider::once(vec![ProviderEvent::Text(
+        TextTurnEvent::TextComplete(String::from(
+            r#"<selection value="4"/><selection value="6"/>"#,
+        )),
+    )]));
+
+    host.dispatch_llm_reaction(&mut components)
+        .await
+        .expect("shared XML route completes");
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "open:4",
+            "decoded:4",
+            "complete:4:",
+            "open:6",
+            "decoded:6",
+            "complete:6:",
+        ]
+    );
 }

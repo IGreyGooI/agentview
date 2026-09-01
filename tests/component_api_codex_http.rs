@@ -199,6 +199,24 @@ fn history_policy_maps_assistant_text_to_output_text() {
 }
 
 #[test]
+fn interrupted_assistant_text_fails_closed_until_wire_grouping_is_supported() {
+    let transcript = CanonicalTranscript::new()
+        .appended(CanonicalInputItem::interrupted_assistant_text(
+            "partial response",
+            None,
+        ))
+        .unwrap();
+
+    let error = CodexHttpV1HistoryPolicy
+        .project_history(&transcript)
+        .expect_err("interrupted text must not be silently encoded as sealed output");
+    assert!(matches!(
+        error,
+        CodexHttpV1Error::InterruptedAssistantTextUnsupported
+    ));
+}
+
+#[test]
 fn codex_function_names_fail_before_an_invalid_request_is_encoded() {
     for name in ["bad.name".to_owned(), "x".repeat(129)] {
         let error = CodexFunctionTool::new(name.clone(), "invalid", json!({}), false)

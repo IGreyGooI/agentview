@@ -7,41 +7,77 @@
 
 use std::{
     collections::BTreeMap,
-    future::Future,
-    sync::{Arc, Mutex},
-    task::Poll,
+    num::{NonZeroU128, NonZeroU64},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
+#[cfg(feature = "legacy-provider-port")]
+use std::{future::Future, sync::Mutex, task::Poll};
 
-use ::async_openai::config::{Config, OpenAIConfig};
+#[cfg(feature = "legacy-provider-port")]
+use ::async_openai::config::Config;
+use ::async_openai::config::OpenAIConfig;
+#[cfg(feature = "legacy-provider-port")]
 use async_trait::async_trait;
-use eventsource_stream::{Event, EventStreamError, Eventsource};
+use eventsource_stream::Event;
+#[cfg(feature = "legacy-provider-port")]
+use eventsource_stream::{EventStreamError, Eventsource};
+#[cfg(feature = "legacy-provider-port")]
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use url::{Host, Url};
 
+#[cfg(feature = "legacy-provider-port")]
+#[allow(
+    deprecated,
+    reason = "the Responses adapter retains a feature-gated ProviderPort compatibility path"
+)]
+use crate::component::execution::{ProviderPort, RenderedProjection};
 use crate::{
     component::execution::{
-        ProviderEvent, ProviderEventStream, ProviderFault, ProviderFaultCode, ProviderIdentity,
-        ProviderPort, RenderedProjection, ToolCall, ToolOutput, ToolOutputSink,
+        reaction::{
+            FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision, ReactionPortFault,
+            ReactionPortFaultKind, TargetDeclaration, TargetEpoch, TargetIdentity,
+        },
+        ProviderFault, ProviderIdentity, ToolCall,
     },
-    llm_call::TextTurnEvent,
     provider::codex_http_v1::CodexHttpV1Encoder,
 };
+#[cfg(feature = "legacy-provider-port")]
+use crate::{
+    component::execution::{
+        ProviderEvent, ProviderEventStream, ProviderFaultCode, ToolOutput, ToolOutputSink,
+    },
+    llm_call::TextTurnEvent,
+};
 
+#[cfg(feature = "legacy-provider-port")]
 use self::continuation::{OpenAiContinuation, ResponsesInputGateReady};
-use self::output::{CompletedOpenAiOutput, OpenAiOutputLedger};
-use self::usage::{observe_response_usage, validated_response_usage, ResponseUsageObserver};
+use self::usage::ResponseUsageObserver;
+#[cfg(feature = "legacy-provider-port")]
+use self::{
+    output::{CompletedOpenAiOutput, OpenAiOutputLedger},
+    usage::{observe_response_usage, validated_response_usage},
+};
 
+#[cfg(feature = "legacy-provider-port")]
 mod artifact_binding;
 mod chat_completions;
+#[cfg(feature = "legacy-provider-port")]
 mod continuation;
 mod faults;
+mod frame_request;
+mod native_reaction;
 mod output;
+mod reaction_fault;
 mod transport;
 mod usage;
 
+#[cfg(feature = "legacy-provider-port")]
 use self::artifact_binding::OpenAiInlineArtifactBinding;
 pub use self::chat_completions::{
     AsyncOpenAiChatCompletionsProvider, OpenAiChatCompletionsError, OpenAiChatCompletionsOptions,
@@ -50,13 +86,16 @@ pub use self::chat_completions::{
 use self::faults::{
     has_plaintext_reasoning_completed_content, has_plaintext_reasoning_lifecycle_content,
     has_unsupported_completed_item, has_unsupported_content_part, has_unsupported_lifecycle_item,
-    is_native_tool_event, output_limit_fault, redacted_status_fault, request_transport_fault,
-    required_string, response_body_limit_fault, response_completed_ledger_fault,
-    response_event_envelope_fault, response_event_shape_fault, response_output_item_added_fault,
-    response_stream_completion_fault, serialized_request_body_limit_fault, stream_error_code,
-    stream_event_limit_fault, stream_transport_fault, unsupported_content_part_fault,
-    unsupported_output_item_fault, unsupported_reasoning_content_fault, OpenAiApi,
-    OpenAiBodyStreamFault, ResponseEventReason,
+    is_native_tool_event, OpenAiBodyStreamFault,
+};
+#[cfg(feature = "legacy-provider-port")]
+use self::faults::{
+    output_limit_fault, redacted_status_fault, request_transport_fault, required_string,
+    response_body_limit_fault, response_completed_ledger_fault, response_event_envelope_fault,
+    response_event_shape_fault, response_output_item_added_fault, response_stream_completion_fault,
+    serialized_request_body_limit_fault, stream_error_code, stream_event_limit_fault,
+    stream_transport_fault, unsupported_content_part_fault, unsupported_output_item_fault,
+    unsupported_reasoning_content_fault, OpenAiApi, ResponseEventReason,
 };
 pub use self::usage::OpenAiResponsesUsage;
 
@@ -68,6 +107,11 @@ const DEFAULT_MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_OUTPUT_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_RESPONSES_SERIALIZED_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_CHAT_COMPLETIONS_SERIALIZED_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_RESPONSES_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_RESPONSES_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_MAX_CHAT_COMPLETIONS_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_CHAT_COMPLETIONS_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
+static NEXT_RESPONSES_TARGET_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Validated connection inputs shared by the OpenAI HTTP adapters.
 pub struct AsyncOpenAiTransportConfig {
@@ -82,6 +126,8 @@ pub struct AsyncOpenAiTransportConfig {
     max_output_text_bytes: usize,
     max_responses_serialized_request_body_bytes: usize,
     max_chat_completions_serialized_request_body_bytes: usize,
+    responses_frame_constraints: FrameConstraints,
+    chat_completions_frame_constraints: FrameConstraints,
 }
 
 impl AsyncOpenAiTransportConfig {
@@ -138,6 +184,18 @@ impl AsyncOpenAiTransportConfig {
                 DEFAULT_MAX_RESPONSES_SERIALIZED_REQUEST_BODY_BYTES,
             max_chat_completions_serialized_request_body_bytes:
                 DEFAULT_MAX_CHAT_COMPLETIONS_SERIALIZED_REQUEST_BODY_BYTES,
+            responses_frame_constraints: FrameConstraints {
+                max_frame_bytes: DEFAULT_MAX_RESPONSES_FRAME_BYTES,
+                max_component_bytes: DEFAULT_MAX_RESPONSES_COMPONENT_BYTES,
+                context_window_tokens: None,
+                reserved_output_tokens: None,
+            },
+            chat_completions_frame_constraints: FrameConstraints {
+                max_frame_bytes: DEFAULT_MAX_CHAT_COMPLETIONS_FRAME_BYTES,
+                max_component_bytes: DEFAULT_MAX_CHAT_COMPLETIONS_COMPONENT_BYTES,
+                context_window_tokens: None,
+                reserved_output_tokens: None,
+            },
         })
     }
 
@@ -194,6 +252,22 @@ impl AsyncOpenAiTransportConfig {
         })
     }
 
+    /// Replaces the mount-stable canonical Frame constraints declared by the
+    /// OpenAI Responses reaction target.
+    ///
+    /// These limits apply to AgentView's canonical Frame encoding. The exact
+    /// serialized OpenAI request body retains its independent transport limit.
+    pub fn with_responses_frame_constraints(
+        self,
+        constraints: FrameConstraints,
+    ) -> Result<Self, AsyncOpenAiConfigError> {
+        responses_frame_profile(constraints.clone())?;
+        Ok(Self {
+            responses_frame_constraints: constraints,
+            ..self
+        })
+    }
+
     /// Replaces the Chat Completions serialized outbound request body byte limit.
     ///
     /// The limit is applied to the exact final JSON body after history
@@ -210,6 +284,56 @@ impl AsyncOpenAiTransportConfig {
             ..self
         })
     }
+
+    /// Replaces the mount-stable canonical Frame constraints declared by the
+    /// OpenAI Chat Completions reaction target.
+    ///
+    /// These limits apply to AgentView's canonical Frame encoding. The exact
+    /// serialized Chat request retains its independent transport limit.
+    pub fn with_chat_completions_frame_constraints(
+        self,
+        constraints: FrameConstraints,
+    ) -> Result<Self, AsyncOpenAiConfigError> {
+        chat_completions_frame_profile(constraints.clone())?;
+        Ok(Self {
+            chat_completions_frame_constraints: constraints,
+            ..self
+        })
+    }
+}
+
+fn responses_frame_profile(
+    constraints: FrameConstraints,
+) -> Result<FrameProfile, AsyncOpenAiConfigError> {
+    let profile = FrameProfile::new(constraints, FrameCapabilities::new(true));
+    profile
+        .validate()
+        .map_err(|_| AsyncOpenAiConfigError::InvalidResponsesFrameProfile)?;
+    Ok(profile)
+}
+
+fn chat_completions_frame_profile(
+    constraints: FrameConstraints,
+) -> Result<FrameProfile, AsyncOpenAiConfigError> {
+    let profile = FrameProfile::new(constraints, FrameCapabilities::new(true));
+    profile
+        .validate()
+        .map_err(|_| AsyncOpenAiConfigError::InvalidChatCompletionsFrameProfile)?;
+    Ok(profile)
+}
+
+fn next_responses_target_identity() -> Result<TargetIdentity, AsyncOpenAiConfigError> {
+    NEXT_RESPONSES_TARGET_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map(|value| {
+            TargetIdentity::new(
+                NonZeroU128::new(u128::from(value))
+                    .expect("Responses target identity counter starts at one"),
+            )
+        })
+        .map_err(|_| AsyncOpenAiConfigError::ResponsesTargetIdentityExhausted)
 }
 
 fn validate_timeout(name: &'static str, timeout: Duration) -> Result<(), AsyncOpenAiConfigError> {
@@ -246,17 +370,108 @@ pub struct AsyncOpenAiResponsesProvider {
     max_sse_event_bytes: usize,
     max_output_text_bytes: usize,
     max_responses_serialized_request_body_bytes: usize,
+    #[cfg(feature = "legacy-provider-port")]
     artifact_binding: Option<OpenAiInlineArtifactBinding>,
+    #[cfg(feature = "legacy-provider-port")]
     continuation: Option<OpenAiContinuation>,
+    #[cfg(feature = "legacy-provider-port")]
     tool_outputs: Arc<Mutex<ToolOutputStaging>>,
     response_usage_observer: Option<Arc<ResponseUsageObserver>>,
+    execution_mode: ResponsesExecutionMode,
+    reaction_target: ResponsesReactionTarget,
+    reaction_frame: Option<frame_request::ResponsesFrameRequestState>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesExecutionMode {
+    Unclaimed,
+    #[cfg(feature = "legacy-provider-port")]
+    Legacy,
+    FrameNative,
+}
+
+#[derive(Debug)]
+struct ResponsesReactionTarget {
+    identity: TargetIdentity,
+    epoch: TargetEpoch,
+    accepted_revision: Option<FrameRevision>,
+    profile: FrameProfile,
+    terminal_fault: Option<ReactionPortFault>,
+}
+
+impl ResponsesReactionTarget {
+    fn new(profile: FrameProfile) -> Result<Self, AsyncOpenAiConfigError> {
+        Ok(Self {
+            identity: next_responses_target_identity()?,
+            epoch: TargetEpoch::new(NonZeroU64::MIN),
+            accepted_revision: None,
+            profile,
+            terminal_fault: None,
+        })
+    }
+
+    fn declaration(&self) -> Result<TargetDeclaration, ReactionPortFault> {
+        if let Some(fault) = self.terminal_fault {
+            return Err(fault);
+        }
+        Ok(match self.accepted_revision {
+            Some(revision) => TargetDeclaration::resume(revision, self.profile.clone()),
+            None => TargetDeclaration::full(self.identity, self.epoch, self.profile.clone()),
+        })
+    }
+
+    fn accept(&mut self, revision: FrameRevision) {
+        let accepted = TargetDeclaration::resume(revision, self.profile.clone());
+        debug_assert_eq!(accepted.identity(), self.identity);
+        debug_assert_eq!(accepted.continuity().epoch(), self.epoch);
+        self.accepted_revision = Some(revision);
+    }
+
+    fn lose_continuity(&mut self) {
+        if self.terminal_fault.is_some() {
+            return;
+        }
+        self.accepted_revision = None;
+        let next_epoch = self
+            .epoch
+            .get()
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(TargetEpoch::new);
+        match next_epoch {
+            Some(epoch) => self.epoch = epoch,
+            None => self.terminal_fault = Some(declaration_state_lost_fault()),
+        }
+    }
+
+    fn record_fault(&mut self, fault: ReactionPortFault) {
+        self.accepted_revision = None;
+        match fault.kind() {
+            ReactionPortFaultKind::Retryable => self.lose_continuity(),
+            ReactionPortFaultKind::Terminal => {
+                if self.terminal_fault.is_none() {
+                    self.terminal_fault = Some(fault);
+                }
+            }
+        }
+    }
+}
+
+fn declaration_state_lost_fault() -> ReactionPortFault {
+    reaction_fault::map_openai_fault(&reaction_fault::OpenAiReactionFailure::static_diagnostic(
+        reaction_fault::OpenAiFailureClass::DeclarationStateLost,
+        "Responses target declaration state is unavailable",
+    ))
+}
+
+#[cfg(feature = "legacy-provider-port")]
 #[derive(Debug, Default)]
 struct ToolOutputStaging {
     calls: BTreeMap<u64, (String, Option<ToolOutput>)>,
 }
 
+#[cfg(feature = "legacy-provider-port")]
 impl ToolOutputStaging {
     fn register(&mut self, ordinal: u64, call_id: String) -> Result<(), ()> {
         match self.calls.entry(ordinal) {
@@ -303,6 +518,7 @@ impl ToolOutputStaging {
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 impl ToolOutputSink for Mutex<ToolOutputStaging> {
     fn register(&self, ordinal: u64, call_id: &str) -> Result<(), ()> {
         self.lock()
@@ -338,6 +554,7 @@ impl AsyncOpenAiResponsesProvider {
         encoder: CodexHttpV1Encoder,
     ) -> Result<Self, AsyncOpenAiConfigError> {
         let initialized = transport::initialize(config)?;
+        let reaction_target = ResponsesReactionTarget::new(initialized.responses_frame_profile)?;
         Ok(Self {
             client: initialized.client,
             config: initialized.config,
@@ -349,10 +566,16 @@ impl AsyncOpenAiResponsesProvider {
             max_output_text_bytes: initialized.max_output_text_bytes,
             max_responses_serialized_request_body_bytes: initialized
                 .max_responses_serialized_request_body_bytes,
+            #[cfg(feature = "legacy-provider-port")]
             artifact_binding: None,
+            #[cfg(feature = "legacy-provider-port")]
             continuation: None,
+            #[cfg(feature = "legacy-provider-port")]
             tool_outputs: Arc::new(Mutex::new(ToolOutputStaging::default())),
             response_usage_observer: None,
+            execution_mode: ResponsesExecutionMode::Unclaimed,
+            reaction_target,
+            reaction_frame: None,
         })
     }
 
@@ -373,6 +596,26 @@ impl AsyncOpenAiResponsesProvider {
         self
     }
 
+    fn ensure_frame_native_mode(&self) -> Result<(), ReactionPortFault> {
+        match self.execution_mode {
+            ResponsesExecutionMode::Unclaimed | ResponsesExecutionMode::FrameNative => Ok(()),
+            #[cfg(feature = "legacy-provider-port")]
+            ResponsesExecutionMode::Legacy => Err(declaration_state_lost_fault()),
+        }
+    }
+
+    #[cfg(feature = "legacy-provider-port")]
+    fn ensure_legacy_mode(&self) -> Result<(), ProviderFault> {
+        match self.execution_mode {
+            ResponsesExecutionMode::Unclaimed | ResponsesExecutionMode::Legacy => Ok(()),
+            ResponsesExecutionMode::FrameNative => Err(ProviderFault::model_rejected(
+                "OpenAI Responses provider is already using the Frame-native protocol",
+            )
+            .with_code(ProviderFaultCode::RequestPreparation)),
+        }
+    }
+
+    #[cfg(feature = "legacy-provider-port")]
     fn staged_tool_output_receipt(&self) -> Result<Vec<(u64, ToolOutput)>, ProviderFault> {
         self.tool_outputs
             .lock()
@@ -386,6 +629,7 @@ impl AsyncOpenAiResponsesProvider {
             })
     }
 
+    #[cfg(feature = "legacy-provider-port")]
     async fn start_stream<'a>(
         &'a mut self,
         gate: ResponsesInputGateReady,
@@ -406,6 +650,7 @@ impl AsyncOpenAiResponsesProvider {
                     .with_code(ProviderFaultCode::RequestPreparation)
             })?;
         let client = self.client.clone();
+        let execution_mode = &mut self.execution_mode;
         let continuation_slot = &mut self.continuation;
         let artifact_binding_slot = &mut self.artifact_binding;
         let encoder = self.encoder.clone();
@@ -432,6 +677,18 @@ impl AsyncOpenAiResponsesProvider {
                     "OpenAI tool result staging changed before handoff",
                 )
                 .with_code(ProviderFaultCode::RequestPreparation)));
+            }
+            match execution_mode {
+                ResponsesExecutionMode::Unclaimed => {
+                    *execution_mode = ResponsesExecutionMode::Legacy;
+                }
+                ResponsesExecutionMode::Legacy => {}
+                ResponsesExecutionMode::FrameNative => {
+                    return Poll::Ready(Err(ProviderFault::model_rejected(
+                        "OpenAI Responses provider is already using the Frame-native protocol",
+                    )
+                    .with_code(ProviderFaultCode::RequestPreparation)));
+                }
             }
             let response = transport
                 .as_mut()
@@ -1163,11 +1420,17 @@ impl AsyncOpenAiResponsesProvider {
 }
 
 #[async_trait]
+#[cfg(feature = "legacy-provider-port")]
+#[allow(
+    deprecated,
+    reason = "this impl preserves the legacy Responses ProviderPort contract"
+)]
 impl ProviderPort for AsyncOpenAiResponsesProvider {
     async fn execute<'a>(
         &'a mut self,
         projection: RenderedProjection,
     ) -> Result<ProviderEventStream<'a>, ProviderFault> {
+        self.ensure_legacy_mode()?;
         let staged_tool_outputs = self.staged_tool_output_receipt()?;
         let prepared = OpenAiContinuation::prepare_bounded(
             self.continuation.as_ref(),
@@ -1192,6 +1455,7 @@ impl ProviderPort for AsyncOpenAiResponsesProvider {
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 struct OpenAiStreamState<'a, S> {
     stream: S,
     completed_output: Option<CompletedOpenAiOutput>,
@@ -1286,10 +1550,12 @@ fn exceeds_limit(current: usize, additional: usize, limit: usize) -> bool {
         .is_none_or(|total| total > limit)
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn post_handoff_fault<'a>(fault: ProviderFault) -> ProviderEventStream<'a> {
     Box::pin(futures::stream::once(async move { Err(fault) }))
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn finish_openai_stream<S>(
     state: &mut OpenAiStreamState<'_, S>,
 ) -> Result<ProviderEvent, ProviderFault> {
@@ -1348,6 +1614,7 @@ fn finish_openai_stream<S>(
     Ok(ProviderEvent::Text(TextTurnEvent::TextComplete(final_text)))
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn finish_accepted_response<S>(
     state: &mut OpenAiStreamState<'_, S>,
     payload: &Map<String, Value>,
@@ -1365,6 +1632,7 @@ fn finish_accepted_response<S>(
     Ok(event)
 }
 
+#[cfg(feature = "legacy-provider-port")]
 impl<S> Drop for OpenAiStreamState<'_, S> {
     fn drop(&mut self) {
         if self.terminal_published {
@@ -1376,6 +1644,7 @@ impl<S> Drop for OpenAiStreamState<'_, S> {
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn advance_sequence(
     previous: &mut Option<u64>,
     event_type: &str,
@@ -1615,7 +1884,7 @@ fn has_native_function_call_completed(payload: &Map<String, Value>) -> bool {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-provider-port"))]
 mod terminal_precedence_tests {
     use super::*;
     use crate::provider::codex_http_v1::CodexHttpV1Options;
@@ -1753,6 +2022,7 @@ mod native_tool_tests {
     }
 
     #[test]
+    #[cfg(feature = "legacy-provider-port")]
     fn provider_owned_tool_result_staging_rejects_duplicate_and_orphan_output() {
         let staging = Mutex::new(ToolOutputStaging::default());
         staging.register(3, "call-1").unwrap();
@@ -1765,6 +2035,7 @@ mod native_tool_tests {
     }
 
     #[test]
+    #[cfg(feature = "legacy-provider-port")]
     fn tool_result_staging_consumes_only_an_exact_full_table_receipt() {
         let staging = Mutex::new(ToolOutputStaging::default());
         let first = ToolCall::new("call-1", "first", "{}").unwrap();
@@ -1831,6 +2102,186 @@ pub enum AsyncOpenAiConfigError {
     InvalidSerializedRequestBodyLimit,
     #[error("OpenAI Chat Completions serialized outbound request body limit must be non-zero")]
     InvalidChatCompletionsSerializedRequestBodyLimit,
+    #[error("OpenAI Responses Frame profile is invalid")]
+    InvalidResponsesFrameProfile,
+    #[error("OpenAI Chat Completions Frame profile is invalid")]
+    InvalidChatCompletionsFrameProfile,
+    #[error("OpenAI Responses target identity space is exhausted")]
+    ResponsesTargetIdentityExhausted,
+    #[error("OpenAI Chat Completions target identity space is exhausted")]
+    ChatCompletionsTargetIdentityExhausted,
     #[error("OpenAI transport initialization failed")]
     TransportInitialization,
+}
+
+#[cfg(test)]
+mod responses_frame_profile_tests {
+    use super::*;
+    use crate::component::execution::reaction::{
+        ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason, TargetContinuity,
+    };
+    use crate::provider::codex_http_v1::CodexHttpV1Options;
+
+    fn config() -> AsyncOpenAiTransportConfig {
+        AsyncOpenAiTransportConfig::new("http://127.0.0.1:1/v1", "test-token").unwrap()
+    }
+
+    fn provider(config: AsyncOpenAiTransportConfig) -> AsyncOpenAiResponsesProvider {
+        let identity =
+            ProviderIdentity::new("openai", "codex-http-v1", 1, "frame-profile-test").unwrap();
+        let options = CodexHttpV1Options::new("test-model", None, None, None::<String>).unwrap();
+        AsyncOpenAiResponsesProvider::try_new(config, identity, CodexHttpV1Encoder::new(options))
+            .unwrap()
+    }
+
+    fn assert_invalid(constraints: FrameConstraints) {
+        let error = match config().with_responses_frame_constraints(constraints) {
+            Ok(_) => panic!("invalid Responses Frame constraints were accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error, AsyncOpenAiConfigError::InvalidResponsesFrameProfile);
+    }
+
+    #[test]
+    fn responses_target_declares_exact_production_defaults() {
+        let provider = provider(config());
+        let declaration = provider.reaction_target.declaration().unwrap();
+
+        assert_eq!(
+            declaration.profile().constraints,
+            FrameConstraints {
+                max_frame_bytes: 16 * 1024 * 1024,
+                max_component_bytes: 4 * 1024 * 1024,
+                context_window_tokens: None,
+                reserved_output_tokens: None,
+            }
+        );
+        assert!(declaration.profile().capabilities.supports_semantic_delta());
+        assert!(matches!(
+            declaration.continuity(),
+            TargetContinuity::FullRequired { epoch }
+                if *epoch == TargetEpoch::new(NonZeroU64::MIN)
+        ));
+    }
+
+    #[test]
+    fn responses_target_retains_custom_frame_constraints() {
+        let constraints = FrameConstraints {
+            max_frame_bytes: 32 * 1024,
+            max_component_bytes: 8 * 1024,
+            context_window_tokens: Some(128_000),
+            reserved_output_tokens: Some(8_192),
+        };
+        let provider = provider(
+            config()
+                .with_responses_frame_constraints(constraints.clone())
+                .unwrap(),
+        );
+
+        assert_eq!(
+            provider
+                .reaction_target
+                .declaration()
+                .unwrap()
+                .profile()
+                .constraints,
+            constraints
+        );
+    }
+
+    #[test]
+    fn responses_frame_constraints_reject_every_invalid_profile_shape() {
+        let valid = FrameConstraints {
+            max_frame_bytes: 1_024,
+            max_component_bytes: 256,
+            context_window_tokens: Some(4_096),
+            reserved_output_tokens: Some(512),
+        };
+
+        assert_invalid(FrameConstraints {
+            max_frame_bytes: 0,
+            ..valid.clone()
+        });
+        assert_invalid(FrameConstraints {
+            max_component_bytes: 0,
+            ..valid.clone()
+        });
+        assert_invalid(FrameConstraints {
+            context_window_tokens: Some(0),
+            ..valid.clone()
+        });
+        assert_invalid(FrameConstraints {
+            reserved_output_tokens: Some(0),
+            ..valid.clone()
+        });
+        assert_invalid(FrameConstraints {
+            max_frame_bytes: 255,
+            ..valid.clone()
+        });
+        assert_invalid(FrameConstraints {
+            max_frame_bytes: 64,
+            max_component_bytes: 64,
+            ..valid
+        });
+    }
+
+    #[test]
+    fn responses_target_declaration_is_idempotent() {
+        let provider = provider(config());
+
+        assert_eq!(
+            provider.reaction_target.declaration().unwrap(),
+            provider.reaction_target.declaration().unwrap()
+        );
+    }
+
+    #[test]
+    fn responses_provider_instances_have_distinct_target_identities() {
+        let first = provider(config());
+        let second = provider(config());
+
+        assert_ne!(
+            first.reaction_target.declaration().unwrap().identity(),
+            second.reaction_target.declaration().unwrap().identity()
+        );
+    }
+
+    #[test]
+    fn accepted_continuity_preserves_the_mount_stable_profile() {
+        let mut provider = provider(config());
+        let initial = provider.reaction_target.declaration().unwrap();
+        let revision = FrameRevision::new(
+            NonZeroU128::new(9).unwrap(),
+            initial.identity(),
+            initial.continuity().epoch(),
+            NonZeroU64::MIN,
+        );
+
+        provider.reaction_target.accept(revision);
+        let accepted = provider.reaction_target.declaration().unwrap();
+
+        assert_eq!(accepted.profile(), initial.profile());
+        assert!(matches!(
+            accepted.continuity(),
+            TargetContinuity::Accepted {
+                revision: accepted_revision,
+                ..
+            } if *accepted_revision == revision
+        ));
+    }
+
+    #[test]
+    fn exhausted_epoch_becomes_a_stable_terminal_declaration_fault() {
+        let mut provider = provider(config());
+        provider.reaction_target.epoch = TargetEpoch::new(NonZeroU64::new(u64::MAX).unwrap());
+
+        provider.reaction_target.lose_continuity();
+
+        for _ in 0..2 {
+            let fault = provider.reaction_target.declaration().unwrap_err();
+            assert_eq!(fault.kind(), ReactionPortFaultKind::Terminal);
+            assert_eq!(fault.code(), ReactionPortFaultCode::Internal);
+            assert_eq!(fault.reason(), ReactionPortFaultReason::Declaration);
+        }
+    }
 }

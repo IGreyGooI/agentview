@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Barrier,
     },
     time::{Duration, Instant},
 };
@@ -260,6 +260,93 @@ fn hook_location_drift_fails_closed() {
 }
 
 #[test]
+fn mixed_hook_kind_drift_fails_closed_and_preserves_committed_topology() {
+    let runtime = SignalRuntime::new();
+    let identity = component("mixed-kind", 0);
+
+    let mut initial = runtime.begin_render().unwrap();
+    initial
+        .render_component(identity.clone(), |scope| {
+            let _ = scope.use_signal_at(0, || 1usize)?;
+            let _ = scope.use_marker_at(1, HookKind::ProviderEventHandler)?;
+            Ok(())
+        })
+        .unwrap();
+    initial.commit();
+
+    let mut drifted = runtime.begin_render().unwrap();
+    assert!(matches!(
+        drifted.render_component(identity.clone(), |scope| {
+            let _ = scope.use_marker_at(0, HookKind::ProviderEventHandler)?;
+            let _ = scope.use_signal_at(1, || 2usize)?;
+            Ok(())
+        }),
+        Err(SignalRenderError::HookKindMismatch {
+            slot: 0,
+            expected: HookKind::Signal,
+            observed: HookKind::ProviderEventHandler,
+            ..
+        })
+    ));
+    drop(drifted);
+
+    let mut retry = runtime.begin_render().unwrap();
+    retry
+        .render_component(identity, |scope| {
+            let signal = scope.use_signal_at(0, || 9usize)?;
+            assert_eq!(signal.with(|value| *value).unwrap(), 1);
+            let _ = scope.use_marker_at(1, HookKind::ProviderEventHandler)?;
+            Ok(())
+        })
+        .unwrap();
+    retry.commit();
+}
+
+#[test]
+fn mount_fence_linearizes_operation_commit_before_retirement() {
+    let fence = Arc::new(MountFence::pending());
+    fence.activate();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let committed = Arc::new(AtomicUsize::new(0));
+
+    let operation_fence = Arc::clone(&fence);
+    let operation_entered = Arc::clone(&entered);
+    let operation_release = Arc::clone(&release);
+    let operation_committed = Arc::clone(&committed);
+    let operation = std::thread::spawn(move || {
+        operation_fence.with_active(|| {
+            operation_entered.wait();
+            operation_release.wait();
+            operation_committed.store(1, Ordering::SeqCst);
+        })
+    });
+    entered.wait();
+
+    let retirement_fence = Arc::clone(&fence);
+    let retirement = std::thread::spawn(move || retirement_fence.invalidate());
+    release.wait();
+
+    assert_eq!(operation.join().unwrap(), Some(()));
+    retirement.join().unwrap();
+    assert_eq!(committed.load(Ordering::SeqCst), 1);
+    assert!(fence
+        .with_active(|| panic!("stale operation ran"))
+        .is_none());
+}
+
+#[test]
+fn mount_fence_rejects_operation_when_retirement_wins() {
+    let fence = MountFence::pending();
+    fence.activate();
+    fence.invalidate();
+
+    assert!(fence
+        .with_active(|| panic!("stale operation ran"))
+        .is_none());
+}
+
+#[test]
 fn signal_is_send_and_sync_when_value_is() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Signal<String>>();
@@ -488,6 +575,41 @@ fn stale_write_from_a_new_render_owner_fails_as_stale() {
         })
         .unwrap();
     remount.commit();
+}
+
+#[test]
+fn deferred_commit_keeps_new_mount_pending_until_activation() {
+    let runtime = SignalRuntime::new();
+    let identity = component("deferred", 0);
+    let mut render = runtime.begin_render().unwrap();
+    let signal = render
+        .render_component(identity, |scope| scope.use_signal(|| 1usize))
+        .unwrap();
+
+    let transition = render.commit_deferred();
+    assert_eq!(signal.with(|value| *value), Err(SignalAccessError::Stale));
+
+    transition.activate();
+    assert_eq!(signal.with(|value| *value).unwrap(), 1);
+}
+
+#[test]
+fn abandoning_removal_only_transition_marks_runtime_dirty() {
+    let runtime = SignalRuntime::new();
+    let identity = component("removed", 0);
+    let mut initial = runtime.begin_render().unwrap();
+    let stale = initial
+        .render_component(identity, |scope| scope.use_signal(|| 1usize))
+        .unwrap();
+    initial.commit();
+
+    let transition = runtime.begin_render().unwrap().commit_deferred();
+    assert_eq!(transition.retired().len(), 1);
+    assert!(!runtime.is_dirty());
+    drop(transition);
+
+    assert!(runtime.is_dirty());
+    assert_eq!(stale.with(|value| *value), Err(SignalAccessError::Stale));
 }
 
 #[test]

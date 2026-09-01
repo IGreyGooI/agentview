@@ -1,3 +1,9 @@
+#![cfg(feature = "legacy-provider-port")]
+#![allow(
+    deprecated,
+    reason = "this compatibility test intentionally exercises ApplicationHost and ProviderPort"
+)]
+
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -271,25 +277,40 @@ fn streaming_handler_application(
     let finish_release = Arc::clone(&props.finish_release);
     let finish_count = Arc::clone(&props.finish_count);
 
-    XmlStreamingToolCall::contract("test.application-host", "v1")
-        .empty_element("value")
-        .required_attribute::<usize>("number")
-        .exactly_one()
-        .listen_to(events.select(ProviderEvent::TEXT))
-        .on_decoded(move |_| {
-            let decoded = Arc::clone(&decoded);
-            async move {
-                decoded.notify_one();
-                Ok::<(), Infallible>(())
-            }
-        })
-        .on_invalid(|_| async { Ok::<(), Infallible>(()) })
-        .on_finish(move || async move {
-            finish_count.fetch_add(1, Ordering::SeqCst);
-            finish_started.notify_one();
-            finish_release.notified().await;
-            Ok::<(), Infallible>(())
-        })
+    let text = events.select(ProviderEvent::TEXT);
+    view! {
+        {
+            XmlStreamingToolCall::contract("test.application-host.value", "v1")
+                .empty_element("value")
+                .required_attribute::<usize>("number")
+                .listen_to(text.clone())
+                .on_decoded(move |_| {
+                    let decoded = Arc::clone(&decoded);
+                    async move {
+                        decoded.notify_one();
+                        Ok::<(), Infallible>(())
+                    }
+                })
+                .on_invalid(|_| async { Ok::<(), Infallible>(()) })
+        }
+        {
+            XmlStreamingToolCall::contract("test.application-host.eof-diagnostic", "v1")
+                .empty_element("finish")
+                .listen_to(text)
+                .on_decoded(|| async { Ok::<(), Infallible>(()) })
+                .on_invalid(move |_| {
+                    let finish_count = Arc::clone(&finish_count);
+                    let finish_started = Arc::clone(&finish_started);
+                    let finish_release = Arc::clone(&finish_release);
+                    async move {
+                        finish_count.fetch_add(1, Ordering::SeqCst);
+                        finish_started.notify_one();
+                        finish_release.notified().await;
+                        Ok::<(), Infallible>(())
+                    }
+                })
+        }
+    }
 }
 
 struct StreamingPort {
@@ -452,6 +473,41 @@ fn scripted_no_event_port(
         },
         projections,
     )
+}
+
+#[tokio::test]
+async fn successful_reaction_post_reconciles_handler_state_before_return() {
+    let exposed = Arc::new(Mutex::new(None));
+    let renders = Arc::new(AtomicUsize::new(0));
+    let projections = Arc::new(Mutex::new(Vec::new()));
+    let port = ScriptedEventPort {
+        scripts: VecDeque::from([EventScript::Eof(vec![7])]),
+        execute_calls: Arc::new(AtomicUsize::new(0)),
+        projections: Arc::clone(&projections),
+        polls: None,
+    };
+    let mut components = ComponentHost::new(
+        handler_application,
+        HandlerProps {
+            exposed,
+            renders: Arc::clone(&renders),
+        },
+    );
+    let mut host = ApplicationHost::new(port);
+
+    host.dispatch_llm_reaction(&mut components)
+        .await
+        .expect("reaction reaches EOF and reconciles handler state");
+
+    assert_eq!(renders.load(Ordering::SeqCst), 2);
+    assert!(!components.is_dirty());
+    let submitted = projections.lock().unwrap();
+    assert_eq!(submitted.len(), 1);
+    assert!(projection_text(&submitted[0]).contains("<state>\\[\\]</state>"));
+    let committed = components
+        .current_projection()
+        .expect("post-reconciled projection is committed");
+    assert!(projection_text(committed).contains("<state>\\[7\\]</state>"));
 }
 
 #[tokio::test]
@@ -640,7 +696,7 @@ async fn reaction_awaits_events_and_handlers_in_provider_and_structural_order() 
 }
 
 #[tokio::test]
-async fn provider_eof_awaits_the_terminal_handler() {
+async fn provider_eof_awaits_the_incomplete_xml_handler() {
     let decoded = Arc::new(Notify::new());
     let finish_started = Arc::new(Notify::new());
     let finish_release = Arc::new(Notify::new());
@@ -648,7 +704,7 @@ async fn provider_eof_awaits_the_terminal_handler() {
     let (eof_sender, eof) = mpsc::unbounded();
     let port = StreamingPort {
         events: Some(vec![ProviderEvent::Text(TextTurnEvent::TextComplete(
-            String::from("<value number=\"7\" />"),
+            String::from("<value number=\"7\" /><finish"),
         ))]),
         eof: Some(eof),
     };
@@ -683,18 +739,18 @@ async fn provider_eof_awaits_the_terminal_handler() {
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
             () = finish_started.notified() => {}
-            result = reaction.as_mut() => panic!("reaction completed before terminal handler blocked: {result:?}"),
+            result = reaction.as_mut() => panic!("reaction completed before EOF diagnostic handler blocked: {result:?}"),
         }
     })
     .await
-    .expect("Provider EOF starts the terminal handler");
+    .expect("Provider EOF starts the incomplete XML handler");
     assert_eq!(finish_count.load(Ordering::SeqCst), 1);
 
     finish_release.notify_one();
     tokio::time::timeout(Duration::from_secs(1), reaction)
         .await
-        .expect("reaction resumes after terminal handler completion")
-        .expect("reaction succeeds after Provider EOF and terminal completion");
+        .expect("reaction resumes after incomplete XML handler completion")
+        .expect("reaction succeeds after Provider EOF diagnostics complete");
 }
 
 #[tokio::test]
@@ -818,10 +874,16 @@ async fn provider_stream_fault_is_reported_and_the_provider_remains_reusable() {
     };
     assert_eq!(provider_fault.message(), "stream fault sentinel");
     assert_eq!(exposed_value(&exposed), vec![7]);
+    assert!(components.is_dirty());
+    let committed = components
+        .current_projection()
+        .expect("pre-reaction projection remains committed after stream fault");
+    assert!(projection_text(committed).contains("<state>\\[\\]</state>"));
 
     host.dispatch_llm_reaction(&mut components)
         .await
         .expect("Port remains reusable after a stream fault");
+    assert!(!components.is_dirty());
     assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
     let second_projection = projection_text(&projections.lock().unwrap()[1]);
     assert!(second_projection.contains("<state>\\[7\\]</state>"));
@@ -860,10 +922,16 @@ async fn binding_fault_preserves_prior_signal_updates_and_the_provider_remains_r
         "{binding_fault:?}"
     );
     assert_eq!(exposed_value(&exposed), 7);
+    assert!(components.is_dirty());
+    let committed = components
+        .current_projection()
+        .expect("pre-reaction projection remains committed after binding fault");
+    assert!(projection_text(committed).contains("<state>0</state>"));
 
     host.dispatch_llm_reaction(&mut components)
         .await
         .expect("Port remains reusable after a binding fault");
+    assert!(!components.is_dirty());
     assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
     let second_projection = projection_text(&projections.lock().unwrap()[1]);
     assert!(

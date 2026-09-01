@@ -29,7 +29,7 @@ fn greeting_request(recipient: String) -> Component {
 }
 
 #[component]
-fn hello_application(props: HelloProps, _events: EventInput<ProviderEvent>) -> Component {
+fn hello_application(props: HelloProps) -> Component {
     view! {
         greeting_policy()
         greeting_request(props.recipient)
@@ -37,7 +37,7 @@ fn hello_application(props: HelloProps, _events: EventInput<ProviderEvent>) -> C
 }
 
 fn render_hello(recipient: &str) -> anyhow::Result<RenderedProjection> {
-    let mut components = ComponentHost::new(
+    let mut components = ComponentHost::new_root(
         hello_application,
         HelloProps {
             recipient: recipient.to_owned(),

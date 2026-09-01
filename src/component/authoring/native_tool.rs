@@ -1,13 +1,8 @@
 use std::{fmt, future::Future, pin::Pin};
 
-use futures::FutureExt;
-
 use crate::component::execution::{ToolCall, ToolOutput};
 
-use super::{
-    declaration::{Component, ComponentNode},
-    handler::panic_message,
-};
+use super::declaration::{Component, ComponentNode};
 
 type ToolFuture = Pin<Box<dyn Future<Output = Result<ToolOutput, String>> + Send + 'static>>;
 
@@ -35,12 +30,9 @@ impl NativeToolCallNamed {
             NativeToolCallDeclaration {
                 name: self.name,
                 invoke: Box::new(move |call| {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(call)))
-                        .map(|future| {
-                            Box::pin(async move { future.await.map_err(|error| error.to_string()) })
-                                as ToolFuture
-                        })
-                        .map_err(|panic| panic_message(&*panic))
+                    let future = handler(call);
+                    Box::pin(async move { future.await.map_err(|error| error.to_string()) })
+                        as ToolFuture
                 }),
             },
         )))
@@ -49,7 +41,7 @@ impl NativeToolCallNamed {
 
 pub(crate) struct NativeToolCallDeclaration {
     name: &'static str,
-    invoke: Box<dyn FnMut(ToolCall) -> Result<ToolFuture, String> + Send + 'static>,
+    invoke: Box<dyn FnMut(ToolCall) -> ToolFuture + Send + 'static>,
 }
 
 impl NativeToolCallDeclaration {
@@ -65,8 +57,7 @@ impl NativeToolCallDeclaration {
                 name: call.name().to_owned(),
             });
         }
-        (self.invoke)(call)
-            .map_err(|message| NativeToolDispatchFault::Invocation { call_id, message })
+        Ok((self.invoke)(call))
     }
 }
 
@@ -74,14 +65,10 @@ pub(crate) async fn await_output(
     call_id: String,
     future: ToolFuture,
 ) -> Result<ToolOutput, NativeToolDispatchFault> {
-    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
-        Ok(Ok(output)) if output.call_id() == call_id => Ok(output),
-        Ok(Ok(_)) => Err(NativeToolDispatchFault::OutputCallIdMismatch { call_id }),
-        Ok(Err(message)) => Err(NativeToolDispatchFault::Handler { call_id, message }),
-        Err(panic) => Err(NativeToolDispatchFault::Panic {
-            call_id,
-            message: panic_message(&*panic),
-        }),
+    match future.await {
+        Ok(output) if output.call_id() == call_id => Ok(output),
+        Ok(_) => Err(NativeToolDispatchFault::OutputCallIdMismatch { call_id }),
+        Err(message) => Err(NativeToolDispatchFault::Handler { call_id, message }),
     }
 }
 
@@ -89,12 +76,8 @@ pub(crate) async fn await_output(
 pub(crate) enum NativeToolDispatchFault {
     #[error("unsupported tool `{name}` for call `{call_id}`")]
     WrongTool { call_id: String, name: String },
-    #[error("tool call `{call_id}` invocation failed: {message}")]
-    Invocation { call_id: String, message: String },
     #[error("tool call `{call_id}` handler failed: {message}")]
     Handler { call_id: String, message: String },
-    #[error("tool call `{call_id}` handler panicked: {message}")]
-    Panic { call_id: String, message: String },
     #[error("tool handler returned output for a different call than `{call_id}`")]
     OutputCallIdMismatch { call_id: String },
 }

@@ -1,0 +1,15 @@
+error[E0382]: borrow of moved value: `application`
+  --> tests/ui/component_target/fail_application_reuse_after_shutdown.rs:36:13
+   |
+34 | async fn shutdown_and_reuse(application: Application<Port>) {
+   |                             ----------- move occurs because `application` has type `agentview::component::execution::Application<Port>`, which does not implement the `Copy` trait
+35 |     application.shutdown().await.unwrap();
+   |                 ---------- `application` moved due to this method call
+36 |     let _ = application.current_projection();
+   |             ^^^^^^^^^^^ value borrowed here after move
+   |
+note: `agentview::component::execution::Application::<P>::shutdown` takes ownership of the receiver `self`, which moves `application`
+  --> src/component/execution/application.rs
+   |
+   |     pub async fn shutdown(mut self) -> Result<(), ApplicationFault> {
+   |                               ^^^^

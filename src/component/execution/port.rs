@@ -1,6 +1,10 @@
-use std::{collections::HashSet, pin::Pin, str::FromStr, sync::Arc};
+use std::{collections::HashSet, str::FromStr};
+#[cfg(feature = "legacy-provider-port")]
+use std::{pin::Pin, sync::Arc};
 
+#[cfg(feature = "legacy-provider-port")]
 use async_trait::async_trait;
+#[cfg(feature = "legacy-provider-port")]
 use futures::Stream;
 
 use crate::{
@@ -325,7 +329,9 @@ pub struct ToolCall {
     call_id: String,
     name: String,
     raw_arguments: String,
+    #[cfg(feature = "legacy-provider-port")]
     output_sink: Option<Arc<dyn ToolOutputSink>>,
+    #[cfg(feature = "legacy-provider-port")]
     output_ordinal: Option<u64>,
 }
 
@@ -364,7 +370,9 @@ impl ToolCall {
             call_id,
             name,
             raw_arguments,
+            #[cfg(feature = "legacy-provider-port")]
             output_sink: None,
+            #[cfg(feature = "legacy-provider-port")]
             output_ordinal: None,
         })
     }
@@ -388,6 +396,7 @@ impl ToolCall {
         }
     }
 
+    #[cfg(feature = "legacy-provider-port")]
     pub(crate) fn with_output_sink(
         mut self,
         ordinal: u64,
@@ -399,6 +408,7 @@ impl ToolCall {
         Ok(self)
     }
 
+    #[cfg(feature = "legacy-provider-port")]
     pub(crate) fn publish_output(&self, output: ToolOutput) -> Result<(), ()> {
         self.output_sink
             .as_ref()
@@ -411,6 +421,7 @@ impl ToolCall {
 ///
 /// Acceptance is synchronous so Runtime observation cannot report a lane as
 /// closed before the provider owns its one allowed result.
+#[cfg(feature = "legacy-provider-port")]
 pub(crate) trait ToolOutputSink: std::fmt::Debug + Send + Sync {
     fn register(&self, ordinal: u64, call_id: &str) -> Result<(), ()>;
     fn accept(&self, ordinal: u64, output: ToolOutput) -> Result<(), ()>;
@@ -445,10 +456,13 @@ impl ProviderEvent {
     );
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub type ProviderEventStream<'a> =
     Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderFault>> + Send + 'a>>;
 
 /// The only public model-backend boundary.
+#[cfg(feature = "legacy-provider-port")]
+#[deprecated(note = "use `ReactionPort`")]
 #[async_trait]
 pub trait ProviderPort: Send {
     async fn execute<'a>(

@@ -1,3 +1,5 @@
+#![allow(deprecated, reason = "legacy EventInput compile fixture")]
+
 use agentview::component::{prelude::*, ComponentHost};
 
 #[derive(Clone, Copy)]

@@ -180,7 +180,7 @@ fn expand_function(mut function: ItemFn) -> syn::Result<proc_macro2::TokenStream
 #[derive(Default)]
 struct HookCallRewriter {
     found: bool,
-    next_signal_site: u32,
+    next_hook_site: u32,
 }
 
 impl VisitMut for HookCallRewriter {
@@ -193,19 +193,33 @@ impl VisitMut for HookCallRewriter {
             visit_mut::visit_expr_mut(self, expression);
             return;
         };
-        if !is_signal_hook_call(&function.path, call.args.len()) {
+        let Some(kind) = component_hook_call(&function.path, call.args.len()) else {
             visit_mut::visit_expr_mut(self, expression);
             return;
-        }
+        };
 
         let arguments = call.args.clone();
-        let site = self.next_signal_site;
-        self.next_signal_site = self
-            .next_signal_site
+        let site = self.next_hook_site;
+        self.next_hook_site = self
+            .next_hook_site
             .checked_add(1)
-            .expect("Component signal hook site space exhausted");
-        *expression = syn::parse_quote! {
-            __agentview_hooks.use_signal_at(#site, #arguments)
+            .expect("Component hook site space exhausted");
+        *expression = match kind {
+            ComponentHookCall::Signal => syn::parse_quote! {
+                __agentview_hooks.use_signal_at(#site, #arguments)
+            },
+            ComponentHookCall::ProviderEventHandler => syn::parse_quote! {
+                __agentview_hooks.use_provider_event_handler_at(#site, #arguments)
+            },
+            ComponentHookCall::ReactionRequest => syn::parse_quote! {
+                __agentview_hooks.use_reaction_request_at(#site)
+            },
+            ComponentHookCall::Future => syn::parse_quote! {
+                __agentview_hooks.use_future_at(#site, #arguments)
+            },
+            ComponentHookCall::Coroutine => syn::parse_quote! {
+                __agentview_hooks.use_coroutine_at(#site, #arguments)
+            },
         };
         self.found = true;
     }
@@ -216,22 +230,36 @@ impl VisitMut for HookCallRewriter {
     }
 }
 
-fn is_signal_hook_call(path: &syn::Path, argument_count: usize) -> bool {
-    if argument_count != 1 {
-        return false;
-    }
+#[derive(Clone, Copy)]
+enum ComponentHookCall {
+    Signal,
+    ProviderEventHandler,
+    ReactionRequest,
+    Future,
+    Coroutine,
+}
+
+fn component_hook_call(path: &syn::Path, argument_count: usize) -> Option<ComponentHookCall> {
     let segments = path
         .segments
         .iter()
         .map(|segment| segment.ident.to_string())
         .collect::<Vec<_>>();
-    match segments.as_slice() {
-        [hook] => hook == "use_signal",
+    let hook = match segments.as_slice() {
+        [hook] => hook.as_str(),
         [crate_name, component, prelude, hook]
             if crate_name == "agentview" && component == "component" && prelude == "prelude" =>
         {
-            hook == "use_signal"
+            hook.as_str()
         }
-        _ => false,
+        _ => return None,
+    };
+    match (hook, argument_count) {
+        ("use_signal", 1) => Some(ComponentHookCall::Signal),
+        ("use_provider_event_handler", 2) => Some(ComponentHookCall::ProviderEventHandler),
+        ("use_reaction_request", 0) => Some(ComponentHookCall::ReactionRequest),
+        ("use_future", 1) => Some(ComponentHookCall::Future),
+        ("use_coroutine", 2) => Some(ComponentHookCall::Coroutine),
+        _ => None,
     }
 }

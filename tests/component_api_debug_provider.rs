@@ -1,3 +1,9 @@
+#![cfg(feature = "legacy-provider-port")]
+#![allow(
+    deprecated,
+    reason = "this compatibility test intentionally exercises DebugProviderPort through ProviderPort"
+)]
+
 use agentview::{
     component::execution::{
         DebugProviderPort, ProviderPort, RenderedProjection, RenderedProjectionNode,

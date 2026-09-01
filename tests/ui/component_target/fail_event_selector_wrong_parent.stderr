@@ -1,7 +1,7 @@
 error[E0308]: mismatched types
-  --> tests/ui/component_target/fail_event_selector_wrong_parent.rs:15:27
+  --> tests/ui/component_target/fail_event_selector_wrong_parent.rs:17:27
    |
-15 |     let _ = events.select(SecondEvent::CLOCK);
+17 |     let _ = events.select(SecondEvent::CLOCK);
    |                    ------ ^^^^^^^^^^^^^^^^^^ expected `EventSelector<FirstEvent, _>`, found `EventSelector<SecondEvent, u64>`
    |                    |
    |                    arguments to this method are incorrect

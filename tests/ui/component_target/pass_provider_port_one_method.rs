@@ -1,3 +1,5 @@
+#![allow(deprecated, reason = "legacy ProviderPort compile fixture")]
+
 use agentview::component::execution::{
     ApplicationHost, ProviderEvent, ProviderEventStream, ProviderFault, ProviderPort,
     RenderedProjection,

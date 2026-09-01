@@ -1,6 +1,6 @@
 use agentview::component::{
-    execution::{ProviderEvent, RenderedProjectionDiffMarker},
-    prelude::{component, view, Component, EventInput},
+    execution::RenderedProjectionDiffMarker,
+    prelude::{component, view, Component},
     ComponentHost,
 };
 use agentview::{pom_renderer::render_pom_document, transcript::CanonicalInputItem};
@@ -59,10 +59,7 @@ fn shared_system_child() -> Component {
 }
 
 #[component]
-fn separate_system_siblings_application(
-    _props: ProjectionProps,
-    _events: EventInput<ProviderEvent>,
-) -> Component {
+fn separate_system_siblings_application(_props: ProjectionProps) -> Component {
     view! {
         #[system_once]
         shared_system_child()
@@ -73,10 +70,7 @@ fn separate_system_siblings_application(
 }
 
 #[component]
-fn ordinary_and_system_siblings_application(
-    _props: ProjectionProps,
-    _events: EventInput<ProviderEvent>,
-) -> Component {
+fn ordinary_and_system_siblings_application(_props: ProjectionProps) -> Component {
     view! {
         shared_system_child()
 
@@ -89,10 +83,7 @@ fn ordinary_and_system_siblings_application(
 }
 
 #[component]
-fn projection_application(
-    _props: ProjectionProps,
-    _events: EventInput<ProviderEvent>,
-) -> Component {
+fn projection_application(_props: ProjectionProps) -> Component {
     view! {
         empty_feature()
         history_feature()
@@ -101,20 +92,14 @@ fn projection_application(
 }
 
 #[component]
-fn interleaved_application(
-    _props: ProjectionProps,
-    _events: EventInput<ProviderEvent>,
-) -> Component {
+fn interleaved_application(_props: ProjectionProps) -> Component {
     view! {
         interleaved_parent()
     }
 }
 
 #[component]
-fn diff_projection_application(
-    props: DiffProjectionProps,
-    _events: EventInput<ProviderEvent>,
-) -> Component {
+fn diff_projection_application(props: DiffProjectionProps) -> Component {
     let value = props.value;
     view! {
         before_diff { "before" }
@@ -138,7 +123,7 @@ fn rendered(item: &CanonicalInputItem) -> String {
 
 #[test]
 fn render_preserves_ordered_component_nodes_and_their_item_vectors() {
-    let mut host = ComponentHost::new(projection_application, ProjectionProps);
+    let mut host = ComponentHost::new_root(projection_application, ProjectionProps);
     let projection = host.render().unwrap().projection().clone();
     let nodes = projection.nodes();
 
@@ -171,7 +156,7 @@ fn render_preserves_ordered_component_nodes_and_their_item_vectors() {
 
 #[test]
 fn render_treats_components_as_ordered_ownership_units() {
-    let mut host = ComponentHost::new(interleaved_application, ProjectionProps);
+    let mut host = ComponentHost::new_root(interleaved_application, ProjectionProps);
     let projection = host.render().unwrap().projection().clone();
     let parent = projection
         .nodes()
@@ -222,7 +207,7 @@ fn render_treats_components_as_ordered_ownership_units() {
 
 #[test]
 fn separate_system_once_siblings_have_distinct_child_component_identities() {
-    let mut host = ComponentHost::new(separate_system_siblings_application, ProjectionProps);
+    let mut host = ComponentHost::new_root(separate_system_siblings_application, ProjectionProps);
     let projection = host.render().unwrap().projection().clone();
     let child_identities = projection
         .nodes()
@@ -237,7 +222,8 @@ fn separate_system_once_siblings_have_distinct_child_component_identities() {
 
 #[test]
 fn ordinary_and_system_mounts_of_same_child_have_disjoint_identities() {
-    let mut host = ComponentHost::new(ordinary_and_system_siblings_application, ProjectionProps);
+    let mut host =
+        ComponentHost::new_root(ordinary_and_system_siblings_application, ProjectionProps);
     let projection = host.render().unwrap().projection().clone();
     let child_identities = projection
         .nodes()
@@ -270,7 +256,7 @@ fn ordinary_and_system_mounts_of_same_child_have_disjoint_identities() {
 
 #[test]
 fn diff_root_retains_stable_item_provenance_and_complete_current_pom() {
-    let mut host = ComponentHost::new(
+    let mut host = ComponentHost::new_root(
         diff_projection_application,
         DiffProjectionProps {
             value: "A".to_owned(),

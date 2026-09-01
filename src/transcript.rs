@@ -37,6 +37,24 @@ pub enum AssistantPhase {
     FinalAnswer,
 }
 
+/// Whether provider-authored assistant text reached its semantic boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantTextStatus {
+    #[default]
+    Sealed,
+    Interrupted,
+}
+
+impl AssistantTextStatus {
+    fn is_sealed(&self) -> bool {
+        matches!(self, Self::Sealed)
+    }
+}
+
+pub(crate) const ASSISTANT_OUTPUT_INTERRUPTED_MARKER: &str =
+    "[agentview: assistant output interrupted before completion]";
+
 /// Provider-scoped fact retained for audit or same-provider replay.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProviderExtension {
@@ -132,6 +150,8 @@ pub enum CanonicalInputItem {
     AssistantText {
         text: String,
         phase: Option<AssistantPhase>,
+        #[serde(default, skip_serializing_if = "AssistantTextStatus::is_sealed")]
+        status: AssistantTextStatus,
     },
     ToolCall {
         call_id: String,
@@ -164,6 +184,8 @@ impl<'de> Deserialize<'de> for CanonicalInputItem {
             AssistantText {
                 text: String,
                 phase: Option<AssistantPhase>,
+                #[serde(default)]
+                status: AssistantTextStatus,
             },
             ToolCall {
                 call_id: String,
@@ -182,9 +204,15 @@ impl<'de> Deserialize<'de> for CanonicalInputItem {
                 Self::Instruction { authority, pom }
             }
             WireCanonicalInputItem::Message { role, pom } => Self::Message { role, pom },
-            WireCanonicalInputItem::AssistantText { text, phase } => {
-                Self::AssistantText { text, phase }
-            }
+            WireCanonicalInputItem::AssistantText {
+                text,
+                phase,
+                status,
+            } => Self::AssistantText {
+                text,
+                phase,
+                status,
+            },
             WireCanonicalInputItem::ToolCall {
                 call_id,
                 name,
@@ -219,6 +247,18 @@ impl CanonicalInputItem {
         Self::AssistantText {
             text: text.into(),
             phase,
+            status: AssistantTextStatus::Sealed,
+        }
+    }
+
+    pub fn interrupted_assistant_text(
+        text: impl Into<String>,
+        phase: Option<AssistantPhase>,
+    ) -> Self {
+        Self::AssistantText {
+            text: text.into(),
+            phase,
+            status: AssistantTextStatus::Interrupted,
         }
     }
 
@@ -331,8 +371,21 @@ impl CanonicalTranscript {
         Self::try_from_items(items)
     }
 
+    #[cfg(feature = "legacy-provider-port")]
     pub(crate) fn into_items(self) -> Vec<CanonicalInputItem> {
         self.items
+    }
+
+    /// Temporarily transfers an already validated sequence to an exclusive
+    /// transactional owner.
+    pub(crate) fn take_validated_items(&mut self) -> Vec<CanonicalInputItem> {
+        std::mem::take(&mut self.items)
+    }
+
+    /// Restores a sequence previously obtained from this transcript and only
+    /// changed through already validated canonical mutations.
+    pub(crate) fn restore_validated_items(&mut self, items: Vec<CanonicalInputItem>) {
+        self.items = items;
     }
 
     pub(crate) fn validate_sequence<'a>(

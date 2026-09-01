@@ -1,7 +1,4 @@
-use std::{
-    panic::{catch_unwind, AssertUnwindSafe},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -115,6 +112,6 @@ pub(super) fn observe_response_usage(
     usage: OpenAiResponsesUsage,
 ) {
     if let Some(observer) = observer {
-        let _ = catch_unwind(AssertUnwindSafe(|| observer(usage)));
+        observer(usage);
     }
 }

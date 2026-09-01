@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Reactor-driven Reaction",
+    "subtitle": "The Reactor owns timing; one structured call owns Frame, events, and reconciliation",
+    "output": "docs/reactor-reaction.sequence.html",
+    "viewBox": [820, 800]
+  },
+  "participants": [
+    { "id": "reactor", "type": "external", "label": "Reactor", "sublabel": "owns scheduling" },
+    { "id": "handle", "type": "frontend", "label": "Reaction", "sublabel": "single-flight handle" },
+    { "id": "runtime", "type": "backend", "label": "Component", "sublabel": "runtime + bindings" },
+    { "id": "exchange", "type": "messagebus", "label": "Exchange", "sublabel": "Frame callback" },
+    { "id": "target", "type": "cloud", "label": "Target", "sublabel": "provider / host" }
+  ],
+  "segments": [
+    { "from": 150, "to": 270, "label": "Schedule" },
+    { "from": 285, "to": 455, "label": "Frame exchange" },
+    { "from": 470, "to": 685, "label": "Reaction" }
+  ],
+  "messages": [
+    { "from": "reactor", "to": "handle", "y": 185, "label": "react(exchange)", "variant": "emphasis", "note": "Called only when this Reactor wants one reaction" },
+    { "from": "handle", "to": "runtime", "y": 230, "label": "reconcile + prepare", "variant": "emphasis" },
+    { "from": "runtime", "to": "handle", "y": 270, "label": "Frame + private bindings", "variant": "return" },
+    { "from": "handle", "to": "exchange", "y": 325, "label": "exchange(Frame)", "variant": "emphasis" },
+    { "from": "exchange", "to": "target", "y": 370, "label": "complete projection", "variant": "emphasis" },
+    { "from": "target", "to": "exchange", "y": 415, "label": "ProviderEventStream", "variant": "return" },
+    { "from": "exchange", "to": "handle", "y": 455, "label": "event stream", "variant": "return" },
+    { "from": "handle", "to": "runtime", "y": 515, "label": "dispatch with bindings", "variant": "emphasis" },
+    { "from": "runtime", "to": "handle", "y": 565, "label": "EOF + lanes complete", "variant": "return" },
+    { "from": "handle", "to": "runtime", "y": 615, "label": "reconcile dirty state", "variant": "emphasis" },
+    { "from": "runtime", "to": "handle", "y": 660, "label": "committed projection", "variant": "return" },
+    { "from": "handle", "to": "reactor", "y": 705, "label": "reaction complete", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "handle", "from": 180, "to": 712, "type": "frontend" },
+    { "participant": "runtime", "from": 225, "to": 670, "type": "backend" },
+    { "participant": "exchange", "from": 320, "to": 462, "type": "messagebus" },
+    { "participant": "target", "from": 365, "to": 422, "type": "cloud" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Scheduling owner",
+      "items": [
+        "The Reactor waits for its own wake, request, timer, or policy",
+        "AgentView does not expose a universal EventLoop or FramePort"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Structured causality",
+      "items": [
+        "The Runtime retains exact private bindings while the callback owns Frame",
+        "No public FrameId is needed for a single-flight scoped exchange"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "Provider boundary",
+      "items": [
+        "The callback always receives a complete projection",
+        "ProviderPort alone owns history, compaction, and diff baseline"
+      ]
+    }
+  ]
+}

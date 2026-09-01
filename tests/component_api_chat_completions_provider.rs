@@ -1,3 +1,9 @@
+#![cfg(feature = "legacy-provider-port")]
+#![allow(
+    deprecated,
+    reason = "this compatibility test intentionally exercises the Chat ProviderPort adapter"
+)]
+
 use std::convert::Infallible;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},

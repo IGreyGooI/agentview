@@ -1,0 +1,50 @@
+[package]
+name = "agentview-legacy-default-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+agentview = { path = "../../.." }
+
+[[bin]]
+name = "provider_port"
+path = "../legacy_consumer/src/bin/provider_port.rs"
+
+[[bin]]
+name = "application_host"
+path = "../legacy_consumer/src/bin/application_host.rs"
+
+[[bin]]
+name = "component_reaction_runtime"
+path = "../legacy_consumer/src/bin/component_reaction_runtime.rs"
+
+[[bin]]
+name = "prelude_event_input"
+path = "../legacy_consumer/src/bin/prelude_event_input.rs"
+
+[[bin]]
+name = "prelude_event_listener"
+path = "../legacy_consumer/src/bin/prelude_event_listener.rs"
+
+[[bin]]
+name = "prelude_component_events"
+path = "../legacy_consumer/src/bin/prelude_component_events.rs"
+
+[[bin]]
+name = "authoring_event_input"
+path = "../legacy_consumer/src/bin/authoring_event_input.rs"
+
+[[bin]]
+name = "authoring_event_listener"
+path = "../legacy_consumer/src/bin/authoring_event_listener.rs"
+
+[[bin]]
+name = "component_host_new"
+path = "../legacy_consumer/src/bin/component_host_new.rs"
+
+[[bin]]
+name = "external_application_new"
+path = "../legacy_consumer/src/bin/external_application_new.rs"

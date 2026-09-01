@@ -11,8 +11,9 @@ use std::{
 use crate::{
     pom_renderer::{render_pom_document, PomRenderError},
     transcript::{
-        AssistantPhase, CanonicalInputItem, CanonicalTranscript, ConversationRole,
-        InstructionAuthority, ProviderExtension,
+        AssistantPhase, AssistantTextStatus, CanonicalInputItem, CanonicalTranscript,
+        ConversationRole, InstructionAuthority, ProviderExtension,
+        ASSISTANT_OUTPUT_INTERRUPTED_MARKER,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -198,10 +199,12 @@ impl<'a> CodexHttpV1WireRequest<'a> {
 }
 
 impl CodexHttpV1Request {
+    #[cfg(feature = "legacy-provider-port")]
     pub(crate) fn instructions(&self) -> &str {
         &self.instructions
     }
 
+    #[cfg(feature = "legacy-provider-port")]
     pub(crate) fn canonical_input(&self) -> Result<Vec<Value>, CodexHttpV1Error> {
         self.input
             .iter()
@@ -210,6 +213,7 @@ impl CodexHttpV1Request {
             .map_err(Into::into)
     }
 
+    #[cfg(feature = "legacy-provider-port")]
     pub(crate) fn encode_bounded(&self, limit: usize) -> Result<Vec<u8>, CodexHttpV1Error> {
         serialize_json_bounded(self, limit)
     }
@@ -268,77 +272,147 @@ impl HistoryPolicy for CodexHttpV1HistoryPolicy {
         &self,
         transcript: &CanonicalTranscript,
     ) -> Result<Self::History, Self::Error> {
-        let mut instructions = None;
-        let mut input = Vec::with_capacity(transcript.items().len());
+        project_codex_items(transcript.items(), InterruptedTextEncoding::Reject)
+    }
+}
 
-        for item in transcript.items() {
-            match item {
-                CanonicalInputItem::Instruction {
-                    authority: InstructionAuthority::System,
-                    pom,
-                } => {
-                    if instructions.is_some() {
-                        return Err(CodexHttpV1Error::MultipleSystemInstructions);
-                    }
-                    instructions = Some(render_pom_document(pom)?);
-                }
-                CanonicalInputItem::Instruction {
-                    authority: InstructionAuthority::Developer,
-                    pom,
-                } => input.push(CodexInputItem::message(
-                    MessageRole::Developer,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptedTextEncoding {
+    Reject,
+    AssistantAndBoundary,
+}
+
+fn project_codex_items(
+    items: &[CanonicalInputItem],
+    interrupted_text: InterruptedTextEncoding,
+) -> Result<CodexHttpV1History, CodexHttpV1Error> {
+    let mut instructions = None;
+    let mut input = Vec::with_capacity(items.len());
+
+    for item in items {
+        let lowered = lower_codex_item(item, interrupted_text)?;
+        if let Some(current) = lowered.instructions {
+            if instructions.replace(current).is_some() {
+                return Err(CodexHttpV1Error::MultipleSystemInstructions);
+            }
+        }
+        input.extend(lowered.input);
+    }
+
+    Ok(CodexHttpV1History {
+        instructions: instructions.unwrap_or_default(),
+        input,
+    })
+}
+
+struct LoweredCodexItem {
+    instructions: Option<String>,
+    input: Vec<CodexInputItem>,
+}
+
+fn lower_codex_item(
+    item: &CanonicalInputItem,
+    interrupted_text: InterruptedTextEncoding,
+) -> Result<LoweredCodexItem, CodexHttpV1Error> {
+    let mut instructions = None;
+    let mut input = Vec::with_capacity(2);
+    match item {
+        CanonicalInputItem::Instruction {
+            authority: InstructionAuthority::System,
+            pom,
+        } => instructions = Some(render_pom_document(pom)?),
+        CanonicalInputItem::Instruction {
+            authority: InstructionAuthority::Developer,
+            pom,
+        } => input.push(CodexInputItem::message(
+            MessageRole::Developer,
+            TextContent::InputText {
+                text: render_pom_document(pom)?,
+            },
+        )),
+        CanonicalInputItem::Message { role, pom } => {
+            let (role, content) = match role {
+                ConversationRole::User => (
+                    MessageRole::User,
                     TextContent::InputText {
                         text: render_pom_document(pom)?,
                     },
-                )),
-                CanonicalInputItem::Message { role, pom } => {
-                    let (role, content) = match role {
-                        ConversationRole::User => (
-                            MessageRole::User,
-                            TextContent::InputText {
-                                text: render_pom_document(pom)?,
-                            },
-                        ),
-                        ConversationRole::Assistant => (
-                            MessageRole::Assistant,
-                            TextContent::OutputText {
-                                text: render_pom_document(pom)?,
-                            },
-                        ),
-                    };
-                    input.push(CodexInputItem::message(role, content));
-                }
-                CanonicalInputItem::AssistantText { text, phase } => {
-                    input.push(CodexInputItem::assistant_text(text.clone(), *phase));
-                }
-                CanonicalInputItem::ToolCall {
-                    call_id,
-                    name,
-                    raw_arguments,
-                } => {
-                    validate_function_name(name)?;
-                    input.push(CodexInputItem::FunctionCall {
-                        name: name.clone(),
-                        arguments: raw_arguments.clone(),
-                        call_id: call_id.clone(),
-                    });
-                }
-                CanonicalInputItem::ToolResult { call_id, content } => {
-                    input.push(CodexInputItem::FunctionCallOutput {
-                        call_id: call_id.clone(),
-                        output: content.clone(),
-                    });
-                }
-                CanonicalInputItem::ProviderExtension(extension) => {
-                    input.push(reasoning_input(extension)?);
-                }
-            }
+                ),
+                ConversationRole::Assistant => (
+                    MessageRole::Assistant,
+                    TextContent::OutputText {
+                        text: render_pom_document(pom)?,
+                    },
+                ),
+            };
+            input.push(CodexInputItem::message(role, content));
         }
+        CanonicalInputItem::AssistantText {
+            text,
+            phase,
+            status: AssistantTextStatus::Sealed,
+        } => input.push(CodexInputItem::assistant_text(text.clone(), *phase)),
+        CanonicalInputItem::AssistantText {
+            text,
+            phase,
+            status: AssistantTextStatus::Interrupted,
+        } => match interrupted_text {
+            InterruptedTextEncoding::Reject => {
+                return Err(CodexHttpV1Error::InterruptedAssistantTextUnsupported)
+            }
+            InterruptedTextEncoding::AssistantAndBoundary => {
+                input.push(CodexInputItem::assistant_text(text.clone(), *phase));
+                input.push(CodexInputItem::message(
+                    MessageRole::User,
+                    TextContent::InputText {
+                        text: ASSISTANT_OUTPUT_INTERRUPTED_MARKER.to_owned(),
+                    },
+                ));
+            }
+        },
+        CanonicalInputItem::ToolCall {
+            call_id,
+            name,
+            raw_arguments,
+        } => {
+            validate_function_name(name)?;
+            input.push(CodexInputItem::FunctionCall {
+                name: name.clone(),
+                arguments: raw_arguments.clone(),
+                call_id: call_id.clone(),
+            });
+        }
+        CanonicalInputItem::ToolResult { call_id, content } => {
+            input.push(CodexInputItem::FunctionCallOutput {
+                call_id: call_id.clone(),
+                output: content.clone(),
+            });
+        }
+        CanonicalInputItem::ProviderExtension(extension) => {
+            input.push(reasoning_input(extension)?);
+        }
+    }
+    Ok(LoweredCodexItem {
+        instructions,
+        input,
+    })
+}
 
-        Ok(CodexHttpV1History {
-            instructions: instructions.unwrap_or_default(),
-            input,
-        })
+/// Native Frame lowering for one canonical item.
+///
+/// System state occupies the separate instructions lane and therefore yields
+/// no input values. Ordinary items yield one value, except interrupted
+/// assistant text, which yields the visible output and its boundary marker.
+#[allow(dead_code)] // Wired into AsyncOpenAiResponsesProvider during Phase 6 migration.
+pub(crate) struct CodexHttpV1LoweredItem {
+    instructions: Option<String>,
+    input: Vec<Value>,
+}
+
+impl CodexHttpV1LoweredItem {
+    #[allow(dead_code)] // Wired into AsyncOpenAiResponsesProvider during Phase 6 migration.
+    pub(crate) fn into_parts(self) -> (Option<String>, Vec<Value>) {
+        (self.instructions, self.input)
     }
 }
 
@@ -373,24 +447,61 @@ impl CodexHttpV1Encoder {
         let tools = if native_tool_names.is_empty() {
             self.options.tools.clone()
         } else {
-            Some(
-                native_tool_names
-                    .iter()
-                    .map(|name| {
-                        CodexFunctionTool::new(
-                            name.clone(),
-                            "AgentView native tool",
-                            serde_json::json!({
-                                "type": "object",
-                                "additionalProperties": true,
-                            }),
-                            false,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
+            Some(native_function_tools(native_tool_names)?)
         };
-        Ok(CodexHttpV1Request {
+        Ok(self.request_from_history(history, tools))
+    }
+
+    /// Lowers one already-validated Frame item without requiring its section to
+    /// be a standalone canonical transcript.
+    ///
+    /// This matters for Delta sections, where a ToolResult may close a ToolCall
+    /// held by the accepted checkpoint. Callers concatenate returned groups in
+    /// `replay -> staged_inputs -> projection` order.
+    #[allow(dead_code)] // Wired into AsyncOpenAiResponsesProvider during Phase 6 migration.
+    pub(crate) fn lower_canonical_item(
+        &self,
+        item: &CanonicalInputItem,
+    ) -> Result<CodexHttpV1LoweredItem, CodexHttpV1Error> {
+        let lowered = lower_codex_item(item, InterruptedTextEncoding::AssistantAndBoundary)?;
+        let input = lowered
+            .input
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CodexHttpV1LoweredItem {
+            instructions: lowered.instructions,
+            input,
+        })
+    }
+
+    /// Encodes the exact native Frame wire candidate under its complete tool
+    /// catalog. An empty catalog is serialized as `tools: []`; it never falls
+    /// back to tools configured on the encoder.
+    #[allow(dead_code)] // Wired into AsyncOpenAiResponsesProvider during Phase 6 migration.
+    pub(crate) fn encode_frame_request_bounded(
+        &self,
+        input: &[Value],
+        instructions: &str,
+        exact_tool_names: &[String],
+        limit: usize,
+    ) -> Result<Vec<u8>, CodexHttpV1Error> {
+        let request = self.request_from_history(
+            CodexHttpV1History {
+                instructions: String::new(),
+                input: Vec::new(),
+            },
+            Some(native_function_tools(exact_tool_names)?),
+        );
+        request.encode_with_input_and_instructions_bounded(input, instructions, limit)
+    }
+
+    fn request_from_history(
+        &self,
+        history: CodexHttpV1History,
+        tools: Option<Vec<CodexFunctionTool>>,
+    ) -> CodexHttpV1Request {
+        CodexHttpV1Request {
             model: self.options.model.clone(),
             instructions: history.instructions,
             input: history.input,
@@ -403,7 +514,7 @@ impl CodexHttpV1Encoder {
             stream: true,
             include: vec![IncludedField::ReasoningEncryptedContent],
             prompt_cache_key: self.options.prompt_cache_key.clone(),
-        })
+        }
     }
 
     #[cfg(test)]
@@ -421,6 +532,25 @@ impl CodexHttpV1Encoder {
         );
         Ok(serde_json::to_vec(&request)?)
     }
+}
+
+fn native_function_tools(
+    native_tool_names: &[String],
+) -> Result<Vec<CodexFunctionTool>, CodexHttpV1Error> {
+    native_tool_names
+        .iter()
+        .map(|name| {
+            CodexFunctionTool::new(
+                name.clone(),
+                "AgentView native tool",
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": true,
+                }),
+                false,
+            )
+        })
+        .collect()
 }
 
 struct BoundedJsonWriter {
@@ -673,6 +803,8 @@ pub enum CodexHttpV1Error {
     EmptyPromptCacheKey,
     #[error("codex-http-v1 accepts at most one System instruction")]
     MultipleSystemInstructions,
+    #[error("legacy codex-http-v1 history cannot encode interrupted assistant text")]
+    InterruptedAssistantTextUnsupported,
     #[error(
         "codex-http-v1 does not accept provider extension {provider}/{capability}@{schema_version}"
     )]
@@ -751,6 +883,105 @@ mod tests {
             String::from_utf8(encoded).unwrap(),
             r#"{"model":"gpt-5.6-codex","instructions":"<system>Retain these instructions.</system>","input":[{"encrypted_content":"opaque","id":"cmp_7","type":"compaction"}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":{"effort":"max","summary":"detailed"},"context_management":[{"type":"compaction","compact_threshold":200000}],"store":false,"stream":true,"include":["reasoning.encrypted_content"],"prompt_cache_key":"retained-session"}"#
         );
+    }
+
+    #[test]
+    fn native_frame_items_expand_interrupted_text_and_accept_delta_tool_result() {
+        let encoder = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new(
+                "gpt-5.6-codex",
+                Some(vec![CodexFunctionTool::new(
+                    "configured_tool",
+                    "old",
+                    json!({}),
+                    false,
+                )
+                .unwrap()]),
+                None,
+                None::<String>,
+            )
+            .unwrap(),
+        );
+        let interrupted = CanonicalInputItem::interrupted_assistant_text(
+            "visible partial",
+            Some(AssistantPhase::Commentary),
+        );
+        let tool_result =
+            CanonicalInputItem::tool_result("call-from-checkpoint", "tool result").unwrap();
+        let (instructions, mut input) = encoder
+            .lower_canonical_item(&interrupted)
+            .unwrap()
+            .into_parts();
+        let (tool_instructions, tool_input) = encoder
+            .lower_canonical_item(&tool_result)
+            .unwrap()
+            .into_parts();
+        input.extend(tool_input);
+
+        assert_eq!(instructions, None);
+        assert_eq!(tool_instructions, None);
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[0]["phase"], "commentary");
+        assert_eq!(input[0]["content"][0]["text"], "visible partial");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(
+            input[1]["content"][0]["text"],
+            ASSISTANT_OUTPUT_INTERRUPTED_MARKER
+        );
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call-from-checkpoint");
+        assert_eq!(input[2]["output"], "tool result");
+
+        let body = encoder
+            .encode_frame_request_bounded(&input, "", &[], usize::MAX)
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["tools"], json!([]));
+        assert!(!body.to_string().contains("configured_tool"));
+    }
+
+    #[test]
+    fn legacy_history_policy_keeps_interrupted_text_fail_closed() {
+        let transcript = CanonicalTranscript::new()
+            .appended(CanonicalInputItem::interrupted_assistant_text(
+                "visible partial",
+                None,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            CodexHttpV1HistoryPolicy.project_history(&transcript),
+            Err(CodexHttpV1Error::InterruptedAssistantTextUnsupported)
+        ));
+    }
+
+    #[test]
+    fn native_frame_request_uses_system_lane_and_inclusive_wire_limit() {
+        let encoder = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+        );
+        let system = CanonicalInputItem::instruction(
+            InstructionAuthority::System,
+            xml_document("system", "Current instructions."),
+        );
+        let (instructions, input) = encoder.lower_canonical_item(&system).unwrap().into_parts();
+        let instructions = instructions.unwrap();
+
+        assert!(input.is_empty());
+        let body = encoder
+            .encode_frame_request_bounded(&input, &instructions, &[], usize::MAX)
+            .unwrap();
+        assert_eq!(
+            encoder
+                .encode_frame_request_bounded(&input, &instructions, &[], body.len())
+                .unwrap(),
+            body
+        );
+        assert!(matches!(
+            encoder.encode_frame_request_bounded(&input, &instructions, &[], body.len() - 1,),
+            Err(CodexHttpV1Error::SerializedRequestBodyLimit)
+        ));
     }
 
     #[test]

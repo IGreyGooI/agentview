@@ -25,11 +25,18 @@ impl<E> EventInput<E> {
     where
         E: Send + Sync + 'static,
     {
+        Self::from_origin(EventInputOrigin {
+            map_id: EventMapId::fresh(),
+            generation,
+        })
+    }
+
+    pub(crate) fn from_origin(origin: EventInputOrigin) -> Self
+    where
+        E: Send + Sync + 'static,
+    {
         Self {
-            route: Arc::new(EventRouteDescriptor::root::<E>(EventInputOrigin {
-                map_id: EventMapId::fresh(),
-                generation,
-            })),
+            route: Arc::new(EventRouteDescriptor::root::<E>(origin)),
             marker: PhantomData,
         }
     }
@@ -403,6 +410,10 @@ pub(crate) enum EventRouteProjectionFault {
 }
 
 #[cfg(test)]
+#[allow(
+    deprecated,
+    reason = "this test module verifies the retained ComponentEvents derive ABI"
+)]
 mod tests {
     use std::{any::type_name, sync::Arc};
 

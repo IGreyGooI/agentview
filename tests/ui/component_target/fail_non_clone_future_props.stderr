@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `NonCloneProps: Clone` is not satisfied
+ --> tests/ui/component_target/fail_non_clone_future_props.rs:7:1
+  |
+7 | #[component]
+  | ^^^^^^^^^^^^ the trait `Clone` is not implemented for `NonCloneProps`
+  |
+note: required by a bound in `clone_repeatable_input`
+ --> src/component/authoring.rs
+  |
+  |     pub fn clone_repeatable_input<T>(value: &T) -> T
+  |            ---------------------- required by a bound in this function
+  |     where
+  |         T: Clone,
+  |            ^^^^^ required by this bound in `clone_repeatable_input`
+  = note: this error originates in the attribute macro `component` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider annotating `NonCloneProps` with `#[derive(Clone)]`
+  |
+3 + #[derive(Clone)]
+4 | struct NonCloneProps {
+  |

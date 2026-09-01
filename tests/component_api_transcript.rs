@@ -3,8 +3,8 @@ use agentview::{
     pom_renderer::render_pom_document,
     pom_resolution::resolve_artifact_document,
     transcript::{
-        CanonicalInputItem, CanonicalTranscript, CanonicalTranscriptError, ConversationRole,
-        InstructionAuthority, ProviderExtension,
+        AssistantPhase, AssistantTextStatus, CanonicalInputItem, CanonicalTranscript,
+        CanonicalTranscriptError, ConversationRole, InstructionAuthority, ProviderExtension,
     },
 };
 use serde_json::json;
@@ -53,6 +53,44 @@ fn canonical_transcript_is_immutable_ordered_pom_history() {
         panic!("the second item must remain a canonical message");
     };
     assert_eq!(render_pom_document(pom).unwrap(), "Choose one move.");
+}
+
+#[test]
+fn sealed_assistant_text_keeps_its_legacy_json_and_interrupted_is_explicit() {
+    let sealed = CanonicalInputItem::assistant_text("complete", Some(AssistantPhase::FinalAnswer));
+    let legacy =
+        br#"{"kind":"assistant_text","payload":{"text":"complete","phase":"final_answer"}}"#;
+
+    assert_eq!(serde_json::to_vec(&sealed).unwrap(), legacy);
+    assert_eq!(
+        serde_json::from_slice::<CanonicalInputItem>(legacy).unwrap(),
+        sealed
+    );
+
+    let interrupted = CanonicalInputItem::interrupted_assistant_text("partial", None);
+    assert!(matches!(
+        interrupted,
+        CanonicalInputItem::AssistantText {
+            status: AssistantTextStatus::Interrupted,
+            ..
+        }
+    ));
+    assert_eq!(
+        serde_json::to_value(&interrupted).unwrap(),
+        json!({
+            "kind": "assistant_text",
+            "payload": {
+                "text": "partial",
+                "phase": null,
+                "status": "interrupted"
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<CanonicalInputItem>(serde_json::to_value(&interrupted).unwrap())
+            .unwrap(),
+        interrupted
+    );
 }
 
 #[test]

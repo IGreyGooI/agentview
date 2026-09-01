@@ -4,10 +4,12 @@ use crate::component::authoring::{
     event_input::{EventInputOrigin, EventRouteTopology},
     event_listener::EventListenerDeclaration,
     streaming_xml::{
-        MountedStreamingRoute, MountedXmlStreamingToolCall, XmlContractDiagnostic,
+        MountedStreamingRoute, MountedStreamingXmlTag, MountedXmlStreamingToolCall,
+        StreamingXmlPhase, StreamingXmlTagDeclaration, XmlContractDiagnostic,
         XmlStreamingToolCallDeclaration,
     },
 };
+use crate::stream_parser::XmlElement;
 
 use super::ComponentAttemptFault;
 
@@ -41,7 +43,18 @@ impl MountedListener {
         let mounted = MountedXmlStreamingToolCall::new(declaration, event_origin)
             .map_err(ComponentAttemptFault::streaming_mount)?;
         Ok(Self {
-            declaration: MountedListenerDeclaration::Streaming(Box::new(mounted)),
+            declaration: MountedListenerDeclaration::StreamingToolCall(Box::new(mounted)),
+        })
+    }
+
+    pub(super) fn new_streaming_tag(
+        declaration: StreamingXmlTagDeclaration,
+        event_origin: EventInputOrigin,
+    ) -> Result<Self, ComponentAttemptFault> {
+        let mounted = MountedStreamingXmlTag::new(declaration, event_origin)
+            .map_err(ComponentAttemptFault::streaming_mount)?;
+        Ok(Self {
+            declaration: MountedListenerDeclaration::StreamingTag(Box::new(mounted)),
         })
     }
 
@@ -57,18 +70,19 @@ impl MountedListener {
                 .dispatch_root(root)
                 .await
                 .map_err(ComponentAttemptFault::listener_dispatch),
-            MountedListenerDeclaration::Streaming(_) => Ok(false),
+            MountedListenerDeclaration::StreamingToolCall(_)
+            | MountedListenerDeclaration::StreamingTag(_) => Ok(false),
         }
     }
 
-    pub(super) async fn dispatch_streaming(
+    pub(super) async fn dispatch_streaming_decoded(
         &mut self,
         decoded: Option<String>,
         invalid: Option<XmlContractDiagnostic>,
     ) -> Result<(), ComponentAttemptFault> {
-        let MountedListenerDeclaration::Streaming(streaming) = &mut self.declaration else {
+        let MountedListenerDeclaration::StreamingToolCall(streaming) = &mut self.declaration else {
             return Err(ComponentAttemptFault::RuntimeInvariant {
-                message: String::from("streaming parser targeted a non-streaming listener"),
+                message: String::from("streaming decoder targeted a non-tool-call listener"),
             });
         };
         match (decoded, invalid) {
@@ -86,20 +100,48 @@ impl MountedListener {
         }
     }
 
-    pub(super) async fn finish(&mut self) -> Result<(), ComponentAttemptFault> {
+    pub(super) async fn dispatch_streaming_phase(
+        &mut self,
+        phase: StreamingXmlPhase,
+        element: XmlElement,
+    ) -> Result<(), ComponentAttemptFault> {
+        let MountedListenerDeclaration::StreamingTag(streaming) = &mut self.declaration else {
+            return Err(ComponentAttemptFault::RuntimeInvariant {
+                message: String::from("streaming lifecycle event targeted a non-tag listener"),
+            });
+        };
+        streaming
+            .dispatch_phase(phase, element)
+            .await
+            .map_err(ComponentAttemptFault::streaming_input)
+    }
+
+    pub(super) async fn dispatch_streaming_invalid(
+        &mut self,
+        diagnostic: XmlContractDiagnostic,
+    ) -> Result<(), ComponentAttemptFault> {
         match &mut self.declaration {
-            MountedListenerDeclaration::Event(_) => Ok(()),
-            MountedListenerDeclaration::Streaming(streaming) => streaming
-                .finish()
+            MountedListenerDeclaration::StreamingToolCall(streaming) => streaming
+                .dispatch_invalid(diagnostic)
                 .await
                 .map_err(ComponentAttemptFault::streaming_input),
+            MountedListenerDeclaration::StreamingTag(streaming) => streaming
+                .dispatch_invalid(diagnostic)
+                .await
+                .map_err(ComponentAttemptFault::streaming_input),
+            MountedListenerDeclaration::Event(_) => Err(ComponentAttemptFault::RuntimeInvariant {
+                message: String::from("streaming diagnostic targeted a raw event listener"),
+            }),
         }
     }
 
     fn route_topology(&self) -> EventRouteTopology {
         match &self.declaration {
             MountedListenerDeclaration::Event(declaration) => declaration.topology(),
-            MountedListenerDeclaration::Streaming(streaming) => {
+            MountedListenerDeclaration::StreamingToolCall(streaming) => {
+                streaming.route_descriptor().topology()
+            }
+            MountedListenerDeclaration::StreamingTag(streaming) => {
                 streaming.route_descriptor().topology()
             }
         }
@@ -108,7 +150,8 @@ impl MountedListener {
 
 enum MountedListenerDeclaration {
     Event(EventListenerDeclaration),
-    Streaming(Box<MountedXmlStreamingToolCall>),
+    StreamingToolCall(Box<MountedXmlStreamingToolCall>),
+    StreamingTag(Box<MountedStreamingXmlTag>),
 }
 
 pub(super) fn build_streaming_routes(
@@ -134,10 +177,17 @@ pub(super) fn build_streaming_routes(
     let mut routes = Vec::<MountedStreamingRoute>::new();
     let mut by_topology = HashMap::<EventRouteTopology, usize>::new();
     for (listener_index, listener) in listeners.iter().enumerate() {
-        let MountedListenerDeclaration::Streaming(streaming) = &listener.declaration else {
-            continue;
+        let (descriptor, registration) = match &listener.declaration {
+            MountedListenerDeclaration::StreamingToolCall(streaming) => (
+                streaming.route_descriptor(),
+                streaming.registration(listener_index),
+            ),
+            MountedListenerDeclaration::StreamingTag(streaming) => (
+                streaming.route_descriptor(),
+                streaming.registration(listener_index),
+            ),
+            MountedListenerDeclaration::Event(_) => continue,
         };
-        let descriptor = streaming.route_descriptor();
         let topology = descriptor.topology();
         let route_index = if let Some(route_index) = by_topology.get(&topology).copied() {
             route_index
@@ -148,7 +198,7 @@ pub(super) fn build_streaming_routes(
             route_index
         };
         routes[route_index]
-            .register(streaming.registration(listener_index))
+            .register(registration)
             .map_err(ComponentAttemptFault::streaming_mount)?;
     }
     Ok(routes)

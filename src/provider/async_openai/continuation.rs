@@ -8,13 +8,10 @@ use serde_json::Value;
 
 use crate::{
     component::execution::{
-        ProjectionExecutionScope, RenderedProjection, RenderedProjectionFragment,
-        RenderedProjectionNode, ToolOutput,
+        ProjectionAppendPolicy, ProjectionDiffState, ProjectionExecutionScope, RenderedProjection,
+        RenderedProjectionFragment, RenderedProjectionNode, ToolOutput,
     },
-    provider::{
-        codex_http_v1::{CodexHttpV1Encoder, CodexHttpV1Error},
-        projection_diff::{ProjectionAppendPolicy, ProjectionDiffState},
-    },
+    provider::codex_http_v1::{CodexHttpV1Encoder, CodexHttpV1Error},
     transcript::{
         AssistantPhase, CanonicalInputItem, CanonicalTranscript, CanonicalTranscriptError,
         InstructionAuthority,
@@ -469,7 +466,7 @@ impl OpenAiContinuation {
                 .find(|(ordinal, _)| **ordinal > output_index)
                 .map(|(_, placement)| placement);
             let semantic_output =
-                CanonicalInputItem::assistant_text(output.text.clone(), output.phase);
+                CanonicalInputItem::interrupted_assistant_text(output.text.clone(), output.phase);
             let semantic_insertion = next
                 .and_then(|placement| placement.semantic_output.as_ref())
                 .and_then(|later| {
@@ -966,9 +963,11 @@ impl ItemOccurrenceIndex {
 
 fn submission_item_key(item: &CanonicalInputItem) -> Result<Vec<u8>, OpenAiContinuationError> {
     let result = match item {
-        CanonicalInputItem::AssistantText { text, phase } => {
-            serde_json::to_vec(&(0_u8, text, normalized_final_phase(*phase)))
-        }
+        CanonicalInputItem::AssistantText {
+            text,
+            phase,
+            status,
+        } => serde_json::to_vec(&(0_u8, text, normalized_final_phase(*phase), status)),
         _ => serde_json::to_vec(&(1_u8, item)),
     };
     result.map_err(|_| OpenAiContinuationError::InvalidEncodedRequest)
@@ -1387,8 +1386,8 @@ mod tests {
             CodexFunctionTool, CodexHttpV1Encoder, CodexHttpV1Options, CodexReasoning,
         },
         transcript::{
-            reset_construction_work, take_construction_work, AssistantPhase, CanonicalInputItem,
-            ConversationRole,
+            reset_construction_work, take_construction_work, AssistantPhase, AssistantTextStatus,
+            CanonicalInputItem, ConversationRole,
         },
     };
 
@@ -1891,6 +1890,15 @@ mod tests {
             .record_text_partial(7, "visible partial", None)
             .unwrap();
         initial.abort_open_outputs();
+
+        assert!(matches!(
+            initial.unclaimed_provider_outputs.as_slice(),
+            [CanonicalInputItem::AssistantText {
+                text,
+                status: AssistantTextStatus::Interrupted,
+                ..
+            }] if text == "visible partial"
+        ));
 
         let next = OpenAiContinuation::prepare(
             Some(&initial),

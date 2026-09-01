@@ -6,8 +6,12 @@ use crate::{
     },
 };
 
-use super::streaming_xml::XmlStreamingToolCallDeclaration;
-use super::{event_listener::EventListenerDeclaration, render_context::HookRenderContext};
+#[cfg(any(feature = "legacy-provider-port", test))]
+use super::event_listener::EventListenerDeclaration;
+use super::render_context::HookRenderContext;
+use super::streaming_xml::{
+    StreamingXmlTag, StreamingXmlTagDeclaration, XmlStreamingToolCallDeclaration,
+};
 
 pub struct Component {
     pub(crate) node: ComponentNode,
@@ -34,7 +38,9 @@ pub(crate) enum ComponentNode {
         slot: &'static str,
         child: Box<Component>,
     },
+    #[cfg(any(feature = "legacy-provider-port", test))]
     EventListener(EventListenerDeclaration),
+    StreamingXmlTag(Box<StreamingXmlTagDeclaration>),
     XmlStreamingToolCall(Box<XmlStreamingToolCallDeclaration>),
     NativeToolCall(Box<super::native_tool::NativeToolCallDeclaration>),
 }
@@ -203,6 +209,12 @@ impl IntoViewRoot for Component {
     }
 }
 
+impl IntoViewRoot for StreamingXmlTag {
+    fn into_view_root(self) -> Component {
+        self.into_component()
+    }
+}
+
 impl<T> private::Sealed for T
 where
     T: AgentView,
@@ -237,6 +249,7 @@ where
 }
 
 impl private::Sealed for Component {}
+impl private::Sealed for StreamingXmlTag {}
 
 mod private {
     pub trait Sealed {}

@@ -5,14 +5,19 @@ use ::async_openai::types::responses::{
     OutputStatus, OutputTextContent, ReasoningItem, ResponseOutputTextAnnotationAddedEvent,
     SummaryPart,
 };
-use serde_json::{json, Map, Value};
+#[cfg(any(feature = "legacy-provider-port", test))]
+use serde_json::json;
+use serde_json::{Map, Value};
 
+#[cfg(any(feature = "legacy-provider-port", test))]
+use crate::transcript::CanonicalInputItem;
+#[cfg(feature = "legacy-provider-port")]
+use crate::{component::execution::ProviderResponseLedgerReason, transcript::ProviderExtension};
 use crate::{
     component::execution::{
-        ProviderFault, ProviderResponseCompletedReconciliation, ProviderResponseLedgerReason,
-        ProviderResponseMessageTextReason, ProviderResponseOutputIdentityDetail,
-        ProviderResponseOutputIdentityKindPair, ProviderResponseOutputIdentityLifecycleState,
-        ProviderResponseOutputIdentityMappingBasis,
+        ProviderFault, ProviderResponseCompletedReconciliation, ProviderResponseMessageTextReason,
+        ProviderResponseOutputIdentityDetail, ProviderResponseOutputIdentityKindPair,
+        ProviderResponseOutputIdentityLifecycleState, ProviderResponseOutputIdentityMappingBasis,
         ProviderResponseOutputIdentityObservedMessageDistance,
         ProviderResponseOutputIdentityObservedMessageRelation,
         ProviderResponseOutputIdentityObservedSpan,
@@ -26,11 +31,14 @@ use crate::{
         ProviderResponseReconciliationResponseStatus, ProviderResponseReconciliationTextPresence,
         ProviderResponseReconciliationTextRelation,
     },
-    transcript::{AssistantPhase, CanonicalInputItem, ProviderExtension},
+    transcript::AssistantPhase,
 };
 
+#[cfg(feature = "legacy-provider-port")]
 const OPENAI_PROVIDER: &str = "openai";
+#[cfg(feature = "legacy-provider-port")]
 const REASONING_CAPABILITY: &str = "reasoning.encrypted_content";
+#[cfg(feature = "legacy-provider-port")]
 const REASONING_SCHEMA_VERSION: u32 = 1;
 
 struct TextOutputKey {
@@ -82,10 +90,12 @@ struct TextLifecycle {
     content_part_done_sequence: Option<u64>,
 }
 
+#[cfg(any(feature = "legacy-provider-port", test))]
 pub(super) struct CompletedOpenAiOutput {
     pub(super) output_items: Vec<CanonicalInputItem>,
     pub(super) wire_items: Vec<Value>,
     pub(super) final_text: String,
+    #[cfg(feature = "legacy-provider-port")]
     pub(super) output_text_bytes: usize,
 }
 
@@ -94,6 +104,7 @@ pub(super) struct CompletedOpenAiOutput {
 #[derive(Clone)]
 pub(super) struct SealedOpenAiPrivateOutput {
     pub(super) output_index: u64,
+    #[cfg(feature = "legacy-provider-port")]
     pub(super) output_item: Option<CanonicalInputItem>,
     pub(super) wire_item: Value,
 }
@@ -141,6 +152,7 @@ pub(super) enum ResponseOutputLedgerError {
         terminal_output_index: u64,
         observed_lifecycle_index: u64,
     },
+    #[cfg(any(feature = "legacy-provider-port", test))]
     MultipleFinalMessages,
     MissingFinalMessage,
     Canonicalization,
@@ -165,6 +177,7 @@ pub(super) enum ResponseOutputItemLifecycleError {
 }
 
 impl ResponseOutputItemLifecycleError {
+    #[cfg(feature = "legacy-provider-port")]
     pub(super) fn response_ledger_reason(self) -> ProviderResponseLedgerReason {
         match self {
             Self::InvalidOutputIndex => ProviderResponseLedgerReason::OutputIndex,
@@ -198,6 +211,7 @@ impl ResponseOutputItemLifecycleError {
 }
 
 impl ResponseOutputLedgerError {
+    #[cfg(feature = "legacy-provider-port")]
     pub(super) fn response_ledger_reason(&self) -> ProviderResponseLedgerReason {
         match self {
             Self::MissingResponseObject | Self::InvalidResponse => {
@@ -220,6 +234,7 @@ impl ResponseOutputLedgerError {
             | Self::TerminalMessagePhaseMismatch { .. } => {
                 ProviderResponseLedgerReason::MessageText
             }
+            #[cfg(any(feature = "legacy-provider-port", test))]
             Self::MultipleFinalMessages => ProviderResponseLedgerReason::FinalMessageCount,
             Self::MissingFinalMessage => ProviderResponseLedgerReason::FinalMessageMissing,
             Self::Canonicalization => ProviderResponseLedgerReason::Canonicalization,
@@ -265,6 +280,7 @@ impl ResponseOutputLedgerError {
             Self::TerminalMessagePhaseMismatch { .. } => {
                 "OpenAI terminal message phase does not match observed message"
             }
+            #[cfg(any(feature = "legacy-provider-port", test))]
             Self::MultipleFinalMessages => {
                 "OpenAI response contains more than one final assistant message"
             }
@@ -273,6 +289,7 @@ impl ResponseOutputLedgerError {
         })
     }
 
+    #[cfg(any(feature = "legacy-provider-port", test))]
     pub(super) fn response_output_identity_reason(
         &self,
     ) -> Option<ProviderResponseOutputIdentityReason> {
@@ -300,6 +317,7 @@ impl ResponseOutputLedgerError {
         }
     }
 
+    #[cfg(any(feature = "legacy-provider-port", test))]
     pub(super) fn response_output_identity_detail(
         &self,
     ) -> Option<ProviderResponseOutputIdentityDetail> {
@@ -336,26 +354,31 @@ impl ResponseOutputLedgerFailure {
         self.error
     }
 
+    #[cfg(feature = "legacy-provider-port")]
     pub(super) fn response_ledger_reason(&self) -> ProviderResponseLedgerReason {
         self.error.response_ledger_reason()
     }
 
+    #[cfg(any(feature = "legacy-provider-port", test))]
     pub(super) fn response_message_text_reason(&self) -> Option<ProviderResponseMessageTextReason> {
         self.error.response_message_text_reason()
     }
 
+    #[cfg(any(feature = "legacy-provider-port", test))]
     pub(super) fn response_completed_reconciliation(
         &self,
     ) -> Option<ProviderResponseCompletedReconciliation> {
         self.response_completed_reconciliation.as_deref().copied()
     }
 
+    #[cfg(any(feature = "legacy-provider-port", test))]
     pub(super) fn response_output_identity_reason(
         &self,
     ) -> Option<ProviderResponseOutputIdentityReason> {
         self.error.response_output_identity_reason()
     }
 
+    #[cfg(any(feature = "legacy-provider-port", test))]
     pub(super) fn response_output_identity_detail(
         &self,
     ) -> Option<ProviderResponseOutputIdentityDetail> {
@@ -686,6 +709,7 @@ impl OpenAiOutputLedger {
         Ok(())
     }
 
+    #[cfg(any(feature = "legacy-provider-port", test))]
     pub(super) fn complete(
         &self,
         payload: &Map<String, Value>,
@@ -700,10 +724,65 @@ impl OpenAiOutputLedger {
         })
     }
 
+    /// Validates a Frame-native terminal response without requiring a primary
+    /// text output. Tool-only, reasoning-only, and commentary-only reactions
+    /// still have to reconcile every observed public/private lifecycle.
+    pub(super) fn validate_completed_allowing_no_primary(
+        &self,
+        payload: &Map<String, Value>,
+    ) -> Result<(), ResponseOutputLedgerFailure> {
+        self.validate_completed_allowing_no_primary_inner(payload)
+            .map_err(|error| {
+                let response_completed_reconciliation =
+                    self.completed_reconciliation_snapshot(payload, &error);
+                ResponseOutputLedgerFailure {
+                    error,
+                    response_completed_reconciliation: response_completed_reconciliation
+                        .map(Box::new),
+                }
+            })
+    }
+
+    #[cfg(any(feature = "legacy-provider-port", test))]
     fn complete_inner(
         &self,
         payload: &Map<String, Value>,
     ) -> Result<CompletedOpenAiOutput, ResponseOutputLedgerError> {
+        self.reconcile_completed_terminal(payload)?;
+        self.completed_from_sealed_lifecycle()
+    }
+
+    fn validate_completed_allowing_no_primary_inner(
+        &self,
+        payload: &Map<String, Value>,
+    ) -> Result<(), ResponseOutputLedgerError> {
+        self.reconcile_completed_terminal(payload)?;
+        for lifecycle in self.items.values() {
+            if !lifecycle.done {
+                return Err(ResponseOutputLedgerError::InvalidCompletedItem);
+            }
+            match lifecycle.kind {
+                OutputKind::Reasoning | OutputKind::Compaction
+                    if lifecycle.sealed_private.is_none() =>
+                {
+                    return Err(ResponseOutputLedgerError::InvalidCompletedItem);
+                }
+                OutputKind::Reasoning | OutputKind::Compaction => {}
+                OutputKind::Message
+                    if lifecycle.text.as_ref().and_then(observed_text).is_none() =>
+                {
+                    return Err(ResponseOutputLedgerError::MissingFinalMessage);
+                }
+                OutputKind::Message => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_completed_terminal(
+        &self,
+        payload: &Map<String, Value>,
+    ) -> Result<(), ResponseOutputLedgerError> {
         let response = completed_response(payload)?;
         if self
             .response_id
@@ -729,17 +808,19 @@ impl OpenAiOutputLedger {
                 .collect::<Result<Vec<_>, _>>()?;
             self.reconcile_terminal_items(&mut parsed)?;
         }
-        self.completed_from_sealed_lifecycle()
+        Ok(())
     }
 
     /// A Responses completion frame is metadata, not a second output source.
     /// Some compatible streams omit `response.output` entirely after every
     /// item was already sealed. In that form, only the completed lifecycle may
     /// supply the final public text; no terminal item is invented or adopted.
+    #[cfg(any(feature = "legacy-provider-port", test))]
     fn completed_from_sealed_lifecycle(
         &self,
     ) -> Result<CompletedOpenAiOutput, ResponseOutputLedgerError> {
         let mut final_text = None;
+        #[cfg(feature = "legacy-provider-port")]
         let mut output_text_bytes = 0_usize;
         let mut output_items = Vec::new();
 
@@ -760,9 +841,13 @@ impl OpenAiOutputLedger {
                         .as_ref()
                         .and_then(observed_text)
                         .ok_or(ResponseOutputLedgerError::MissingFinalMessage)?;
-                    output_text_bytes = output_text_bytes.saturating_add(text.len());
+                    #[cfg(feature = "legacy-provider-port")]
+                    {
+                        output_text_bytes = output_text_bytes.saturating_add(text.len());
+                    }
                     let phase = lifecycle.phase;
                     output_items.push(CanonicalInputItem::assistant_text(text, phase));
+                    #[cfg(any(feature = "legacy-provider-port", test))]
                     if phase != Some(AssistantPhase::Commentary)
                         && final_text.replace(text.to_owned()).is_some()
                     {
@@ -776,6 +861,7 @@ impl OpenAiOutputLedger {
             output_items,
             wire_items: Vec::new(),
             final_text: final_text.ok_or(ResponseOutputLedgerError::MissingFinalMessage)?,
+            #[cfg(feature = "legacy-provider-port")]
             output_text_bytes,
         })
     }
@@ -1899,11 +1985,12 @@ fn sealed_private_output(
     item: &ParsedOutputItem,
 ) -> Result<Option<SealedOpenAiPrivateOutput>, ResponseOutputLedgerError> {
     match &item.body {
-        ParsedOutputItemBody::Sdk(OutputItem::Reasoning(reasoning)) => {
+        ParsedOutputItemBody::Sdk(OutputItem::Reasoning(_reasoning)) => {
             validate_terminal_item(item)?;
             Ok(Some(SealedOpenAiPrivateOutput {
                 output_index: item.output_index,
-                output_item: Some(reasoning_output(reasoning)?),
+                #[cfg(feature = "legacy-provider-port")]
+                output_item: Some(reasoning_output(_reasoning)?),
                 wire_item: canonical_wire_item(item)?,
             }))
         }
@@ -1911,6 +1998,7 @@ fn sealed_private_output(
             validate_terminal_item(item)?;
             Ok(Some(SealedOpenAiPrivateOutput {
                 output_index: item.output_index,
+                #[cfg(feature = "legacy-provider-port")]
                 output_item: None,
                 wire_item: canonical_wire_item(item)?,
             }))
@@ -2097,6 +2185,7 @@ fn valid_empty_reasoning_content(raw: &Value, reasoning: &ReasoningItem) -> bool
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn reasoning_output(
     reasoning: &ReasoningItem,
 ) -> Result<CanonicalInputItem, ResponseOutputLedgerError> {

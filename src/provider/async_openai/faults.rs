@@ -5,6 +5,7 @@ use crate::component::execution::{
 };
 use serde_json::{Map, Value};
 
+#[cfg(feature = "legacy-provider-port")]
 #[derive(Clone, Copy)]
 pub(super) enum OpenAiApi {
     Responses,
@@ -13,11 +14,14 @@ pub(super) enum OpenAiApi {
 
 #[derive(Debug)]
 pub(super) enum OpenAiBodyStreamFault {
+    #[cfg(feature = "legacy-provider-port")]
     ClassifiedTransport(ProviderFaultCode),
+    #[cfg(feature = "legacy-provider-port")]
     BodyLimit,
     EventLimit,
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn request_transport_fault(api: OpenAiApi, error: &reqwest::Error) -> ProviderFault {
     let code = if error.is_timeout() {
         ProviderFaultCode::RequestTimeout
@@ -37,6 +41,7 @@ pub(super) fn request_transport_fault(api: OpenAiApi, error: &reqwest::Error) ->
     ProviderFault::retryable_transport(message).with_code(code)
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn stream_error_code(error: &reqwest::Error) -> ProviderFaultCode {
     if error.is_timeout() {
         ProviderFaultCode::StreamTimeout
@@ -47,6 +52,7 @@ pub(super) fn stream_error_code(error: &reqwest::Error) -> ProviderFaultCode {
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn stream_transport_fault(api: OpenAiApi, code: ProviderFaultCode) -> ProviderFault {
     let message = match api {
         OpenAiApi::Responses => "OpenAI API returned an invalid streaming response",
@@ -55,6 +61,7 @@ pub(super) fn stream_transport_fault(api: OpenAiApi, code: ProviderFaultCode) ->
     ProviderFault::retryable_transport(message).with_code(code)
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn response_body_limit_fault(api: OpenAiApi) -> ProviderFault {
     let message = match api {
         OpenAiApi::Responses => "OpenAI API response exceeded configured body limit",
@@ -65,6 +72,7 @@ pub(super) fn response_body_limit_fault(api: OpenAiApi) -> ProviderFault {
     ProviderFault::model_rejected(message).with_code(ProviderFaultCode::ResponseBodyLimit)
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn stream_event_limit_fault(api: OpenAiApi) -> ProviderFault {
     let message = match api {
         OpenAiApi::Responses => "OpenAI SSE event exceeded configured event limit",
@@ -73,6 +81,7 @@ pub(super) fn stream_event_limit_fault(api: OpenAiApi) -> ProviderFault {
     ProviderFault::model_rejected(message).with_code(ProviderFaultCode::StreamEventLimit)
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn output_limit_fault(api: OpenAiApi) -> ProviderFault {
     let message = match api {
         OpenAiApi::Responses => "OpenAI output text exceeded configured output limit",
@@ -83,6 +92,7 @@ pub(super) fn output_limit_fault(api: OpenAiApi) -> ProviderFault {
     ProviderFault::model_rejected(message).with_code(ProviderFaultCode::OutputLimit)
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn serialized_request_body_limit_fault() -> ProviderFault {
     ProviderFault::model_rejected(
         "OpenAI Responses serialized outbound request body exceeded configured limit",
@@ -90,6 +100,7 @@ pub(super) fn serialized_request_body_limit_fault() -> ProviderFault {
     .with_code(ProviderFaultCode::RequestPreparation)
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn redacted_status_fault(api: OpenAiApi, status: reqwest::StatusCode) -> ProviderFault {
     let code = match status {
         reqwest::StatusCode::UNAUTHORIZED => ProviderFaultCode::Authentication,
@@ -118,11 +129,17 @@ pub(super) fn redacted_status_fault(api: OpenAiApi, status: reqwest::StatusCode)
 #[derive(Clone, Copy)]
 pub(super) enum ResponseEventReason {
     Envelope,
+    #[cfg(feature = "legacy-provider-port")]
     Sequence,
+    #[cfg(feature = "legacy-provider-port")]
     LifecycleIdentity,
+    #[cfg(feature = "legacy-provider-port")]
     LedgerMismatch,
+    #[cfg(feature = "legacy-provider-port")]
     TerminalOrder,
+    #[cfg(feature = "legacy-provider-port")]
     UnsupportedOutput,
+    #[cfg(feature = "legacy-provider-port")]
     StreamCompletion,
 }
 
@@ -130,11 +147,17 @@ impl ResponseEventReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::Envelope => "envelope",
+            #[cfg(feature = "legacy-provider-port")]
             Self::Sequence => "sequence",
+            #[cfg(feature = "legacy-provider-port")]
             Self::LifecycleIdentity => "lifecycle_identity",
+            #[cfg(feature = "legacy-provider-port")]
             Self::LedgerMismatch => "ledger_mismatch",
+            #[cfg(feature = "legacy-provider-port")]
             Self::TerminalOrder => "terminal_order",
+            #[cfg(feature = "legacy-provider-port")]
             Self::UnsupportedOutput => "unsupported_output",
+            #[cfg(feature = "legacy-provider-port")]
             Self::StreamCompletion => "stream_completion",
         }
     }
@@ -175,6 +198,7 @@ pub(super) fn response_event_shape_fault(
     )
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn response_completed_ledger_fault(
     reason: ProviderResponseLedgerReason,
     message_text_reason: Option<ProviderResponseMessageTextReason>,
@@ -199,6 +223,7 @@ pub(super) fn response_completed_ledger_fault(
     )
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn response_output_item_added_fault(
     reason: ProviderResponseLedgerReason,
     fault: ProviderFault,
@@ -215,6 +240,7 @@ pub(super) fn response_output_item_added_fault(
     )
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn response_event_envelope_fault(message: &'static str) -> ProviderFault {
     diagnosed_response_event_shape_fault(
         ResponseEventShapeDiagnosis::new("unknown", ResponseEventReason::Envelope),
@@ -222,6 +248,7 @@ pub(super) fn response_event_envelope_fault(message: &'static str) -> ProviderFa
     )
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn response_stream_completion_fault(fault: ProviderFault) -> ProviderFault {
     diagnosed_response_event_shape_fault(
         ResponseEventShapeDiagnosis::new("stream_end", ResponseEventReason::StreamCompletion),
@@ -229,6 +256,7 @@ pub(super) fn response_stream_completion_fault(fault: ProviderFault) -> Provider
     )
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn required_string(
     payload: &Map<String, Value>,
     field: &str,
@@ -245,16 +273,19 @@ pub(super) fn required_string(
         })
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn unsupported_content_part_fault() -> ProviderFault {
     ProviderFault::model_rejected("OpenAI message content part is not supported output text")
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn unsupported_output_item_fault() -> ProviderFault {
     ProviderFault::model_rejected(
         "native or unsupported OpenAI output items are not supported by this adapter version",
     )
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) fn unsupported_reasoning_content_fault() -> ProviderFault {
     ProviderFault::model_rejected(
         "plaintext OpenAI reasoning content is not supported by this adapter version",
@@ -451,7 +482,7 @@ fn allowlisted_response_event_type(event_type: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-provider-port"))]
 mod tests {
     use crate::component::execution::{
         ProviderFault, ProviderResponseCompletedReconciliation, ProviderResponseLedgerReason,

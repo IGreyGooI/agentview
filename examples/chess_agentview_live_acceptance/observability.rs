@@ -15,12 +15,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use serde::Serialize;
 
-use agentview::component::execution::{
-    ProviderFaultCode, ProviderResponseCompletedReconciliation, ProviderResponseEventReason,
-    ProviderResponseEventType, ProviderResponseLedgerReason, ProviderResponseMessageTextReason,
-    ProviderResponseOutputIdentityDetail, ProviderResponseOutputIdentityReason,
-    ProviderResponseOutputItemShapeReason,
-};
+use agentview::component::execution::{ApplicationFaultReason, ReactionPortFaultReason};
 use agentview::provider::async_openai::OpenAiResponsesUsage;
 
 use crate::{
@@ -153,31 +148,21 @@ pub(crate) enum ObservedInfrastructureReason {
     NonProviderRuntime,
     ProviderTransport,
     ProviderRequestPreparation,
-    ProviderConnectSecureTransport,
     ProviderRequestTransport,
-    ProviderRequestTimeout,
     ProviderAuthentication,
     ProviderAuthorization,
     ProviderRateLimited,
     ProviderUpstreamStatus,
     ProviderResponseProtocol,
-    ProviderResponseContentType,
-    ProviderStreamDecode,
-    ProviderResponseEventJson,
-    ProviderResponseEventShape,
     ProviderStreamTransport,
     ProviderStreamTimeout,
-    ProviderResponseBodyLimit,
-    ProviderStreamEventLimit,
     ProviderOutputLimit,
-    ProviderModelRejected,
     ReactionTimeout,
+    StateWriteFailure,
     StateUnavailable,
     StateUnfinished,
     TextIncomplete,
     StateMismatch,
-    PropsUpdateFailure,
-    HostIdentityChanged,
     ProviderResponseCaptureFailure,
     EngineFailure,
     EngineTimeout,
@@ -193,31 +178,21 @@ impl ObservedInfrastructureReason {
             Self::NonProviderRuntime => "non_provider_runtime",
             Self::ProviderTransport => "provider_transport",
             Self::ProviderRequestPreparation => "provider_request_preparation",
-            Self::ProviderConnectSecureTransport => "provider_connect_secure_transport",
             Self::ProviderRequestTransport => "provider_request_transport",
-            Self::ProviderRequestTimeout => "provider_request_timeout",
             Self::ProviderAuthentication => "provider_authentication",
             Self::ProviderAuthorization => "provider_authorization",
             Self::ProviderRateLimited => "provider_rate_limited",
             Self::ProviderUpstreamStatus => "provider_upstream_status",
             Self::ProviderResponseProtocol => "provider_response_protocol",
-            Self::ProviderResponseContentType => "provider_response_content_type",
-            Self::ProviderStreamDecode => "provider_stream_decode",
-            Self::ProviderResponseEventJson => "provider_response_event_json",
-            Self::ProviderResponseEventShape => "provider_response_event_shape",
             Self::ProviderStreamTransport => "provider_stream_transport",
             Self::ProviderStreamTimeout => "provider_stream_timeout",
-            Self::ProviderResponseBodyLimit => "provider_response_body_limit",
-            Self::ProviderStreamEventLimit => "provider_stream_event_limit",
             Self::ProviderOutputLimit => "provider_output_limit",
-            Self::ProviderModelRejected => "provider_model_rejected",
             Self::ReactionTimeout => "reaction_timeout",
+            Self::StateWriteFailure => "state_write_failure",
             Self::StateUnavailable => "state_unavailable",
             Self::StateUnfinished => "state_unfinished",
             Self::TextIncomplete => "text_incomplete",
             Self::StateMismatch => "state_mismatch",
-            Self::PropsUpdateFailure => "props_update_failure",
-            Self::HostIdentityChanged => "host_identity_changed",
             Self::ProviderResponseCaptureFailure => "provider_response_capture_failure",
             Self::EngineFailure => "engine_failure",
             Self::EngineTimeout => "engine_timeout",
@@ -232,18 +207,15 @@ impl ObservedInfrastructureReason {
 impl From<InfrastructureAbortReason> for ObservedInfrastructureReason {
     fn from(value: InfrastructureAbortReason) -> Self {
         match value {
-            InfrastructureAbortReason::Provider(code) => observed_provider_reason(code),
-            InfrastructureAbortReason::ProviderResponseEventShape(_) => {
-                Self::ProviderResponseEventShape
+            InfrastructureAbortReason::Application { reason, .. } => {
+                observed_application_reason(reason)
             }
-            InfrastructureAbortReason::NonProviderRuntime => Self::NonProviderRuntime,
             InfrastructureAbortReason::ReactionTimeout => Self::ReactionTimeout,
+            InfrastructureAbortReason::StateWriteFailure => Self::StateWriteFailure,
             InfrastructureAbortReason::StateUnavailable => Self::StateUnavailable,
             InfrastructureAbortReason::StateUnfinished => Self::StateUnfinished,
             InfrastructureAbortReason::TextIncomplete => Self::TextIncomplete,
             InfrastructureAbortReason::StateMismatch => Self::StateMismatch,
-            InfrastructureAbortReason::PropsUpdateFailure => Self::PropsUpdateFailure,
-            InfrastructureAbortReason::HostIdentityChanged => Self::HostIdentityChanged,
             InfrastructureAbortReason::ProviderResponseCaptureFailure => {
                 Self::ProviderResponseCaptureFailure
             }
@@ -257,88 +229,40 @@ impl From<InfrastructureAbortReason> for ObservedInfrastructureReason {
     }
 }
 
-fn observed_provider_reason(code: ProviderFaultCode) -> ObservedInfrastructureReason {
-    match code {
-        ProviderFaultCode::Transport => ObservedInfrastructureReason::ProviderTransport,
-        ProviderFaultCode::RequestPreparation => {
+fn observed_application_reason(reason: ApplicationFaultReason) -> ObservedInfrastructureReason {
+    let ApplicationFaultReason::Port(reason) = reason else {
+        return ObservedInfrastructureReason::NonProviderRuntime;
+    };
+    match reason {
+        ReactionPortFaultReason::Declaration => ObservedInfrastructureReason::ProviderTransport,
+        ReactionPortFaultReason::RequestPreparation => {
             ObservedInfrastructureReason::ProviderRequestPreparation
         }
-        ProviderFaultCode::ConnectSecureTransport => {
-            ObservedInfrastructureReason::ProviderConnectSecureTransport
-        }
-        ProviderFaultCode::RequestTransport => {
+        ReactionPortFaultReason::Transport => {
             ObservedInfrastructureReason::ProviderRequestTransport
         }
-        ProviderFaultCode::RequestTimeout => ObservedInfrastructureReason::ProviderRequestTimeout,
-        ProviderFaultCode::Authentication => ObservedInfrastructureReason::ProviderAuthentication,
-        ProviderFaultCode::Authorization => ObservedInfrastructureReason::ProviderAuthorization,
-        ProviderFaultCode::RateLimited => ObservedInfrastructureReason::ProviderRateLimited,
-        ProviderFaultCode::UpstreamStatus => ObservedInfrastructureReason::ProviderUpstreamStatus,
-        ProviderFaultCode::ResponseProtocol => {
+        ReactionPortFaultReason::Authentication => {
+            ObservedInfrastructureReason::ProviderAuthentication
+        }
+        ReactionPortFaultReason::Authorization => {
+            ObservedInfrastructureReason::ProviderAuthorization
+        }
+        ReactionPortFaultReason::RateLimited => ObservedInfrastructureReason::ProviderRateLimited,
+        ReactionPortFaultReason::UpstreamRejected => {
+            ObservedInfrastructureReason::ProviderUpstreamStatus
+        }
+        ReactionPortFaultReason::ResponseProtocol => {
             ObservedInfrastructureReason::ProviderResponseProtocol
         }
-        ProviderFaultCode::ResponseContentType => {
-            ObservedInfrastructureReason::ProviderResponseContentType
+        ReactionPortFaultReason::StreamTransport => {
+            ObservedInfrastructureReason::ProviderStreamTransport
         }
-        ProviderFaultCode::StreamDecode => ObservedInfrastructureReason::ProviderStreamDecode,
-        ProviderFaultCode::ResponseEventJson => {
-            ObservedInfrastructureReason::ProviderResponseEventJson
+        ReactionPortFaultReason::StreamTimeout => {
+            ObservedInfrastructureReason::ProviderStreamTimeout
         }
-        ProviderFaultCode::ResponseEventShape => {
-            ObservedInfrastructureReason::ProviderResponseEventShape
-        }
-        ProviderFaultCode::StreamTransport => ObservedInfrastructureReason::ProviderStreamTransport,
-        ProviderFaultCode::StreamTimeout => ObservedInfrastructureReason::ProviderStreamTimeout,
-        ProviderFaultCode::ResponseBodyLimit => {
-            ObservedInfrastructureReason::ProviderResponseBodyLimit
-        }
-        ProviderFaultCode::StreamEventLimit => {
-            ObservedInfrastructureReason::ProviderStreamEventLimit
-        }
-        ProviderFaultCode::OutputLimit => ObservedInfrastructureReason::ProviderOutputLimit,
-        ProviderFaultCode::ModelRejected => ObservedInfrastructureReason::ProviderModelRejected,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct ObservedResponseEventDiagnostic {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_event_type: Option<ProviderResponseEventType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_event_reason: Option<ProviderResponseEventReason>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_ledger_reason: Option<ProviderResponseLedgerReason>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_message_text_reason: Option<ProviderResponseMessageTextReason>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_completed_reconciliation: Option<ProviderResponseCompletedReconciliation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_output_identity_reason: Option<ProviderResponseOutputIdentityReason>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_output_identity_detail: Option<ProviderResponseOutputIdentityDetail>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_output_item_shape_reason: Option<ProviderResponseOutputItemShapeReason>,
-}
-
-impl ObservedResponseEventDiagnostic {
-    fn boxed(
-        diagnostic: Option<agentview::component::execution::ProviderResponseEventDiagnostic>,
-    ) -> Box<Self> {
-        Box::new(Self {
-            response_event_type: diagnostic.map(|value| value.event_type()),
-            response_event_reason: diagnostic.map(|value| value.reason()),
-            response_ledger_reason: diagnostic.and_then(|value| value.response_ledger_reason()),
-            response_message_text_reason: diagnostic
-                .and_then(|value| value.response_message_text_reason()),
-            response_completed_reconciliation: diagnostic
-                .and_then(|value| value.response_completed_reconciliation()),
-            response_output_identity_reason: diagnostic
-                .and_then(|value| value.response_output_identity_reason()),
-            response_output_identity_detail: diagnostic
-                .and_then(|value| value.response_output_identity_detail()),
-            response_output_item_shape_reason: diagnostic
-                .and_then(|value| value.response_output_item_shape_reason()),
-        })
+        ReactionPortFaultReason::OutputLimit => ObservedInfrastructureReason::ProviderOutputLimit,
+        ReactionPortFaultReason::Other => ObservedInfrastructureReason::NonProviderRuntime,
+        _ => ObservedInfrastructureReason::NonProviderRuntime,
     }
 }
 
@@ -356,8 +280,6 @@ pub(crate) enum ObservedAttemptResult {
     InfrastructureAbort {
         stage: ObservedInfrastructureStage,
         reason_code: ObservedInfrastructureReason,
-        #[serde(flatten)]
-        response_diagnostic: Box<ObservedResponseEventDiagnostic>,
     },
 }
 
@@ -374,11 +296,9 @@ impl From<AttemptResult> for ObservedAttemptResult {
                 reason: reason.into(),
             },
             AttemptResult::InfrastructureAbort { stage, reason_code } => {
-                let diagnostic = reason_code.response_event_diagnostic();
                 Self::InfrastructureAbort {
                     stage: stage.into(),
                     reason_code: reason_code.into(),
-                    response_diagnostic: ObservedResponseEventDiagnostic::boxed(diagnostic),
                 }
             }
         }
@@ -421,8 +341,6 @@ pub(crate) enum ObservedTerminal {
     InfrastructureAbort {
         stage: ObservedInfrastructureStage,
         reason_code: ObservedInfrastructureReason,
-        #[serde(flatten)]
-        response_diagnostic: Box<ObservedResponseEventDiagnostic>,
     },
     PlyLimitReached {
         max_plies: usize,
@@ -512,14 +430,10 @@ impl ObservedTerminal {
                 final_reason: final_reason.into(),
                 attempts,
             },
-            GameOutcome::InfrastructureAbort { stage, reason_code } => {
-                let diagnostic = reason_code.response_event_diagnostic();
-                Self::InfrastructureAbort {
-                    stage: stage.into(),
-                    reason_code: reason_code.into(),
-                    response_diagnostic: ObservedResponseEventDiagnostic::boxed(diagnostic),
-                }
-            }
+            GameOutcome::InfrastructureAbort { stage, reason_code } => Self::InfrastructureAbort {
+                stage: stage.into(),
+                reason_code: reason_code.into(),
+            },
             GameOutcome::PlyLimitReached => Self::PlyLimitReached { max_plies },
         }
     }
@@ -528,6 +442,7 @@ impl ObservedTerminal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct CleanupDisposition {
     pub(crate) engine_shutdown_observed: bool,
+    pub(crate) application_shutdown_observed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1262,157 +1177,12 @@ fn report_attempt(output: &mut impl Write, outcome: &ObservedAttemptResult) -> i
             "white reaction completed result=correctable reason={}",
             reason.code()
         ),
-        ObservedAttemptResult::InfrastructureAbort {
-            stage,
-            reason_code,
-            response_diagnostic,
-        } => {
-            let ObservedResponseEventDiagnostic {
-                response_event_type,
-                response_event_reason,
-                response_ledger_reason,
-                response_message_text_reason,
-                response_completed_reconciliation,
-                response_output_identity_reason,
-                response_output_identity_detail,
-                response_output_item_shape_reason,
-            } = **response_diagnostic;
-            match (
-    response_event_type,
-    response_event_reason,
-    response_ledger_reason,
-    response_message_text_reason,
-    response_completed_reconciliation,
-    response_output_identity_reason,
-    response_output_identity_detail,
-    response_output_item_shape_reason,
-) {
-    (
-        Some(event_type),
-        Some(event_reason),
-        Some(ledger_reason),
-        None,
-        None,
-        Some(identity_reason),
-        Some(identity_detail),
-        None,
-    ) => writeln!(
-        output,
-        "white reaction aborted stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={} response_output_identity_reason={} response_output_identity_mapping_basis={} response_output_identity_kind_pair={} response_output_identity_observed_message_relation={} response_output_identity_observed_text_relation={} response_output_identity_lifecycle_state={}",
-        stage.code(),
-        reason_code.code(),
-        event_type.code(),
-        event_reason.code(),
-        ledger_reason.code(),
-        identity_reason.code(),
-        identity_detail.mapping_basis().code(),
-        identity_detail.kind_pair().code(),
-        identity_detail.observed_message_relation().code(),
-        identity_detail.observed_text_relation().code(),
-        identity_detail.resolved_lifecycle_state().code(),
-    ),
-    (
-        Some(event_type),
-        Some(event_reason),
-        Some(ledger_reason),
-        None,
-        None,
-        Some(identity_reason),
-        None,
-        None,
-    ) => writeln!(
-        output,
-        "white reaction aborted stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={} response_output_identity_reason={}",
-        stage.code(),
-        reason_code.code(),
-        event_type.code(),
-        event_reason.code(),
-        ledger_reason.code(),
-        identity_reason.code()
-    ),
-    (
-        Some(event_type),
-        Some(event_reason),
-        Some(ledger_reason),
-        None,
-        None,
-        None,
-        None,
-        Some(shape_reason),
-    ) => writeln!(
-        output,
-        "white reaction aborted stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={} response_output_item_shape_reason={}",
-        stage.code(),
-        reason_code.code(),
-        event_type.code(),
-        event_reason.code(),
-        ledger_reason.code(),
-        shape_reason.code()
-    ),
-    (
-        Some(event_type),
-        Some(event_reason),
-        Some(ledger_reason),
-        Some(message_text_reason),
-        Some(reconciliation),
-        None,
-        None,
-        None,
-    ) => writeln!(
-        output,
-        "white reaction aborted stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={} response_message_text_reason={} {}",
-        stage.code(),
-        reason_code.code(),
-        event_type.code(),
-        event_reason.code(),
-        ledger_reason.code(),
-        message_text_reason.code(),
-        completed_reconciliation_summary(reconciliation),
-    ),
-    (
-        Some(event_type),
-        Some(event_reason),
-        Some(ledger_reason),
-        Some(message_text_reason),
-        None,
-        None,
-        None,
-        None,
-    ) => writeln!(
-        output,
-        "white reaction aborted stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={} response_message_text_reason={}",
-        stage.code(),
-        reason_code.code(),
-        event_type.code(),
-        event_reason.code(),
-        ledger_reason.code(),
-        message_text_reason.code()
-    ),
-    (Some(event_type), Some(event_reason), Some(ledger_reason), None, None, None, None, None) => writeln!(
-        output,
-        "white reaction aborted stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={}",
-        stage.code(),
-        reason_code.code(),
-        event_type.code(),
-        event_reason.code(),
-        ledger_reason.code()
-    ),
-    (Some(event_type), Some(event_reason), None, None, None, None, None, None) => writeln!(
-        output,
-        "white reaction aborted stage={} reason={} response_event_type={} response_event_reason={}",
-        stage.code(),
-        reason_code.code(),
-        event_type.code(),
-        event_reason.code()
-    ),
-    _ => writeln!(
-        output,
-        "white reaction aborted stage={} reason={}",
-        stage.code(),
-        reason_code.code()
-    ),
-    }
-        }
+        ObservedAttemptResult::InfrastructureAbort { stage, reason_code } => writeln!(
+            output,
+            "white reaction aborted stage={} reason={}",
+            stage.code(),
+            reason_code.code()
+        ),
     }
 }
 
@@ -1434,7 +1204,7 @@ fn report_terminal(
     provider_responses: &ProviderResponseSummary,
     trace_artifact_disposition: Option<ObservedTraceArtifactDisposition>,
 ) -> io::Result<()> {
-    let cleanup = if cleanup.engine_shutdown_observed {
+    let cleanup = if cleanup.engine_shutdown_observed && cleanup.application_shutdown_observed {
         "complete"
     } else {
         "incomplete"
@@ -1463,149 +1233,11 @@ fn report_terminal(
             "terminal model_forfeit reason={} attempts={attempts}",
             final_reason.code()
         ),
-        ObservedTerminal::InfrastructureAbort {
-            stage,
-            reason_code,
-            response_diagnostic,
-        } => {
-            let ObservedResponseEventDiagnostic {
-                response_event_type,
-                response_event_reason,
-                response_ledger_reason,
-                response_message_text_reason,
-                response_completed_reconciliation,
-                response_output_identity_reason,
-                response_output_identity_detail,
-                response_output_item_shape_reason,
-            } = *response_diagnostic;
-            match (
-        response_event_type,
-        response_event_reason,
-        response_ledger_reason,
-        response_message_text_reason,
-        response_completed_reconciliation,
-        response_output_identity_reason,
-        response_output_identity_detail,
-        response_output_item_shape_reason,
-    ) {
-        (
-            Some(event_type),
-            Some(event_reason),
-            Some(ledger_reason),
-            None,
-            None,
-            Some(identity_reason),
-            Some(identity_detail),
-            None,
-        ) => format!(
-            "terminal infrastructure_abort stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={} response_output_identity_reason={} response_output_identity_mapping_basis={} response_output_identity_kind_pair={} response_output_identity_observed_message_relation={} response_output_identity_observed_text_relation={} response_output_identity_lifecycle_state={}",
-            stage.code(),
-            reason_code.code(),
-            event_type.code(),
-            event_reason.code(),
-            ledger_reason.code(),
-            identity_reason.code(),
-            identity_detail.mapping_basis().code(),
-            identity_detail.kind_pair().code(),
-            identity_detail.observed_message_relation().code(),
-            identity_detail.observed_text_relation().code(),
-            identity_detail.resolved_lifecycle_state().code(),
-        ),
-        (
-            Some(event_type),
-            Some(event_reason),
-            Some(ledger_reason),
-            None,
-            None,
-            Some(identity_reason),
-            None,
-            None,
-        ) => format!(
-            "terminal infrastructure_abort stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={} response_output_identity_reason={}",
-            stage.code(),
-            reason_code.code(),
-            event_type.code(),
-            event_reason.code(),
-            ledger_reason.code(),
-            identity_reason.code()
-        ),
-        (
-            Some(event_type),
-            Some(event_reason),
-            Some(ledger_reason),
-            None,
-            None,
-            None,
-            None,
-            Some(shape_reason),
-        ) => format!(
-            "terminal infrastructure_abort stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={} response_output_item_shape_reason={}",
-            stage.code(),
-            reason_code.code(),
-            event_type.code(),
-            event_reason.code(),
-            ledger_reason.code(),
-            shape_reason.code()
-        ),
-        (
-            Some(event_type),
-            Some(event_reason),
-            Some(ledger_reason),
-            Some(message_text_reason),
-            Some(reconciliation),
-            None,
-            None,
-            None,
-        ) => format!(
-            "terminal infrastructure_abort stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={} response_message_text_reason={} {}",
-            stage.code(),
-            reason_code.code(),
-            event_type.code(),
-            event_reason.code(),
-            ledger_reason.code(),
-            message_text_reason.code(),
-            completed_reconciliation_summary(reconciliation),
-        ),
-        (
-            Some(event_type),
-            Some(event_reason),
-            Some(ledger_reason),
-            Some(message_text_reason),
-            None,
-            None,
-            None,
-            None,
-        ) => format!(
-            "terminal infrastructure_abort stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={} response_message_text_reason={}",
-            stage.code(),
-            reason_code.code(),
-            event_type.code(),
-            event_reason.code(),
-            ledger_reason.code(),
-            message_text_reason.code()
-        ),
-        (Some(event_type), Some(event_reason), Some(ledger_reason), None, None, None, None, None) => format!(
-            "terminal infrastructure_abort stage={} reason={} response_event_type={} response_event_reason={} response_ledger_reason={}",
-            stage.code(),
-            reason_code.code(),
-            event_type.code(),
-            event_reason.code(),
-            ledger_reason.code()
-        ),
-        (Some(event_type), Some(event_reason), None, None, None, None, None, None) => format!(
-            "terminal infrastructure_abort stage={} reason={} response_event_type={} response_event_reason={}",
-            stage.code(),
-            reason_code.code(),
-            event_type.code(),
-            event_reason.code()
-        ),
-        _ => format!(
+        ObservedTerminal::InfrastructureAbort { stage, reason_code } => format!(
             "terminal infrastructure_abort stage={} reason={}",
             stage.code(),
             reason_code.code()
         ),
-        }
-        }
         ObservedTerminal::PlyLimitReached { max_plies } => {
             format!("terminal ply_limit_reached max_plies={max_plies}")
         }
@@ -1633,29 +1265,6 @@ fn report_terminal(
         ),
         None => writeln!(output, "{terminal} cleanup={cleanup} {accounting}"),
     }
-}
-
-fn completed_reconciliation_summary(
-    reconciliation: ProviderResponseCompletedReconciliation,
-) -> String {
-    format!(
-        "response_reconciliation_branch={} response_completed_sequence={} \
-     terminal_output_count={} observed_lifecycle_count={} \
-     terminal_output_index={} observed_lifecycle_index={} \
-     response_id_relation={} response_text_relation={}",
-        reconciliation.branch().code(),
-        reconciliation.response_completed_sequence(),
-        reconciliation.terminal_output_count(),
-        reconciliation.observed_lifecycle_count(),
-        optional_ordinal(reconciliation.terminal_output_index()),
-        optional_ordinal(reconciliation.observed_lifecycle_index()),
-        reconciliation.id_relation().code(),
-        reconciliation.text_relation().code(),
-    )
-}
-
-fn optional_ordinal(value: Option<u64>) -> String {
-    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1843,10 +1452,7 @@ where
                 .accepted
                 .load(Ordering::SeqCst)
                 != self.observed_provider_responses.len()
-            || !matches!(
-                self.provider_responses.receiver.try_recv(),
-                Err(TryRecvError::Empty)
-            )
+            || !provider_response_inbox_is_drained(self.provider_responses.receiver.try_recv())
         {
             return Err(ObservationFailure::ProviderResponseCapture);
         }
@@ -1902,6 +1508,28 @@ where
         };
         self.trace_artifact_disposition = Some(disposition);
         Some(disposition)
+    }
+}
+
+fn provider_response_inbox_is_drained<T>(result: Result<T, TryRecvError>) -> bool {
+    matches!(
+        result,
+        Err(TryRecvError::Empty | TryRecvError::Disconnected)
+    )
+}
+
+#[cfg(test)]
+mod provider_response_tests {
+    use super::*;
+
+    #[test]
+    fn a_drained_inbox_remains_valid_after_the_provider_sender_is_dropped() {
+        let (capture, inbox) = provider_response_capture(1);
+        drop(capture);
+
+        assert!(provider_response_inbox_is_drained(
+            inbox.receiver.try_recv()
+        ));
     }
 }
 

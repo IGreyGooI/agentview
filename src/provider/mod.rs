@@ -9,7 +9,6 @@ use crate::transcript::CanonicalTranscript;
 
 pub mod async_openai;
 pub mod codex_http_v1;
-pub(crate) mod projection_diff;
 
 /// Projects canonical history into one provider profile's accepted window.
 pub trait HistoryPolicy {

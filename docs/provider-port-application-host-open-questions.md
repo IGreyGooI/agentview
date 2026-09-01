@@ -1,5 +1,10 @@
 # ProviderPort / ApplicationHost 开放问题
 
+> **Status: superseded historical question snapshot.** This document is not the current issue
+> tracker or public contract. For the current runtime contract and deferred scope, see
+> [`engine.md`](engine.md) and
+> [`frame-driven-runtime-plan.md`](frame-driven-runtime-plan.md).
+
 日期：2026-08-08
 
 本文只记录会改变公共语义、且尚未由

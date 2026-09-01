@@ -1,0 +1,308 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Frame-driven AgentView Runtime",
+    "subtitle": "Application<P> drives Frame submission through one fixed ReactionPort",
+    "output": "frame-driven-runtime.architecture.html",
+    "animation": "none",
+    "quality_profile": "showcase",
+    "viewBox": [1540, 760]
+  },
+  "components": [
+    {
+      "id": "agent-driver",
+      "type": "external",
+      "label": "Agent Driver",
+      "sublabel": "policy / timer / demand",
+      "pos": [40, 100],
+      "size": [150, 58]
+    },
+    {
+      "id": "skill-driver",
+      "type": "external",
+      "label": "Skill Driver",
+      "sublabel": "invocation / CLI",
+      "pos": [40, 236],
+      "size": [150, 58]
+    },
+    {
+      "id": "plugin-driver",
+      "type": "external",
+      "label": "Plugin Driver",
+      "sublabel": "parent invocation",
+      "pos": [40, 372],
+      "size": [150, 58]
+    },
+    {
+      "id": "application",
+      "type": "frontend",
+      "label": "Application<P>",
+      "sublabel": "fixed target + port + react()",
+      "tag": "single-flight",
+      "pos": [290, 230],
+      "size": [170, 70]
+    },
+    {
+      "id": "component-runtime",
+      "type": "backend",
+      "label": "Component Runtime",
+      "sublabel": "state + complete DOM",
+      "tag": "RenderedProjection",
+      "pos": [540, 100],
+      "size": [190, 70]
+    },
+    {
+      "id": "frame-session",
+      "type": "database",
+      "label": "Private FrameSession",
+      "sublabel": "canonical + target delivery state",
+      "tag": "history / diff / receipts",
+      "pos": [535, 260],
+      "size": [200, 82]
+    },
+    {
+      "id": "public-frame",
+      "type": "messagebus",
+      "label": "Public Frame",
+      "sublabel": "exact Full / Delta submission",
+      "tag": "identity / precondition / revision",
+      "pos": [800, 266],
+      "size": [180, 70]
+    },
+    {
+      "id": "reaction-port",
+      "type": "cloud",
+      "label": "ReactionPort",
+      "sublabel": "declare + submit(Frame)",
+      "tag": "snapshot + crossing poll",
+      "pos": [1040, 266],
+      "size": [190, 70]
+    },
+    {
+      "id": "port-session",
+      "type": "security",
+      "label": "Port-private Session",
+      "sublabel": "private causal + transport state",
+      "tag": "no canonical ownership",
+      "pos": [1040, 100],
+      "size": [190, 70]
+    },
+    {
+      "id": "transport",
+      "type": "cloud",
+      "label": "Remote Boundary",
+      "sublabel": "HTTP / queue / protocol",
+      "pos": [1300, 100],
+      "size": [160, 70]
+    },
+    {
+      "id": "fact-stream",
+      "type": "messagebus",
+      "label": "ProviderFactStream",
+      "sublabel": "one ordered causal stream",
+      "tag": "terminal grammar",
+      "pos": [800, 430],
+      "size": [180, 70]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Integration-owned scheduling",
+      "wraps": ["agent-driver", "skill-driver", "plugin-driver"]
+    },
+    {
+      "kind": "region",
+      "label": "AgentView private reaction kernel",
+      "wraps": ["application", "component-runtime", "frame-session", "public-frame", "fact-stream"]
+    },
+    {
+      "kind": "security-group",
+      "label": "ReactionPort-private execution context",
+      "wraps": ["reaction-port", "port-session", "transport"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "declare-snapshot",
+      "from": "reaction-port",
+      "to": "application",
+      "label": "declaration before reconcile",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [[1515, 301], [1515, 50], [375, 50]],
+      "labelAt": [700, 45]
+    },
+    {
+      "id": "agent-react",
+      "from": "agent-driver",
+      "to": "application",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [[240, 129], [240, 265]]
+    },
+    {
+      "id": "skill-react",
+      "from": "skill-driver",
+      "to": "application",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "plugin-react",
+      "from": "plugin-driver",
+      "to": "application",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [[240, 401], [240, 265]]
+    },
+    {
+      "id": "reconcile-component",
+      "from": "application",
+      "to": "component-runtime",
+      "label": "reconcile complete DOM",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "left",
+      "via": [[375, 200], [500, 200], [500, 135]]
+    },
+    {
+      "id": "complete-projection",
+      "from": "component-runtime",
+      "to": "frame-session",
+      "label": "complete projection",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [635, 184]
+    },
+    {
+      "id": "prepare-frame",
+      "from": "frame-session",
+      "to": "public-frame",
+      "label": "prepare exact submission",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [770, 240]
+    },
+    {
+      "id": "cross-handoff",
+      "from": "public-frame",
+      "to": "reaction-port",
+      "label": "crossing poll",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [1010, 240]
+    },
+    {
+      "id": "commit-frame-session",
+      "from": "application",
+      "to": "frame-session",
+      "label": "sync commit",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "left",
+      "via": [[375, 370], [500, 370], [500, 301]],
+      "labelAt": [435, 365]
+    },
+    {
+      "id": "lower-request",
+      "from": "port-session",
+      "to": "transport",
+      "label": "request handoff",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [1265, 184]
+    },
+    {
+      "id": "port-private-state",
+      "from": "reaction-port",
+      "to": "port-session",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "return-stream",
+      "from": "reaction-port",
+      "to": "application",
+      "label": "Ready Ok(stream)",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [[1135, 540], [375, 540]],
+      "labelAt": [880, 535]
+    },
+    {
+      "id": "yield-facts",
+      "from": "reaction-port",
+      "to": "fact-stream",
+      "label": "ordered facts",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "right",
+      "via": [[1135, 465], [1000, 465]]
+    },
+    {
+      "id": "admit-fact",
+      "from": "fact-stream",
+      "to": "frame-session",
+      "label": "validate + commit fact",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [[760, 465], [760, 385], [635, 385]],
+      "labelAt": [690, 380]
+    },
+    {
+      "id": "dispatch-event",
+      "from": "frame-session",
+      "to": "component-runtime",
+      "label": "dispatch admitted event",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "left",
+      "via": [[510, 301], [510, 135]],
+      "labelAt": [570, 215]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "DOM versus Frame",
+      "items": [
+        "RenderedProjection is always complete",
+        "Full is self-contained across replay, staged and Component sections",
+        "Raw complete projection and bindings remain private",
+        "Canonical replay rebase forces Full"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Atomic submit",
+      "items": [
+        "Pending and Err prove no handoff",
+        "Ready Ok(stream) returns to Application",
+        "Infallible sync commit has no await",
+        "Fact admission commits before Component dispatch"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "Fixed ownership",
+      "items": [
+        "Application fixes TargetIdentity, profile and port",
+        "FrameSession owns canonical and delivery state",
+        "Port retains required private causal artifacts",
+        "Drivers decide timing; facts commit before dispatch"
+      ]
+    }
+  ]
+}

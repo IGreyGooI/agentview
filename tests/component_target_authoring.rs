@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-provider-port")]
+
 //! Code-shape guards for the retained Component and minimal Provider boundary.
 //!
 //! Behavioral details belong in focused runtime tests. These checks prevent
@@ -104,13 +106,16 @@ fn external_protocol_stream_stays_below_the_public_wrapper() {
     assert!(EXTERNAL_PROVIDER.contains("#[doc(hidden)]\n    pub fn __from_cli_json_lines"));
 
     let provider_impl = EXTERNAL_PROVIDER
-        .split_once("impl ProviderPort for ExternalProviderPort {")
-        .expect("ExternalProviderPort must implement ProviderPort")
+        .split_once("impl ReactionPort for ExternalProviderPort {")
+        .expect("ExternalProviderPort must implement ReactionPort")
         .1
         .split_once("\n}")
         .expect("ExternalProviderPort implementation must close")
         .0;
-    assert!(provider_impl.contains("async fn execute<'a>("));
+    assert!(provider_impl.contains("async fn submit<'a>("));
+    assert!(provider_impl.contains("frame: Frame"));
+    assert!(provider_impl.contains("reserve_owned()"));
+    assert!(!provider_impl.contains("render_projection_prompt"));
     assert!(!provider_impl.contains("fn observe"));
     assert!(!provider_impl.contains("fn act"));
 }
@@ -140,7 +145,9 @@ fn application_host_owns_provider_binding_and_observer_state() {
     assert!(APPLICATION_HOST.contains("pub fn with_observer("));
     assert!(APPLICATION_HOST.contains("ReactionLifecycle::new(&mut self.observer)"));
     assert!(!COMPONENT_HOST.contains("observer"));
-    assert!(APPLICATION_HOST.contains("let prepared = match components.render()"));
+    assert!(
+        APPLICATION_HOST.contains("let prepared = match prepare_component_reaction(components)")
+    );
     assert!(APPLICATION_HOST.contains("lifecycle.terminal(\"render\", \"component_render\")"));
     assert!(APPLICATION_HOST.contains(".execute(projection)"));
     assert!(APPLICATION_HOST.contains("await_bindings_with_lanes("));
@@ -164,16 +171,26 @@ fn application_host_owns_provider_binding_and_observer_state() {
 
 #[test]
 fn prepared_render_transfers_scoped_projection_and_local_bindings() {
-    assert!(COMPONENT_HOST.contains("ComponentRenderStage::prepare_complete_root_with_signals("));
+    assert!(COMPONENT_HOST.contains("let committed = self.begin_managed_render()?;"));
+    assert!(COMPONENT_HOST.contains("self.publish_managed_render(committed)"));
+    assert!(COMPONENT_HOST
+        .contains("ComponentRenderStage::prepare_complete_root_candidate_with_capabilities("));
     assert!(COMPONENT_HOST.contains(".with_execution_scope(ProjectionExecutionScope {"));
-    assert!(COMPONENT_HOST.contains("stage.set_projection(projection.clone());"));
-    assert!(COMPONENT_HOST.contains("bindings: stage.into_bindings()"));
+    assert!(COMPONENT_HOST.contains("candidate.stage_mut().set_projection(projection.clone());"));
+    assert!(COMPONENT_HOST.contains("let (stage, _, mounts) = candidate.commit_deferred();"));
+    assert!(COMPONENT_HOST.contains("let (bindings, task_starts) = stage.into_execution_parts();"));
+    assert!(COMPONENT_HOST.contains("pub(crate) struct CommittedRenderTransition"));
+    assert!(COMPONENT_HOST.contains("pub(crate) fn retired_mounts(&self)"));
+    assert!(COMPONENT_HOST.contains("mounts.activate();"));
     assert!(COMPONENT_HOST.contains("bindings: RenderBindings<ProviderEvent>"));
     assert!(COMPONENT_HOST.contains("pub(crate) fn into_execution_parts("));
     assert!(COMPONENT_HOST.contains("(RenderedProjection, RenderBindings<ProviderEvent>)"));
     assert!(COMPONENT_HOST.contains("(self.projection, self.bindings)"));
-    assert!(APPLICATION_HOST
-        .contains("let (projection, mut bindings) = prepared.into_execution_parts();"));
+    assert!(APPLICATION_HOST.contains("fn prepare_component_reaction<Props>("));
+    assert!(
+        APPLICATION_HOST.contains("let (projection, bindings) = prepared.into_execution_parts();")
+    );
+    assert!(APPLICATION_HOST.contains("async fn dispatch_prepared_reaction<P>("));
     assert!(!COMPONENT_HOST.contains("ComponentHost<Props, Events>"));
 
     for removed in ["RecordLog", "baseline", "ProviderContext", "checkpoint"] {

@@ -1,54 +1,199 @@
-# AgentView Chess Example
+# AgentView Chess Examples
 
-Last reviewed: 2026-08-24
+Last reviewed: 2026-09-01
 
-[`examples/chess_agentview`](../examples/chess_agentview) is the canonical
-runnable Chess example. It is a live application, not a mock Provider demo or
-an alternative engine lifecycle.
+The repository exposes two Chess binaries with different jobs:
 
-## Runtime Boundary
+- [`chess_agentview`](../examples/chess_agentview/main.rs) is the readable
+  application example. The model plays White, Stockfish plays Black, and the
+  mounted Component owns the game workflow.
+- [`chess_agentview_live_acceptance`](../examples/chess_agentview_live_acceptance/main.rs)
+  is the paid production-evidence harness. It retains the bounded deadlines,
+  JSONL trace, provider-usage correlation, cleanup arbitration, and terminal
+  evidence validation that would obscure the ordinary API example.
+
+## Application Boundary
 
 ```text
-Chess match runner
-  -> ComponentReactionRuntime
-  -> chess_agent Component tree
-       -> Agent identity and private reasoning policy
-       -> Current game state and semantic diff
-       -> Legal actions and response contract
-       -> Referee and match feedback
-  -> Responses ProviderPort for White
-  -> Stockfish UCI process for Black
+thin chess_agentview binary
+  |-- build provider and immutable ChessApplicationConfig
+  `-- ChessApplication::mount(config, provider)?.run().await
+        |-- Application<P>
+        |     |-- mounted chess_application Component
+        |     |     |-- Signal<ChessState> (business authority)
+        |     |     |-- pure reduce(ChessState, ChessEvent) -> ChessEffect
+        |     |     |-- chess_action_component
+        |     |     |     |-- five sibling XmlStreamingToolCall Components
+        |     |     |     `-- decoded/invalid callbacks await ChessAttemptInput handling
+        |     |     |-- use_coroutine actor owning Stockfish
+        |     |     `-- use_reaction_request for the next model turn
+        |     |-- private FrameSession and canonical history
+        |     `-- fixed Responses ReactionPort
+        |-- mechanical demand -> react loop
+        `-- typed actor exit/stop handshake and consuming shutdown
 ```
 
-The example owns match policy, Chess rules, UCI orchestration, status output,
-and JSONL evidence. The shared runtime owns Component identity, rendering,
-event dispatch, Provider history, and reaction cleanup.
+`ChessState` owns the authoritative board, committed move history, retry state,
+feedback, draw state, phase, and terminal outcome. Model actions carry a typed
+attempt key, so a duplicate or late action cannot consume the next
+attempt. Stockfish requests carry the committed position revision and history.
 
-Component state is authoritative. Provider continuation, prompt-cache state,
-and wire history remain private, discardable Provider optimizations. A model
-move is accepted only after parsing and legal-move validation; infrastructure
-faults do not become Chess decisions.
+The reducer owns Chess policy. It validates actions, applies legal moves,
+enforces the model retry budget, selects the next side, detects terminal
+positions and draw conditions, and emits one of three effects:
 
-## Run
+- request another model reaction;
+- request a Stockfish move;
+- publish the terminal outcome.
 
-The example makes paid model requests. Configure the Provider credentials in
-the ignored `.env` file or process environment and install Stockfish. Then run:
+The long-lived Component coroutine serializes those effects. It starts and
+owns `UciEngine`, reads the authoritative history from reducer effects, feeds
+Stockfish results back as typed events, and shuts the engine down before
+publishing a normal terminal result.
+
+`chess_action_component` mounts five prompt-producing, typed
+`XmlStreamingToolCall` declarations:
+`choose_move`, `move_and_offer_draw`, `resign`, `accept_draw`, and `claim_draw`.
+They register with one parser hub for the mounted reaction's provider text route;
+the example passes neither a route nor an `EventInput`. Every matching element
+occurrence is dispatched, including repeated occurrences and occurrences for
+multiple sibling declarations. The runtime preserves their XML source order
+and awaits each async handler before starting the next one.
+
+The prompt-free `StreamingXml::tag(...)` API uses that same per-route hub when
+a Component needs `on_open`, cumulative `on_stream`, `on_complete`, or
+`on_invalid` lifecycle events without adding another action shape to the prompt.
+
+Each decoded or invalid occurrence sends one attempt-keyed `ChessAttemptInput`
+into the Component-owned FIFO coroutine and awaits its handling receipt. The
+coroutine lowers that input to `ChessEvent::ModelAction`, runs the reducer and
+its immediate effect chain, then acknowledges the handler. There is no attempt
+collector, sibling completion barrier, or frame cardinality rule. The reducer's
+current business state decides whether a later action is still applicable. The
+XML Components do not own the board, legality policy, retry loop, or scheduling
+policy.
+
+If the provider or driver fails, the facade requests actor stop and waits for
+the actor's bounded UCI cleanup result before consuming `Application`.
+
+## Driver And Props
+
+The immutable startup values are passed through the root closure as ordinary
+Component arguments. Mutable Chess business state is initialized with
+`use_signal`; it is not stored in `Application` props or exported through an
+external `ChessControl`.
+
+`ChessApplication` is a small example-local facade over `Application<P>`. Its
+driver waits for either terminal completion or a Component reaction request.
+After a request it awaits exactly one complete `react()` call. The loop contains
+no Chess policy:
+
+```rust,ignore
+loop {
+    tokio::select! {
+        changed = completion.changed() => changed?,
+        demand = application.wait_for_reaction_request() => {
+            demand?;
+            application.react().await?;
+        }
+    }
+}
+```
+
+An admitted `react()` is allowed to finish before terminal completion is
+observed. Cancelling it after provider handoff would terminally cancel the
+underlying `Application`. `ChessApplication::run` always consumes that runtime
+with `shutdown().await` before returning. Its stop channel carries lifecycle
+only; it cannot mutate `ChessState`, choose a move, schedule a retry, or access
+the UCI process.
+
+## Ordinary Paid Run
+
+The ordinary example makes paid OpenAI Responses requests and starts a local
+Stockfish process. Configure variables in the process environment or the
+ignored `.env` file:
+
+| Variable | Requirement |
+| --- | --- |
+| `OPENAI_API_KEY` | Required. |
+| `OPENAI_BASE_URL` | Optional; defaults to `https://api.openai.com/v1`. |
+| `AGENTVIEW_MODEL` | Optional; defaults to `gpt-5.6-terra`. |
+| `AGENTVIEW_STOCKFISH_BIN` | Optional absolute path; defaults to `/usr/games/stockfish`. |
+| `AGENTVIEW_CHESS_PLY_LIMIT` | Optional positive integer; bounds the ordinary example game. |
+| `AGENTVIEW_ENGINE_NODES` | Optional positive integer; controls Stockfish work per move. |
+| `AGENTVIEW_ENGINE_TIMEOUT_SECS` | Optional positive integer; bounds engine setup, work, and cleanup. |
+
+Run it with:
 
 ```bash
-cargo run --example chess_agentview
+cargo run --no-default-features --example chess_agentview
 ```
 
-The default engine path is `/usr/games/stockfish`. Override it with
-`AGENTVIEW_STOCKFISH_BIN` when necessary. The example writes a bounded JSONL
-trace and reports its path without logging credentials, raw reasoning, or the
-complete Provider request.
+The terminal output reports only the business result: outcome, final FEN, and
+committed moves. UCI commands, bounded-read checks, shutdown evidence, and
+provider usage belong to the separate acceptance target.
 
-## Offline Evidence
+## Paid Live Acceptance
+
+Run the separate evidence target when validating the production harness:
 
 ```bash
-cargo check --example chess_agentview
+cargo run --no-default-features --example chess_agentview_live_acceptance
 ```
 
-The shared Component and Provider contracts are defined by
-[`engine.md`](engine.md) and
-[`provider-port-application-host-boundary.md`](provider-port-application-host-boundary.md).
+This target uses `OPENAI_API_KEY` and the same optional `OPENAI_BASE_URL`,
+`AGENTVIEW_MODEL`, and `AGENTVIEW_STOCKFISH_BIN` values. Its reaction, engine,
+whole-game, and evidence limits are intentionally fixed by the acceptance
+harness rather than by the ordinary example's tuning variables.
+
+The harness writes a bounded trace to
+`target/agentview-chess-live-<run-id>.jsonl`. Schema-versioned events cover run
+configuration, turns, model attempts, provider usage when reported, Stockfish
+work, committed moves, terminal outcome, and cleanup evidence. It emits a
+terminal summary only after post-terminal consistency validation. Incomplete
+runs attempt to remove their trace artifact.
+
+The trace and status output exclude credentials, raw model reasoning, complete
+provider requests, and provider-private continuation state.
+
+## Offline Verification
+
+Compilation, reducer tests, scripted provider tests, fake-UCI lifecycle tests,
+retry paths, stale-attempt rejection, terminal idempotence, cleanup, and panic
+priority can be checked without credentials, network access, or an installed
+Stockfish binary:
+
+```bash
+cargo test --no-default-features --example chess_agentview
+cargo test --no-default-features --example chess_agentview_live_acceptance
+cargo check --no-default-features --example chess_agentview
+cargo check --no-default-features --example chess_agentview_live_acceptance
+cargo run --no-default-features --example chess_agentview -- --help
+cargo run --no-default-features --example chess_agentview_live_acceptance -- --help
+```
+
+The help paths exit before provider, credential, or UCI setup. Offline fixtures
+are verification infrastructure; they are not an unauthenticated production
+provider configuration.
+
+## Source Map
+
+- [`chess_application.rs`](../examples/chess_agentview/chess_application.rs):
+  facade, Component root, actor, mechanical driver, and projection.
+- [`chess_action_component.rs`](../examples/chess_agentview/chess_action_component.rs):
+  five direct, unbounded streaming XML action Components.
+- [`chess_action.rs`](../examples/chess_agentview/chess_action.rs): typed Chess
+  actions shared by the readable example and acceptance binary.
+- [`application_state.rs`](../examples/chess_agentview/application_state.rs):
+  authoritative state, typed events/effects, reducer, and focused tests.
+- [`uci.rs`](../examples/chess_agentview/uci.rs): bounded UCI process adapter.
+- [`live_provider.rs`](../examples/chess_agentview/live_provider.rs): ordinary
+  paid-run environment and provider construction.
+- [`chess_actions.rs`](../examples/chess_agentview_live_acceptance/chess_actions.rs),
+  [`game.rs`](../examples/chess_agentview_live_acceptance/game.rs),
+  [`live.rs`](../examples/chess_agentview_live_acceptance/live.rs), and
+  [`observability.rs`](../examples/chess_agentview_live_acceptance/observability.rs): heavy
+  acceptance machinery linked by `chess_agentview_live_acceptance`, not by the
+  ordinary binary.
+
+The shared runtime protocol remains specified by [`engine.md`](engine.md).

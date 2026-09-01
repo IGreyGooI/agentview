@@ -1,3 +1,8 @@
+#![allow(
+    deprecated,
+    reason = "this compatibility fixture intentionally exercises retained Component and Provider APIs"
+)]
+
 //! Executable fixture for the retained Component and Provider boundary.
 
 use std::{

@@ -3,6 +3,7 @@
 //! This module does not convert to the legacy generic component compiler. Its
 //! private declaration tree is the permanent lowering target for `view!`.
 
+mod async_task;
 mod attempt;
 mod capture;
 mod declaration;
@@ -10,19 +11,36 @@ mod event_input;
 mod event_listener;
 mod handler;
 mod native_tool;
+mod provider_event_handler;
+mod reaction_request;
 mod render_context;
 mod signal;
 mod streaming_xml;
 
+pub(crate) use async_task::MountTaskStart;
+pub use async_task::{
+    spawn, use_coroutine, use_future, Coroutine, CoroutineInbox, CoroutineSendError, SpawnError,
+};
 pub use attempt::ComponentAttemptFault;
 pub(crate) use attempt::{ComponentRenderStage, RenderBindings};
 pub use capture::ComponentCaptureError;
 pub use declaration::Component;
-pub use event_input::EventInput;
-pub use event_listener::EventListener;
+pub(crate) use event_input::EventInput as InternalEventInput;
+#[cfg(feature = "legacy-provider-port")]
+#[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
+pub type EventInput<E> = InternalEventInput<E>;
+#[cfg(test)]
+pub(crate) use event_listener::EventListener as InternalEventListener;
+#[cfg(feature = "legacy-provider-port")]
+#[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
+pub type EventListener = event_listener::EventListener;
 pub use native_tool::NativeToolCall;
+pub use provider_event_handler::{use_provider_event_handler, ProviderEventSelector};
+pub use reaction_request::{use_reaction_request, ReactionRequest, ReactionRequestError};
 pub use signal::{use_signal, Signal};
-pub use streaming_xml::{XmlContractDiagnostic, XmlStreamingToolCall};
+pub use streaming_xml::{
+    StreamingXml, StreamingXmlTag, XmlContractDiagnostic, XmlStreamingToolCall,
+};
 
 /// Macro expansion helpers. They are public only because proc-macro output is
 /// type-checked in the consuming crate.

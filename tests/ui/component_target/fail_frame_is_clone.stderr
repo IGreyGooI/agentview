@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `Frame` in the current scope
+ --> tests/ui/component_target/fail_frame_is_clone.rs:4:28
+  |
+4 |     let _duplicate = frame.clone();
+  |                            ^^^^^ method not found in `Frame`

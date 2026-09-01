@@ -18,7 +18,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
     thread::ThreadId,
@@ -30,10 +30,6 @@ use std::panic::Location;
 use tokio::sync::Notify;
 
 use super::ComponentId;
-
-const MOUNT_PENDING: u8 = 0;
-const MOUNT_ACTIVE: u8 = 1;
-const MOUNT_STALE: u8 = 2;
 
 thread_local! {
     static SIGNAL_ACCESS_RUNTIME: Cell<Option<usize>> = const { Cell::new(None) };
@@ -111,7 +107,7 @@ pub struct Signal<T> {
     runtime: Arc<SignalRuntimeCore>,
     component: ComponentId,
     generation: u64,
-    mount_state: Arc<AtomicU8>,
+    mount_fence: Arc<MountFence>,
     slot: usize,
     state: Arc<RwLock<T>>,
 }
@@ -122,7 +118,7 @@ impl<T> Clone for Signal<T> {
             runtime: Arc::clone(&self.runtime),
             component: self.component.clone(),
             generation: self.generation,
-            mount_state: Arc::clone(&self.mount_state),
+            mount_fence: Arc::clone(&self.mount_fence),
             slot: self.slot,
             state: Arc::clone(&self.state),
         }
@@ -201,9 +197,10 @@ where
         if !self.runtime.active.load(Ordering::Acquire) {
             return Err(SignalAccessError::RuntimeInactive);
         }
-        match self.mount_state.load(Ordering::Acquire) {
-            MOUNT_PENDING | MOUNT_ACTIVE => Ok(()),
-            _ => Err(self.stale_error()),
+        if self.mount_fence.is_render_readable() {
+            Ok(())
+        } else {
+            Err(self.stale_error())
         }
     }
 
@@ -211,10 +208,11 @@ where
         if !self.runtime.active.load(Ordering::Acquire) {
             return Err(SignalAccessError::RuntimeInactive);
         }
-        if self.mount_state.load(Ordering::Acquire) != MOUNT_ACTIVE {
-            return Err(self.stale_error());
+        if self.mount_fence.is_active() {
+            Ok(())
+        } else {
+            Err(self.stale_error())
         }
-        Ok(())
     }
 
     fn stale_error(&self) -> SignalAccessError {
@@ -226,6 +224,79 @@ where
             component: self.component.to_string(),
             slot: self.slot,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountState {
+    Pending,
+    Active,
+    Stale,
+}
+
+/// One lock-backed ordering point shared by every capability from a mount.
+///
+/// Operations that can escape the render transaction must commit through
+/// [`with_active`](Self::with_active). Unmount takes the same lock before it
+/// closes the generation, so either the operation is accepted first and is
+/// owned by cleanup, or it observes a stale mount and performs no work.
+#[derive(Debug)]
+pub(crate) struct MountFence {
+    state: Mutex<MountState>,
+}
+
+impl MountFence {
+    fn pending() -> Self {
+        Self {
+            state: Mutex::new(MountState::Pending),
+        }
+    }
+
+    fn activate(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert_eq!(*state, MountState::Pending);
+        if *state == MountState::Pending {
+            *state = MountState::Active;
+        }
+    }
+
+    fn invalidate(&self) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = MountState::Stale;
+    }
+
+    fn is_render_readable(&self) -> bool {
+        matches!(
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            MountState::Pending | MountState::Active
+        )
+    }
+
+    fn is_active(&self) -> bool {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            == MountState::Active
+    }
+
+    pub(crate) fn with_active<R>(&self, operation: impl FnOnce() -> R) -> Option<R> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *state != MountState::Active {
+            return None;
+        }
+        Some(operation())
     }
 }
 
@@ -252,7 +323,7 @@ pub enum SignalAccessError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SignalHookSite {
+pub(crate) enum HookSite {
     Authoring(u32),
     #[cfg(test)]
     Runtime {
@@ -262,7 +333,7 @@ pub(crate) enum SignalHookSite {
     },
 }
 
-impl SignalHookSite {
+impl HookSite {
     #[cfg(test)]
     fn caller(location: &'static Location<'static>) -> Self {
         Self::Runtime {
@@ -273,13 +344,64 @@ impl SignalHookSite {
     }
 }
 
-impl fmt::Display for SignalHookSite {
+impl fmt::Display for HookSite {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Authoring(site) => write!(formatter, "component-hook-{site}"),
             #[cfg(test)]
             Self::Runtime { file, line, column } => write!(formatter, "{file}:{line}:{column}"),
         }
+    }
+}
+
+/// Closed runtime classification for one lexical Component hook slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Phase 8 hook kinds are wired into authoring incrementally.
+pub(crate) enum HookKind {
+    Signal,
+    ProviderEventHandler,
+    ReactionRequest,
+    Future,
+    Coroutine,
+}
+
+/// Stable identity of one Component mount generation.
+///
+/// This value is intentionally independent from any particular capability so
+/// render reconciliation can hand retired generations to lifecycle owners.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct MountIdentity {
+    component: ComponentId,
+    generation: u64,
+}
+
+impl MountIdentity {
+    pub(crate) fn new(component: ComponentId, generation: u64) -> Self {
+        Self {
+            component,
+            generation,
+        }
+    }
+
+    pub(crate) fn component(&self) -> &ComponentId {
+        &self.component
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl fmt::Display for HookKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Signal => "signal",
+            Self::ProviderEventHandler => "provider-event-handler",
+            Self::ReactionRequest => "reaction-request",
+            Self::Future => "future",
+            Self::Coroutine => "coroutine",
+        };
+        formatter.write_str(name)
     }
 }
 
@@ -298,7 +420,7 @@ pub(crate) enum SignalRenderError {
     #[error("component `{component}` was rendered more than once in one transaction")]
     DuplicateComponent { component: String },
 
-    #[error("component `{component}` signal hook count changed from {expected} to {observed}")]
+    #[error("component `{component}` hook count changed from {expected} to {observed}")]
     HookCountMismatch {
         component: String,
         expected: usize,
@@ -315,60 +437,178 @@ pub(crate) enum SignalRenderError {
         observed: &'static str,
     },
 
-    #[error("component `{component}` signal hook {slot} moved from `{expected}` to `{observed}`")]
+    #[error("component `{component}` hook {slot} changed kind from `{expected}` to `{observed}`")]
+    HookKindMismatch {
+        component: String,
+        slot: usize,
+        expected: HookKind,
+        observed: HookKind,
+    },
+
+    #[error("component `{component}` hook {slot} moved from `{expected}` to `{observed}`")]
     HookLocationMismatch {
         component: String,
         slot: usize,
-        expected: SignalHookSite,
-        observed: SignalHookSite,
+        expected: HookSite,
+        observed: HookSite,
+    },
+
+    #[error(
+        "component `{component}` hook {slot} changed retained type from `{expected}` to `{observed}`"
+    )]
+    HookRetainedTypeMismatch {
+        component: String,
+        slot: usize,
+        expected: &'static str,
+        observed: &'static str,
     },
 }
 
-trait ErasedSignalSlot: Send + Sync {
-    fn clone_box(&self) -> Box<dyn ErasedSignalSlot>;
-    fn state_type_id(&self) -> TypeId;
-    fn state_type_name(&self) -> &'static str;
-    fn site(&self) -> SignalHookSite;
-    fn state_any(&self) -> &dyn Any;
+trait ErasedHookSlot: Send + Sync {
+    fn clone_box(&self) -> Box<dyn ErasedHookSlot>;
+    fn kind(&self) -> HookKind;
+    fn site(&self) -> HookSite;
+    fn signal_state_type_id(&self) -> Option<TypeId>;
+    fn signal_state_type_name(&self) -> Option<&'static str>;
+    fn signal_state_any(&self) -> Option<&dyn Any>;
+    fn retained_state_type_id(&self) -> Option<TypeId> {
+        None
+    }
+    fn retained_state_type_name(&self) -> Option<&'static str> {
+        None
+    }
+    fn retained_state_any(&self) -> Option<&dyn Any> {
+        None
+    }
+}
+
+struct TypedRetainedHookSlot<T> {
+    state: Arc<T>,
+    kind: HookKind,
+    site: HookSite,
+}
+
+impl<T> ErasedHookSlot for TypedRetainedHookSlot<T>
+where
+    T: Send + Sync + 'static,
+{
+    fn clone_box(&self) -> Box<dyn ErasedHookSlot> {
+        Box::new(Self {
+            state: Arc::clone(&self.state),
+            kind: self.kind,
+            site: self.site,
+        })
+    }
+
+    fn kind(&self) -> HookKind {
+        self.kind
+    }
+
+    fn site(&self) -> HookSite {
+        self.site
+    }
+
+    fn signal_state_type_id(&self) -> Option<TypeId> {
+        None
+    }
+
+    fn signal_state_type_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn signal_state_any(&self) -> Option<&dyn Any> {
+        None
+    }
+
+    fn retained_state_type_id(&self) -> Option<TypeId> {
+        Some(TypeId::of::<T>())
+    }
+
+    fn retained_state_type_name(&self) -> Option<&'static str> {
+        Some(type_name::<T>())
+    }
+
+    fn retained_state_any(&self) -> Option<&dyn Any> {
+        Some(&self.state)
+    }
 }
 
 struct TypedSignalSlot<T> {
     state: Arc<RwLock<T>>,
-    site: SignalHookSite,
+    site: HookSite,
 }
 
-impl<T> ErasedSignalSlot for TypedSignalSlot<T>
+impl<T> ErasedHookSlot for TypedSignalSlot<T>
 where
     T: Send + Sync + 'static,
 {
-    fn clone_box(&self) -> Box<dyn ErasedSignalSlot> {
+    fn clone_box(&self) -> Box<dyn ErasedHookSlot> {
         Box::new(Self {
             state: Arc::clone(&self.state),
             site: self.site,
         })
     }
 
-    fn state_type_id(&self) -> TypeId {
-        TypeId::of::<T>()
+    fn kind(&self) -> HookKind {
+        HookKind::Signal
     }
 
-    fn state_type_name(&self) -> &'static str {
-        type_name::<T>()
-    }
-
-    fn site(&self) -> SignalHookSite {
+    fn site(&self) -> HookSite {
         self.site
     }
 
-    fn state_any(&self) -> &dyn Any {
-        &self.state
+    fn signal_state_type_id(&self) -> Option<TypeId> {
+        Some(TypeId::of::<T>())
+    }
+
+    fn signal_state_type_name(&self) -> Option<&'static str> {
+        Some(type_name::<T>())
+    }
+
+    fn signal_state_any(&self) -> Option<&dyn Any> {
+        Some(&self.state)
+    }
+}
+
+#[allow(dead_code)] // Constructed by the Phase 8 non-state authoring hooks.
+struct MarkerHookSlot {
+    kind: HookKind,
+    site: HookSite,
+}
+
+impl ErasedHookSlot for MarkerHookSlot {
+    fn clone_box(&self) -> Box<dyn ErasedHookSlot> {
+        Box::new(Self {
+            kind: self.kind,
+            site: self.site,
+        })
+    }
+
+    fn kind(&self) -> HookKind {
+        self.kind
+    }
+
+    fn site(&self) -> HookSite {
+        self.site
+    }
+
+    fn signal_state_type_id(&self) -> Option<TypeId> {
+        None
+    }
+
+    fn signal_state_type_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn signal_state_any(&self) -> Option<&dyn Any> {
+        None
     }
 }
 
 struct MountedSignalComponent {
     generation: u64,
-    mount_state: Arc<AtomicU8>,
-    slots: Vec<Box<dyn ErasedSignalSlot>>,
+    mount_fence: Arc<MountFence>,
+    slots: Vec<Box<dyn ErasedHookSlot>>,
     pending: bool,
 }
 
@@ -376,7 +616,7 @@ impl MountedSignalComponent {
     fn pending(generation: u64) -> Self {
         Self {
             generation,
-            mount_state: Arc::new(AtomicU8::new(MOUNT_PENDING)),
+            mount_fence: Arc::new(MountFence::pending()),
             slots: Vec::new(),
             pending: true,
         }
@@ -385,19 +625,19 @@ impl MountedSignalComponent {
     fn snapshot(&self) -> Self {
         Self {
             generation: self.generation,
-            mount_state: Arc::clone(&self.mount_state),
+            mount_fence: Arc::clone(&self.mount_fence),
             slots: self.slots.iter().map(|slot| slot.clone_box()).collect(),
             pending: false,
         }
     }
 
     fn activate(&mut self) {
-        self.mount_state.store(MOUNT_ACTIVE, Ordering::Release);
+        self.mount_fence.activate();
         self.pending = false;
     }
 
     fn invalidate(&self) {
-        self.mount_state.store(MOUNT_STALE, Ordering::Release);
+        self.mount_fence.invalidate();
     }
 }
 
@@ -536,12 +776,13 @@ impl SignalRuntime {
         self.core.mark_dirty();
     }
 
+    #[cfg(feature = "legacy-provider-port")]
     pub(crate) fn owns<T>(&self, signal: &Signal<T>) -> bool {
         Arc::ptr_eq(&self.core, &signal.runtime)
     }
 
     /// Explicitly remount the complete tree and fence every previously issued handle.
-    pub(crate) fn invalidate_all(&self) -> Result<(), SignalRenderError> {
+    pub(crate) fn invalidate_all(&self) -> Result<Vec<MountIdentity>, SignalRenderError> {
         if self.core.is_render_owner() {
             return Err(SignalRenderError::NestedRender);
         }
@@ -557,6 +798,10 @@ impl SignalRuntime {
             .components
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retired = components
+            .iter()
+            .map(|(identity, component)| MountIdentity::new(identity.clone(), component.generation))
+            .collect::<Vec<_>>();
         for component in components.values() {
             component.invalidate();
         }
@@ -568,7 +813,7 @@ impl SignalRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.core.mark_dirty();
-        Ok(())
+        Ok(retired)
     }
 
     /// Explicitly unmount one identity, fencing every handle from its old generation.
@@ -739,24 +984,36 @@ impl SignalRenderTransaction<'_> {
         }
     }
 
-    /// Publish all staged hook shapes and retire identities absent from this render.
-    pub(crate) fn commit(mut self) {
+    /// Publish all staged hook shapes and immediately activate new mounts.
+    pub(crate) fn commit(self) {
+        self.commit_deferred().activate();
+    }
+
+    /// Publish hook topology and fence identities absent from this render.
+    ///
+    /// Newly introduced mounts remain pending until the returned transition is
+    /// activated. This lets an async lifecycle owner retire and join tasks from
+    /// old mounts before any capability from a replacement mount becomes live.
+    pub(crate) fn commit_deferred(mut self) -> SignalMountTransition {
         let mut components = self
             .runtime
             .core
             .components
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut retired = Vec::new();
         for (identity, previous) in components.iter() {
             if !self.staged.contains_key(identity) {
                 previous.invalidate();
+                retired.push(MountIdentity::new(identity.clone(), previous.generation));
             }
         }
-        for component in self.staged.values_mut() {
-            if component.pending {
-                component.activate();
-            }
-        }
+        let pending = self
+            .staged
+            .iter()
+            .filter(|(_, component)| component.pending)
+            .map(|(identity, component)| MountIdentity::new(identity.clone(), component.generation))
+            .collect();
         *components = std::mem::take(&mut self.staged);
         self.runtime
             .core
@@ -765,6 +1022,70 @@ impl SignalRenderTransaction<'_> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.runtime.core.dirty.store(false, Ordering::Release);
+        SignalMountTransition {
+            runtime: Arc::clone(&self.runtime.core),
+            pending,
+            retired,
+            finished: false,
+        }
+    }
+}
+
+/// A committed hook topology waiting for replacement mounts to become active.
+///
+/// Dropping an unfinished transition removes its still-pending mounts and
+/// marks the runtime dirty so a later render can safely recreate them.
+pub(crate) struct SignalMountTransition {
+    runtime: Arc<SignalRuntimeCore>,
+    pending: Vec<MountIdentity>,
+    retired: Vec<MountIdentity>,
+    finished: bool,
+}
+
+impl SignalMountTransition {
+    pub(crate) fn retired(&self) -> &[MountIdentity] {
+        &self.retired
+    }
+
+    pub(crate) fn activate(mut self) {
+        let mut components = self
+            .runtime
+            .components
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for identity in &self.pending {
+            let component = components
+                .get_mut(identity.component())
+                .filter(|component| component.generation == identity.generation())
+                .expect("pending Component mount must remain installed until activation");
+            component.activate();
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for SignalMountTransition {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut components = self
+            .runtime
+            .components
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for identity in &self.pending {
+            let should_remove = components
+                .get(identity.component())
+                .is_some_and(|component| {
+                    component.pending && component.generation == identity.generation()
+                });
+            if should_remove {
+                components.remove(identity.component());
+            }
+        }
+        drop(components);
+        self.runtime.mark_dirty();
     }
 }
 
@@ -799,7 +1120,7 @@ impl SignalRenderScope {
     where
         T: Send + Sync + 'static,
     {
-        self.use_signal_with_site(SignalHookSite::caller(Location::caller()), initialize)
+        self.use_signal_with_site(HookSite::caller(Location::caller()), initialize)
     }
 
     pub(crate) fn use_signal_at<T>(
@@ -810,12 +1131,12 @@ impl SignalRenderScope {
     where
         T: Send + Sync + 'static,
     {
-        self.use_signal_with_site(SignalHookSite::Authoring(site), initialize)
+        self.use_signal_with_site(HookSite::Authoring(site), initialize)
     }
 
     fn use_signal_with_site<T>(
         &mut self,
-        site: SignalHookSite,
+        site: HookSite,
         initialize: impl FnOnce() -> T,
     ) -> Result<Signal<T>, SignalRenderError>
     where
@@ -836,11 +1157,23 @@ impl SignalRenderScope {
                 self.record_fault(fault.clone());
                 return Err(fault);
             };
-            if slot.state_type_id() != TypeId::of::<T>() {
+            if slot.kind() != HookKind::Signal {
+                let fault = SignalRenderError::HookKindMismatch {
+                    component: self.component.to_string(),
+                    slot: slot_index,
+                    expected: slot.kind(),
+                    observed: HookKind::Signal,
+                };
+                self.record_fault(fault.clone());
+                return Err(fault);
+            }
+            if slot.signal_state_type_id() != Some(TypeId::of::<T>()) {
                 let fault = SignalRenderError::HookTypeMismatch {
                     component: self.component.to_string(),
                     slot: slot_index,
-                    expected: slot.state_type_name(),
+                    expected: slot
+                        .signal_state_type_name()
+                        .expect("a signal hook slot has a state type"),
                     observed: type_name::<T>(),
                 };
                 self.record_fault(fault.clone());
@@ -856,7 +1189,8 @@ impl SignalRenderScope {
                 self.record_fault(fault.clone());
                 return Err(fault);
             }
-            slot.state_any()
+            slot.signal_state_any()
+                .expect("a signal hook slot has state")
                 .downcast_ref::<Arc<RwLock<T>>>()
                 .expect("matching signal TypeId must downcast")
                 .clone()
@@ -874,10 +1208,161 @@ impl SignalRenderScope {
             runtime: Arc::clone(&self.runtime),
             component: self.component.clone(),
             generation: self.mounted.generation,
-            mount_state: Arc::clone(&self.mounted.mount_state),
+            mount_fence: Arc::clone(&self.mounted.mount_fence),
             slot: slot_index,
             state,
         })
+    }
+
+    #[allow(dead_code)] // Called by the Phase 8 non-state authoring hooks.
+    pub(crate) fn use_marker_at(
+        &mut self,
+        site: u32,
+        kind: HookKind,
+    ) -> Result<HookMount, SignalRenderError> {
+        self.use_marker_with_site(HookSite::Authoring(site), kind)
+    }
+
+    #[allow(dead_code)] // Called by the Phase 8 non-state authoring hooks.
+    fn use_marker_with_site(
+        &mut self,
+        site: HookSite,
+        kind: HookKind,
+    ) -> Result<HookMount, SignalRenderError> {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
+        }
+
+        let slot_index = self.cursor;
+        if self.expected_shape {
+            let Some(slot) = self.mounted.slots.get(slot_index) else {
+                let fault = SignalRenderError::HookCountMismatch {
+                    component: self.component.to_string(),
+                    expected: self.mounted.slots.len(),
+                    observed: slot_index + 1,
+                };
+                self.record_fault(fault.clone());
+                return Err(fault);
+            };
+            if slot.kind() != kind {
+                let fault = SignalRenderError::HookKindMismatch {
+                    component: self.component.to_string(),
+                    slot: slot_index,
+                    expected: slot.kind(),
+                    observed: kind,
+                };
+                self.record_fault(fault.clone());
+                return Err(fault);
+            }
+            if slot.site() != site {
+                let fault = SignalRenderError::HookLocationMismatch {
+                    component: self.component.to_string(),
+                    slot: slot_index,
+                    expected: slot.site(),
+                    observed: site,
+                };
+                self.record_fault(fault.clone());
+                return Err(fault);
+            }
+        } else {
+            self.mounted
+                .slots
+                .push(Box::new(MarkerHookSlot { kind, site }));
+        }
+
+        self.cursor += 1;
+        Ok(HookMount {
+            component: self.component.clone(),
+            generation: self.mounted.generation,
+            mount_fence: Arc::clone(&self.mounted.mount_fence),
+            slot: slot_index,
+            new_mount: self.mounted.pending,
+        })
+    }
+
+    pub(crate) fn use_retained_at<T>(
+        &mut self,
+        site: u32,
+        kind: HookKind,
+        initialize: impl FnOnce() -> T,
+    ) -> Result<(HookMount, Arc<T>), SignalRenderError>
+    where
+        T: Send + Sync + 'static,
+    {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
+        }
+
+        let site = HookSite::Authoring(site);
+        let slot_index = self.cursor;
+        let state = if self.expected_shape {
+            let Some(slot) = self.mounted.slots.get(slot_index) else {
+                let fault = SignalRenderError::HookCountMismatch {
+                    component: self.component.to_string(),
+                    expected: self.mounted.slots.len(),
+                    observed: slot_index + 1,
+                };
+                self.record_fault(fault.clone());
+                return Err(fault);
+            };
+            if slot.kind() != kind {
+                let fault = SignalRenderError::HookKindMismatch {
+                    component: self.component.to_string(),
+                    slot: slot_index,
+                    expected: slot.kind(),
+                    observed: kind,
+                };
+                self.record_fault(fault.clone());
+                return Err(fault);
+            }
+            if slot.site() != site {
+                let fault = SignalRenderError::HookLocationMismatch {
+                    component: self.component.to_string(),
+                    slot: slot_index,
+                    expected: slot.site(),
+                    observed: site,
+                };
+                self.record_fault(fault.clone());
+                return Err(fault);
+            }
+            if slot.retained_state_type_id() != Some(TypeId::of::<T>()) {
+                let fault = SignalRenderError::HookRetainedTypeMismatch {
+                    component: self.component.to_string(),
+                    slot: slot_index,
+                    expected: slot
+                        .retained_state_type_name()
+                        .unwrap_or("non-retained hook state"),
+                    observed: type_name::<T>(),
+                };
+                self.record_fault(fault.clone());
+                return Err(fault);
+            }
+            slot.retained_state_any()
+                .expect("a retained hook slot has state")
+                .downcast_ref::<Arc<T>>()
+                .expect("matching retained TypeId must downcast")
+                .clone()
+        } else {
+            let state = Arc::new(initialize());
+            self.mounted.slots.push(Box::new(TypedRetainedHookSlot {
+                state: Arc::clone(&state),
+                kind,
+                site,
+            }));
+            state
+        };
+
+        self.cursor += 1;
+        Ok((
+            HookMount {
+                component: self.component.clone(),
+                generation: self.mounted.generation,
+                mount_fence: Arc::clone(&self.mounted.mount_fence),
+                slot: slot_index,
+                new_mount: self.mounted.pending,
+            },
+            state,
+        ))
     }
 
     fn record_fault(&mut self, fault: SignalRenderError) {
@@ -898,6 +1383,37 @@ impl SignalRenderScope {
             Some(fault) => Err(fault),
             None => Ok(self.mounted),
         }
+    }
+}
+
+/// Mount identity returned to non-state hooks after topology validation.
+#[derive(Clone)]
+#[allow(dead_code)] // Consumed by Phase 8 binding and task lifecycle fences.
+pub(crate) struct HookMount {
+    pub(crate) component: ComponentId,
+    pub(crate) generation: u64,
+    mount_fence: Arc<MountFence>,
+    pub(crate) slot: usize,
+    new_mount: bool,
+}
+
+pub(crate) struct MountOperationPermit {
+    _fence: Arc<MountFence>,
+}
+
+impl HookMount {
+    pub(crate) const fn is_new_mount(&self) -> bool {
+        self.new_mount
+    }
+    pub(crate) fn authorize(&self) -> Option<MountOperationPermit> {
+        self.mount_fence.with_active(|| MountOperationPermit {
+            _fence: Arc::clone(&self.mount_fence),
+        })
+    }
+
+    #[allow(dead_code)] // Used by Phase 8 demand/task registration in the next slice.
+    pub(crate) fn with_active<R>(&self, operation: impl FnOnce() -> R) -> Option<R> {
+        self.mount_fence.with_active(operation)
     }
 }
 

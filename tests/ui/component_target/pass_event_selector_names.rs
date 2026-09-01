@@ -1,3 +1,5 @@
+#![allow(deprecated, reason = "legacy ComponentEvents compile fixture")]
+
 use agentview::component::prelude::*;
 
 #[derive(ComponentEvents)]

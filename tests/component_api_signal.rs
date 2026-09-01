@@ -57,10 +57,7 @@ impl SignalProps {
 }
 
 #[component]
-fn retained_signal_application(
-    props: SignalProps,
-    _events: EventInput<ProviderEvent>,
-) -> Component {
+fn retained_signal_application(props: SignalProps) -> Component {
     let initializations = Arc::clone(&props.initializations);
     let initial = props.initial.clone();
     let state = use_signal(move || {
@@ -86,8 +83,11 @@ fn retained_signal_application(
 }
 
 fn rendered_projection_text(render: &agentview::component::PreparedRender) -> String {
-    render
-        .projection()
+    projection_text(render.projection())
+}
+
+fn projection_text(projection: &agentview::component::execution::RenderedProjection) -> String {
+    projection
         .nodes()
         .iter()
         .flat_map(|node| node.items())
@@ -103,7 +103,7 @@ fn rendered_projection_text(render: &agentview::component::PreparedRender) -> St
 #[tokio::test]
 async fn spawned_signal_write_is_retained_until_the_next_explicit_render() {
     let props = SignalProps::new("A", "first");
-    let mut host = ComponentHost::new(retained_signal_application, props.clone());
+    let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
 
     let first = host.render().expect("initial render");
     assert!(rendered_projection_text(&first).contains("<value>A</value>"));
@@ -131,7 +131,7 @@ async fn spawned_signal_write_is_retained_until_the_next_explicit_render() {
 #[tokio::test]
 async fn cloned_signal_updates_from_a_spawned_task() {
     let props = SignalProps::new("A", "clone");
-    let mut host = ComponentHost::new(retained_signal_application, props.clone());
+    let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
     host.render().expect("initial render");
 
     let signal = props.signal();
@@ -147,7 +147,7 @@ async fn cloned_signal_updates_from_a_spawned_task() {
 #[test]
 fn replacing_props_preserves_signal_slots_for_the_same_mount() {
     let props = SignalProps::new("A", "first");
-    let mut host = ComponentHost::new(retained_signal_application, props.clone());
+    let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
     host.render().expect("initial render");
     props.signal().set("retained".to_owned()).unwrap();
 
@@ -162,33 +162,37 @@ fn replacing_props_preserves_signal_slots_for_the_same_mount() {
 }
 
 #[test]
-fn current_projection_is_unavailable_after_authoritative_state_changes() {
+fn current_projection_retains_the_latest_commit_while_state_is_dirty() {
     let props = SignalProps::new("A", "first");
-    let mut host = ComponentHost::new(retained_signal_application, props.clone());
+    let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
 
     host.render().expect("initial render");
-    assert!(host.current_projection().is_some());
+    assert!(!host.is_dirty());
+    assert!(projection_text(host.current_projection().unwrap()).contains("<value>A</value>"));
 
     props.signal().set("B".to_owned()).unwrap();
+    assert!(host.is_dirty());
     assert!(
-        host.current_projection().is_none(),
-        "a Signal write makes the previously rendered projection stale"
+        projection_text(host.current_projection().unwrap()).contains("<value>A</value>"),
+        "a Signal write must leave the latest committed projection readable"
     );
 
     host.render().expect("render updated Signal state");
-    assert!(host.current_projection().is_some());
+    assert!(!host.is_dirty());
+    assert!(projection_text(host.current_projection().unwrap()).contains("<value>B</value>"));
 
     host.set_props(props.with_values("unused", "second"));
+    assert!(host.is_dirty());
     assert!(
-        host.current_projection().is_none(),
-        "new props make the previously rendered projection stale"
+        projection_text(host.current_projection().unwrap()).contains("<value>B</value>"),
+        "new props must leave the latest committed projection readable"
     );
 }
 
 #[test]
 fn signal_with_callback_reentrant_render_fails_closed_without_deadlock() {
     let props = SignalProps::new("A", "reentrant-render");
-    let mut host = ComponentHost::new(retained_signal_application, props.clone());
+    let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
     host.render().expect("initial render");
     let signal = props.signal();
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -235,10 +239,7 @@ impl Clone for LockingCloneProps {
 }
 
 #[component]
-fn locking_clone_application(
-    props: LockingCloneProps,
-    _events: EventInput<ProviderEvent>,
-) -> Component {
+fn locking_clone_application(props: LockingCloneProps) -> Component {
     let state = use_signal(|| 1usize);
     *props.exposed.lock().expect("signal exposure lock") = Some(state.clone());
     let value = state.with(|value| *value).expect("mounted Signal read");
@@ -251,7 +252,7 @@ fn reentrant_render_is_rejected_before_props_clone() {
         clone_lock: Arc::new(Mutex::new(())),
         exposed: Arc::new(Mutex::new(None)),
     };
-    let mut host = ComponentHost::new(locking_clone_application, props.clone());
+    let mut host = ComponentHost::new_root(locking_clone_application, props.clone());
     let first_generation = host.render().expect("initial render").generation();
     let expected_next_generation = first_generation + 1;
     let signal = props
@@ -296,7 +297,7 @@ fn reentrant_render_is_rejected_before_props_clone() {
 #[test]
 fn signal_update_callback_reentrant_remount_fails_closed_without_deadlock() {
     let props = SignalProps::new("A", "reentrant-remount");
-    let mut host = ComponentHost::new(retained_signal_application, props.clone());
+    let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
     host.render().expect("initial render");
     let signal = props.signal();
     let remounted_props = props.with_values("B", "must-not-remount");
@@ -311,30 +312,36 @@ fn signal_update_callback_reentrant_remount_fails_closed_without_deadlock() {
         });
         let retained = signal.with(Clone::clone);
         done_tx
-            .send((result, retained, host.current_projection().is_none()))
+            .send((
+                result,
+                retained,
+                host.current_projection().is_some(),
+                host.is_dirty(),
+            ))
             .unwrap();
     });
 
     entered_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("Signal::update callback was not scheduled");
-    let (nested_remount_failed, retained, projection_invalidated) = done_rx
+    let (nested_remount_failed, retained, projection_retained, host_dirty) = done_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("same-host remount deadlocked inside Signal::update");
     let nested_remount_failed = nested_remount_failed.expect("outer Signal update remains valid");
     assert!(nested_remount_failed, "same-host remount must fail closed");
     assert_eq!(retained.unwrap(), "A-updated");
     assert!(
-        projection_invalidated,
-        "the successful outer update must invalidate the old projection"
+        projection_retained,
+        "a rejected remount must preserve the latest committed projection"
     );
+    assert!(host_dirty, "the successful outer update must remain dirty");
     worker.join().unwrap();
 }
 
 #[test]
 fn dropping_host_inside_signal_callback_does_not_deadlock() {
     let props = SignalProps::new("A", "reentrant-drop");
-    let mut host = ComponentHost::new(retained_signal_application, props.clone());
+    let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
     host.render().expect("initial render");
     let signal = props.signal();
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -361,9 +368,9 @@ fn dropping_host_inside_signal_callback_does_not_deadlock() {
 }
 
 #[test]
-fn panicking_signal_update_invalidates_projection_and_poisons_state() {
+fn panicking_signal_update_retains_projection_and_poisons_state() {
     let props = SignalProps::new("A", "panicking-update");
-    let mut host = ComponentHost::new(retained_signal_application, props.clone());
+    let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
     host.render().expect("initial render");
     assert!(host.current_projection().is_some());
     let signal = props.signal();
@@ -386,8 +393,8 @@ fn panicking_signal_update_invalidates_projection_and_poisons_state() {
     );
     assert_eq!(host.wake_revision(), revision + 1);
     assert!(
-        host.current_projection().is_none(),
-        "a projection rendered before a panicking update is stale"
+        projection_text(host.current_projection().unwrap()).contains("<value>A</value>"),
+        "a panicking update must retain the latest successful projection"
     );
     assert!(matches!(
         signal.with(Clone::clone),
@@ -402,11 +409,14 @@ fn panicking_signal_update_invalidates_projection_and_poisons_state() {
 #[test]
 fn explicit_remount_invalidates_old_handles_and_initializes_new_slots() {
     let props = SignalProps::new("A", "first");
-    let mut host = ComponentHost::new(retained_signal_application, props.clone());
+    let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
     host.render().expect("initial render");
     let stale = props.signal();
 
-    let _ = host.remount(props.with_values("C", "remounted"));
+    host.remount(props.with_values("C", "remounted"))
+        .expect("explicit remount");
+    assert!(host.current_projection().is_none());
+    assert!(host.is_dirty());
     assert!(matches!(
         stale.with(Clone::clone),
         Err(SignalAccessError::Stale)
@@ -426,7 +436,7 @@ fn explicit_remount_invalidates_old_handles_and_initializes_new_slots() {
 #[test]
 fn signal_writes_wait_for_a_coherent_render_snapshot() {
     let props = SignalProps::new("A", "serialized");
-    let mut host = ComponentHost::new(retained_signal_application, props.clone());
+    let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
     host.render().expect("initial render");
     let state = props.signal();
     props.block_render.store(true, Ordering::SeqCst);
@@ -477,7 +487,7 @@ struct DriftProps {
 }
 
 #[component]
-fn drifting_application(props: DriftProps, _events: EventInput<ProviderEvent>) -> Component {
+fn drifting_application(props: DriftProps) -> Component {
     let stable = use_signal(|| String::from("stable"));
     if props.add_hook {
         let _candidate = use_signal(|| String::from("candidate"));
@@ -487,18 +497,16 @@ fn drifting_application(props: DriftProps, _events: EventInput<ProviderEvent>) -
 }
 
 #[test]
-fn hook_drift_fails_closed_and_preserves_the_committed_topology() {
-    let mut host = ComponentHost::new(drifting_application, DriftProps { add_hook: false });
+fn hook_drift_panics_without_publishing_the_candidate_topology() {
+    let mut host = ComponentHost::new_root(drifting_application, DriftProps { add_hook: false });
     host.render().expect("initial stable topology");
+    let committed = host.current_projection().unwrap().clone();
 
     host.set_props(DriftProps { add_hook: true });
-    assert!(host.render().is_err(), "hook-count drift must fail closed");
-
-    host.set_props(DriftProps { add_hook: false });
-    let recovered = host
-        .render()
-        .expect("failed candidate topology was not installed");
-    assert!(rendered_projection_text(&recovered).contains("<stable>stable</stable>"));
+    let panic = catch_unwind(AssertUnwindSafe(|| host.render()));
+    assert!(panic.is_err(), "hook-count drift must panic");
+    assert!(host.is_dirty());
+    assert_eq!(host.current_projection(), Some(&committed));
 }
 
 #[derive(Clone)]
@@ -507,7 +515,7 @@ struct OrderDriftProps {
 }
 
 #[component]
-fn same_type_order_drift(props: OrderDriftProps, _events: EventInput<ProviderEvent>) -> Component {
+fn same_type_order_drift(props: OrderDriftProps) -> Component {
     let (first, second) = if props.alternate {
         (use_signal(|| 10_u64), use_signal(|| 20_u64))
     } else {
@@ -521,15 +529,20 @@ fn same_type_order_drift(props: OrderDriftProps, _events: EventInput<ProviderEve
 }
 
 #[test]
-fn same_typed_hook_order_drift_fails_closed() {
-    let mut host = ComponentHost::new(same_type_order_drift, OrderDriftProps { alternate: false });
+fn same_typed_hook_order_drift_panics_without_publishing_the_candidate() {
+    let mut host =
+        ComponentHost::new_root(same_type_order_drift, OrderDriftProps { alternate: false });
     host.render().expect("initial hook order");
+    let committed = host.current_projection().unwrap().clone();
 
     host.set_props(OrderDriftProps { alternate: true });
+    let panic = catch_unwind(AssertUnwindSafe(|| host.render()));
     assert!(
-        host.render().is_err(),
-        "changing same-typed hook callsites must not silently shift retained state"
+        panic.is_err(),
+        "changing same-typed hook callsites must panic"
     );
+    assert!(host.is_dirty());
+    assert_eq!(host.current_projection(), Some(&committed));
 }
 
 #[derive(Clone)]
@@ -564,10 +577,7 @@ impl SecondNominalComponent {
 }
 
 #[component]
-fn nominal_identity_application(
-    props: NominalIdentityProps,
-    _events: EventInput<ProviderEvent>,
-) -> Component {
+fn nominal_identity_application(props: NominalIdentityProps) -> Component {
     if props.render_first {
         FirstNominalComponent::child(props.first)
     } else {
@@ -584,7 +594,7 @@ fn distinct_nominal_components_cannot_share_signal_slots() {
         first: Arc::clone(&first),
         second: Arc::clone(&second),
     };
-    let mut host = ComponentHost::new(nominal_identity_application, initial.clone());
+    let mut host = ComponentHost::new_root(nominal_identity_application, initial.clone());
 
     host.render().expect("first nominal Component renders");
     let stale = first

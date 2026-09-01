@@ -1,3 +1,9 @@
+#![cfg(feature = "legacy-provider-port")]
+#![allow(
+    deprecated,
+    reason = "this compatibility test intentionally exercises legacy Responses continuation"
+)]
+
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,

@@ -3,6 +3,7 @@ use std::{collections::HashMap, str, sync::Arc};
 use quick_xml::{events::Event, reader::Reader, XmlVersion};
 
 use crate::llm_call::TextTurnEvent;
+use crate::stream_parser::XmlElement;
 
 use super::{StreamingXmlDispatchFault, StreamingXmlMountFault, XmlContractDiagnostic};
 use crate::component::authoring::event_input::EventRouteDescriptor;
@@ -10,13 +11,42 @@ use crate::component::authoring::event_input::EventRouteDescriptor;
 const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ELEMENT_DEPTH: usize = 256;
 const MAX_ATTRIBUTES_PER_ELEMENT: usize = 256;
-const MAX_TARGET_EVENTS: usize = 4_096;
 
 pub(crate) struct ContractRegistration {
     pub(crate) listener_index: usize,
     pub(crate) identity: &'static str,
     pub(crate) element: &'static str,
-    pub(crate) attribute: &'static str,
+    pub(crate) kind: StreamingRegistrationKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamingRegistrationKind {
+    EmptyToolCall {
+        attribute: Option<&'static str>,
+    },
+    Lifecycle {
+        open: bool,
+        stream: bool,
+        complete: bool,
+        invalid: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamingXmlPhase {
+    Open,
+    Stream,
+    Complete,
+}
+
+impl StreamingXmlPhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Stream => "stream",
+            Self::Complete => "complete",
+        }
+    }
 }
 
 pub(crate) enum ParsedContractEvent {
@@ -28,11 +58,22 @@ pub(crate) enum ParsedContractEvent {
         listener_index: usize,
         diagnostic: XmlContractDiagnostic,
     },
+    Lifecycle {
+        listener_index: usize,
+        phase: StreamingXmlPhase,
+        element: XmlElement,
+    },
 }
 
 struct TargetState {
-    registration: ContractRegistration,
-    occurrences: usize,
+    element: &'static str,
+    registrations: Vec<ContractRegistration>,
+}
+
+struct TrackedElement {
+    target_index: usize,
+    attributes: HashMap<String, String>,
+    content_start: usize,
 }
 
 pub(crate) struct MountedStreamingRoute {
@@ -41,9 +82,9 @@ pub(crate) struct MountedStreamingRoute {
     targets_by_element: HashMap<&'static str, usize>,
     raw_output: String,
     pending: String,
+    pending_offset: usize,
     incomplete_scan: Option<IncompleteScan>,
     namespace_stack: Vec<NamespaceFrame>,
-    target_events: usize,
     text_complete: bool,
     finished: bool,
 }
@@ -56,9 +97,9 @@ impl MountedStreamingRoute {
             targets_by_element: HashMap::new(),
             raw_output: String::new(),
             pending: String::new(),
+            pending_offset: 0,
             incomplete_scan: None,
             namespace_stack: Vec::new(),
-            target_events: 0,
             text_complete: false,
             finished: false,
         }
@@ -68,18 +109,15 @@ impl MountedStreamingRoute {
         &mut self,
         registration: ContractRegistration,
     ) -> Result<(), StreamingXmlMountFault> {
-        if let Some(first) = self.targets_by_element.get(registration.element).copied() {
-            return Err(StreamingXmlMountFault::DuplicateTarget {
-                element: registration.element,
-                first: self.targets[first].registration.identity,
-                second: registration.identity,
-            });
+        if let Some(target_index) = self.targets_by_element.get(registration.element).copied() {
+            self.targets[target_index].registrations.push(registration);
+            return Ok(());
         }
         let index = self.targets.len();
         self.targets_by_element.insert(registration.element, index);
         self.targets.push(TargetState {
-            registration,
-            occurrences: 0,
+            element: registration.element,
+            registrations: vec![registration],
         });
         Ok(())
     }
@@ -99,7 +137,8 @@ impl MountedStreamingRoute {
                 contract: self
                     .targets
                     .first()
-                    .map_or("unknown", |target| target.registration.identity),
+                    .and_then(|target| target.registrations.first())
+                    .map_or("unknown", |registration| registration.identity),
             },
         )?;
         self.on_text(event)
@@ -113,28 +152,20 @@ impl MountedStreamingRoute {
             return Err(StreamingXmlDispatchFault::RouteMissingTextComplete);
         }
 
-        let incomplete = self.incomplete_target();
         let mut events = Vec::new();
-        for (index, target) in self.targets.iter().enumerate() {
-            let diagnostic = if incomplete == Some(index) {
-                Some(XmlContractDiagnostic::IncompleteElement {
-                    contract: target.registration.identity,
-                    element: target.registration.element,
-                })
-            } else if target.occurrences != 1 {
-                Some(XmlContractDiagnostic::OccurrenceCount {
-                    contract: target.registration.identity,
-                    expected: 1,
-                    observed: target.occurrences,
-                })
-            } else {
-                None
+        for frame in &self.namespace_stack {
+            let Some(tracked) = &frame.tracked else {
+                continue;
             };
-            if let Some(diagnostic) = diagnostic {
-                events.push(ParsedContractEvent::Invalid {
-                    listener_index: target.registration.listener_index,
-                    diagnostic,
-                });
+            self.push_incomplete_events(tracked.target_index, true, &mut events);
+        }
+        let pending = self.pending.trim_start();
+        let pending_is_tracked_close = self.namespace_stack.iter().rev().any(|frame| {
+            frame.tracked.is_some() && incomplete_close_prefix(pending, frame.element_name.as_str())
+        });
+        if !pending_is_tracked_close {
+            if let Some(target_index) = self.incomplete_target() {
+                self.push_incomplete_events(target_index, false, &mut events);
             }
         }
         self.finished = true;
@@ -148,7 +179,7 @@ impl MountedStreamingRoute {
         if self.finished || self.text_complete {
             return Err(StreamingXmlDispatchFault::RouteTextAfterCompletion);
         }
-        match event {
+        let appended = match event {
             TextTurnEvent::TextDelta(chunk) => self.append(chunk)?,
             TextTurnEvent::TextComplete(output) => {
                 if !output.starts_with(&self.raw_output) {
@@ -158,14 +189,19 @@ impl MountedStreamingRoute {
                     });
                 }
                 let suffix = &output[self.raw_output.len()..];
-                self.append(suffix)?;
+                let appended = self.append(suffix)?;
                 self.text_complete = true;
+                appended
             }
+        };
+        let mut events = self.process_pending()?;
+        if appended {
+            self.push_stream_events(&mut events);
         }
-        self.process_pending()
+        Ok(events)
     }
 
-    fn append(&mut self, chunk: &str) -> Result<(), StreamingXmlDispatchFault> {
+    fn append(&mut self, chunk: &str) -> Result<bool, StreamingXmlDispatchFault> {
         let observed = self.raw_output.len().saturating_add(chunk.len());
         if observed > MAX_TEXT_BYTES {
             return Err(StreamingXmlDispatchFault::InputLimitExceeded {
@@ -175,7 +211,7 @@ impl MountedStreamingRoute {
         }
         self.raw_output.push_str(chunk);
         self.pending.push_str(chunk);
-        Ok(())
+        Ok(!chunk.is_empty())
     }
 
     fn process_pending(&mut self) -> Result<Vec<ParsedContractEvent>, StreamingXmlDispatchFault> {
@@ -202,33 +238,59 @@ impl MountedStreamingRoute {
                     self.record_malformed_lexical_target(
                         lexical_element_name(&malformed_prefix),
                         &mut events,
-                    )?;
+                    );
                     cursor += next_start;
                     continue;
                 }
             };
             let markup = self.pending[cursor..cursor + length].to_owned();
-            self.process_markup(&markup, &mut events)?;
+            let markup_start = self.pending_offset + cursor;
+            self.process_markup(&markup, markup_start, &mut events)?;
             cursor += length;
         }
         self.pending.drain(..cursor);
+        self.pending_offset += cursor;
         Ok(events)
     }
 
     fn process_markup(
         &mut self,
         markup: &str,
+        markup_start: usize,
         events: &mut Vec<ParsedContractEvent>,
     ) -> Result<(), StreamingXmlDispatchFault> {
         if is_ignored_markup(markup) {
             return Ok(());
         }
         if markup.starts_with("</") {
-            if let (Ok(name), Some(frame)) = (parse_end_name(markup), self.namespace_stack.last()) {
+            let parsed_name = parse_end_name(markup).ok();
+            if let (Some(name), Some(frame)) = (parsed_name.as_deref(), self.namespace_stack.last())
+            {
                 if frame.element_name == name {
-                    self.namespace_stack.pop();
+                    let frame = self
+                        .namespace_stack
+                        .pop()
+                        .expect("the matching namespace frame exists");
+                    if let Some(tracked) = frame.tracked {
+                        let content =
+                            self.raw_output[tracked.content_start..markup_start].to_owned();
+                        self.push_lifecycle_events(
+                            tracked.target_index,
+                            StreamingXmlPhase::Complete,
+                            &tracked.attributes,
+                            content,
+                            events,
+                        );
+                    }
+                    return Ok(());
                 }
             }
+            self.record_malformed_lexical_target(
+                parsed_name
+                    .as_deref()
+                    .or_else(|| lexical_element_name(markup)),
+                events,
+            );
             return Ok(());
         }
 
@@ -236,7 +298,7 @@ impl MountedStreamingRoute {
         let parsed = match parse_start(markup) {
             Ok(parsed) => parsed,
             Err(ParseStartFault::Malformed) => {
-                self.record_malformed_lexical_target(lexical_name, events)?;
+                self.record_malformed_lexical_target(lexical_name, events);
                 return Ok(());
             }
             Err(ParseStartFault::AttributeLimit { maximum, observed }) => {
@@ -267,91 +329,162 @@ impl MountedStreamingRoute {
                     observed,
                 });
             }
-            self.namespace_stack.push(NamespaceFrame {
-                element_name: parsed.name.clone(),
-                default_namespace: effective_namespace.clone(),
-            });
         }
-        if parsed.name.contains(':') || effective_namespace.is_some() {
-            return Ok(());
-        }
-        let Some(target_index) = self.targets_by_element.get(parsed.name.as_str()).copied() else {
-            return Ok(());
-        };
-        self.record_target_occurrence(target_index)?;
-        let registration = &self.targets[target_index].registration;
-        if !parsed.empty {
-            events.push(invalid_event(
-                registration,
-                "target element must use empty-element syntax",
-            ));
-            return Ok(());
+        let target_index = (!parsed.name.contains(':') && effective_namespace.is_none())
+            .then(|| self.targets_by_element.get(parsed.name.as_str()).copied())
+            .flatten();
+        let attributes = parsed
+            .attributes
+            .iter()
+            .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
+            .collect::<HashMap<_, _>>();
+
+        if let Some(target_index) = target_index {
+            self.push_start_events(target_index, &parsed, &attributes, events);
         }
 
-        let mut value = None;
-        for attribute in parsed.attributes {
-            if attribute.name != registration.attribute {
-                events.push(invalid_event(
-                    registration,
-                    format!("unknown attribute `{}`", attribute.name),
-                ));
-                return Ok(());
-            }
-            value = Some(attribute.value);
-        }
-        match value {
-            Some(value) => events.push(ParsedContractEvent::Decoded {
-                listener_index: registration.listener_index,
-                value,
-            }),
-            None => events.push(invalid_event(
-                registration,
-                format!("missing attribute `{}`", registration.attribute),
-            )),
+        if !parsed.empty {
+            self.namespace_stack.push(NamespaceFrame {
+                element_name: parsed.name,
+                default_namespace: effective_namespace,
+                tracked: target_index.map(|target_index| TrackedElement {
+                    target_index,
+                    attributes,
+                    content_start: markup_start + markup.len(),
+                }),
+            });
         }
         Ok(())
+    }
+
+    fn push_start_events(
+        &self,
+        target_index: usize,
+        parsed: &ParsedStart,
+        attributes: &HashMap<String, String>,
+        events: &mut Vec<ParsedContractEvent>,
+    ) {
+        let target = &self.targets[target_index];
+        for registration in &target.registrations {
+            if matches!(
+                registration.kind,
+                StreamingRegistrationKind::Lifecycle { open: true, .. }
+            ) {
+                events.push(lifecycle_event(
+                    registration,
+                    StreamingXmlPhase::Open,
+                    target.element,
+                    attributes,
+                    String::new(),
+                ));
+            }
+        }
+        for registration in &target.registrations {
+            match registration.kind {
+                StreamingRegistrationKind::EmptyToolCall { attribute } if parsed.empty => {
+                    events.push(tool_call_event(registration, attribute, &parsed.attributes));
+                }
+                StreamingRegistrationKind::EmptyToolCall { .. } => events.push(invalid_event(
+                    registration,
+                    "target element must use empty-element syntax",
+                )),
+                StreamingRegistrationKind::Lifecycle { complete: true, .. } if parsed.empty => {
+                    events.push(lifecycle_event(
+                        registration,
+                        StreamingXmlPhase::Complete,
+                        target.element,
+                        attributes,
+                        String::new(),
+                    ));
+                }
+                StreamingRegistrationKind::Lifecycle { .. } => {}
+            }
+        }
+    }
+
+    fn push_lifecycle_events(
+        &self,
+        target_index: usize,
+        phase: StreamingXmlPhase,
+        attributes: &HashMap<String, String>,
+        content: String,
+        events: &mut Vec<ParsedContractEvent>,
+    ) {
+        let target = &self.targets[target_index];
+        for registration in &target.registrations {
+            let interested = match registration.kind {
+                StreamingRegistrationKind::Lifecycle {
+                    open,
+                    stream,
+                    complete,
+                    ..
+                } => match phase {
+                    StreamingXmlPhase::Open => open,
+                    StreamingXmlPhase::Stream => stream,
+                    StreamingXmlPhase::Complete => complete,
+                },
+                StreamingRegistrationKind::EmptyToolCall { .. } => false,
+            };
+            if interested {
+                events.push(lifecycle_event(
+                    registration,
+                    phase,
+                    target.element,
+                    attributes,
+                    content.clone(),
+                ));
+            }
+        }
+    }
+
+    fn push_stream_events(&self, events: &mut Vec<ParsedContractEvent>) {
+        for (index, frame) in self.namespace_stack.iter().enumerate() {
+            let Some(tracked) = &frame.tracked else {
+                continue;
+            };
+            let content_end = if index + 1 == self.namespace_stack.len()
+                && incomplete_close_prefix(&self.pending, &frame.element_name)
+            {
+                self.pending_offset
+            } else {
+                self.raw_output.len()
+            };
+            if content_end < tracked.content_start {
+                continue;
+            }
+            self.push_lifecycle_events(
+                tracked.target_index,
+                StreamingXmlPhase::Stream,
+                &tracked.attributes,
+                self.raw_output[tracked.content_start..content_end].to_owned(),
+                events,
+            );
+        }
     }
 
     fn record_malformed_lexical_target(
         &mut self,
         lexical_name: Option<&str>,
         events: &mut Vec<ParsedContractEvent>,
-    ) -> Result<(), StreamingXmlDispatchFault> {
+    ) {
         if self
             .namespace_stack
             .last()
             .is_some_and(|frame| frame.default_namespace.is_some())
         {
-            return Ok(());
+            return;
         }
         let Some(name) = lexical_name else {
-            return Ok(());
+            return;
         };
         let Some(index) = self.targets_by_element.get(name).copied() else {
-            return Ok(());
+            return;
         };
-        self.record_target_occurrence(index)?;
-        events.push(invalid_event(
-            &self.targets[index].registration,
-            "malformed XML target element",
-        ));
-        Ok(())
-    }
-
-    fn record_target_occurrence(
-        &mut self,
-        target_index: usize,
-    ) -> Result<(), StreamingXmlDispatchFault> {
-        let observed = self.target_events + 1;
-        if observed > MAX_TARGET_EVENTS {
-            return Err(StreamingXmlDispatchFault::TargetEventLimitExceeded {
-                maximum: MAX_TARGET_EVENTS,
-                observed,
-            });
+        for registration in &self.targets[index].registrations {
+            if registration_receives_invalid(registration) {
+                events.push(invalid_event(registration, "malformed XML target element"));
+            }
         }
-        self.target_events = observed;
-        self.targets[target_index].occurrences += 1;
-        Ok(())
     }
 
     fn incomplete_target(&self) -> Option<usize> {
@@ -366,20 +499,136 @@ impl MountedStreamingRoute {
         {
             return None;
         }
-        self.targets.iter().position(|target| {
-            let prefix = format!("<{}", target.registration.element);
-            prefix.starts_with(remainder)
-                || remainder.starts_with(&prefix)
-                    && remainder.as_bytes().get(prefix.len()).is_none_or(|byte| {
-                        byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
-                    })
-        })
+        let mut candidates = self
+            .targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| {
+                [
+                    format!("<{}", target.element),
+                    format!("</{}", target.element),
+                ]
+                .into_iter()
+                .any(|prefix| {
+                    prefix.starts_with(remainder)
+                        || remainder.starts_with(&prefix)
+                            && remainder.as_bytes().get(prefix.len()).is_none_or(|byte| {
+                                byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
+                            })
+                })
+                .then_some(index)
+            });
+        let candidate = candidates.next()?;
+        candidates.next().is_none().then_some(candidate)
+    }
+
+    fn push_incomplete_events(
+        &self,
+        target_index: usize,
+        lifecycle_only: bool,
+        events: &mut Vec<ParsedContractEvent>,
+    ) {
+        let target = &self.targets[target_index];
+        for registration in &target.registrations {
+            if lifecycle_only
+                && !matches!(
+                    registration.kind,
+                    StreamingRegistrationKind::Lifecycle { .. }
+                )
+            {
+                continue;
+            }
+            if registration_receives_invalid(registration) {
+                events.push(ParsedContractEvent::Invalid {
+                    listener_index: registration.listener_index,
+                    diagnostic: XmlContractDiagnostic::IncompleteElement {
+                        contract: registration.identity,
+                        element: target.element,
+                    },
+                });
+            }
+        }
     }
 }
 
 struct NamespaceFrame {
     element_name: String,
     default_namespace: Option<Arc<str>>,
+    tracked: Option<TrackedElement>,
+}
+
+fn tool_call_event(
+    registration: &ContractRegistration,
+    required_attribute: Option<&'static str>,
+    attributes: &[ParsedAttribute],
+) -> ParsedContractEvent {
+    match required_attribute {
+        Some(required) => {
+            let mut value = None;
+            for attribute in attributes {
+                if attribute.name != required {
+                    return invalid_event(
+                        registration,
+                        format!("unknown attribute `{}`", attribute.name),
+                    );
+                }
+                value = Some(attribute.value.clone());
+            }
+            match value {
+                Some(value) => ParsedContractEvent::Decoded {
+                    listener_index: registration.listener_index,
+                    value,
+                },
+                None => invalid_event(registration, format!("missing attribute `{required}`")),
+            }
+        }
+        None if attributes.is_empty() => ParsedContractEvent::Decoded {
+            listener_index: registration.listener_index,
+            value: String::new(),
+        },
+        None => invalid_event(
+            registration,
+            format!("unknown attribute `{}`", attributes[0].name),
+        ),
+    }
+}
+
+fn lifecycle_event(
+    registration: &ContractRegistration,
+    phase: StreamingXmlPhase,
+    tag: &'static str,
+    attributes: &HashMap<String, String>,
+    content: String,
+) -> ParsedContractEvent {
+    ParsedContractEvent::Lifecycle {
+        listener_index: registration.listener_index,
+        phase,
+        element: XmlElement {
+            tag_name: tag.to_owned(),
+            attributes: attributes.clone(),
+            content,
+        },
+    }
+}
+
+fn registration_receives_invalid(registration: &ContractRegistration) -> bool {
+    match registration.kind {
+        StreamingRegistrationKind::EmptyToolCall { .. } => true,
+        StreamingRegistrationKind::Lifecycle { invalid, .. } => invalid,
+    }
+}
+
+fn incomplete_close_prefix(pending: &str, element: &str) -> bool {
+    if pending.is_empty() {
+        return false;
+    }
+    let name_prefix = format!("</{element}");
+    if name_prefix.starts_with(pending) {
+        return true;
+    }
+    pending.strip_prefix(&name_prefix).is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_whitespace())
+    })
 }
 
 fn invalid_event(

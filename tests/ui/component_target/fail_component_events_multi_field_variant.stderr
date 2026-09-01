@@ -1,5 +1,5 @@
 error: ComponentEvents variants must carry exactly one event payload
- --> tests/ui/component_target/fail_component_events_multi_field_variant.rs:5:9
+ --> tests/ui/component_target/fail_component_events_multi_field_variant.rs:7:9
   |
-5 |     Pair(String, String),
+7 |     Pair(String, String),
   |         ^^^^^^^^^^^^^^^^

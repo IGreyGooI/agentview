@@ -1,32 +1,29 @@
-use std::{
-    any::type_name,
-    fmt,
-    future::Future,
-    marker::PhantomData,
-    panic::{catch_unwind, AssertUnwindSafe},
-    str::FromStr,
-    sync::Arc,
-};
+use std::{any::type_name, fmt, future::Future, marker::PhantomData, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 
 use crate::{
+    component::execution::ProviderEvent,
     llm_call::TextTurnEvent,
     pom::{Document, PomError, XmlName, XmlNode},
+    stream_parser::XmlElement,
 };
 
 use super::{
     declaration::{Component, ComponentNode},
     event_input::{EventInputOrigin, EventRouteDescriptor},
-    handler::{panic_message, AsyncHandler, AsyncOnceHandler},
-    EventInput,
+    handler::AsyncHandler,
+    InternalEventInput as EventInput,
 };
 
 mod fault;
 mod parser;
 
 pub(crate) use fault::{StreamingXmlDispatchFault, StreamingXmlMountFault};
-pub(crate) use parser::{ContractRegistration, MountedStreamingRoute, ParsedContractEvent};
+pub(crate) use parser::{
+    ContractRegistration, MountedStreamingRoute, ParsedContractEvent, StreamingRegistrationKind,
+    StreamingXmlPhase,
+};
 
 /// Strict typed diagnostic emitted by the target streaming XML contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,11 +40,6 @@ pub enum XmlContractDiagnostic {
         expected: &'static str,
         detail: String,
     },
-    OccurrenceCount {
-        contract: &'static str,
-        expected: usize,
-        observed: usize,
-    },
     IncompleteElement {
         contract: &'static str,
         element: &'static str,
@@ -58,10 +50,135 @@ struct ContractSpec {
     identity: &'static str,
     implementation_version: &'static str,
     element: &'static str,
-    attribute: &'static str,
+    attribute: Option<&'static str>,
 }
 
-/// Entry point for the strict streaming XML text contract.
+enum ContractRoute {
+    ProviderText,
+    Explicit(Arc<EventRouteDescriptor>),
+}
+
+/// Prompt-free entry point for subscribing to lifecycle events from the mounted Provider XML
+/// stream.
+///
+/// Every declaration on the same event route is aggregated into one mounted parser. A
+/// `StreamingXml::tag(...)` declaration contributes only one specific-tag subscription; unlike
+/// [`XmlStreamingToolCall`], it does not add instructions or example syntax to the prompt.
+pub struct StreamingXml;
+
+impl StreamingXml {
+    pub fn tag(tag: &'static str) -> StreamingXmlTag {
+        StreamingXmlTag {
+            tag,
+            route: ContractRoute::ProviderText,
+            open: None,
+            stream: None,
+            complete: None,
+            invalid: None,
+        }
+    }
+}
+
+/// One prompt-free, specific-tag subscription to the shared streaming XML parser.
+pub struct StreamingXmlTag {
+    tag: &'static str,
+    route: ContractRoute,
+    open: Option<AsyncHandler<XmlElement>>,
+    stream: Option<AsyncHandler<XmlElement>>,
+    complete: Option<AsyncHandler<XmlElement>>,
+    invalid: Option<AsyncHandler<XmlContractDiagnostic>>,
+}
+
+impl StreamingXmlTag {
+    pub fn on_open<Handler, HandlerFuture, Error>(mut self, handler: Handler) -> Self
+    where
+        Handler: FnMut(XmlElement) -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        assert!(
+            self.open.is_none(),
+            "StreamingXml tag declared on_open twice"
+        );
+        self.open = Some(AsyncHandler::new(handler));
+        self
+    }
+
+    /// Receive cumulative content snapshots while the selected element remains open.
+    pub fn on_stream<Handler, HandlerFuture, Error>(mut self, handler: Handler) -> Self
+    where
+        Handler: FnMut(XmlElement) -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        assert!(
+            self.stream.is_none(),
+            "StreamingXml tag declared on_stream twice"
+        );
+        self.stream = Some(AsyncHandler::new(handler));
+        self
+    }
+
+    pub fn on_complete<Handler, HandlerFuture, Error>(mut self, handler: Handler) -> Self
+    where
+        Handler: FnMut(XmlElement) -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        assert!(
+            self.complete.is_none(),
+            "StreamingXml tag declared on_complete twice"
+        );
+        self.complete = Some(AsyncHandler::new(handler));
+        self
+    }
+
+    pub fn on_invalid<Handler, HandlerFuture, Error>(mut self, handler: Handler) -> Self
+    where
+        Handler: FnMut(XmlContractDiagnostic) -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        assert!(
+            self.invalid.is_none(),
+            "StreamingXml tag declared on_invalid twice"
+        );
+        self.invalid = Some(AsyncHandler::new(handler));
+        self
+    }
+
+    pub fn into_component(self) -> Component {
+        assert!(
+            self.open.is_some()
+                || self.stream.is_some()
+                || self.complete.is_some()
+                || self.invalid.is_some(),
+            "StreamingXml tag requires at least one lifecycle handler"
+        );
+        Component::from_node(ComponentNode::StreamingXmlTag(Box::new(
+            StreamingXmlTagDeclaration {
+                tag: self.tag,
+                route: self.route,
+                open: self.open,
+                stream: self.stream,
+                complete: self.complete,
+                invalid: self.invalid,
+            },
+        )))
+    }
+}
+
+impl From<StreamingXmlTag> for Component {
+    fn from(subscription: StreamingXmlTag) -> Self {
+        subscription.into_component()
+    }
+}
+
+/// Entry point for a prompt-producing, typed streaming XML tool-call declaration.
+///
+/// The declared element is projected as model-visible example syntax and matching empty elements
+/// are decoded before the handler runs. It shares the mounted parser for its event route with
+/// [`StreamingXml`] lifecycle subscriptions and other XML tool-call declarations.
 pub struct XmlStreamingToolCall;
 
 impl XmlStreamingToolCall {
@@ -111,9 +228,45 @@ impl XmlStreamingToolCallElement {
                 identity: self.identity,
                 implementation_version: self.implementation_version,
                 element: self.element,
-                attribute,
+                attribute: Some(attribute),
             },
             marker: PhantomData,
+        }
+    }
+
+    /// Dispatch every matching attribute-free empty element from the current Provider stream.
+    pub fn on_decoded<Handler, HandlerFuture, Error>(
+        self,
+        mut handler: Handler,
+    ) -> XmlStreamingToolCallDecoded
+    where
+        Handler: FnMut() -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        XmlStreamingToolCallDecoded {
+            spec: ContractSpec {
+                identity: self.identity,
+                implementation_version: self.implementation_version,
+                element: self.element,
+                attribute: None,
+            },
+            route: ContractRoute::ProviderText,
+            decoded: Box::new(UnitDecodedHandler {
+                handler: AsyncHandler::new(move |()| handler()),
+            }),
+        }
+    }
+
+    pub fn listen_to(self, input: EventInput<TextTurnEvent>) -> XmlStreamingToolCallEmptyRouted {
+        XmlStreamingToolCallEmptyRouted {
+            spec: ContractSpec {
+                identity: self.identity,
+                implementation_version: self.implementation_version,
+                element: self.element,
+                attribute: None,
+            },
+            route: ContractRoute::Explicit(input.route_descriptor()),
         }
     }
 }
@@ -128,39 +281,66 @@ where
     Decoded: FromStr + Send + Sync + 'static,
     Decoded::Err: fmt::Display,
 {
-    pub fn exactly_one(self) -> XmlStreamingToolCallExactlyOne<Decoded> {
-        XmlStreamingToolCallExactlyOne {
+    /// Dispatch every matching empty element from the current Provider stream.
+    pub fn on_decoded<Handler, HandlerFuture, Error>(
+        self,
+        handler: Handler,
+    ) -> XmlStreamingToolCallDecoded
+    where
+        Handler: FnMut(Decoded) -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+        Decoded::Err: Send + 'static,
+    {
+        XmlStreamingToolCallDecoded {
             spec: self.spec,
-            marker: PhantomData,
+            route: ContractRoute::ProviderText,
+            decoded: Box::new(TypedDecodedHandler {
+                handler: AsyncHandler::new(handler),
+            }),
         }
     }
-}
 
-pub struct XmlStreamingToolCallExactlyOne<Decoded> {
-    spec: ContractSpec,
-    marker: PhantomData<fn() -> Decoded>,
-}
-
-impl<Decoded> XmlStreamingToolCallExactlyOne<Decoded>
-where
-    Decoded: FromStr + Send + Sync + 'static,
-    Decoded::Err: fmt::Display,
-{
     pub fn listen_to(
         self,
         input: EventInput<TextTurnEvent>,
     ) -> XmlStreamingToolCallRouted<Decoded> {
         XmlStreamingToolCallRouted {
             spec: self.spec,
-            route: input.route_descriptor(),
+            route: ContractRoute::Explicit(input.route_descriptor()),
             marker: PhantomData,
+        }
+    }
+}
+
+pub struct XmlStreamingToolCallEmptyRouted {
+    spec: ContractSpec,
+    route: ContractRoute,
+}
+
+impl XmlStreamingToolCallEmptyRouted {
+    pub fn on_decoded<Handler, HandlerFuture, Error>(
+        self,
+        mut handler: Handler,
+    ) -> XmlStreamingToolCallDecoded
+    where
+        Handler: FnMut() -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        XmlStreamingToolCallDecoded {
+            spec: self.spec,
+            route: self.route,
+            decoded: Box::new(UnitDecodedHandler {
+                handler: AsyncHandler::new(move |()| handler()),
+            }),
         }
     }
 }
 
 pub struct XmlStreamingToolCallRouted<Decoded> {
     spec: ContractSpec,
-    route: Arc<EventRouteDescriptor>,
+    route: ContractRoute,
     marker: PhantomData<fn() -> Decoded>,
 }
 
@@ -190,41 +370,14 @@ where
 
 pub struct XmlStreamingToolCallDecoded {
     spec: ContractSpec,
-    route: Arc<EventRouteDescriptor>,
+    route: ContractRoute,
     decoded: Box<dyn ErasedDecodedHandler>,
 }
 
 impl XmlStreamingToolCallDecoded {
-    pub fn on_invalid<Handler, HandlerFuture, Error>(
-        self,
-        handler: Handler,
-    ) -> XmlStreamingToolCallInvalid
+    pub fn on_invalid<Handler, HandlerFuture, Error>(self, handler: Handler) -> Component
     where
         Handler: FnMut(XmlContractDiagnostic) -> HandlerFuture + Send + 'static,
-        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
-        Error: fmt::Display + Send + 'static,
-    {
-        XmlStreamingToolCallInvalid {
-            spec: self.spec,
-            route: self.route,
-            decoded: self.decoded,
-            invalid: AsyncHandler::new(handler),
-        }
-    }
-}
-
-pub struct XmlStreamingToolCallInvalid {
-    spec: ContractSpec,
-    route: Arc<EventRouteDescriptor>,
-    decoded: Box<dyn ErasedDecodedHandler>,
-    invalid: AsyncHandler<XmlContractDiagnostic>,
-}
-
-impl XmlStreamingToolCallInvalid {
-    /// Complete the declaration with a one-shot handler run only for normal EOF.
-    pub fn on_finish<Handler, HandlerFuture, Error>(self, handler: Handler) -> Component
-    where
-        Handler: FnOnce() -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -233,8 +386,7 @@ impl XmlStreamingToolCallInvalid {
                 spec: self.spec,
                 route: self.route,
                 decoded: self.decoded,
-                invalid: self.invalid,
-                terminal: Some(AsyncOnceHandler::new(handler)),
+                invalid: AsyncHandler::new(handler),
             },
         )))
     }
@@ -253,6 +405,10 @@ struct TypedDecodedHandler<Decoded> {
     handler: AsyncHandler<Decoded>,
 }
 
+struct UnitDecodedHandler {
+    handler: AsyncHandler<()>,
+}
+
 #[async_trait]
 impl<Decoded> ErasedDecodedHandler for TypedDecodedHandler<Decoded>
 where
@@ -264,19 +420,14 @@ where
         spec: &ContractSpec,
         raw: &str,
     ) -> Result<Option<XmlContractDiagnostic>, StreamingXmlDispatchFault> {
-        let decoded =
-            catch_unwind(AssertUnwindSafe(|| raw.parse::<Decoded>())).map_err(|panic| {
-                StreamingXmlDispatchFault::ParserPanicked {
-                    contract: spec.identity,
-                    message: panic_message(&*panic),
-                }
-            })?;
-        let decoded = match decoded {
+        let decoded = match raw.parse::<Decoded>() {
             Ok(decoded) => decoded,
             Err(fault) => {
                 return Ok(Some(XmlContractDiagnostic::InvalidAttributeValue {
                     contract: spec.identity,
-                    attribute: spec.attribute,
+                    attribute: spec
+                        .attribute
+                        .expect("typed XML decoding requires one attribute"),
                     value: raw.to_owned(),
                     expected: type_name::<Decoded>(),
                     detail: fault.to_string(),
@@ -294,12 +445,124 @@ where
     }
 }
 
+#[async_trait]
+impl ErasedDecodedHandler for UnitDecodedHandler {
+    async fn decode_and_invoke(
+        &mut self,
+        spec: &ContractSpec,
+        raw: &str,
+    ) -> Result<Option<XmlContractDiagnostic>, StreamingXmlDispatchFault> {
+        debug_assert!(spec.attribute.is_none());
+        debug_assert!(raw.is_empty());
+        self.handler
+            .invoke(())
+            .await
+            .map_err(|source| StreamingXmlDispatchFault::Handler {
+                contract: spec.identity,
+                phase: "decoded",
+                source,
+            })?;
+        Ok(None)
+    }
+}
+
+pub(crate) struct StreamingXmlTagDeclaration {
+    tag: &'static str,
+    route: ContractRoute,
+    open: Option<AsyncHandler<XmlElement>>,
+    stream: Option<AsyncHandler<XmlElement>>,
+    complete: Option<AsyncHandler<XmlElement>>,
+    invalid: Option<AsyncHandler<XmlContractDiagnostic>>,
+}
+
+impl StreamingXmlTagDeclaration {
+    pub(crate) fn identity(&self) -> &'static str {
+        self.tag
+    }
+}
+
+pub(crate) struct MountedStreamingXmlTag {
+    declaration: StreamingXmlTagDeclaration,
+    route: Arc<EventRouteDescriptor>,
+}
+
+impl MountedStreamingXmlTag {
+    pub(crate) fn new(
+        declaration: StreamingXmlTagDeclaration,
+        event_origin: EventInputOrigin,
+    ) -> Result<Self, StreamingXmlMountFault> {
+        XmlName::new(declaration.tag).map_err(|fault| StreamingXmlMountFault::InvalidTag {
+            tag: declaration.tag,
+            detail: fault.to_string(),
+        })?;
+        let route = resolve_route(declaration.identity(), &declaration.route, event_origin)?;
+        Ok(Self { declaration, route })
+    }
+
+    pub(crate) fn route_descriptor(&self) -> Arc<EventRouteDescriptor> {
+        Arc::clone(&self.route)
+    }
+
+    pub(crate) fn registration(&self, listener_index: usize) -> ContractRegistration {
+        ContractRegistration {
+            listener_index,
+            identity: self.declaration.identity(),
+            element: self.declaration.tag,
+            kind: StreamingRegistrationKind::Lifecycle {
+                open: self.declaration.open.is_some(),
+                stream: self.declaration.stream.is_some(),
+                complete: self.declaration.complete.is_some(),
+                invalid: self.declaration.invalid.is_some(),
+            },
+        }
+    }
+
+    pub(crate) async fn dispatch_phase(
+        &mut self,
+        phase: StreamingXmlPhase,
+        element: XmlElement,
+    ) -> Result<(), StreamingXmlDispatchFault> {
+        let handler = match phase {
+            StreamingXmlPhase::Open => self.declaration.open.as_mut(),
+            StreamingXmlPhase::Stream => self.declaration.stream.as_mut(),
+            StreamingXmlPhase::Complete => self.declaration.complete.as_mut(),
+        };
+        let Some(handler) = handler else {
+            return Ok(());
+        };
+        handler
+            .invoke(element)
+            .await
+            .map_err(|source| StreamingXmlDispatchFault::Handler {
+                contract: self.declaration.identity(),
+                phase: phase.as_str(),
+                source,
+            })
+    }
+
+    pub(crate) async fn dispatch_invalid(
+        &mut self,
+        diagnostic: XmlContractDiagnostic,
+    ) -> Result<(), StreamingXmlDispatchFault> {
+        let Some(handler) = self.declaration.invalid.as_mut() else {
+            return Ok(());
+        };
+        handler
+            .invoke(diagnostic)
+            .await
+            .map_err(|source| StreamingXmlDispatchFault::Handler {
+                contract: self.declaration.identity(),
+                phase: "invalid",
+                source,
+            })
+    }
+}
+
 pub(crate) struct XmlStreamingToolCallDeclaration {
     spec: ContractSpec,
-    route: Arc<EventRouteDescriptor>,
+    route: ContractRoute,
     decoded: Box<dyn ErasedDecodedHandler>,
     invalid: AsyncHandler<XmlContractDiagnostic>,
-    terminal: Option<AsyncOnceHandler>,
 }
 
 impl XmlStreamingToolCallDeclaration {
@@ -313,13 +576,16 @@ impl XmlStreamingToolCallDeclaration {
 
     pub(crate) fn prompt_document(&self) -> Result<Document, PomError> {
         let mut node = XmlNode::new(XmlName::new(self.spec.element)?);
-        node.push_attribute(XmlName::new(self.spec.attribute)?, "...")?;
+        if let Some(attribute) = self.spec.attribute {
+            node.push_attribute(XmlName::new(attribute)?, "...")?;
+        }
         Ok(Document::from_xml(node))
     }
 }
 
 pub(crate) struct MountedXmlStreamingToolCall {
     declaration: XmlStreamingToolCallDeclaration,
+    route: Arc<EventRouteDescriptor>,
 }
 
 impl MountedXmlStreamingToolCall {
@@ -327,16 +593,24 @@ impl MountedXmlStreamingToolCall {
         declaration: XmlStreamingToolCallDeclaration,
         event_origin: EventInputOrigin,
     ) -> Result<Self, StreamingXmlMountFault> {
-        if declaration.route.origin() != event_origin {
-            return Err(StreamingXmlMountFault::ForeignEventInput {
-                identity: declaration.identity(),
-            });
-        }
-        Ok(Self { declaration })
+        let route = match &declaration.route {
+            ContractRoute::ProviderText => EventInput::<ProviderEvent>::from_origin(event_origin)
+                .select(ProviderEvent::TEXT)
+                .route_descriptor(),
+            ContractRoute::Explicit(route) => {
+                if route.origin() != event_origin {
+                    return Err(StreamingXmlMountFault::ForeignEventInput {
+                        identity: declaration.identity(),
+                    });
+                }
+                Arc::clone(route)
+            }
+        };
+        Ok(Self { declaration, route })
     }
 
     pub(crate) fn route_descriptor(&self) -> Arc<EventRouteDescriptor> {
-        Arc::clone(&self.declaration.route)
+        Arc::clone(&self.route)
     }
 
     pub(crate) fn registration(&self, listener_index: usize) -> ContractRegistration {
@@ -344,24 +618,10 @@ impl MountedXmlStreamingToolCall {
             listener_index,
             identity: self.declaration.spec.identity,
             element: self.declaration.spec.element,
-            attribute: self.declaration.spec.attribute,
+            kind: StreamingRegistrationKind::EmptyToolCall {
+                attribute: self.declaration.spec.attribute,
+            },
         }
-    }
-
-    pub(crate) async fn finish(&mut self) -> Result<(), StreamingXmlDispatchFault> {
-        let terminal = self
-            .declaration
-            .terminal
-            .take()
-            .ok_or(StreamingXmlDispatchFault::RouteAlreadyFinished)?;
-        terminal
-            .invoke()
-            .await
-            .map_err(|source| StreamingXmlDispatchFault::Handler {
-                contract: self.declaration.identity(),
-                phase: "finish",
-                source,
-            })
     }
 
     pub(crate) async fn dispatch_decoded(
@@ -392,5 +652,23 @@ impl MountedXmlStreamingToolCall {
                 phase: "invalid",
                 source,
             })
+    }
+}
+
+fn resolve_route(
+    identity: &'static str,
+    route: &ContractRoute,
+    event_origin: EventInputOrigin,
+) -> Result<Arc<EventRouteDescriptor>, StreamingXmlMountFault> {
+    match route {
+        ContractRoute::ProviderText => Ok(EventInput::<ProviderEvent>::from_origin(event_origin)
+            .select(ProviderEvent::TEXT)
+            .route_descriptor()),
+        ContractRoute::Explicit(route) => {
+            if route.origin() != event_origin {
+                return Err(StreamingXmlMountFault::ForeignEventInput { identity });
+            }
+            Ok(Arc::clone(route))
+        }
     }
 }

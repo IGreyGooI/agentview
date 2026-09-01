@@ -1,15 +1,6 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::{atomic::AtomicUsize, Arc, Mutex};
 
-use agentview::{
-    component::{
-        execution::{ComponentReactionProps, ProviderEvent},
-        prelude::*,
-    },
-    llm_call::TextTurnEvent,
-};
+use agentview::component::prelude::*;
 use chess::{Board, ChessMove, Color};
 
 use super::{
@@ -113,7 +104,7 @@ pub(crate) struct ChessAgentState {
 }
 
 impl ChessAgentState {
-    fn awaiting(snapshot: Arc<ChessSnapshot>, context: ModelAttemptContext) -> Self {
+    pub(crate) fn awaiting(snapshot: Arc<ChessSnapshot>, context: ModelAttemptContext) -> Self {
         Self {
             snapshot,
             context,
@@ -164,65 +155,70 @@ impl ChessAgentState {
 }
 
 #[derive(Clone)]
-pub(crate) struct ChessAgentProps {
-    snapshot: Arc<ChessSnapshot>,
-    context: ModelAttemptContext,
-    component_render_count: Arc<AtomicUsize>,
+pub(crate) struct ChessControl {
+    state: Signal<ChessAgentState>,
 }
 
-impl ChessAgentProps {
-    pub(crate) fn new(
+impl ChessControl {
+    pub(crate) fn begin_attempt(
+        &self,
         snapshot: ChessSnapshot,
         context: ModelAttemptContext,
-        component_render_count: Arc<AtomicUsize>,
-    ) -> Self {
-        Self {
-            snapshot: Arc::new(snapshot),
-            context,
-            component_render_count,
+    ) -> Result<(), SignalAccessError> {
+        self.state
+            .set(ChessAgentState::awaiting(Arc::new(snapshot), context))
+    }
+
+    pub(crate) fn read_state(&self) -> Result<ChessAgentState, SignalAccessError> {
+        self.state.with(Clone::clone)
+    }
+}
+
+#[component]
+fn chess_attempt_context(context: ModelAttemptContext) -> Component {
+    let turn_id = context.turn_id.as_str().to_owned();
+    let attempt_index = context.attempt_index;
+    let corrective_reason = context
+        .corrective_reason
+        .map(InvalidActionReason::code)
+        .unwrap_or("none");
+
+    view! {
+        model_attempt_context {
+            turn_id { "{turn_id}" }
+            attempt_index { "{attempt_index}" }
+            corrective_reason { "{corrective_reason}" }
         }
-    }
-
-    pub(crate) fn for_attempt(
-        &self,
-        snapshot: ChessSnapshot,
-        context: ModelAttemptContext,
-    ) -> Self {
-        Self::new(snapshot, context, Arc::clone(&self.component_render_count))
-    }
-
-    pub(crate) fn matches_attempt(
-        &self,
-        snapshot: &ChessSnapshot,
-        context: &ModelAttemptContext,
-    ) -> bool {
-        self.snapshot.as_ref() == snapshot && &self.context == context
     }
 }
 
 #[component]
 pub(crate) fn chess_agent(
-    props: ComponentReactionProps<ChessAgentProps, ChessAgentState>,
-    events: EventInput<ProviderEvent>,
+    initial_state: ChessAgentState,
+    exported_control: Arc<Mutex<Option<ChessControl>>>,
+    component_turn_executions: Arc<AtomicUsize>,
 ) -> Component {
-    props
-        .value()
-        .component_render_count
-        .fetch_add(1, Ordering::SeqCst);
-    let snapshot = Arc::clone(&props.value().snapshot);
-    let context = props.value().context.clone();
-    let attempt_state = ChessAgentState::awaiting(Arc::clone(&snapshot), context);
-    let initial_state = attempt_state.clone();
     let state = use_signal(move || initial_state);
-    props
-        .publish(state.clone())
-        .expect("authoritative chess reaction publication");
-    let text: EventInput<TextTurnEvent> = events.select(ProviderEvent::TEXT);
+    *exported_control
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ChessControl {
+        state: state.clone(),
+    });
+    let attempt_state = state
+        .with(Clone::clone)
+        .expect("mounted Chess attempt state");
+    let snapshot = Arc::clone(attempt_state.snapshot());
 
     view! {
+        chess_attempt_context(attempt_state.context().clone())
         chess_player(Arc::clone(&snapshot))
         chess_game_state(Arc::clone(&snapshot))
-        chess_actions(Arc::clone(&snapshot), attempt_state, state, text)
+        chess_actions(
+            Arc::clone(&snapshot),
+            attempt_state,
+            state,
+            component_turn_executions,
+        )
         chess_feedback(snapshot)
     }
 }

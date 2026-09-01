@@ -1,5 +1,5 @@
 error: ComponentEvents enums cannot be generic
- --> tests/ui/component_target/fail_component_events_generic.rs:4:12
+ --> tests/ui/component_target/fail_component_events_generic.rs:6:12
   |
-4 | enum Events<T> {
+6 | enum Events<T> {
   |            ^^^

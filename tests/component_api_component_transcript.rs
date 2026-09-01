@@ -1,3 +1,9 @@
+#![cfg(feature = "legacy-provider-port")]
+#![allow(
+    deprecated,
+    reason = "this compatibility test intentionally exercises legacy component transcript routing"
+)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentview::{

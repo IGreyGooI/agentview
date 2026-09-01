@@ -270,6 +270,7 @@ pub(crate) fn validate_live_evidence(evidence: &GameEvidence) -> Result<(), Live
     if !evidence.component_host_id_retained
         || !evidence.engine_reads_bounded
         || !evidence.child_shutdown_observed
+        || !evidence.application_shutdown_observed
         || evidence.trace_artifact_disposition.is_some()
         || !evidence.status_output_complete
     {
@@ -395,11 +396,7 @@ fn attempt_group_matches(
                 }
             },
         };
-        let start = if group_index == 0 && attempt_index == 0 {
-            AttemptStart::InitialMount
-        } else {
-            AttemptStart::PropsUpdate
-        };
+        let start = AttemptStart::StateWrite;
         usize::from(attempt.attempt_index) == attempt_index
             && attempt.corrective_reason == corrective_reason
             && attempt.board == board

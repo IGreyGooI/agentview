@@ -1,25 +1,74 @@
-use std::{pin::Pin, vec::IntoIter};
+use std::{
+    future::Future,
+    num::{NonZeroU128, NonZeroU64},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    task::Poll,
+    vec::IntoIter,
+};
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use tokio::{
+    runtime::Handle,
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 
-use crate::{component::ComponentHost, llm_call::TextTurnEvent};
-
-use super::{
-    prompt_render::render_projection_prompt, ApplicationHost, ApplicationHostFault, ProviderEvent,
-    ProviderEventStream, ProviderFault, ProviderPort, RenderedProjection,
+use crate::{
+    component::authoring::{Component, InternalEventInput as EventInput},
+    llm_call::TextTurnEvent,
 };
 
-/// Opaque generation of one externally rendered observation baseline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ExternalRenderingGeneration(u64);
+use super::{
+    application::{Application, ApplicationFault},
+    reaction::{
+        Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
+        ProviderFact, ProviderFactStream, ProviderOutputKey, ReactionPort, ReactionPortFault,
+        ReactionPortFaultCode, ReactionPortFaultReason, SubmitFault, TargetDeclaration,
+        TargetEpoch, TargetIdentity,
+    },
+    ProviderEvent, ProviderFault,
+};
 
-/// Whether an external observation establishes or advances a rendering baseline.
+static NEXT_EXTERNAL_TARGET_ID: AtomicU64 = AtomicU64::new(1);
+
+const EXTERNAL_TARGET_ID_DOMAIN: u128 = 3_u128 << 64;
+const EXTERNAL_FRAME_QUEUE_CAPACITY: usize = 1;
+const EXTERNAL_FACT_QUEUE_CAPACITY: usize = 32;
+const EXTERNAL_MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const EXTERNAL_MAX_COMPONENT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EXTERNAL_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EXTERNAL_PROTOCOL_WIRE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_EXTERNAL_PROTOCOL_FRAMES: usize = 65_536;
+
+/// Compatibility rendering lineage backed directly by a Frame revision.
+///
+/// External no longer owns a second string-rendering generation or baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExternalRenderingGeneration(FrameRevision);
+
+impl ExternalRenderingGeneration {
+    pub const fn revision(self) -> FrameRevision {
+        self.0
+    }
+}
+
+/// Reaction-local authority for one external act stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExternalIngressGeneration(NonZeroU64);
+
+impl ExternalIngressGeneration {
+    pub const fn get(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
+/// Whether an exact external Frame is Full or based on an accepted revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExternalObservationKind {
@@ -27,139 +76,650 @@ pub enum ExternalObservationKind {
     Delta,
 }
 
-/// One external rendering update produced by [`ExternalApplication`].
-///
-/// The content encoding is intentionally private to the external adapter. Only
-/// the Full/Delta generation relationship is part of this boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One exact Frame accepted by the external integration boundary.
+#[derive(Debug)]
 pub struct ExternalObservation {
-    kind: ExternalObservationKind,
-    generation: ExternalRenderingGeneration,
-    base_generation: Option<ExternalRenderingGeneration>,
-    content: String,
+    frame: Frame,
+    ingress: ExternalIngressGeneration,
 }
 
 impl ExternalObservation {
     pub fn kind(&self) -> ExternalObservationKind {
-        self.kind
+        match self.frame.basis() {
+            FrameBasis::Full => ExternalObservationKind::Full,
+            FrameBasis::DeltaFrom(_) => ExternalObservationKind::Delta,
+        }
     }
 
     pub fn generation(&self) -> ExternalRenderingGeneration {
-        self.generation
+        ExternalRenderingGeneration(self.frame.revision())
     }
 
     pub fn base_generation(&self) -> Option<ExternalRenderingGeneration> {
-        self.base_generation
-    }
-
-    pub fn content(&self) -> &str {
-        &self.content
-    }
-
-    fn full(snapshot: &ExternalRenderingSnapshot) -> Self {
-        Self {
-            kind: ExternalObservationKind::Full,
-            generation: snapshot.generation,
-            base_generation: None,
-            content: snapshot.content.clone(),
+        match self.frame.basis() {
+            FrameBasis::Full => None,
+            FrameBasis::DeltaFrom(revision) => Some(ExternalRenderingGeneration(revision)),
         }
     }
 
-    fn delta(baseline: &ExternalRenderingSnapshot, current: &ExternalRenderingSnapshot) -> Self {
-        Self {
-            kind: ExternalObservationKind::Delta,
-            generation: current.generation,
-            base_generation: Some(baseline.generation),
-            content: render_external_delta(&baseline.content, &current.content),
+    pub const fn ingress_generation(&self) -> ExternalIngressGeneration {
+        self.ingress
+    }
+
+    /// Exact move-only Frame handed off by the private FrameSession.
+    pub const fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
+    pub fn into_frame(self) -> Frame {
+        self.frame
+    }
+
+    /// Compatibility text view of the exact canonical Frame submission.
+    pub fn content(&self) -> &str {
+        std::str::from_utf8(self.frame.submission().canonical_bytes())
+            .expect("Frame compiler always produces UTF-8 canonical JSON")
+    }
+}
+
+struct ExternalFrameRequest {
+    frame: Frame,
+    ingress: ExternalIngressGeneration,
+}
+
+struct ExternalIngressState {
+    generation: ExternalIngressGeneration,
+    sender: Option<mpsc::Sender<Result<ProviderFact, ReactionPortFault>>>,
+}
+
+struct ExternalTargetState {
+    identity: TargetIdentity,
+    epoch: TargetEpoch,
+    accepted: Option<FrameRevision>,
+    profile: FrameProfile,
+    terminal: Option<ReactionPortFault>,
+}
+
+impl ExternalTargetState {
+    fn declaration(&self) -> Result<TargetDeclaration, ReactionPortFault> {
+        if let Some(fault) = self.terminal {
+            return Err(fault);
+        }
+        Ok(self.accepted.map_or_else(
+            || TargetDeclaration::full(self.identity, self.epoch, self.profile.clone()),
+            |revision| TargetDeclaration::resume(revision, self.profile.clone()),
+        ))
+    }
+
+    fn reset_continuity(&mut self) -> Result<(), ReactionPortFault> {
+        if let Some(fault) = self.terminal {
+            return Err(fault);
+        }
+        let Some(next) = self
+            .epoch
+            .get()
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+        else {
+            let fault = external_terminal_fault(
+                ReactionPortFaultCode::Internal,
+                ReactionPortFaultReason::Declaration,
+            );
+            self.terminal = Some(fault);
+            return Err(fault);
+        };
+        self.epoch = TargetEpoch::new(next);
+        self.accepted = None;
+        Ok(())
+    }
+}
+
+struct ExternalSharedState {
+    target: ExternalTargetState,
+    ingress: Option<ExternalIngressState>,
+    next_ingress: Option<NonZeroU64>,
+    control_alive: bool,
+}
+
+impl ExternalSharedState {
+    fn allocate_ingress(&mut self) -> Result<ExternalIngressGeneration, ReactionPortFault> {
+        let current = match self.next_ingress {
+            Some(current) => current,
+            None => {
+                let fault = external_terminal_fault(
+                    ReactionPortFaultCode::Internal,
+                    ReactionPortFaultReason::Declaration,
+                );
+                self.target.terminal = Some(fault);
+                return Err(fault);
+            }
+        };
+        self.next_ingress = current.get().checked_add(1).and_then(NonZeroU64::new);
+        Ok(ExternalIngressGeneration(current))
+    }
+}
+
+struct ExternalControlInner {
+    frames: tokio::sync::Mutex<mpsc::Receiver<ExternalFrameRequest>>,
+    shared: Arc<Mutex<ExternalSharedState>>,
+}
+
+/// Cloneable, reaction-fenced control plane for one external target.
+///
+/// It can receive accepted Frames and inject an act for the matching ingress
+/// generation. It cannot submit Frames or mutate canonical history.
+#[derive(Clone)]
+pub struct ExternalControl {
+    inner: Arc<ExternalControlInner>,
+}
+
+impl Drop for ExternalControlInner {
+    fn drop(&mut self) {
+        let (sender, terminal) = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            shared.control_alive = false;
+            let terminal = shared.target.terminal.unwrap_or_else(|| {
+                external_terminal_fault(
+                    ReactionPortFaultCode::Unavailable,
+                    ReactionPortFaultReason::Declaration,
+                )
+            });
+            shared.target.terminal = Some(terminal);
+            let sender = shared
+                .ingress
+                .as_mut()
+                .and_then(|ingress| ingress.sender.take());
+            (sender, terminal)
+        };
+        if let Some(sender) = sender {
+            let _ = sender.try_send(Err(terminal));
         }
     }
 }
 
-/// Concrete ProviderPort whose model output is supplied by an external caller.
-///
-/// `observe` and `act` deliberately do not exist on this type. They belong to
-/// [`ExternalApplication`], which owns the current reaction.
+impl ExternalControl {
+    /// Wait for one exact Frame already accepted by the outbound queue.
+    pub async fn next_observation(&self) -> Result<ExternalObservation, ExternalControlFault> {
+        let request = self
+            .inner
+            .frames
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(ExternalControlFault::ObservationChannelClosed)?;
+        Ok(ExternalObservation {
+            frame: request.frame,
+            ingress: request.ingress,
+        })
+    }
+
+    /// Inject exactly one ordered external text protocol into an active reaction.
+    pub async fn act(
+        &self,
+        generation: ExternalIngressGeneration,
+        mut act: ExternalAct,
+    ) -> Result<(), ExternalControlFault> {
+        let sender = self.claim_ingress(generation)?;
+        let output = ProviderOutputKey::new(0);
+        let mut accumulated = String::new();
+
+        while let Some(event) = act.protocol.next().await {
+            match event {
+                Ok(TextTurnEvent::TextDelta(delta)) => {
+                    if exceeds_external_text_limit(accumulated.len(), delta.len()) {
+                        return send_external_fault(sender, external_output_limit_fault()).await;
+                    }
+                    accumulated.push_str(&delta);
+                    send_external_fact(
+                        &sender,
+                        ProviderFact::TextDelta {
+                            output,
+                            phase: None,
+                            delta,
+                        },
+                    )
+                    .await?;
+                }
+                Ok(TextTurnEvent::TextComplete(text)) => {
+                    if text.len() > MAX_EXTERNAL_TEXT_BYTES {
+                        return send_external_fault(sender, external_output_limit_fault()).await;
+                    }
+                    send_external_fact(
+                        &sender,
+                        ProviderFact::TextSealed {
+                            output,
+                            phase: None,
+                            text,
+                        },
+                    )
+                    .await?;
+                    send_external_fact(
+                        &sender,
+                        ProviderFact::ReactionCompleted {
+                            primary_text: Some(output),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    return send_external_fault(
+                        sender,
+                        external_retryable_fault(
+                            ReactionPortFaultCode::Protocol,
+                            ReactionPortFaultReason::StreamTransport,
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        send_external_fact(
+            &sender,
+            ProviderFact::TextSealed {
+                output,
+                phase: None,
+                text: accumulated,
+            },
+        )
+        .await?;
+        send_external_fact(
+            &sender,
+            ProviderFact::ReactionCompleted {
+                primary_text: Some(output),
+            },
+        )
+        .await
+    }
+
+    /// Complete an active reaction without producing a primary text output.
+    ///
+    /// The matching ingress generation can be claimed exactly once. Repeated
+    /// or late completion attempts return [`ExternalControlFault::StaleIngress`].
+    pub async fn complete(
+        &self,
+        generation: ExternalIngressGeneration,
+    ) -> Result<(), ExternalControlFault> {
+        let sender = self.claim_ingress(generation)?;
+        send_external_fact(
+            &sender,
+            ProviderFact::ReactionCompleted { primary_text: None },
+        )
+        .await
+    }
+
+    fn claim_ingress(
+        &self,
+        generation: ExternalIngressGeneration,
+    ) -> Result<mpsc::Sender<Result<ProviderFact, ReactionPortFault>>, ExternalControlFault> {
+        let mut shared = self
+            .inner
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(ingress) = shared.ingress.as_mut() else {
+            return Err(ExternalControlFault::StaleIngress);
+        };
+        if ingress.generation != generation {
+            return Err(ExternalControlFault::StaleIngress);
+        }
+        ingress
+            .sender
+            .take()
+            .ok_or(ExternalControlFault::StaleIngress)
+    }
+
+    fn is_active(&self, generation: ExternalIngressGeneration) -> bool {
+        self.inner
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ingress
+            .as_ref()
+            .is_some_and(|ingress| ingress.generation == generation)
+    }
+
+    fn reset_continuity(&self) -> Result<(), ExternalControlFault> {
+        let mut shared = self
+            .inner
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if shared.ingress.is_some() {
+            return Err(ExternalControlFault::ActiveIngress);
+        }
+        shared
+            .target
+            .reset_continuity()
+            .map_err(|_| ExternalControlFault::ContinuityUnavailable)
+    }
+}
+
+async fn send_external_fact(
+    sender: &mpsc::Sender<Result<ProviderFact, ReactionPortFault>>,
+    fact: ProviderFact,
+) -> Result<(), ExternalControlFault> {
+    sender
+        .send(Ok(fact))
+        .await
+        .map_err(|_| ExternalControlFault::StaleIngress)
+}
+
+async fn send_external_fault(
+    sender: mpsc::Sender<Result<ProviderFact, ReactionPortFault>>,
+    fault: ReactionPortFault,
+) -> Result<(), ExternalControlFault> {
+    sender
+        .send(Err(fault))
+        .await
+        .map_err(|_| ExternalControlFault::StaleIngress)
+}
+
+/// Frame-native external target. Create its control handle before moving the
+/// port into an Application.
 pub struct ExternalProviderPort {
-    observations: mpsc::Sender<ExternalRequest>,
+    frames: mpsc::Sender<ExternalFrameRequest>,
+    shared: Arc<Mutex<ExternalSharedState>>,
+    #[cfg(test)]
+    submit_barrier: Option<Arc<ExternalSubmitBarrier>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ExternalSubmitBarrier {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ExternalSubmitBarrier {
+    async fn hold_after_reserve(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
 }
 
 impl ExternalProviderPort {
-    fn new(observations: mpsc::Sender<ExternalRequest>) -> Self {
-        Self { observations }
+    pub fn new() -> Result<(Self, ExternalControl), ReactionPortFault> {
+        let instance = NEXT_EXTERNAL_TARGET_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| {
+                external_terminal_fault(
+                    ReactionPortFaultCode::Internal,
+                    ReactionPortFaultReason::Declaration,
+                )
+            })?;
+        let identity = TargetIdentity::new(
+            NonZeroU128::new(EXTERNAL_TARGET_ID_DOMAIN | u128::from(instance))
+                .expect("External target domain is non-zero"),
+        );
+        let profile = FrameProfile::new(
+            FrameConstraints {
+                max_frame_bytes: EXTERNAL_MAX_FRAME_BYTES,
+                max_component_bytes: EXTERNAL_MAX_COMPONENT_BYTES,
+                context_window_tokens: None,
+                reserved_output_tokens: None,
+            },
+            FrameCapabilities::new(true),
+        );
+        let shared = Arc::new(Mutex::new(ExternalSharedState {
+            target: ExternalTargetState {
+                identity,
+                epoch: TargetEpoch::new(NonZeroU64::MIN),
+                accepted: None,
+                profile,
+                terminal: None,
+            },
+            ingress: None,
+            next_ingress: Some(NonZeroU64::MIN),
+            control_alive: true,
+        }));
+        let (frames, pending_frames) = mpsc::channel(EXTERNAL_FRAME_QUEUE_CAPACITY);
+        let control = ExternalControl {
+            inner: Arc::new(ExternalControlInner {
+                frames: tokio::sync::Mutex::new(pending_frames),
+                shared: Arc::clone(&shared),
+            }),
+        };
+        Ok((
+            Self {
+                frames,
+                shared,
+                #[cfg(test)]
+                submit_barrier: None,
+            },
+            control,
+        ))
     }
 }
 
 #[async_trait]
-impl ProviderPort for ExternalProviderPort {
-    async fn execute<'a>(
-        &'a mut self,
-        projection: RenderedProjection,
-    ) -> Result<ProviderEventStream<'a>, ProviderFault> {
-        let rendered = render_projection_prompt(&projection)?;
-        let (input, pending_input) = oneshot::channel();
-        self.observations
-            .send(ExternalRequest { rendered, input })
-            .await
-            .map_err(|_| {
-                ProviderFault::retryable_transport(
-                    "external observation receiver closed before projection delivery",
-                )
-            })?;
+impl ReactionPort for ExternalProviderPort {
+    fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .target
+            .declaration()
+    }
 
-        match pending_input.await.map_err(|_| {
-            ProviderFault::retryable_transport(
-                "external reaction owner closed before supplying rollover or model output",
-            )
-        })? {
-            ExternalInput::Rollover => Ok(Box::pin(futures::stream::empty())),
-            ExternalInput::TextProtocol(protocol) => Ok(external_provider_events(protocol)),
+    async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
+        let permit = match self.frames.clone().reserve_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                let shared = self
+                    .shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let fault = shared.target.declaration().err().unwrap_or_else(|| {
+                    external_terminal_fault(
+                        ReactionPortFaultCode::Unavailable,
+                        ReactionPortFaultReason::Declaration,
+                    )
+                });
+                return Err(SubmitFault::Rejected(fault));
+            }
+        };
+
+        #[cfg(test)]
+        if let Some(barrier) = self.submit_barrier.as_ref() {
+            barrier.hold_after_reserve().await;
+        }
+
+        let (ingress, facts) = {
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !shared.control_alive {
+                let fault = shared.target.declaration().err().unwrap_or_else(|| {
+                    external_terminal_fault(
+                        ReactionPortFaultCode::Unavailable,
+                        ReactionPortFaultReason::Declaration,
+                    )
+                });
+                return Err(SubmitFault::Rejected(fault));
+            }
+            let declaration = shared.target.declaration().map_err(SubmitFault::Rejected)?;
+            frame.check_handoff_precondition(&declaration)?;
+            if shared.ingress.is_some() {
+                return Err(SubmitFault::Rejected(external_terminal_fault(
+                    ReactionPortFaultCode::Internal,
+                    ReactionPortFaultReason::Declaration,
+                )));
+            }
+            let ingress = shared.allocate_ingress().map_err(SubmitFault::Rejected)?;
+            let (facts, pending_facts) = mpsc::channel(EXTERNAL_FACT_QUEUE_CAPACITY);
+            shared.target.accepted = Some(frame.revision());
+            shared.ingress = Some(ExternalIngressState {
+                generation: ingress,
+                sender: Some(facts),
+            });
+            (ingress, pending_facts)
+        };
+
+        // The permit makes this send infallible and non-suspending. This is the
+        // crossing poll: queue ownership and Ready(Ok(stream)) are linearized.
+        permit.send(ExternalFrameRequest { frame, ingress });
+        Ok(external_fact_stream(
+            facts,
+            Arc::clone(&self.shared),
+            ingress,
+        ))
+    }
+}
+
+struct ExternalFactStreamGuard {
+    shared: Arc<Mutex<ExternalSharedState>>,
+    generation: ExternalIngressGeneration,
+    clean_eof: bool,
+    continuity_invalidated: bool,
+}
+
+impl ExternalFactStreamGuard {
+    fn invalidate_continuity(&mut self) -> Option<ReactionPortFault> {
+        if self.continuity_invalidated {
+            return self
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .target
+                .terminal;
+        }
+        self.continuity_invalidated = true;
+        let mut shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(fault) = shared.target.terminal {
+            return Some(fault);
+        }
+        let _ = shared.target.reset_continuity();
+        shared.target.terminal
+    }
+}
+
+impl Drop for ExternalFactStreamGuard {
+    fn drop(&mut self) {
+        let mut shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if shared
+            .ingress
+            .as_ref()
+            .is_some_and(|ingress| ingress.generation == self.generation)
+        {
+            shared.ingress = None;
+        }
+        if !self.clean_eof && !self.continuity_invalidated {
+            let _ = shared.target.reset_continuity();
         }
     }
 }
 
-struct ExternalRequest {
-    rendered: String,
-    input: oneshot::Sender<ExternalInput>,
+struct ExternalFactStreamState {
+    facts: mpsc::Receiver<Result<ProviderFact, ReactionPortFault>>,
+    terminal_seen: bool,
+    fault_seen: bool,
+    guard: ExternalFactStreamGuard,
 }
 
-enum ExternalInput {
-    Rollover,
-    TextProtocol(ExternalAct),
+fn external_fact_stream(
+    facts: mpsc::Receiver<Result<ProviderFact, ReactionPortFault>>,
+    shared: Arc<Mutex<ExternalSharedState>>,
+    generation: ExternalIngressGeneration,
+) -> ProviderFactStream<'static> {
+    Box::pin(futures::stream::unfold(
+        ExternalFactStreamState {
+            facts,
+            terminal_seen: false,
+            fault_seen: false,
+            guard: ExternalFactStreamGuard {
+                shared,
+                generation,
+                clean_eof: false,
+                continuity_invalidated: false,
+            },
+        },
+        |mut state| async move {
+            match state.facts.recv().await {
+                Some(Ok(fact)) => {
+                    if matches!(fact, ProviderFact::ReactionCompleted { .. }) {
+                        state.terminal_seen = true;
+                    }
+                    Some((Ok(fact), state))
+                }
+                Some(Err(fault)) => {
+                    state.fault_seen = true;
+                    let _ = state.guard.invalidate_continuity();
+                    Some((Err(fault), state))
+                }
+                None => {
+                    if state.terminal_seen {
+                        state.guard.clean_eof = true;
+                        drop(state);
+                        None
+                    } else if state.fault_seen {
+                        drop(state);
+                        None
+                    } else {
+                        let terminal = state.guard.invalidate_continuity();
+                        state.fault_seen = true;
+                        Some((
+                            Err(terminal.unwrap_or_else(|| {
+                                external_retryable_fault(
+                                    ReactionPortFaultCode::Unavailable,
+                                    ReactionPortFaultReason::StreamTransport,
+                                )
+                            })),
+                            state,
+                        ))
+                    }
+                }
+            }
+        },
+    ))
 }
 
 type ExternalTextProtocolStream =
     Pin<Box<dyn Stream<Item = Result<TextTurnEvent, ProviderFault>> + Send + 'static>>;
 
-const MAX_EXTERNAL_TEXT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_EXTERNAL_PROTOCOL_WIRE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_EXTERNAL_PROTOCOL_FRAMES: usize = 65_536;
-
-/// Opaque payload for one complete external act protocol.
-///
-/// Concrete protocol adapters create this value below the external Port
-/// boundary. Core deliberately exposes no generic Stream or normalized-event
-/// constructor.
+/// Opaque payload for one complete external text protocol.
 pub struct ExternalAct {
     protocol: ExternalTextProtocolStream,
 }
 
 impl ExternalAct {
-    /// Decode the JSON-lines text protocol used by the external CLI adapter.
+    /// Construct one normal, complete external text response.
     ///
-    /// Each line is one `text_delta`, `text_complete`, or abnormal `disconnect`
-    /// frame. End of input is normal protocol EOF. Frames are decoded lazily so
-    /// an explicit completion prevents any later frame from being polled.
+    /// Injection uses the same output-size limit, one-shot ingress claim, and
+    /// sealed-text terminal grammar as every other external text act.
+    pub fn text(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            protocol: Box::pin(futures::stream::once(async move {
+                Ok::<_, ProviderFault>(TextTurnEvent::TextComplete(text))
+            })),
+        }
+    }
+
+    /// Decode the JSON-lines protocol used by the external CLI adapter.
     #[doc(hidden)]
     pub fn __from_cli_json_lines(protocol: impl Into<String>) -> Self {
         let protocol = protocol.into();
         if protocol.len() > MAX_EXTERNAL_PROTOCOL_WIRE_BYTES {
-            return Self {
-                protocol: Box::pin(futures::stream::once(async {
-                    Err(ProviderFault::retryable_transport(
-                        "external text protocol exceeded configured wire limit",
-                    ))
-                })),
-            };
+            return Self::fault(ProviderFault::retryable_transport(
+                "external text protocol exceeded configured wire limit",
+            ));
         }
         if protocol
             .lines()
@@ -167,13 +727,9 @@ impl ExternalAct {
             .count()
             > MAX_EXTERNAL_PROTOCOL_FRAMES
         {
-            return Self {
-                protocol: Box::pin(futures::stream::once(async {
-                    Err(ProviderFault::retryable_transport(
-                        "external text protocol exceeded configured frame limit",
-                    ))
-                })),
-            };
+            return Self::fault(ProviderFault::retryable_transport(
+                "external text protocol exceeded configured frame limit",
+            ));
         }
         let lines = protocol
             .lines()
@@ -182,6 +738,12 @@ impl ExternalAct {
             .into_iter();
         Self {
             protocol: Box::pin(external_json_lines_protocol(lines)),
+        }
+    }
+
+    fn fault(fault: ProviderFault) -> Self {
+        Self {
+            protocol: Box::pin(futures::stream::once(async move { Err(fault) })),
         }
     }
 
@@ -231,82 +793,40 @@ fn external_json_lines_protocol(
     })
 }
 
-struct ExternalProtocolState {
-    protocol: ExternalTextProtocolStream,
-    accumulated: String,
-    complete: bool,
-}
-
-fn external_provider_events(act: ExternalAct) -> ProviderEventStream<'static> {
-    Box::pin(futures::stream::unfold(
-        ExternalProtocolState {
-            protocol: act.protocol,
-            accumulated: String::new(),
-            complete: false,
-        },
-        |mut state| async move {
-            if state.complete {
-                return None;
-            }
-
-            let event = match state.protocol.next().await {
-                Some(Ok(TextTurnEvent::TextDelta(delta))) => {
-                    if exceeds_external_text_limit(state.accumulated.len(), delta.len()) {
-                        state.complete = true;
-                        Err(external_text_limit_fault())
-                    } else {
-                        state.accumulated.push_str(&delta);
-                        Ok(ProviderEvent::Text(TextTurnEvent::TextDelta(delta)))
-                    }
-                }
-                Some(Ok(TextTurnEvent::TextComplete(complete))) => {
-                    state.complete = true;
-                    if complete.len() > MAX_EXTERNAL_TEXT_BYTES {
-                        Err(external_text_limit_fault())
-                    } else {
-                        Ok(ProviderEvent::Text(TextTurnEvent::TextComplete(complete)))
-                    }
-                }
-                Some(Err(fault)) => {
-                    state.complete = true;
-                    Err(fault)
-                }
-                None => {
-                    state.complete = true;
-                    Ok(ProviderEvent::Text(TextTurnEvent::TextComplete(
-                        std::mem::take(&mut state.accumulated),
-                    )))
-                }
-            };
-            Some((event, state))
-        },
-    ))
-}
-
 fn exceeds_external_text_limit(current: usize, additional: usize) -> bool {
     current
         .checked_add(additional)
         .is_none_or(|total| total > MAX_EXTERNAL_TEXT_BYTES)
 }
 
-fn external_text_limit_fault() -> ProviderFault {
-    ProviderFault::retryable_transport("external output text exceeded configured output limit")
+fn external_output_limit_fault() -> ReactionPortFault {
+    external_retryable_fault(
+        ReactionPortFaultCode::Limit,
+        ReactionPortFaultReason::OutputLimit,
+    )
 }
 
-#[derive(Clone)]
-struct ExternalRenderingSnapshot {
-    generation: ExternalRenderingGeneration,
-    content: String,
+fn external_retryable_fault(
+    code: ReactionPortFaultCode,
+    reason: ReactionPortFaultReason,
+) -> ReactionPortFault {
+    ReactionPortFault::retryable(code, reason)
 }
 
-struct ExternalOwner<Props> {
-    host: ApplicationHost<ExternalProviderPort>,
-    components: ComponentHost<Props>,
+fn external_terminal_fault(
+    code: ReactionPortFaultCode,
+    reason: ReactionPortFaultReason,
+) -> ReactionPortFault {
+    ReactionPortFault::terminal(code, reason)
+}
+
+struct ExternalOwner {
+    application: Application<ExternalProviderPort>,
 }
 
 enum ExternalReactionState {
     AwaitingObservation,
-    AwaitingInput(oneshot::Sender<ExternalInput>),
+    AwaitingInput(ExternalIngressGeneration),
     Finishing,
 }
 
@@ -327,31 +847,36 @@ impl ExternalReactionState {
     }
 }
 
-struct ExternalReaction<Props> {
+struct ExternalReaction {
     state: ExternalReactionState,
     cancellation: Option<oneshot::Sender<()>>,
-    task: JoinHandle<ExternalReactionCompletion<Props>>,
+    task: JoinHandle<ExternalReactionCompletion>,
 }
 
-impl<Props> Drop for ExternalReaction<Props> {
+impl Drop for ExternalReaction {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-struct ExternalReactionCompletion<Props> {
-    owner: ExternalOwner<Props>,
+struct ExternalReactionCompletion {
+    owner: ExternalOwner,
     outcome: ExternalReactionOutcome,
 }
 
 enum ExternalReactionOutcome {
-    Finished(Result<(), ApplicationHostFault>),
+    Finished(Result<(), ApplicationFault>),
     Cancelled,
 }
 
-enum ExternalReactionProgress<Props> {
-    Request(Option<ExternalRequest>),
-    Completion(Result<ExternalReactionCompletion<Props>, tokio::task::JoinError>),
+enum ExternalReactionProgress {
+    Request(Box<Result<ExternalObservation, ExternalControlFault>>),
+    Completion(Box<Result<ExternalReactionCompletion, tokio::task::JoinError>>),
+}
+
+enum ExternalReactionFinishProgress {
+    Injection(Result<(), ExternalControlFault>),
+    Completion(Box<Result<ExternalReactionCompletion, tokio::task::JoinError>>),
 }
 
 struct ExternalReactionCancellation {
@@ -382,55 +907,92 @@ impl Drop for ExternalReactionCancellation {
     }
 }
 
-/// External-only wrapper that owns one current Provider reaction.
+/// Compatibility scheduler around the private Frame-driven Application.
 ///
-/// Ordinary `observe` and `act` roll over through normal Provider EOF. `act`
-/// first supplies one complete text protocol stream. Full re-render only
-/// rebuilds the external rendering baseline and leaves the reaction pending.
-pub struct ExternalApplication<Props> {
-    observations: mpsc::Receiver<ExternalRequest>,
-    owner: Option<ExternalOwner<Props>>,
-    reaction: Option<ExternalReaction<Props>>,
-    baseline: Option<ExternalRenderingSnapshot>,
-    current_rendering: Option<ExternalRenderingSnapshot>,
-    next_generation: u64,
+/// Each `observe` or `act` completes at most one prior ingress and explicitly
+/// starts one next reaction. Rendering dirtiness never starts a reaction.
+pub struct ExternalApplication {
+    control: ExternalControl,
+    owner: Option<ExternalOwner>,
+    reaction: Option<ExternalReaction>,
 }
 
-impl<Props> ExternalApplication<Props>
-where
-    Props: Clone + Send + 'static,
-{
-    pub fn new(components: ComponentHost<Props>) -> Self {
-        let (observations, pending_observations) = mpsc::channel(1);
-        let provider = ExternalProviderPort::new(observations);
-        Self {
-            observations: pending_observations,
-            owner: Some(ExternalOwner {
-                host: ApplicationHost::new(provider),
-                components,
-            }),
+impl ExternalApplication {
+    pub fn new_root(
+        root: impl Fn() -> Component + Send + Sync + 'static,
+    ) -> Result<Self, ExternalApplicationFault> {
+        let (port, control) =
+            ExternalProviderPort::new().map_err(|_| ExternalApplicationFault::TargetUnavailable)?;
+        let application =
+            Application::mount(root, port).map_err(ExternalApplicationFault::application)?;
+        Ok(Self {
+            control,
+            owner: Some(ExternalOwner { application }),
             reaction: None,
-            baseline: None,
-            current_rendering: None,
-            next_generation: 1,
-        }
+        })
     }
 
-    /// Finish the current reaction, if any, and return the next observation.
+    #[cfg(feature = "legacy-provider-port")]
+    #[deprecated(note = "use `ExternalApplication::new_root` with `use_provider_event_handler`")]
+    pub fn new(
+        root: impl Fn(EventInput<ProviderEvent>) -> Component + Send + Sync + 'static,
+    ) -> Result<Self, ExternalApplicationFault> {
+        Self::new_with_event_input(root)
+    }
+
+    #[cfg_attr(
+        not(feature = "legacy-provider-port"),
+        allow(dead_code, reason = "retained for crate-internal event-routing tests")
+    )]
+    fn new_with_event_input(
+        root: impl Fn(EventInput<ProviderEvent>) -> Component + Send + Sync + 'static,
+    ) -> Result<Self, ExternalApplicationFault> {
+        let (port, control) =
+            ExternalProviderPort::new().map_err(|_| ExternalApplicationFault::TargetUnavailable)?;
+        let application = Application::mount_with_events(root, port)
+            .map_err(ExternalApplicationFault::application)?;
+        Ok(Self {
+            control,
+            owner: Some(ExternalOwner { application }),
+            reaction: None,
+        })
+    }
+
+    /// Consume this application and finish all Component-owned async work.
+    ///
+    /// Cleanup starts when this method is called, before the returned future is
+    /// polled. Dropping that waiter does not cancel cleanup: the dedicated task
+    /// retains ownership until the active reaction has returned the Application
+    /// and the Application has fenced, aborted, and joined all mount tasks.
+    pub fn shutdown(
+        self,
+    ) -> impl Future<Output = Result<(), ExternalApplicationFault>> + Send + 'static {
+        let cleanup_runtime = Handle::current().id();
+        let mut cleanup = tokio::spawn(self.shutdown_owned());
+        std::future::poll_fn(move |context| {
+            if !Handle::try_current().is_ok_and(|runtime| runtime.id() == cleanup_runtime) {
+                return Poll::Ready(Err(ExternalApplicationFault::ShutdownTaskFailed));
+            }
+            match Pin::new(&mut cleanup).poll(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(result)) => Poll::Ready(result),
+                Poll::Ready(Err(fault)) if fault.is_panic() => {
+                    std::panic::resume_unwind(fault.into_panic())
+                }
+                Poll::Ready(Err(_)) => {
+                    Poll::Ready(Err(ExternalApplicationFault::ShutdownTaskFailed))
+                }
+            }
+        })
+    }
+
+    /// Finish any pending reaction without output, then return the next Frame.
     pub async fn observe(&mut self) -> Result<ExternalObservation, ExternalApplicationFault> {
-        match self.current_reaction_phase() {
-            Some(ExternalReactionPhase::AwaitingInput) => {
-                self.finish_current(ExternalInput::Rollover).await?;
-            }
-            Some(ExternalReactionPhase::AwaitingObservation | ExternalReactionPhase::Finishing) => {
-                self.recover_cancelled_reaction().await?;
-            }
-            None => {}
-        }
+        self.finish_or_recover_current().await?;
         self.start_next().await
     }
 
-    /// Supply one complete external text protocol stream, then observe next.
+    /// Finish the current reaction with one act, then return the next Frame.
     pub async fn act(
         &mut self,
         act: ExternalAct,
@@ -438,62 +1000,134 @@ where
         if self.current_reaction_phase() != Some(ExternalReactionPhase::AwaitingInput) {
             return Err(ExternalApplicationFault::NoActiveReaction);
         }
-        self.finish_current(ExternalInput::TextProtocol(act))
+        let generation = match self.reaction.as_ref().map(|reaction| &reaction.state) {
+            Some(ExternalReactionState::AwaitingInput(generation)) => *generation,
+            _ => return Err(ExternalApplicationFault::NoActiveReaction),
+        };
+        self.finish_current(ExternalCompletion::Act(generation, act))
             .await?;
         self.start_next().await
     }
 
-    /// Re-emit a Full rendering for the current reaction without rolling it over.
-    pub fn full_re_render(&mut self) -> Result<ExternalObservation, ExternalApplicationFault> {
-        if self.current_reaction_phase() != Some(ExternalReactionPhase::AwaitingInput) {
-            return Err(ExternalApplicationFault::NoActiveReaction);
+    /// End the pending ingress, reset target continuity, and explicitly react.
+    ///
+    /// Unlike the removed same-revision re-render path, this always creates a
+    /// new Full Frame in a later epoch and a new ingress generation.
+    pub async fn observe_full(&mut self) -> Result<ExternalObservation, ExternalApplicationFault> {
+        self.finish_or_recover_current().await?;
+        self.control.reset_continuity()?;
+        self.start_next().await
+    }
+
+    async fn finish_or_recover_current(&mut self) -> Result<(), ExternalApplicationFault> {
+        if self
+            .reaction
+            .as_ref()
+            .is_some_and(|reaction| reaction.task.is_finished())
+        {
+            return self.recover_finished_reaction().await;
         }
-        let current = self
-            .current_rendering
-            .clone()
-            .ok_or(ExternalApplicationFault::SynchronizationClosed)?;
-        self.baseline = Some(current.clone());
-        Ok(ExternalObservation::full(&current))
+        match self.current_reaction_phase() {
+            Some(ExternalReactionPhase::AwaitingInput) => {
+                let generation = match self.reaction.as_ref().map(|reaction| &reaction.state) {
+                    Some(ExternalReactionState::AwaitingInput(generation)) => *generation,
+                    _ => return Err(ExternalApplicationFault::NoActiveReaction),
+                };
+                self.finish_current(ExternalCompletion::Empty(generation))
+                    .await
+            }
+            Some(ExternalReactionPhase::AwaitingObservation | ExternalReactionPhase::Finishing) => {
+                self.recover_finished_reaction().await
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn shutdown_owned(mut self) -> Result<(), ExternalApplicationFault> {
+        let reaction_result = if let Some(reaction) = self.reaction.as_mut() {
+            reaction.state = ExternalReactionState::Finishing;
+            if let Some(cancellation) = reaction.cancellation.take() {
+                let _ = cancellation.send(());
+            }
+            let completion = self.await_current_completion().await;
+            let outcome = self.restore_joined_reaction(completion)?;
+            Self::finish_reaction_outcome(outcome)
+        } else {
+            Ok(())
+        };
+
+        let owner = self
+            .owner
+            .take()
+            .ok_or(ExternalApplicationFault::OwnerUnavailable)?;
+        let shutdown_result = owner
+            .application
+            .shutdown()
+            .await
+            .map_err(ExternalApplicationFault::application);
+
+        reaction_result?;
+        shutdown_result
     }
 
     async fn finish_current(
         &mut self,
-        input: ExternalInput,
+        completion: ExternalCompletion,
     ) -> Result<(), ExternalApplicationFault> {
-        let (input_sender, cancellation) = {
+        let stale_ingress_means_already_completed =
+            matches!(&completion, ExternalCompletion::Empty(_));
+        let cancellation = {
             let reaction = self
                 .reaction
                 .as_mut()
                 .ok_or(ExternalApplicationFault::NoActiveReaction)?;
-            let input_sender =
-                match std::mem::replace(&mut reaction.state, ExternalReactionState::Finishing) {
-                    ExternalReactionState::AwaitingInput(input) => input,
-                    state => {
-                        reaction.state = state;
-                        return Err(ExternalApplicationFault::NoActiveReaction);
-                    }
-                };
-            let cancellation = reaction
+            reaction.state = ExternalReactionState::Finishing;
+            reaction
                 .cancellation
                 .take()
-                .ok_or(ExternalApplicationFault::SynchronizationClosed)?;
-            (input_sender, cancellation)
+                .ok_or(ExternalApplicationFault::SynchronizationClosed)?
         };
-        self.current_rendering = None;
-        let input_delivered = input_sender.send(input).is_ok();
         let mut cancellation = ExternalReactionCancellation::new(cancellation);
+        let control = self.control.clone();
+        let injection = async move {
+            match completion {
+                ExternalCompletion::Empty(generation) => control.complete(generation).await,
+                ExternalCompletion::Act(generation, act) => control.act(generation, act).await,
+            }
+        };
+        tokio::pin!(injection);
+        let progress = {
+            let reaction = self
+                .reaction
+                .as_mut()
+                .ok_or(ExternalApplicationFault::NoActiveReaction)?;
+            tokio::select! {
+                biased;
+                completion = &mut reaction.task => {
+                    ExternalReactionFinishProgress::Completion(Box::new(completion))
+                },
+                injection = &mut injection => {
+                    ExternalReactionFinishProgress::Injection(injection)
+                },
+            }
+        };
+        let injection = match progress {
+            ExternalReactionFinishProgress::Completion(completion) => {
+                cancellation.disarm();
+                let outcome = self.restore_joined_reaction(*completion)?;
+                return Self::finish_reaction_outcome(outcome);
+            }
+            ExternalReactionFinishProgress::Injection(injection) => injection,
+        };
+
         let completion = self.await_current_completion().await;
         cancellation.disarm();
-        let completion = match completion {
-            Ok(completion) => completion,
-            Err(fault) => return Err(self.consume_failed_reaction(fault)),
-        };
-        match self.restore_completed_reaction(completion)? {
-            ExternalReactionOutcome::Finished(result) => result?,
-            ExternalReactionOutcome::Cancelled => {}
-        }
-        if !input_delivered {
-            return Err(ExternalApplicationFault::SynchronizationClosed);
+        let outcome = self.restore_joined_reaction(completion)?;
+        Self::finish_reaction_outcome(outcome)?;
+        match injection {
+            Ok(()) => {}
+            Err(ExternalControlFault::StaleIngress) if stale_ingress_means_already_completed => {}
+            Err(fault) => return Err(fault.into()),
         }
         Ok(())
     }
@@ -521,85 +1155,98 @@ where
             .and_then(|reaction| reaction.cancellation.take())
             .ok_or(ExternalApplicationFault::SynchronizationClosed)?;
         let mut cancellation = ExternalReactionCancellation::new(cancellation);
+        let control = self.control.clone();
 
         loop {
             let progress = {
-                let observations = &mut self.observations;
                 let reaction = self
                     .reaction
                     .as_mut()
                     .ok_or(ExternalApplicationFault::NoActiveReaction)?;
                 tokio::select! {
-                    request = observations.recv() => ExternalReactionProgress::Request(request),
+                    biased;
                     completion = &mut reaction.task => {
-                        ExternalReactionProgress::Completion(completion)
-                    }
+                        ExternalReactionProgress::Completion(Box::new(completion))
+                    },
+                    request = control.next_observation() => {
+                        ExternalReactionProgress::Request(Box::new(request))
+                    },
                 }
             };
-
             match progress {
-                ExternalReactionProgress::Request(Some(request)) => {
-                    if request.input.is_closed() {
-                        continue;
+                ExternalReactionProgress::Request(request) => match *request {
+                    Ok(observation) => {
+                        if !self.control.is_active(observation.ingress_generation()) {
+                            continue;
+                        }
+                        let cancellation = cancellation
+                            .take()
+                            .ok_or(ExternalApplicationFault::SynchronizationClosed)?;
+                        let reaction = self
+                            .reaction
+                            .as_mut()
+                            .ok_or(ExternalApplicationFault::NoActiveReaction)?;
+                        reaction.state =
+                            ExternalReactionState::AwaitingInput(observation.ingress_generation());
+                        reaction.cancellation = Some(cancellation);
+                        return Ok(observation);
                     }
-                    let observation = self.publish_rendering(request.rendered)?;
-                    let cancellation = cancellation
-                        .take()
-                        .ok_or(ExternalApplicationFault::SynchronizationClosed)?;
-                    let reaction = self
-                        .reaction
-                        .as_mut()
-                        .ok_or(ExternalApplicationFault::NoActiveReaction)?;
-                    reaction.state = ExternalReactionState::AwaitingInput(request.input);
-                    reaction.cancellation = Some(cancellation);
-                    return Ok(observation);
-                }
-                ExternalReactionProgress::Request(None) => {
-                    return Err(ExternalApplicationFault::SynchronizationClosed);
-                }
+                    Err(ExternalControlFault::ObservationChannelClosed) => {
+                        // The only persistent frame sender belongs to the
+                        // Application inside `run_reaction`; submit-time clones
+                        // cannot outlive `submit()`. Closure therefore proves
+                        // that producer ownership has been destroyed. The
+                        // receiver is never closed independently. Join the task
+                        // to arbitrate its terminal result instead of racing
+                        // Tokio's completion publication.
+                        let completion = self.await_current_completion().await;
+                        cancellation.disarm();
+                        return self.finish_before_observation(completion);
+                    }
+                    Err(fault) => return Err(fault.into()),
+                },
                 ExternalReactionProgress::Completion(completion) => {
                     cancellation.disarm();
-                    let completion = match completion {
-                        Ok(completion) => completion,
-                        Err(fault) => return Err(self.consume_failed_reaction(fault)),
-                    };
-                    return match self.restore_completed_reaction(completion)? {
-                        ExternalReactionOutcome::Finished(Ok(()))
-                        | ExternalReactionOutcome::Cancelled => {
-                            Err(ExternalApplicationFault::ReactionEndedBeforeObservation)
-                        }
-                        ExternalReactionOutcome::Finished(Err(fault)) => Err(fault.into()),
-                    };
+                    return self.finish_before_observation(*completion);
                 }
             }
         }
     }
 
-    async fn recover_cancelled_reaction(&mut self) -> Result<(), ExternalApplicationFault> {
-        let phase = self
-            .current_reaction_phase()
-            .ok_or(ExternalApplicationFault::NoActiveReaction)?;
+    fn finish_before_observation(
+        &mut self,
+        completion: Result<ExternalReactionCompletion, tokio::task::JoinError>,
+    ) -> Result<ExternalObservation, ExternalApplicationFault> {
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(fault) => return Err(self.consume_failed_reaction(fault)),
+        };
+        match self.restore_completed_reaction(completion)? {
+            ExternalReactionOutcome::Finished(Ok(())) | ExternalReactionOutcome::Cancelled => {
+                Err(ExternalApplicationFault::ReactionEndedBeforeObservation)
+            }
+            ExternalReactionOutcome::Finished(Err(fault)) => {
+                Err(ExternalApplicationFault::application(fault))
+            }
+        }
+    }
+
+    async fn recover_finished_reaction(&mut self) -> Result<(), ExternalApplicationFault> {
         let completion = match self.await_current_completion().await {
             Ok(completion) => completion,
             Err(fault) => return Err(self.consume_failed_reaction(fault)),
         };
         match self.restore_completed_reaction(completion)? {
             ExternalReactionOutcome::Cancelled => Ok(()),
-            ExternalReactionOutcome::Finished(result)
-                if phase == ExternalReactionPhase::Finishing =>
-            {
-                result.map_err(Into::into)
+            ExternalReactionOutcome::Finished(result) => {
+                result.map_err(ExternalApplicationFault::application)
             }
-            ExternalReactionOutcome::Finished(Ok(())) => {
-                Err(ExternalApplicationFault::ReactionEndedBeforeObservation)
-            }
-            ExternalReactionOutcome::Finished(Err(fault)) => Err(fault.into()),
         }
     }
 
     async fn await_current_completion(
         &mut self,
-    ) -> Result<ExternalReactionCompletion<Props>, tokio::task::JoinError> {
+    ) -> Result<ExternalReactionCompletion, tokio::task::JoinError> {
         let reaction = self
             .reaction
             .as_mut()
@@ -609,15 +1256,36 @@ where
 
     fn restore_completed_reaction(
         &mut self,
-        completion: ExternalReactionCompletion<Props>,
+        completion: ExternalReactionCompletion,
     ) -> Result<ExternalReactionOutcome, ExternalApplicationFault> {
-        let finished_reaction = self
+        let finished = self
             .reaction
             .take()
             .ok_or(ExternalApplicationFault::NoActiveReaction)?;
-        drop(finished_reaction);
+        drop(finished);
         self.owner = Some(completion.owner);
         Ok(completion.outcome)
+    }
+
+    fn restore_joined_reaction(
+        &mut self,
+        completion: Result<ExternalReactionCompletion, tokio::task::JoinError>,
+    ) -> Result<ExternalReactionOutcome, ExternalApplicationFault> {
+        match completion {
+            Ok(completion) => self.restore_completed_reaction(completion),
+            Err(fault) => Err(self.consume_failed_reaction(fault)),
+        }
+    }
+
+    fn finish_reaction_outcome(
+        outcome: ExternalReactionOutcome,
+    ) -> Result<(), ExternalApplicationFault> {
+        match outcome {
+            ExternalReactionOutcome::Finished(result) => {
+                result.map_err(ExternalApplicationFault::application)
+            }
+            ExternalReactionOutcome::Cancelled => Ok(()),
+        }
     }
 
     fn current_reaction_phase(&self) -> Option<ExternalReactionPhase> {
@@ -631,61 +1299,60 @@ where
         fault: tokio::task::JoinError,
     ) -> ExternalApplicationFault {
         drop(self.reaction.take());
-        ExternalApplicationFault::reaction_task(fault)
+        if fault.is_panic() {
+            std::panic::resume_unwind(fault.into_panic());
+        }
+        ExternalApplicationFault::ReactionTaskFailed
     }
 
-    fn publish_rendering(
-        &mut self,
-        content: String,
-    ) -> Result<ExternalObservation, ExternalApplicationFault> {
-        let generation = ExternalRenderingGeneration(self.next_generation);
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .ok_or(ExternalApplicationFault::GenerationExhausted)?;
-        let current = ExternalRenderingSnapshot {
-            generation,
-            content,
-        };
-        let observation = self.baseline.as_ref().map_or_else(
-            || ExternalObservation::full(&current),
-            |baseline| ExternalObservation::delta(baseline, &current),
-        );
-        self.baseline = Some(current.clone());
-        self.current_rendering = Some(current);
-        Ok(observation)
+    #[cfg(test)]
+    fn control(&self) -> ExternalControl {
+        self.control.clone()
     }
 }
 
-async fn run_reaction<Props>(
-    mut owner: ExternalOwner<Props>,
+enum ExternalCompletion {
+    Empty(ExternalIngressGeneration),
+    Act(ExternalIngressGeneration, ExternalAct),
+}
+
+async fn run_reaction(
+    mut owner: ExternalOwner,
     cancellation: oneshot::Receiver<()>,
-) -> ExternalReactionCompletion<Props>
-where
-    Props: Clone + Send + 'static,
-{
-    let outcome = {
-        let reaction = owner.host.dispatch_llm_reaction(&mut owner.components);
-        tokio::pin!(reaction);
-        tokio::select! {
-            result = &mut reaction => ExternalReactionOutcome::Finished(result),
-            cancelled = cancellation => {
-                match cancelled {
-                    Ok(()) => ExternalReactionOutcome::Cancelled,
-                    Err(_) => ExternalReactionOutcome::Finished(reaction.await),
-                }
-            }
-        }
-    };
+) -> ExternalReactionCompletion {
+    let outcome = await_reaction_or_cancellation(owner.application.react(), cancellation).await;
     ExternalReactionCompletion { owner, outcome }
 }
 
-fn render_external_delta(baseline: &str, current: &str) -> String {
-    if baseline == current {
-        String::new()
-    } else {
-        current.to_owned()
+async fn await_reaction_or_cancellation(
+    reaction: impl std::future::Future<Output = Result<(), ApplicationFault>>,
+    cancellation: oneshot::Receiver<()>,
+) -> ExternalReactionOutcome {
+    tokio::pin!(reaction);
+    tokio::pin!(cancellation);
+    tokio::select! {
+        biased;
+        result = &mut reaction => ExternalReactionOutcome::Finished(result),
+        cancelled = &mut cancellation => {
+            match cancelled {
+                Ok(()) => ExternalReactionOutcome::Cancelled,
+                Err(_) => ExternalReactionOutcome::Finished(reaction.await),
+            }
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ExternalControlFault {
+    #[error("external observation channel is closed")]
+    ObservationChannelClosed,
+    #[error("external act ingress is stale or was already consumed")]
+    StaleIngress,
+    #[error("external continuity cannot reset while an ingress is active")]
+    ActiveIngress,
+    #[error("external target continuity is unavailable")]
+    ContinuityUnavailable,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -699,19 +1366,21 @@ pub enum ExternalApplicationFault {
     ReactionEndedBeforeObservation,
     #[error("external application owner is unavailable after an internal task failure")]
     OwnerUnavailable,
-    #[error("external reaction task failed: {message}")]
-    ReactionTaskFailed { message: String },
-    #[error("external rendering generation space is exhausted")]
-    GenerationExhausted,
+    #[error("external reaction task failed")]
+    ReactionTaskFailed,
+    #[error("external application cleanup task failed")]
+    ShutdownTaskFailed,
+    #[error("external target could not be created")]
+    TargetUnavailable,
+    #[error("external frame-driven application failed")]
+    Application,
     #[error(transparent)]
-    Application(#[from] ApplicationHostFault),
+    Control(#[from] ExternalControlFault),
 }
 
 impl ExternalApplicationFault {
-    fn reaction_task(fault: tokio::task::JoinError) -> Self {
-        Self::ReactionTaskFailed {
-            message: fault.to_string(),
-        }
+    fn application(_fault: ApplicationFault) -> Self {
+        Self::Application
     }
 }
 

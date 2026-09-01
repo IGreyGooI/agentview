@@ -1,3 +1,9 @@
+#![cfg(feature = "legacy-provider-port")]
+#![allow(
+    deprecated,
+    reason = "this compatibility test intentionally exercises ComponentReactionRuntime"
+)]
+
 use std::{
     collections::VecDeque,
     fmt,
@@ -19,6 +25,7 @@ use agentview::component::{
     prelude::*,
 };
 use async_trait::async_trait;
+use futures::FutureExt;
 
 #[derive(Clone)]
 struct ReactionProps {
@@ -128,6 +135,41 @@ fn render_failure_component(
         .publish(state)
         .expect("current generation publication");
     panic!("render failure sentinel")
+}
+
+#[component]
+fn post_reconcile_failure_component(
+    props: ComponentReactionProps<(), String>,
+    events: EventInput<ProviderEvent>,
+) -> Component {
+    let output = use_signal(|| String::from("initial"));
+    let fail_render = use_signal(|| false);
+    props.publish(output.clone()).unwrap();
+    assert!(
+        !fail_render.with(|fail| *fail).unwrap(),
+        "post-reconcile render failure sentinel"
+    );
+    let output_writer = output.clone();
+
+    view! {
+        output { "selected output" }
+        {
+            EventListener::observe("test.post-reconcile-failure", "v1")
+                .listen_to(events.select(ProviderEvent::TEXT))
+                .on_event(move |event| {
+                    let output = output_writer.clone();
+                    let fail_render = fail_render.clone();
+                    async move {
+                        let value = match event {
+                            TextTurnEvent::TextDelta(value)
+                            | TextTurnEvent::TextComplete(value) => value,
+                        };
+                        output.set(value)?;
+                        fail_render.set(true)
+                    }
+                })
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -420,7 +462,7 @@ async fn provider_failure_does_not_expose_render_time_publication() {
 }
 
 #[tokio::test]
-async fn failed_render_discards_its_uncommitted_publication() {
+async fn render_panic_propagates_and_discards_its_uncommitted_publication() {
     let executions = Arc::new(AtomicUsize::new(0));
     let provider = ScriptedProvider {
         replies: VecDeque::new(),
@@ -429,7 +471,17 @@ async fn failed_render_discards_its_uncommitted_publication() {
     let mut runtime =
         ComponentReactionRuntime::new(provider, render_failure_component, props("failed:"));
 
-    assert!(runtime.dispatch_llm_reaction().await.is_err());
+    let panic = match std::panic::AssertUnwindSafe(runtime.dispatch_llm_reaction())
+        .catch_unwind()
+        .await
+    {
+        Err(panic) => panic,
+        Ok(_) => panic!("the Component render panic must propagate"),
+    };
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("render failure sentinel")
+    );
     assert!(matches!(
         runtime.current_output(),
         Err(ComponentReactionOutputError::Absent { .. })
@@ -439,6 +491,33 @@ async fn failed_render_discards_its_uncommitted_publication() {
         0,
         "a failed render must not reach the Provider"
     );
+}
+
+#[tokio::test]
+async fn post_reconcile_panic_propagates_and_discards_the_output_capture() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let provider = event_provider(
+        [vec![Ok(text_event("captured-before-failure"))]],
+        &executions,
+    );
+    let mut runtime = ComponentReactionRuntime::new(provider, post_reconcile_failure_component, ());
+
+    let panic = match std::panic::AssertUnwindSafe(runtime.dispatch_llm_reaction())
+        .catch_unwind()
+        .await
+    {
+        Err(panic) => panic,
+        Ok(_) => panic!("the post-reconcile render panic must propagate"),
+    };
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("post-reconcile render failure sentinel")
+    );
+    assert!(matches!(
+        runtime.current_output(),
+        Err(ComponentReactionOutputError::Absent { .. })
+    ));
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -578,7 +657,7 @@ async fn cancelled_reaction_discards_pending_output() {
 }
 
 #[tokio::test]
-async fn output_destruction_runs_after_the_publication_lock_is_released() {
+async fn output_destruction_after_render_panic_runs_without_the_publication_lock() {
     let executions = Arc::new(AtomicUsize::new(0));
     let drop_blocked = Arc::new(AtomicBool::new(false));
     let drop_checks = Arc::new(AtomicUsize::new(0));
@@ -603,7 +682,17 @@ async fn output_destruction_runs_after_the_publication_lock_is_released() {
             fail_render: true,
         })
         .unwrap();
-    assert!(runtime.dispatch_llm_reaction().await.is_err());
+    let panic = match std::panic::AssertUnwindSafe(runtime.dispatch_llm_reaction())
+        .catch_unwind()
+        .await
+    {
+        Err(panic) => panic,
+        Ok(_) => panic!("the Component render panic must propagate"),
+    };
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("destruction render sentinel")
+    );
 
     assert_eq!(drop_checks.load(Ordering::SeqCst), 1);
     assert!(

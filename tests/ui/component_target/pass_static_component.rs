@@ -15,8 +15,7 @@ fn inline_note() -> Component {
 }
 
 #[component]
-fn turn(_props: Props, events: EventInput<ProviderEvent>) -> Component {
-    let _cloned_route = events.clone();
+fn turn(_props: Props) -> Component {
     view! {
         #[developer]
         contract { version: "v1", "typed" }
@@ -26,14 +25,14 @@ fn turn(_props: Props, events: EventInput<ProviderEvent>) -> Component {
 }
 
 #[component]
-fn application_root(props: Props, events: EventInput<ProviderEvent>) -> Component {
+fn application_root(props: Props) -> Component {
     view! {
         #[system_once]
         protocol {
             nested { "stable" }
         }
 
-        turn(props, events)
+        turn(props)
     }
 }
 
@@ -41,5 +40,5 @@ fn main() {
     let _derived = CompileNote {
         body: String::from("derive helper and view! coexist"),
     };
-    let _components = ComponentHost::new(application_root, Props);
+    let _components = ComponentHost::new_root(application_root, Props);
 }

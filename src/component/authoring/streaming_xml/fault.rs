@@ -4,14 +4,8 @@ use super::super::{event_input::EventRouteProjectionFault, handler::HandlerFault
 pub(crate) enum StreamingXmlMountFault {
     #[error("streaming contract `{identity}` uses an EventInput from another render generation")]
     ForeignEventInput { identity: &'static str },
-    #[error(
-        "streaming XML target <{element}> is registered by `{first}` and `{second}` on one route"
-    )]
-    DuplicateTarget {
-        element: &'static str,
-        first: &'static str,
-        second: &'static str,
-    },
+    #[error("streaming XML tag `{tag}` is not a valid XML name: {detail}")]
+    InvalidTag { tag: &'static str, detail: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,13 +33,6 @@ pub(crate) enum StreamingXmlDispatchFault {
     ElementDepthLimitExceeded { maximum: usize, observed: usize },
     #[error("streaming XML element exceeded {maximum} attributes (observed {observed})")]
     AttributeLimitExceeded { maximum: usize, observed: usize },
-    #[error("streaming XML route exceeded {maximum} target events (observed {observed})")]
-    TargetEventLimitExceeded { maximum: usize, observed: usize },
-    #[error("streaming contract `{contract}` parser panicked: {message}")]
-    ParserPanicked {
-        contract: &'static str,
-        message: String,
-    },
     #[error("streaming contract `{contract}` {phase} handler failed: {source}")]
     Handler {
         contract: &'static str,

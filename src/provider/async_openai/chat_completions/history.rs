@@ -1,19 +1,28 @@
+#[cfg(feature = "legacy-provider-port")]
 use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 
+#[cfg(feature = "legacy-provider-port")]
 use crate::{
-    component::execution::{RenderedProjection, RenderedProjectionNode},
+    component::execution::{
+        ProjectionAppendPolicy, ProjectionDiffState, RenderedProjection, RenderedProjectionNode,
+    },
+    transcript::{AssistantPhase, CanonicalTranscriptError},
+};
+use crate::{
     pom_renderer::render_pom_document,
-    provider::projection_diff::{ProjectionAppendPolicy, ProjectionDiffState},
     transcript::{
-        AssistantPhase, CanonicalInputItem, CanonicalTranscriptError, ConversationRole,
-        InstructionAuthority,
+        AssistantTextStatus, CanonicalInputItem, ConversationRole, InstructionAuthority,
+        ASSISTANT_OUTPUT_INTERRUPTED_MARKER,
     },
 };
 
-use super::{OpenAiChatCompletionsError, OpenAiChatCompletionsOptions};
+use super::OpenAiChatCompletionsError;
+#[cfg(feature = "legacy-provider-port")]
+use super::OpenAiChatCompletionsOptions;
 
+#[cfg(feature = "legacy-provider-port")]
 #[derive(Clone)]
 pub(super) struct ChatHistory {
     history_epoch: u64,
@@ -26,18 +35,21 @@ pub(super) struct ChatHistory {
     partial_records: Vec<String>,
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) struct PreparedChatHistory {
     pub(super) request_body: Vec<u8>,
     pub(super) candidate: ChatHistory,
     pub(super) memo: ChatDiffMemo,
 }
 
+#[cfg(feature = "legacy-provider-port")]
 pub(super) struct ChatDiffMemo {
     history_epoch: u64,
     scope: Option<crate::component::execution::ProjectionExecutionScope>,
     diff_state: ProjectionDiffState,
 }
 
+#[cfg(feature = "legacy-provider-port")]
 impl ChatDiffMemo {
     fn valid_for(
         &self,
@@ -48,6 +60,7 @@ impl ChatDiffMemo {
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 impl ChatHistory {
     pub(super) fn prepare(
         previous: Option<&Self>,
@@ -85,7 +98,7 @@ impl ChatHistory {
                     reconciled
                         .new_input_indices
                         .iter()
-                        .map(|index| current_messages[*index].clone()),
+                        .flat_map(|index| current_messages[*index].iter().cloned()),
                 )
                 .collect();
             Self {
@@ -108,7 +121,7 @@ impl ChatHistory {
                 submitted_items: projection_items(&current).cloned().collect(),
                 submitted_projection: current,
                 unclaimed_provider_outputs: Vec::new(),
-                wire_messages: current_messages,
+                wire_messages: current_messages.into_iter().flatten().collect(),
                 open_text: String::new(),
                 partial_records: Vec::new(),
             }
@@ -118,15 +131,11 @@ impl ChatHistory {
             &candidate.unclaimed_provider_outputs,
         )?;
         let candidate_epoch = candidate.history_epoch;
-        let request_body = serde_json::to_vec(&ChatRequest {
-            model: options.model(),
-            messages: &candidate.wire_messages,
-            stream: true,
-            tool_choice: ToolChoice::None,
-        })?;
-        if request_body.len() > max_serialized_request_body_bytes {
-            return Err(OpenAiChatCompletionsError::SerializedRequestBodyLimit);
-        }
+        let request_body = encode_request(
+            options.model(),
+            &candidate.wire_messages,
+            max_serialized_request_body_bytes,
+        )?;
         Ok(PreparedChatHistory {
             request_body,
             candidate,
@@ -178,16 +187,20 @@ impl ChatHistory {
         let text = std::mem::take(&mut self.open_text);
         self.partial_records.clear();
         self.unclaimed_provider_outputs
-            .push(CanonicalInputItem::assistant_text(text.clone(), None));
+            .push(CanonicalInputItem::interrupted_assistant_text(
+                text.clone(),
+                None,
+            ));
         self.wire_messages
             .push(ChatMessage::text(ChatRole::Assistant, text));
         self.wire_messages.push(ChatMessage::text(
             ChatRole::User,
-            "[agentview: assistant output interrupted before completion]".to_owned(),
+            ASSISTANT_OUTPUT_INTERRUPTED_MARKER.to_owned(),
         ));
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn ensure_system_authority(
     previous: Option<&ChatHistory>,
     current: &[CanonicalInputItem],
@@ -202,6 +215,7 @@ fn ensure_system_authority(
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn projection_system_instructions(projection: &RenderedProjection) -> Vec<CanonicalInputItem> {
     projection_items(projection)
         .filter(|item| {
@@ -233,7 +247,7 @@ enum ToolChoice {
 
 #[derive(Clone, Serialize)]
 #[serde(untagged)]
-enum ChatMessage {
+pub(super) enum ChatMessage {
     Text(ChatTextMessage),
     AssistantToolCall(ChatAssistantToolCallMessage),
     Tool(ChatToolMessage),
@@ -246,7 +260,7 @@ impl ChatMessage {
 }
 
 #[derive(Clone, Serialize)]
-struct ChatTextMessage {
+pub(super) struct ChatTextMessage {
     role: ChatRole,
     content: String,
 }
@@ -261,7 +275,7 @@ enum ChatRole {
 }
 
 #[derive(Clone, Serialize)]
-struct ChatAssistantToolCallMessage {
+pub(super) struct ChatAssistantToolCallMessage {
     role: AssistantRole,
     content: Option<String>,
     tool_calls: Vec<ChatToolCall>,
@@ -294,7 +308,7 @@ struct ChatFunctionCall {
 }
 
 #[derive(Clone, Serialize)]
-struct ChatToolMessage {
+pub(super) struct ChatToolMessage {
     role: ToolRole,
     tool_call_id: String,
     content: String,
@@ -306,12 +320,14 @@ enum ToolRole {
     Tool,
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn lower_projection(
     projection: &RenderedProjection,
-) -> Result<Vec<ChatMessage>, OpenAiChatCompletionsError> {
+) -> Result<Vec<Vec<ChatMessage>>, OpenAiChatCompletionsError> {
     projection_items(projection).map(lower_item).collect()
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn projection_items(projection: &RenderedProjection) -> impl Iterator<Item = &CanonicalInputItem> {
     projection
         .nodes()
@@ -319,30 +335,45 @@ fn projection_items(projection: &RenderedProjection) -> impl Iterator<Item = &Ca
         .flat_map(|node| node.items().iter())
 }
 
-fn lower_item(item: &CanonicalInputItem) -> Result<ChatMessage, OpenAiChatCompletionsError> {
+pub(super) fn lower_item(
+    item: &CanonicalInputItem,
+) -> Result<Vec<ChatMessage>, OpenAiChatCompletionsError> {
     match item {
         CanonicalInputItem::Instruction { authority, pom } => {
             let role = match authority {
                 InstructionAuthority::System => ChatRole::System,
                 InstructionAuthority::Developer => ChatRole::Developer,
             };
-            Ok(ChatMessage::text(role, render_pom_document(pom)?))
+            Ok(vec![ChatMessage::text(role, render_pom_document(pom)?)])
         }
         CanonicalInputItem::Message { role, pom } => {
             let role = match role {
                 ConversationRole::User => ChatRole::User,
                 ConversationRole::Assistant => ChatRole::Assistant,
             };
-            Ok(ChatMessage::text(role, render_pom_document(pom)?))
+            Ok(vec![ChatMessage::text(role, render_pom_document(pom)?)])
         }
-        CanonicalInputItem::AssistantText { text, .. } => {
-            Ok(ChatMessage::text(ChatRole::Assistant, text.clone()))
-        }
+        CanonicalInputItem::AssistantText {
+            text,
+            status: AssistantTextStatus::Sealed,
+            ..
+        } => Ok(vec![ChatMessage::text(ChatRole::Assistant, text.clone())]),
+        CanonicalInputItem::AssistantText {
+            text,
+            status: AssistantTextStatus::Interrupted,
+            ..
+        } => Ok(vec![
+            ChatMessage::text(ChatRole::Assistant, text.clone()),
+            ChatMessage::text(
+                ChatRole::User,
+                ASSISTANT_OUTPUT_INTERRUPTED_MARKER.to_owned(),
+            ),
+        ]),
         CanonicalInputItem::ToolCall {
             call_id,
             name,
             raw_arguments,
-        } => Ok(ChatMessage::AssistantToolCall(
+        } => Ok(vec![ChatMessage::AssistantToolCall(
             ChatAssistantToolCallMessage {
                 role: AssistantRole::Assistant,
                 content: None,
@@ -355,13 +386,13 @@ fn lower_item(item: &CanonicalInputItem) -> Result<ChatMessage, OpenAiChatComple
                     },
                 }],
             },
-        )),
+        )]),
         CanonicalInputItem::ToolResult { call_id, content } => {
-            Ok(ChatMessage::Tool(ChatToolMessage {
+            Ok(vec![ChatMessage::Tool(ChatToolMessage {
                 role: ToolRole::Tool,
                 tool_call_id: call_id.clone(),
                 content: content.clone(),
-            }))
+            })])
         }
         CanonicalInputItem::ProviderExtension(extension) => {
             Err(OpenAiChatCompletionsError::UnsupportedProviderExtension {
@@ -373,6 +404,24 @@ fn lower_item(item: &CanonicalInputItem) -> Result<ChatMessage, OpenAiChatComple
     }
 }
 
+pub(super) fn encode_request(
+    model: &str,
+    messages: &[ChatMessage],
+    max_serialized_request_body_bytes: usize,
+) -> Result<Vec<u8>, OpenAiChatCompletionsError> {
+    let request_body = serde_json::to_vec(&ChatRequest {
+        model,
+        messages,
+        stream: true,
+        tool_choice: ToolChoice::None,
+    })?;
+    if request_body.len() > max_serialized_request_body_bytes {
+        return Err(OpenAiChatCompletionsError::SerializedRequestBodyLimit);
+    }
+    Ok(request_body)
+}
+
+#[cfg(feature = "legacy-provider-port")]
 struct ReconciledProjection {
     submitted_projection: RenderedProjection,
     submitted_items: Vec<CanonicalInputItem>,
@@ -380,6 +429,7 @@ struct ReconciledProjection {
     new_input_indices: Vec<usize>,
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn reconcile_projection(
     previous: &ChatHistory,
     current: &RenderedProjection,
@@ -471,11 +521,13 @@ fn reconcile_projection(
     })
 }
 
+#[cfg(feature = "legacy-provider-port")]
 struct MutableSubmittedNode {
     identity: String,
     items: Vec<CanonicalInputItem>,
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn claim_equal_item(
     submitted: &[CanonicalInputItem],
     matched: &mut [bool],
@@ -492,25 +544,30 @@ fn claim_equal_item(
     true
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn items_match_for_submission(left: &CanonicalInputItem, right: &CanonicalInputItem) -> bool {
     match (left, right) {
         (
             CanonicalInputItem::AssistantText {
                 text: left_text,
                 phase: left_phase,
+                status: left_status,
             },
             CanonicalInputItem::AssistantText {
                 text: right_text,
                 phase: right_phase,
+                status: right_status,
             },
         ) => {
             left_text == right_text
                 && normalized_final_phase(*left_phase) == normalized_final_phase(*right_phase)
+                && left_status == right_status
         }
         _ => left == right,
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn normalized_final_phase(phase: Option<AssistantPhase>) -> Option<AssistantPhase> {
     match phase {
         None | Some(AssistantPhase::FinalAnswer) => Some(AssistantPhase::FinalAnswer),
@@ -518,6 +575,7 @@ fn normalized_final_phase(phase: Option<AssistantPhase>) -> Option<AssistantPhas
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn transcript_from_items(
     items: &[CanonicalInputItem],
 ) -> Result<crate::transcript::CanonicalTranscript, CanonicalTranscriptError> {
@@ -527,6 +585,7 @@ fn transcript_from_items(
     )
 }
 
+#[cfg(feature = "legacy-provider-port")]
 fn ensure_all_tool_calls_closed(
     submitted: &[CanonicalInputItem],
     outputs: &[CanonicalInputItem],
@@ -555,8 +614,42 @@ fn ensure_all_tool_calls_closed(
     }
 }
 
+#[cfg(feature = "legacy-provider-port")]
 impl From<CanonicalTranscriptError> for OpenAiChatCompletionsError {
     fn from(error: CanonicalTranscriptError) -> Self {
         Self::Canonical(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{lower_item, ASSISTANT_OUTPUT_INTERRUPTED_MARKER};
+    use crate::transcript::CanonicalInputItem;
+
+    #[test]
+    fn interrupted_text_lowers_to_partial_assistant_text_and_a_user_marker() {
+        let messages = lower_item(&CanonicalInputItem::interrupted_assistant_text(
+            "visible partial",
+            None,
+        ))
+        .unwrap();
+        let wire = messages
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            wire,
+            vec![
+                json!({"role": "assistant", "content": "visible partial"}),
+                json!({
+                    "role": "user",
+                    "content": ASSISTANT_OUTPUT_INTERRUPTED_MARKER
+                }),
+            ]
+        );
     }
 }

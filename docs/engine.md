@@ -1,614 +1,970 @@
 # AgentView Engine 设计
 
 本文是 AgentView Engine 的权威设计文档。它规定稳定边界、状态所有权、调度语义和必须保持的
-不变量，不记录实现进度、测试数量、提交版本或临时工作状态。
+不变量，不记录实现进度、测试数量、提交版本或临时迁移状态。
 
-若其他实现说明与本文冲突，以本文为准。
+若其他设计说明与本文冲突，以本文为准。实施顺序和迁移锚点见
+[`frame-driven-runtime-plan.md`](frame-driven-runtime-plan.md)。
 
 ## 1. Engine 的目标
 
 AgentView 把 LLM 应用组织成 retained Component tree：
 
-- Component 持有业务状态，并声明模型当前需要看到的界面；
-- Engine render 完整的当前界面；
-- ProviderPort 把界面转换成具体模型请求；
-- 模型输出被转换成 provider-neutral Event；
-- Component 消费 Event、更新业务状态或回答 ToolCall；
-- 只有应用显式发起下一次 reaction 时，Engine 才再次 render 和调用模型。
-
-Engine 保证因果顺序、历史一致性、取消和资源回收。它不替业务决定某个棋步是否合法，也不把
-Provider conversation 当成业务数据库。
+- Component 持有业务状态，并声明外部 target 当前需要看到的完整界面；
+- Component Runtime reconcile 出完整 `RenderedProjection`；
+- private `FrameSession` 将 canonical history、完整 projection 和 staged ToolOutput 编译为一个 target-ready
+  `Frame`；
+- `ReactionPort` 把 Frame handoff 给 Provider、Skill 或 Plugin，并返回有序 `ProviderFactStream`；
+- Runtime 先把 fact 接纳进 canonical history，再向 Component dispatch provider-neutral Event；
+- 只有 external driver 显式调用 `Application::react()`，Engine 才开始一次新的 reaction。
 
 ```text
-ComponentHost                   ProviderPort
-props + Signal                  local/open/wire history
-      |                                  |
-      | render                           | encode / stream
-      v                                  v
-RenderedProjection -> ApplicationHost -> Model Provider
-                           ^                 |
-                           | ProviderEvent   |
-                           +-----------------+
-                           |
-                    Component consumers
+external driver
+      |
+      | Application<P>::react()
+      v
+Component Runtime -> complete RenderedProjection
+      |                         |
+      | private bindings        | private FrameSession
+      |                         v
+      |                  Full | DeltaFrom Frame
+      |                         |
+      |                         v
+      +------------------ ReactionPort
+                                |
+                         ProviderFactStream
+                                |
+                  canonical commit -> Component dispatch
 ```
+
+Engine 保证 structured handoff、因果顺序、history/diff 一致性、取消和资源回收。它不替业务决定棋步
+是否合法，也不把 Provider continuation 或 Component projection 当成业务数据库。
 
 ## 2. 所有权边界
 
-### ComponentHost
+### Component Runtime
 
-`ComponentHost` 是业务权威，拥有：
+Component Runtime 是业务权威，拥有：
 
-- root props；
-- mounted Component identity；
+- mounted Component identity 和 mount generation；
 - `use_signal` state；
 - Component tree 表达的完整业务 POM；
-- render 时生成的 reaction-local consumers。
+- latest committed complete `RenderedProjection`；
+- retained provider-event handler slots；
+- 每次 render/reaction generation 的 private dispatch bindings。
 
-Signal 写入立即成为业务事实。Engine 不 fork 或回滚 Component state。业务需要事务性时，应在
-业务 Component 内先校验，再一次性写入自洽的新状态。
+Signal 写入立即成为业务事实。Engine 不 fork 或回滚 Component state。业务需要事务性时，应在业务
+Component 内先校验，再一次性写入自洽的新状态。
 
-### ApplicationHost / Runtime
+`RenderedProjection` 始终是完整值，不是 patch。Runtime 可以跳过 clean subtree 的重复执行并复用
+retained fragment，但这只能是内部优化，不能让 projection 变成 partial。
 
-`ApplicationHost` 负责一次 reaction 的生命周期：
+### Application<P>
 
-- render Component tree；
-- 调用 ProviderPort；
-- 消费 ProviderEvent stream；
-- 调度普通 Event handler 和 ToolCall lanes；
-- 等待 reaction-local 工作完成。
+`Application<P>` 是公开的应用编排 owner，长期固定持有：
 
-它不拥有业务状态，也不拥有 Provider wire history。
+- 一个 Component Runtime；
+- 一个 crate-private `FrameSession`；
+- 一个不可替换的 `P: ReactionPort`；
+- single-flight reaction gate。
 
-### ProviderPort
+一个 Application 只代表一个 logical target session。它不公开 `port_mut()`、FrameSession mutation、
+history commit 或替换 port 的 API。`&mut Application` 使第一版同一 Application 最多运行一个 reaction。
 
-公共 Provider 边界保持一个方法：
+公共编排入口保持很小；root没有运行时props，但可以由mount closure捕获只读启动配置：
+
+```rust
+impl<P: ReactionPort> Application<P> {
+    pub fn mount(
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        port: P,
+    ) -> Result<Self, ApplicationFault>;
+
+    pub fn current_projection(&self) -> ProjectionSnapshot<'_>;
+    pub async fn wait_for_reaction_request(&mut self) -> Result<(), ApplicationFault>;
+    pub fn take_reaction_request(&self) -> Result<bool, ApplicationFault>;
+    pub async fn react(&mut self) -> Result<(), ApplicationFault>;
+}
+```
+
+`ReactionRequest::request()`只记录至少一次后续reaction的sticky request；重复request在driver消费前合并。
+`wait_for_reaction_request()`阻塞直到消费一个请求，`take_reaction_request()`不阻塞地消费当前请求并在没有请求时
+返回`Ok(false)`。二者都不render Component、不调用`declare()`或`submit()`，并在消费前后复用与`react()`相同的
+outer-boundary仲裁：mount fence、supervisor `Closed`和已经终结的Application均fail closed，fresh Component task
+panic保留原payload并优先unwind。
+
+### private FrameSession
+
+FrameSession 原子持有两类不同状态：
+
+```text
+CanonicalHistoryState
+  handed-off canonical input
+  admitted public output partial / seal / interruption
+  ToolCall and ToolOutput causal facts
+
+TargetDeliveryState
+  FrameSession namespace and current FrameRevision
+  retained complete projection checkpoint
+  selected replay-view identity
+  #[diff] complete baseline
+  staged ToolOutput receipt
+  disposable PreparedFrame candidate
+```
+
+Canonical history 是 shared causal truth；target delivery state 是同一 history 对一个 fixed target 的
+delivery cursor。第一版二者由一个 FrameSession 持有，但不能把 revision、projection baseline 或 staged
+receipt误称为 canonical history。未来多 target 可以拆开这两类 owner，不改变 Component API。
+
+FrameSession 负责 `HistoryPolicy`、canonical replay、`#[diff]` lowering、Full/Delta 选择、hard budget、
+prepare/commit transaction 和 ToolOutput staging。它不编码 Provider HTTP body，不持有 response id，
+也不解析 SSE。
+
+### ReactionPort
+
+`ReactionPort` 是 Agent、Skill 和 Plugin 共用的 integration boundary：
 
 ```rust
 #[async_trait]
-pub trait ProviderPort: Send {
-    async fn execute<'a>(
+pub trait ReactionPort: Send {
+    fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault>;
+
+    async fn submit<'a>(
         &'a mut self,
-        projection: RenderedProjection,
-    ) -> Result<ProviderEventStream<'a>, ProviderFault>;
+        frame: Frame,
+    ) -> Result<ProviderFactStream<'a>, SubmitFault>;
+}
+
+#[non_exhaustive]
+pub enum ReactionPortFaultKind { Retryable, Terminal }
+
+#[non_exhaustive]
+pub enum ReactionPortFaultCode { Unavailable, Rejected, Protocol, Limit, Internal }
+
+#[non_exhaustive]
+pub enum ReactionPortFaultReason {
+    Declaration,
+    RequestPreparation,
+    Transport,
+    Authentication,
+    Authorization,
+    RateLimited,
+    UpstreamRejected,
+    ResponseProtocol,
+    StreamTransport,
+    StreamTimeout,
+    OutputLimit,
+    Other,
+}
+
+pub struct ReactionPortFault {
+    kind: ReactionPortFaultKind,
+    code: ReactionPortFaultCode,
+    reason: ReactionPortFaultReason,
+}
+
+#[non_exhaustive]
+pub enum ApplicationFaultKind { Retryable, Terminal }
+
+#[non_exhaustive]
+pub enum ApplicationFaultCode {
+    Unavailable,
+    Rejected,
+    Protocol,
+    InvalidConfiguration,
+    Limit,
+    Exhausted,
+    Component,
+    Internal,
+}
+
+#[non_exhaustive]
+pub enum ApplicationFaultStage {
+    Reaction,
+    Declaration,
+    Bootstrap,
+    Reconcile,
+    FramePrepare,
+    Submit,
+    FactStream,
+    Admission,
+    Binding,
+    ToolOutput,
+    PostReconcile,
+}
+
+#[non_exhaustive]
+pub enum ApplicationFaultReason {
+    CancelledAfterHandoff,
+    Port(ReactionPortFaultReason),
+    InvalidDeclaration,
+    InvalidFrameProfile,
+    NamespaceExhausted,
+    TargetIdentityChanged,
+    FrameProfileChanged,
+    EpochRegressed,
+    AcceptedRevisionInNewEpoch,
+    ContinuityResetWithoutEpochAdvance,
+    ReplayReplacementUnsupported,
+    AmbiguousProjectionProvenance,
+    RevisionExhausted,
+    PendingToolCall,
+    CanonicalInvariant,
+    FrameBudget,
+    FrameInvariant,
+    UnstableContinuity,
+    ProfileChangedBeforeHandoff,
+    ComponentRuntime,
+    ComponentContract,
+    ComponentInvariant,
+    BindingLifecycle,
+    EventHandler,
+    ToolBinding,
+    ToolLane,
+    Admission(ReactionAdmissionReason),
+    ToolOutput(ToolOutputStagingReason),
+    FactProjectionInvariant,
+}
+
+pub struct ApplicationFault {
+    stage: ApplicationFaultStage,
+    kind: ApplicationFaultKind,
+    code: ApplicationFaultCode,
+    reason: ApplicationFaultReason,
+}
+
+pub enum SubmitFault {
+    ContinuityChanged,
+    ProfileChanged,
+    Rejected(ReactionPortFault),
 }
 ```
 
-ProviderPort 私下拥有：
+`ReactionPortFault`只保留closed、payload-free classification，不持有provider text、wire body、credential、
+arbitrary source或自由字符串。`ApplicationFault`在编排边界同样只暴露payload-free
+`stage/kind/code/reason`；tool/call identity和authored/model text必须在分类后丢弃。Component、handler、tool、
+parser或observer panic不进入`ApplicationFault`，而是保留原payload沿caller stack unwind。
+`ReactionAdmissionReason`和`ToolOutputStagingReason`同样是closed、payload-free的子分类；其具体variant在
+Phase 9 curated public export前保持crate-private，不允许携带任意字符串或底层source。
+详细诊断属于integration-private observability。`ContinuityChanged`与`ProfileChanged`都保证pre-handoff；
+前者允许Application重新declare/reprepare一次，后者在当前mount内terminal fail closed。
+post-handoff `Retryable` fault或没有terminal proof的stream cancellation会丢失continuity并推进epoch；
+post-handoff `Terminal` fault必须成为logical target的sticky terminal state，后续`declare()`不能把它降级成
+新epoch `FullRequired`。
 
-- canonical input 到具体 wire item 的编码；
-- `instructions`、tools 和其他 request capability 的 lowering；
-- local history、inflight items 和 pending ToolCall results；
-- Provider output ledger、item identity 和顺序校验；
-- ToolCall 与 ToolOutput 的配对；
-- prompt cache、compaction、continuation 和 recovery。
+port 只拥有 integration-specific protocol state：
 
-Component 不直接调用 Provider `commit`、`abort` 或修改 history。ProviderEvent stream 在 Engine
-内部关联本轮 history writer 和 ToolOutput sink；具体 Rust 表示可以调整，但不能增加 Component
-可调用的 history API。
+- canonical item 到 wire item 的 deterministic lowering；
+- request body、headers、transport 和 wire/token limit；
+- Provider output ledger、SSE framing和remote acceptance state；
+- response id、remote cursor和prompt-cache hint；
+- encrypted reasoning、remote compaction和其他 protocol-required private causal artifact。
+
+port 不拥有 shared canonical history、Component checkpoint、semantic `#[diff]` baseline或 ToolOutput
+staging。它也不能在 `declare()` 中读取这些 private FrameSession 内容。
+
+`declare()` 中的 `FullRequired` 只证明 port 具有不依赖具体 canonical payload 的 recovery strategy，且
+当前仍保留该 strategy 所需的 required private causal state。它不声称已经验证某个 exact Full request；
+因为 declaration 看不到 canonical history，这个证明只能在 `submit(frame)` 拿到 exact Frame 后完成。
+port 必须在 crossing poll 前把 Full、required private artifacts、真实 wire bytes和token limit一起验证；
+失败返回 structured、确定 pre-handoff 的 `SubmitFault::Rejected`。若 required state 已丢失且没有
+provider-defined stateless rebuild，port 必须在 declaration 阶段 fail closed，不能声明 `FullRequired`。
+
+旧`ProviderPort::execute(RenderedProjection)`不是这个contract的specialization；它只在新API发布后通过
+default-enabled、deprecated `legacy-provider-port` feature保留一个minor release，随后删除。built-in
+ports和新correctness tests不能通过legacy adapter实现。
+同一个built-in provider实例不能交替驱动legacy与Frame-native state；mode只能在各自真实handoff crossing
+poll claim，确定的pre-handoff local failure不claim，claim后另一入口typed fail closed。
 
 ### ToolCall Component
 
-ToolCall Component 声明一个模型可调用的能力。它接收完整 ToolCall，执行、拒绝或报告失败，
-然后产生同一 `call_id` 的 ToolOutput。它不编码 Responses wire item，也不直接写 Provider
-history。
+ToolCall Component 声明 target 可调用的能力。它接收完整 ToolCall，执行、拒绝或报告失败，然后产生
+同一 `call_id` 的 typed ToolOutput。它不编码 Provider wire item，也不直接写 canonical history。
 
-`call_id` 只能标识这一次模型调用，不能保证同一业务动作在重试时仍使用相同 ID。有外部副作用
-的工具默认只能承诺 at-least-once；需要 exactly-once 时，业务 Component 必须使用稳定的业务
-幂等键或持久 effect journal。Engine 的本地取消不能撤销已经发生的外部动作。
+`call_id` 只能标识这一次模型调用，不能保证业务重试仍使用相同 ID。有外部副作用的工具默认只能
+承诺 at-least-once；需要 exactly-once 时，业务 Component 必须使用稳定业务幂等键或持久 effect
+journal。Engine 的取消不能撤销已经发生的外部动作。
 
-## 3. Component tree 如何变成 Responses input
+## 3. Rendering、Frame 与 #[diff]
 
-每次 reaction 都从完整 render 开始，而不是从上一次 UI patch 开始：
+### Complete projection
 
-1. Component tree render 为有序的 `RenderedProjectionNode` 列表；
-2. 每个 node 带稳定的 runtime `ComponentId` 和自己的有序 `CanonicalInputItem`；
-3. ProviderPort 用 node identity 对照已接受的 projection diff memo，找出新增内容；
-4. `#[diff]` slot 在 node 内 lower 为 `full`、`delta` 或 `omit`；
-5. provider-neutral item 再编码成 Responses `instructions` 和 `input` items；
-6. 新输入与当前 wire-legal history 组成本轮不可变 request snapshot。
+`Application::mount` 先读取一次 side-effect-free declaration，再执行 bootstrap reconcile。bootstrap
+不创建 Frame、不调用 `submit()`，但保证 bare latest 已经有一版 committed complete projection，也让
+Component mount lifecycle 可以建立 retained state。
 
-完整 projection 中的 `RenderedProjectionDiffMarker` 只是 `#[diff]` 产生的声明元数据，不是已经
-计算出的 delta。它的 `item_index` 定位本轮完整 item；ProviderPort 再把 node identity、
-node-local structural path 和 diff slot 组成 memo key，并根据私有 baseline 计算 `full`、`delta`
-或 `omit`。
+Signal dirty 表示 Component state 比 latest committed projection 更新。dirty 不会自动 reconcile或
+react；`current_projection()` 仍返回上一版完整 projection，并同时暴露 projection revision和dirty bit。
+正常 reaction返回前执行一次 post-reconcile，使 handler和ToolCall lane产生的状态出现在下一 Frame。
 
-这不是对渲染字符串做文本 diff。diff 的地址是：
+完整projection中的全部`Instruction(System, pom)`不是普通append history。Frame compiler按node/item
+render顺序拼接每个POM的top-level children，形成零或一个normalized System snapshot；结果没有child时
+等价于`None`，表示clear。这里是“完整snapshot整体替换”，不是最后一个System item获胜，也不做value
+dedup。System snapshot不进入canonical transcript、ordinary occurrence reconciliation或`#[diff]`。
 
-```text
-ComponentId + node-local structural path + diff slot
-```
+private checkpoint保存最近一次成功handoff的snapshot。首次非空、内容变化、`Some -> None` clear和
+`None -> Some`都强制Full；snapshot相等才允许继续检查Delta eligibility。Full的Component section以零或
+一个normalized System item开头，随后才是ordinary reconciled items；Delta永远不携带System，表示保留
+accepted baseline。prepare、Pending、pre-handoff Err都不推进snapshot；successful handoff与Frame revision
+及其他commit candidate同步原子提交，post-handoff stream fault不回滚。port只应用这个Full/Delta结果，
+不得从private history推断System replacement。
 
-首次出现、context 丢失或无法安全表达增量时发送完整值；值未变化时 omit；只有结构明确且可省略
-稳定字段时才发送 semantic delta。逻辑 causal history 是 append-only，当前 tree 不再渲染某个
-旧 item 不代表从模型历史中撤回它。wire replay window 可以被已经验证的 compaction
-原子替换，但 compaction 不能改变逻辑顺序或丢失仍然需要的因果事实。
+### Frame boundary
 
-Responses lowering 的基本映射是：
-
-| AgentView 内容 | Responses 位置 |
-| --- | --- |
-| 基础 system instruction | 顶层 `instructions` |
-| developer/user/assistant message | `input` 对应 message item |
-| ToolCall / ToolOutput | `input` function call/output item |
-| reasoning / compaction | ProviderPort 私有 wire history |
-
-普通 Responses HTTP 使用 `store: false`，不依赖 `previous_response_id`。每次请求发送完整、合法的
-wire history 加本轮新输入。`prompt_cache_key` 只优化相同前缀的缓存命中，不承担历史
-正确性。
-
-## 4. 一次 reaction
-
-```text
-render complete projection
-  -> compile a wire-legal request snapshot
-  -> commit newly submitted input to local history
-  -> start Provider request
-  -> consume ProviderEvents
-       -> delta: commit partial record -> update inflight item -> publish event
-       -> output_item.done: validate and seal the accumulated item
-       -> ToolCall item done: publish -> schedule call_id lane
-  -> Provider completes and stream reaches normal EOF
-  -> await all ToolCall lanes
-  -> stage ToolOutputs in ToolCall ordinal for the next Input Gate
-  -> run terminal handlers
-  -> validate required typed/business output
-  -> commit business output
-  -> return success
-```
-
-同一次 reaction 只 render 一次、调用 Provider 一次。Signal 更新只会影响下一次显式 reaction，
-不会在当前 reaction 内自动 rerender 或再次调用模型。
-
-`response.completed` 只校验 Provider 的终态摘要并结束当前 response，不是 history commit 点。
-terminal handler、typed output 和整个 reaction 的成功也不是 Provider history 的提交门槛。
-
-Provider history 按已经发生的因果事实逐段推进：请求 input 在提交时推进；每个 partial output
-Event 在发布前推进；`response.output_item.done` 只封口已经累计的 item。ToolOutput 是 outbound
-input：handler 完成时仅进入 provider-owned staging table，和新 projection input 一起在下一次
-Input Gate handoff 才推进。后续 timeout、断流或业务失败不回滚这些已经推进的记录。
-
-业务层拒绝模型行为不等于 reaction 基础设施失败。例如 Chess 裁判判定棋步非法时，模型确实
-产生过该输出；Engine 保留模型输出，同时由业务 Component 写入非法原因，让下一轮模型看到
-纠错反馈。
-
-## 5. Provider history
-
-ProviderPort 内部必须区分三种东西：
-
-```text
-local_history
-  已提交的 input、每个已发布 partial record、item boundary、ToolCall 和已经 handoff 的 ToolOutput
-  是 append-only 本地因果日志，可以暂时包含未完成 item 或未闭合 ToolCall
-
-inflight_items
-  从 local_history 中的 partial records 累计出的当前 output assembly
-  尚未 item.done 或 aborted；不能原样进入下一次 wire request
-
-staged_inputs
-  已被 ToolCall handler 接受、按 call_id 隔离保存的 ToolOutput；它们是下一次 outbound input
-  candidate 的一部分，但在 Gate handoff 前不属于 local_history，不能因本地 prepare failure 消失
-
-wire_snapshot
-  每次发送前从 local_history 编译出的不可变、语法合法请求
-  其中所有 ToolCall 都必须已经闭合
-```
-
-history 的推进点：
-
-1. projection lowering、diff、pending ToolCall closure 和编码全部成功后，生成不可变 request snapshot；
-2. request 交给 transport 时，本轮 projection input 与已 staged ToolOutput 作为一个 submission
-   segment 写入 local history；
-3. 每个可见 wire delta 先作为 partial record 追加到 local history，再更新 inflight assembly，
-   最后发布对应 Event；
-4. `response.output_item.done` 校验 item identity、类型和累计内容后，在 local history 追加 sealed
-   boundary；它不再是该模型输出首次进入 history 的时刻，也不等待 `response.completed`；
-5. 完整 ToolCall 同样在 item done 时进入 local history，并登记为 pending；
-6. ToolOutput 先进入 per-call result table；Provider output 顺序封口后，下一次 Input Gate 将它们
-   和 projection input 按 ToolCall ordinal 组成同一个不可变 submission，并只在 handoff 时追加到
-   local history；
-7. ToolCall 和 ToolOutput 的追加都经过串行 sequencer；同一 `call_id` 第二次出现、重复 result、
-   orphan result 都是 ledger fault；
-8. terminal handler 或 typed/business output 的成功与否，不回滚已经追加的 Provider history。
-
-local history 可以暂时是“open”的，但 wire snapshot 绝不能 open。发起任何下一次 HTTP 请求前，
-ProviderPort 必须检查：
-
-- 当前 response 已结束；正常 item 已 sealed，异常中止的 partial item 已标记 aborted；
-- 每个 ToolCall 都存在唯一的 ToolOutput，并且该 ToolOutput 就在下一次请求中提交；
-- item identity、顺序和类型可以编码成合法 Responses input。
-
-检查通过才发送；检查失败则在本地返回 fault，不发送 HTTP。`response.completed`、normal EOF 和
-Component reaction success 都不是额外的 history commit gate。
-
-wire compiler 必须把 committed partial records 折叠成具体 Provider 接受的合法表示，同时保留
-“这是 incomplete/aborted output”的事实。若某种 partial output 无法被可靠地转换成下一次请求的
-合法 history，ProviderPort 就不得把它发布成 ProviderEvent。
-
-对于已经发布但随后中止的 text partial，下一次 wire history 必须同时包含已经累计的实际文本和
-中止事实：优先使用 Provider 原生 incomplete/aborted item；Provider 不支持时，lower 为合法的
-assistant 内容并紧跟一个模型可见的 interruption marker。不能只留下 marker 而丢掉已发布文本。
-
-timeout、断流或取消只会终止当前 inflight response：已经提交的 input、所有已经发布的 partial
-records、sealed items 和已经组装的 ToolOutputs 都保留；尚未 sealed 的 assembly 标记为 aborted，
-不能静默删除，也不能冒充正常完成。下一次 reaction 从它们编译出的 wire-legal history 和当前
-Component projection 恢复。
-
-### Input Gate
-
-每个 outbound model request 都先经过一个 ProviderPort 私有的 Input Gate。Gate 的 owner 是具体
-Provider adapter；它一次接收当前 instruction/policy、只读 retained causal replay、按此前 ToolCall
-provider ordinal 排好的全部 staged ToolOutput、新的完整 Component projection、独立且可丢弃的
-Projection Diff Memo、native tool declarations、execution scope，以及编码和 request limit/config。
-旧 replay 只读；ToolOutput、projection 和 instruction/policy 变化共同构成一个新的 submission；
-memo 只是 compiler state，model output/Event 不属于 Gate。
-
-GateReady 必须拥有同一份 exact immutable wire snapshot、对应的新 causal submission candidate、memo
-candidate、exact staged-output consumption receipt 和 observer receipt。closure、ordinal、scope、epoch、
-native declaration、encoding 和大小限制全部在 handoff 前针对 exact wire snapshot 校验。lowering、
-reconcile、closure、encoding、request-build 或 body-limit 的本地失败不得推进 causal history、memo 或
-staging，也不得发送 HTTP。
-
-request 交给 transport 的瞬间，Gate 原子追加新的 input submission、安装对应 complete-projection
-memo 并消费 exact staged receipt；retained replay 不会再次追加。此后 HTTP、SSE、timeout、取消或
-业务失败都不能回滚它们。`ProviderPort::execute` 返回的 Err 只表示这个 handoff 前的 setup/gate
-failure；handoff 后的 reqwest await、HTTP status、content-type 或 transport failure 作为 stream 的
-第一个 Err 出现。因此 Runtime 只在 execute 成功返回 stream 后观察一次 `InputSubmitted`，并且该
-观察先于任何 ProviderEvent 或 stream error。
-
-Gate 必须检查 exact wire snapshot：每个 pending ToolCall 有唯一 ToolOutput，call/result identity
-匹配，结果按 ToolCall ordinal 排列，且全部 output 在任何无关 projection input 前。Fresh、retained
-和 retry 沿用同一检查；不能借由 Fresh、丢 continuation 或 context 切换绕过 closure。
-
-### Projection Diff Memo
-
-Projection Diff Memo 是 causal history 之外的 Provider 私有状态。它的 retained value 是
-`ProjectionDiffState`、语义 sidecar 和可供下一轮 lowering 使用的 complete projection baseline；
-不是模型 history，也不是 response EOF 的 commit 标志。
-
-Memo 的 key/scope 包含 provider history epoch、ComponentHost instance、mount generation、
-ComponentId path、node-local structural path 和 diff slot。render generation 只标识一次 candidate，
-不构成 baseline key。prepare 仅生成 candidate；只有同一 Input Gate handoff 才 advance。memo 对
-history epoch 单向依赖：history epoch 不匹配、memo 缺失或损坏时，只 invalidate memo 并在下一轮
-发送 full projection，保留并重放 causal history。普通 props update 保留当前 Component mount 和
-memo scope，使下一次完整 render 可以相对上一 baseline lower；Component remount 必然改变 memo
-scope，因此新 mount 的首次 render 发送 full。
-
-## 6. Event 调度
-
-普通 Text Event 保持串行：按 ProviderEvent ordinal 消费，一个 Event 的匹配 handlers 按
-Component 结构顺序逐个 `await`。
-
-ToolCall 使用独立的 per-lane 调度：
-
-- lane key 是 `call_id`；
-- ToolCall 只有在完整 item 校验并写入 local history 后才进入 lane；
-- handler future 启动后，Provider event pump 立即继续读取下一个 Event；
-- 不同 `call_id` 的 lanes 可以并发；
-- 同一 `call_id` lane 内严格保序；
-- Provider history mutation 不并发，全部经过一个串行 sequencer；
-- lane result 先按 `call_id` 隔离保存，不能改变 Provider output item 的原始 ordinal；
-- Provider EOF 后，Runtime 必须等待所有 lanes 完成，才能结束 reaction；
-- 下一次模型请求必须回答当前所有 pending ToolCall，不能先提交无关的新回合。
-
-`parallel_tool_calls` 只表示模型是否可以在同一 response 中产生多个 call。它不改变上述闭合规则，
-也不把普通 Event dispatch 变成并发。
-
-一个 response 中的多个 ToolCall 不需要“马上”逐个闭合；它们可以并发执行。但下一次提交给
-Responses API 的请求中，每个 ToolCall 都必须存在唯一的对应 ToolOutput。这个回答不能推迟到
-更后面的回合。
-
-ToolCall lane 在完整 item done 后即可启动，不等待 `response.completed`；event pump 同时继续读取
-后续 Event。这是明确的低延迟选择，不代表整轮 response 已完成。若后续断流或终态校验失败，
-已经 item.done 的 ToolCall 和已经产生的 ToolOutput 仍然保留；Engine 也不会假装能够撤销已经
-完成的工具副作用。因此普通工具语义是 at-least-once；需要 exactly-once 的业务必须使用稳定
-幂等键或 effect journal。
-
-## 7. 应用编排与 AgentLoop
-
-`ApplicationHost` 只执行一次 reaction；`AgentLoop` 是它上面的长期应用编排层。一个
-`AgentLoop` 长期持有同一组：
-
-- `ComponentHost`，包括 root Component、props 和 retained Signal state；
-- `ApplicationHost` 及其 `ProviderPort`；
-- mounted Component task registry；
-- 单调递增、不会丢通知的 wake epoch。
-
-`AgentLoop` 根据 Component 在本轮给出的 disposition，决定清理完成后立即开始下一次 reaction，
-还是等待 wake。它不包含业务 reducer，也不把自身或 `ApplicationHost` 暴露给 Component。
-
-Loop policy 的语义 owner 必须是 mounted Component tree。Component 通过 `use_loop()` 决定正常
-流程是立即继续还是等待，并通过 `use_task()` 持有的 wake capability 请求从等待中继续；
-`AgentLoop` 只机械地持有 Host、task registry 和 wake epoch，并在安全边界执行这些决定。它不得从
-Signal dirty、Provider EOF、CLI 读取或某个 command 名称自行推断下一轮 reaction。
-
-```text
-AgentLoop
-  | owns
-  +-- ComponentHost -- root Component + Signal state
-  +-- ApplicationHost -- one reaction at a time
-  |     +-- ProviderPort
-  +-- Component task registry
-  +-- wake epoch
-
-reaction:
-  render complete projection
-    -> ApplicationHost dispatch
-    -> ProviderEvents -> Component handlers
-    -> cleanup
-    -> continue_now | continue_on_wake
-```
-
-### 唯一的 Component 入口
-
-应用的前端定义只有一个普通 root Component：
+public `Frame` 是一次 exact target-visible submission：
 
 ```rust
-#[component]
-fn chess_agent(props: ChessAgentProps) -> Component {
-    // use_signal, use_provider_event_handler, use_loop and use_task
+pub struct Frame {
+    revision: FrameRevision,
+    target: TargetIdentity,
+    epoch: TargetEpoch,
+    prepared_against: TargetContinuity,
+    prepared_profile: FrameProfile,
+    basis: FrameBasis, // Full | DeltaFrom(FrameRevision)
+    submission: FrameSubmission,
 }
 ```
 
-root 不接收 `EventInput`，不返回特殊的 completion/program 类型，也不需要
-`ChessApplication`、`ComponentAgent` 或 `ApplicationReducer` trait。业务 reducer 是应用自己的
-普通函数，由 Event handler 调用并把新状态写入 Signal。应用作者也不需要直接编排
-`ApplicationHost` 或 `ComponentReactionRuntime`；这些属于 Engine 和低层显式 reaction API。
+Frame只能由crate-private validated constructor创建，并同时满足以下一致性不变量：
 
-每次 reaction 面向 Provider 的结果仍然是完整 `RenderedProjection`。Engine 可以跳过 clean
-Component 的重复执行并复用 retained fragment，也可以在整棵 tree 都 clean 时复用缓存结果；这只
-是 render 优化，绝不能把 partial projection 交给 ProviderPort。Signal dirty 表示 projection 需要
-重算，不代表 AgentLoop 应该自动开始下一次 Provider reaction。
+- `revision`内嵌的TargetIdentity和TargetEpoch必须分别等于`target`和`epoch`；
+- `prepared_against.epoch()`必须等于`epoch`；`Accepted`中的revision也必须属于同一target和epoch；
+- `prepared_profile`是prepare时使用的完整mount-stable profile；
+- `DeltaFrom(base)`必须精确对应`prepared_against == Accepted { epoch, revision: base }`；
+- base与新revision必须属于同一FrameSession namespace，且新revision sequence严格递增；
+- Full可以从`FullRequired`或`Accepted`prepare。Accepted revision仍须属于同一target/epoch并作为exact
+  handoff precondition，但它不必与新revision属于同一FrameSession namespace，也不约束新revision
+  sequence；successful Full handoff会让port rebase到新revision。
+
+因此port接到的Frame不会在这些重复control字段之间自相矛盾；port只需把完整precondition同自己的当前
+snapshot比较，而不需要猜测哪个字段优先。
+
+`FrameSubmission` 包含本次 Full或Delta的 ordered canonical items和ToolCatalog。`replay`与
+`staged_inputs`永不包含System；Full的`projection.items`至多有一个位于首位的normalized System snapshot，
+缺失即clear，Delta的`projection.items`不包含System。它不包含：
+
+- complete `RenderedProjection` 或 complete private checkpoint；
+- Component Signal、closures或reaction bindings；
+- diff candidate、commit receipt或mutable history capability；
+- Provider response id、wire history或private compaction artifact。
+
+private、non-cloneable `PreparedFrame` 同时保留 public Frame、generation-exact bindings、complete checkpoint
+和commit candidate。prepare不推进任何 state；successful handoff后的同步 commit一次性推进 canonical
+outbound segment、revision、complete diff baseline和exact staged ToolOutput receipt。
+
+### #[diff]
+
+完整 projection 中的 diff marker只是 `#[diff]` 生成的 address/template metadata，不是已经算好的 delta。
+Frame compiler 使用以下稳定地址：
+
+```text
+ComponentId + mount/execution scope + node-local structural path + diff slot
+```
+
+compiler 对照 private complete checkpoint，决定一个 slot是 full、semantic delta还是omit。首次出现、
+baseline缺失、mount改变或target要求Full时发送完整值；v1 non-append replay view按下一节fail closed，
+不能绕过provenance要求直接生成Full。mount/execution scope改变时清空authored occurrence ledger和diff
+baseline。`#[diff]` lowering产生的append-forced item始终直接提交，不参与provider occurrence claim。
+这个过程不对最终渲染字符串做任意文本 diff，也不泄漏完整 checkpoint给Delta port。
+
+普通projection item在同一execution scope内采用稳定的canonical value/count等价规则：先claim同node
+已经提交的occurrence，再claim本scope尚未claim的provider occurrence，否则作为authored item提交。
+v1 projection没有逐item origin，因此scope改变时不能把旧provider value继续当成provenance：旧scope
+累计provider outputs、checkpoint之后尚未reconcile的replay tail和staged inputs全部转入持久的
+ambiguous multiset。普通item若在完成本scopeclaim后仍匹配该multiset，Frame prepare返回typed terminal
+`AmbiguousProjectionProvenance`；不能省略或重复提交它。ambiguous occurrence不会被失败或无关的成功Frame
+消费，后续Frame仍受同一fence约束。未来显式projection provenance可以替换这个保守fault。
+
+### HistoryPolicy 与 canonical replay
+
+`HistoryPolicy` 是 crate-private pure function：它从只读 `CanonicalTranscript` 和mount-stable
+`FrameProfile` 选择 replay view。它不拥有history、不提交Event、不推进revision，也不参与ToolOutput
+receipt。
+
+v1唯一合法view是`CompleteTranscript`：按原顺序包含全部committed append-only canonical items，不删除
+前缀、不生成summary、不替换closed turn，也不注入provider artifact。Component-owned System snapshot不在
+transcript中，它按上一节的独立、可证明规则随Full原子replace/clear；这不放宽ordinary history replacement
+或occurrence provenance。FrameSession验证pending ToolCall由本次staged ToolOutput闭合。若完整replay无法
+满足Full reserve，session返回typed`CanonicalReplayTooLarge`并停止后续handoff；不能静默truncate或调用
+未定义的semantic compaction。
+
+未来canonical checkpoint/summary必须先定义显式canonical fact、覆盖区间、digest、ToolCall closure和
+每个selected occurrence的origin/provenance grammar。该扩展存在后，view replacement强制下一Frame为
+Full；在扩展落地前，任何non-append selected view都必须typed fail closed，不能仅凭item value猜来源后
+生成Full。matching head始终只是Delta必要条件。
+
+Provider-private remote compaction是另一类状态。它只有在对应private output完整验证并seal后才能安装，
+不进入public Frame或canonical transcript，也不因后续stream fault回滚。只要port仍能合法承认head，
+private compaction本身不强制Full。
+
+### Budget closure
+
+`FrameProfile` 在一个Application mount期间稳定：
+
+```rust
+pub struct FrameConstraints {
+    pub max_frame_bytes: usize,
+    pub max_component_bytes: usize,
+    pub context_window_tokens: Option<u64>,
+    pub reserved_output_tokens: Option<u64>,
+}
+```
+
+`max_component_bytes` 是complete Component projection加Component-declared ToolCatalog的authoring
+envelope；`max_frame_bytes` 是整个stable canonical `FrameSubmission` payload的hard limit。二者使用同一
+versioned meter：RFC 8785 JSON Canonicalization Scheme（JCS）的UTF-8 byte length。
+
+```text
+ProjectionSubmissionV1 {
+  items: [CanonicalInputItemV1],
+}
+
+ToolCatalogEntryV1 {
+  name: non-empty UTF-8 string,
+}
+
+ComponentEnvelopeV1 {
+  version: 1,
+  projection: ProjectionSubmissionV1,
+  tools: [ToolCatalogEntryV1],
+}
+
+FrameSubmissionV1 {
+  version: 1,
+  replay: ordered canonical replay items,
+  staged_inputs: ordered mandatory inputs,
+  component: ComponentEnvelopeV1,
+}
+```
+
+`ProjectionSubmissionV1.items`按Component render顺序扁平化ordinary items；Full在它们之前放零或一个
+normalized System snapshot。Full携带shared reconciliation后的self-contained Component segment：
+`replay + staged_inputs + component`整体不依赖旧delivery checkpoint即可解释，但replay/staged已经表示的
+provider-output occurrence不会在Component section重复。raw complete projection始终保存在private
+checkpoint；`max_component_bytes`计量normalized System snapshot加完整ordinary projection和ToolCatalog。
+Delta携带compiler已经lower完成的full/delta ordinary items且不携带System，omit项不出现；node identity和
+diff address保持private。port不得再次对这些section做semantic dedup或System replacement inference。
+`CanonicalInputItemV1`使用canonical transcript的versioned tagged encoding。sealed `AssistantText`沿用
+既有编码并省略默认status；interrupted text显式编码`status: "interrupted"`，不能伪装成sealed output。
+ToolCatalog按name的JCS string comparator升序排列，重复name非法；数组顺序是meter的一部分，port不得
+重排后再解释`canonical_bytes()`。
+
+Component meter包括version、projection/tool字段名、容器和ToolCatalog；Frame meter包括version、三个
+section字段名和全部容器。identity、epoch、revision、prepared-against和basis是fixed-size structured
+control metadata，不进入semantic payload meter。JCS object key排序，causal/tool arrays保持规定顺序。
+
+Full reserve按exact公式验证。将使用actual CompleteTranscript replay和actual staged inputs的候选Full中
+`component`替换为JSON `null`：
+
+```text
+full_non_component_bytes = len(JCS(candidate_with_component_null)) - 4
+required_full_bytes = full_non_component_bytes + max_component_bytes
+required_full_bytes <= max_frame_bytes
+```
+
+mount先对空transcript/staging验证；每次TextDelta、ToolCall和ToolOutput admission用候选完整state再次验证，
+Delta也必须证明hypothetical next-Full成立。prepare最后验证actual JCS bytes。checked arithmetic失败、零值、
+Component limit大于Frame limit或初始reserve失败都是typed invalid-profile fault。
+
+port随后独立校验private artifact、真实wire bytes和tokenizer。任何一层超限都是typed pre-handoff fault，
+任何一层都不能静默truncate。
+
+## 4. Target declaration 与 handoff
+
+`TargetDeclaration` 是幂等状态快照：
+
+```rust
+pub struct TargetIdentity(NonZeroU128);
+
+impl TargetIdentity {
+    pub const fn new(value: NonZeroU128) -> Self;
+    pub const fn get(self) -> NonZeroU128;
+}
+
+pub struct TargetDeclaration {
+    identity: TargetIdentity,
+    continuity: TargetContinuity,
+    profile: FrameProfile,
+}
+
+pub enum TargetContinuity {
+    FullRequired { epoch: TargetEpoch },
+    Accepted { epoch: TargetEpoch, revision: FrameRevision },
+}
+```
+
+Application在mount时固定opaque `TargetIdentity`和`FrameProfile`。相同snapshot的重复`declare()`完全
+幂等，不推进state，也不会仅因调用次数使PreparedFrame失效。identity变化或profile变化fail closed；
+同一identity内epoch只能单调推进且不得复用。切换Provider account、Skill session或Plugin parent必须
+创建新的Application，不能继承旧canonical history。
+
+每次成功校验declaration都会同步推进private `highest_observed_epoch`，即使后续prepare或submit在handoff前
+失败也不回滚。后续较低epoch必须在render和submit前fail closed；successful handoff另行推进committed
+delivery epoch，这两个水位不能合并。
+
+Frame携带target identity、epoch、exact `prepared_against` continuity、完整`prepared_profile`和basis。
+port在real delivery前重新校验当前snapshot。Full也不能绕过precondition：从
+`Accepted(epoch, R1)` prepare的canonical-rebase Full若遇到当前`Accepted(epoch, R2)`，必须确定未交付地
+返回`SubmitFault::ContinuityChanged`；profile变化返回`SubmitFault::ProfileChanged`。
+Runtime最多重新declare/reprepare一次；continuity再次变化则返回typed unstable-continuity fault。
+
+### Poll-level cancellation contract
+
+`Ok(stream)` 是唯一public handoff proof，不增加public commit、AcceptedFrame或declaration nonce：
+
+```text
+submit poll -> Pending          Frame确定尚未handoff
+submit poll -> Ready(Err)       Frame确定尚未handoff
+submit poll -> Ready(Ok(stream)) Frame已经handoff
+```
+
+第一个可能造成real或ambiguous delivery的poll必须在同一个poll返回`Ready(Ok(stream))`；跨过boundary后
+不得再次返回Pending。Application在同一个outer poll紧接着执行同步、已预验证、不可失败的private commit，
+两者之间没有`.await`。boundary后的HTTP status、断流、receiver断开或其他fault只能由stream yield。
+
+drop一个返回Pending的submit future必须是零handoff、零FrameSession commit、零receipt consumption。
+drop一个已经成功返回但尚未poll的stream属于post-handoff，不回滚outbound segment或diff baseline。
+drop整个`Application::react()` future时，handoff前取消仍允许之后显式重试；handoff后取消会终止当前
+Application。RAII cancellation guard在future drop时设置terminal state，后续`react()`必须在
+`declare()`、render和submit之前返回typed `CancelledAfterHandoff` fault。v1不把reaction-local lanes
+提升为跨invocation resumable service；继续运行必须创建新的Application/logical target session。
+
+External/Skill adapter可以先异步reserve outbound queue capacity；取得permit后必须在crossing poll同步
+send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame，不是下游业务callback最终读取。
+
+## 5. 一次 reaction
+
+```text
+1. &mut Application acquires single-flight ownership
+2. port.declare() -> identity + continuity + stable profile
+3. validate fixed target/profile and monotonic epoch
+4. reconcile Component -> complete projection + exact bindings
+5. FrameSession.prepare(...)
+     -> select and validate canonical replay view
+     -> lower #[diff]
+     -> close staged ToolOutputs
+     -> validate admission closure and exact budgets
+     -> private PreparedFrame
+6. port.submit(public Frame)
+7. Ready(Ok(stream)) -> synchronous infallible FrameSession commit
+8. run one fact/lane pump
+     -> validate fact
+     -> precompute the optional admitted root ProviderEvent
+     -> commit canonical fact
+     -> dispatch event
+     -> committed ToolCall starts its lane immediately
+     -> poll fact stream and active lanes concurrently
+9. valid terminal + normal EOF -> drain remaining lanes
+10. finalize streaming parsers and dispatch EOF diagnostics
+11. post-reconcile Component state
+12. release gate and return
+```
+
+一次`react()`最多render/submit一个Frame，不自动开始下一次reaction。pre-handoff failure不推进任何
+candidate state；post-handoff HTTP、stream、handler或lane failure不回滚已经handoff的input、已经接纳的
+fact、Component写入或外部副作用。
+
+## 6. ProviderFact 与 canonical admission
+
+port返回的是history可以直接接纳的ordered fact，而不是只有UI含义的event：
+
+```rust
+pub enum ProviderFact {
+    TextDelta {
+        output: ProviderOutputKey,
+        phase: Option<AssistantPhase>,
+        delta: String,
+    },
+    TextSealed {
+        output: ProviderOutputKey,
+        phase: Option<AssistantPhase>,
+        text: String,
+    },
+    ToolCall {
+        output: ProviderOutputKey,
+        ordinal: u64,
+        call: ProviderToolCall,
+    },
+    ReactionCompleted {
+        primary_text: Option<ProviderOutputKey>,
+    },
+}
+```
+
+`ProviderOutputKey` 是reaction-local、provider-neutral identity。`ProviderFactStream`的yield顺序也是
+canonical publication顺序：一个key的first fact固定其output position；后续交错facts保持该position。
+如果Provider wire以不同顺序完成output，adapter必须在yield前buffer/reorder，不能把private arrival order
+泄漏成不确定的canonical history。一个fact最多投影出一个Component event：
+
+| Fact | Canonical admission | Component event |
+|---|---|---|
+| `TextDelta` | append partial | `TextDelta` |
+| `TextSealed` | validate accumulated text and seal | none |
+| `ToolCall` | register completed call and ordinal | `ToolCall` |
+| completed with `Some(key)` | validate sealed primary output | derive `TextComplete` from sealed text |
+| completed with `None` | validate no-primary-text completion | none |
+
+Runtime对每个fact执行`validate -> precompute event -> canonical commit -> dispatch`。Event不得先被
+Observer或Component看见，之后才写history；handler fault不回滚已经commit的fact。
+
+terminal/ordering grammar固定如下：
+
+- 一个output key标识一个lifecycle；first fact固定kind和canonical position，同一key不能在text与
+  ToolCall之间复用；
+- text lifecycle可以包含多个delta和一个seal；所有fact的AssistantPhase必须exact相同；没有delta时
+  `TextSealed`可以作为first fact并直接建立sealed text；
+- seal恰好一次并校验accumulated text，seal后不能再delta；
+- 每个ToolCall key只出现一次，ordinal在ToolCall facts中唯一且严格递增；private/non-tool output可以造成
+  gap，ordinal不能直接当Vec index；
+- v1最多一个non-commentary text lifecycle；存在时primary key必须引用它，不存在时必须是None；None允许
+  tool-only或empty completion，不伪造空文本；
+- ReactionCompleted恰好一次且是最后一个fact。duplicate completion、post-terminal item、unknown/unsealed
+  primary key、open text和normal EOF without terminal都是protocol fault。
+
+Built-in target capability在v1仍可比公共fact grammar更窄。Chat Completions target当前是text-only：
+非空`ToolCatalog`必须在handoff前typed reject，上游返回tool call也必须作为terminal upstream rejection；
+这不表示Responses或公共`ReactionPort`失去ToolCall能力。`FrameCapabilities`尚未表达tool support，后续若让
+Chat支持streamed tool calls，必须先扩展mount-stable capability negotiation，不能静默改变现有profile。
+
+异常EOF、stream fault或reaction future drop不能依赖adapter再yield Abort。Runtime的RAII canonical
+guard独占一份已经验证的transaction buffer；每个可见TextDelta发布前，buffer中对应item已经是
+`AssistantTextStatus::Interrupted`，seal只原位改成`Sealed`。正常完成或Drop只做不可失败、无重新验证的
+buffer归还，因此secondary admission ledger损坏也不能丢弃已发布tail。partial只有在exact interrupted
+replay可以通过admission budget时才能发布，port lowering必须把interrupted状态编码成target可理解的
+assistant text加中断边界，或fail closed。
+
+### Required port-private causal state
+
+encrypted reasoning、remote compaction和某些protocol correlation虽然不进入public fact或canonical
+transcript，却可能是下一次合法wire continuation必需的因果artifact。port必须按provider output顺序
+seal/abort并保留它们。未sealprivate output可以丢弃；已经seal的artifact不因随后stream fault回滚。
+
+port只有在具备content-independent recovery strategy并仍保留其required private state时，才能推进epoch
+并声明FullRequired；declare阶段不证明某个canonical Full payload合法。收到exact Full后，port才在
+crossing poll前联合验证canonical payload、required private state、wire bytes和token limit。required
+artifact丢失后只能执行provider-defined、已验证的stateless rebuild，或fail closed；generic Full不是
+万能恢复。request scratch、cache hint、SSE framing和connection state等disposable state可以重建。
+如果opaque compaction可能覆盖replaceable System instructions，它的recovery proof还必须绑定生成时的
+normalized System snapshot；System change/clear不能仅凭ordinary canonical prefix相同就复用旧artifact。
+
+## 7. ToolCall lanes
+
+ToolCall 使用独立的 per-call lane：
+
+- lane key是`call_id`；
+- fact完整校验并写入canonical history后才dispatch/start lane；
+- lane启动后fact stream pump立即继续；不同call lanes可以并发；
+- 同一lane和所有history mutation严格保序；
+- lane result按call identity隔离，ToolOutput按Provider ToolCall ordinal staging；
+- valid provider terminal和EOF后，Runtime等待所有已启动lanes完成；
+- 下一Frame必须闭合当前全部pending ToolCall，不能先提交无关input。
+
+ToolOutput不是ProviderFact。handler完成时它只进入FrameSession staging；下一次successful Frame handoff才
+把它作为outbound canonical input commit。local prepare或pre-handoff submit failure不能消费receipt；
+successful handoff只消费一次。
+
+Provider stream与active lanes必须在同一个pump中并发推进，不能先读完整stream再启动tools。后续断流或
+终态校验失败不会撤销已经完成的ToolCall副作用或已经组装的ToolOutput。
+
+## 8. 应用编排与 frontend
+
+### External driver owns scheduling
+
+AgentView不提供framework-owned AgentLoop、public Reactor trait、ReactionHandle或Frame scheduling stream。
+external driver根据自己的timer、channel、CLI request、parent invocation或policy决定何时调用：
+
+```rust
+application.react().await?;
+```
+
+`react()`完成一整个structured reaction并返回。Signal dirty、Provider EOF、读取latest和command名称都
+不会自动调用它。Agent、Skill和Plugin共用Application/FrameSession/ReactionPort kernel，但不共享一个
+万能wait loop。
+
+| Integration | driver waits for | ReactionPort handoff |
+|---|---|---|
+| Autonomous Agent | timer、policy、external request或Component demand | model transport accepts request |
+| Skill reaction | explicit invocation | owned observation queue accepts Frame |
+| Plugin | parent-agent invocation | plugin protocol accepts Frame |
+
+Plugin多parent由外层registry持有多个独立Application。一个port不能切换parent identity并继续使用旧
+FrameSession。
+
+### Component entry and demand
+
+high-level application frontend只有一个普通、无root props的Component definition：
+
+```rust
+#[component]
+fn chess_agent() -> Component {
+    // use_signal, provider-event handlers and Component-scoped async primitives
+}
+```
+
+启动配置由root closure捕获或向普通子Component传props；低层`ComponentHost<Props>`仍可保留显式props
+embedding API。root不返回framework completion/program类型，也不需要`ChessApplication`、
+`ComponentAgent`或`ApplicationReducer` trait。业务reducer是普通函数，由handler调用并写Signal。
+
+Autonomous Agent需要一条mount-fenced Component-to-driver demand channel，但它表达的只是“至少需要一个
+更晚turn”，不是Continue/Sleep/Stop policy：
+
+```rust
+let reaction = use_reaction_request();
+
+// A handler or Component-owned task first publishes its state, then requests
+// at least one later driver turn.
+state.set(next)?;
+reaction.request()?;
+```
+
+- demand在driver真正wait前后都sticky，不丢通知；
+- 多个尚未满足的demand可以coalesce；
+- handle绑定mount generation，旧mount不能唤醒新mount；
+- 先写Signal再request，下一Frame必须包含该state；
+- `request()`不重入当前reaction，也不直接render或submit；
+- 没有Application orchestration capability的低层Host调用该hook时触发Component contract panic；render
+  candidate不publish。
+
+`use_reaction_request()`只返回这一项capability；不能恢复`use_loop()`或让Component直接控制通用host
+lifecycle。
 
 ### Skill / CLI frontend
 
-Skill 模式没有框架保留的 `observe` 或通用 `act` subcommand。裸调用 CLI 只返回最新 committed
-rendering；其他操作是 mounted Component 定义的 subcommands：
+Skill的普通frontend与reaction exchange分开：
 
 ```text
-agentview                       -> latest committed rendering
-agentview <subcommand> <args>   -> Component-defined operation, then latest committed rendering
+agentview                       -> latest committed projection
+agentview <subcommand> <args>   -> typed Component operation, then latest projection
+explicit reaction invocation    -> Application<SkillPort>::react()
 ```
 
-读取 latest、调用 subcommand 和返回 CLI output 本身都不驱动 render 或下一次 reaction。subcommand
-handler 可以更新 Signal、提交 task 或显式使用 `use_loop()`；正常循环是否推进仍由 Component 决定。
-subcommand 的具体声明语法、参数 schema 和调度形式留到 frontend command API 单独设计。
+latest只读，不render、不submit。typed subcommand可以更新Signal并按需要发出driver demand，但它本身不是
+ProviderFact，也不隐式开始reaction。只有明确的reaction invocation进入SkillPort exchange；delayed act
+必须绑定active adapter ingress generation。stream结束或drop后late act明确返回stale，不能进入下一轮。
 
-### `use_provider_event_handler()`
+Plugin message遵守同一reaction-local stale fence；correlation属于adapter protocol，不恢复public core
+`FrameId`。
 
-Provider Event handler 在 `view!` 外声明。`view!` 只描述交给 ProviderPort 的完整 projection，不包含
-listener node：
+### Declarative provider event handler
+
+Provider event handler在`view!`外声明；`view!`只描述完整projection。目标authoring shape是：
 
 ```rust
-#[component]
-fn chess_agent(props: ChessAgentProps) -> Component {
-    let ChessAgentProps { initial_state, board } = props;
-    let state = use_signal(move || initial_state);
-    let event_state = state.clone();
-
-    use_provider_event_handler(
-        ProviderEvent::TEXT,
-        move |event| {
-            let state = event_state.clone();
-            async move {
-                state.set(reduce(event))
-            }
-        },
-    );
-
-    view! {
-        chess_board(board)
-    }
-}
-```
-
-selector 决定 callback 接收的具体 typed Event。listener 可能收到多个 Event，因此参数不是一个已经
-创建好的 Future，而是每次调用都创建新 Future 的 callback。概念签名是：
-
-```rust
-pub fn use_provider_event_handler<Event, Handler, HandlerFuture, Error>(
-    selector: ProviderEventSelector<Event>,
-    handler: Handler,
-)
-where
-    Event: Clone + Send + Sync + 'static,
-    Handler: FnMut(Event) -> HandlerFuture + Send + 'static,
-    HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
-    Error: Display + Send + 'static;
-```
-
-`Future` 是异步执行形式，`Result` 是 Future 的输出；二者不是互斥选择。Runtime 必须完整 `await`
-handler Future，并把 returned error 或 panic 作为当前 reaction 的 handler fault。
-
-handler registration 和一次 reaction 的 dispatch binding 是两层不同生命周期：
-
-```text
-MountedProviderEventHandler
-  identity = ComponentId + HookSite + MountGeneration
-  selector + current callback
-  retained across reactions
-            |
-            | bind for each render/reaction generation
-            v
-ReactionProviderEventBinding
-  dispatches only the current ProviderEvent stream
-  dropped when the reaction completes or is cancelled
-```
-
-successful rerender 原子更新 mounted slot 中的 callback capture；失败或 abandoned render 丢弃
-candidate，继续保留上一版 callback。clean Component 没有重复执行时，mounted slot 仍可为下一轮
-生成 binding。Component 从 tree 中卸载或显式 remount 时删除 slot；旧 binding 和旧 callback 不得
-进入新 mount。
-
-同一个 Provider Event 匹配的 handlers 按 Component 结构顺序和 HookSite 顺序串行 `await`。
-Provider Event 是 typed multicast，不引入 DOM `ElementId`、bubbling 或 capture。
-
-公共 authoring API 不暴露 `EventInput`、`EventListener::observe(...)`、`listen_to(...)` 或用户填写的
-listener identity/version。旧 API 可以暂时保留给 streaming XML 和低层兼容路径，等 streaming
-listener 单独设计后再移除。
-
-`#[component]` proc macro 直接识别调用并分配静态 HookSite：
-
-```text
-use_provider_event_handler(selector, callback)
-  -> HookRenderContext::use_provider_event_handler_at(site, selector, callback)
-  -> render transaction stages a mounted-slot candidate
-  -> successful commit updates the mounted handler registry
-  -> ComponentHost derives the current generation's RenderBindings
-```
-
-实现复用现有 typed `AsyncHandler` 的 Future/error/panic 擦除和 dispatch 逻辑，但不要求先公开一个
-通用 `use_hook<T>`。通用 hook kernel 可以以后与 `use_task` 一起评估，不属于本 API 的前置条件。
-
-### `use_loop()`
-
-Component 用一个窄 handle 决定当前 reaction 之后如何推进：
-
-```rust
-let loop_control = use_loop();
-
-loop_control.continue_now();
-loop_control.continue_on_wake();
-```
-
-`continue_now()` 表示当前 reaction 的 stream、handlers、ToolCall lanes 和 cleanup 全部结束后，立即
-开始下一次 reaction；它不允许在当前 handler 内重入 render 或 Provider。
-
-`continue_on_wake()` 表示 cleanup 后停止推进，直到 wake epoch 超过本轮开始时观察到的 epoch。
-Signal 写入本身不满足这个条件。Component 获得的是 decision handle，不是 `AgentLoop`、
-`ApplicationHost` 或一个可任意操作 Host 生命周期的引用。
-
-### `use_task()` 与显式 wake
-
-`use_task()` 提交由 mounted Component 拥有的后台 future。实际提交是 committed handler 中发生的
-effect，不是 render 本身的副作用：
-
-```rust
-let loop_control = use_loop();
-let task = use_task();
-
 use_provider_event_handler(ProviderEvent::TEXT, move |event| {
-    let task = task.clone();
     let state = state.clone();
-    let loop_control = loop_control.clone();
-
-    async move {
-        task.submit(move |wake| async move {
-            let next = run_background_work(event).await;
-            state.set(next)?;
-            wake.wake();
-            Ok(())
-        })?;
-
-        loop_control.continue_on_wake();
-        Ok(())
-    }
+    async move { state.set(reduce(event)) }
 });
 ```
 
-Runtime 为每个 submitted task 提供权限受限的 `TaskWakeHandle`。task 可以在完成前、完成时或长期
-sidecar 的多个进度点调用 `wake.wake()`。`wake()` 只推进所属 Component mount 的 wake epoch；它
-不修改 Signal、不直接 render，也不重入 Provider。task 要把业务结果写入 projection，仍然必须
-显式更新 Signal。
+selector决定callback接收的typed Event；callback每次调用创建一个Future。Runtime完整await Future；returned
+error作为当前reaction handler fault，callback invocation或Future panic原样向caller传播。
 
-task completion 不隐式 wake。这样，不影响 Agent 推进的 maintenance task 可以安静结束，长期
-sidecar 也能精确选择哪些状态变化需要一次新 reaction。
+mounted handler identity是`ComponentId + HookSite + MountGeneration`，跨reaction retained；每次render
+generation派生一次private binding。successful rerender原子更新callback capture；abandoned render保留旧
+slot；unmount删除slot。旧binding不能dispatch到新mount。公共API不暴露`EventInput`、
+`EventListener::observe`、listener identity/version或DOM bubbling/capture。
 
-AgentLoop 在每轮开始时记录 observed epoch。若 task 在 Loop 真正进入等待前调用 `wake()`，本轮
-结束时已经能观察到更大的 epoch，因此立即开始下一轮；若 `wake()` 发生在等待后，watch 通知唤醒
-Loop。多个尚未观察的 wake 可以合并为一次后续 reaction；wake 是状态变化通知，不是任务队列。
+### User panic boundary
 
-`use_task` 的 task 属于 Component mount，而不是某一次 Provider reaction。Component 从 tree 中
-卸载、显式 remount 或 AgentLoop 停止时，Runtime 取消对应 tasks 并使旧 `TaskWakeHandle` 失效；
-旧 task 或旧 wake handle 不能唤醒新的 mount。
+Runtime不在Component root/render、provider-event handler、legacy event listener、native tool handler、streaming
+decoder、engine observer或usage observer外层调用`catch_unwind`。这些user-code panic不转换成typed fault、不吞掉、
+也不通过ErrorBoundary恢复旧Application。正常返回的`Result::Err`仍按各自typed contract处理。
 
-## 8. Unsupported ToolCall
+render candidate、hook topology、listener declaration和task factory仍遵守commit-before-publish；panic unwind时未发布
+candidate由RAII丢弃。这只证明candidate未publish，不构成对任意user side effect、共享`Arc`或live Signal mutation
+的rollback保证。caller若自行catch，必须丢弃该Application以及可能被这次调用触及的可变user资源；继续复用它们
+超出Runtime contract。v1不为这种外部catch建立状态隔离、回滚、恢复或terminalization协议。
 
-正常情况下，Provider request 只暴露当前 Component tree 声明的工具能力。即使 Provider 返回了
-没有可用 Component 的 ToolCall，Engine 也不能伪造 ToolOutput，更不能发送包含裸 ToolCall 的
-下一次请求。
+panic unwind期间Runtime不得再次进入任何user callback或observer；RAII cleanup只销毁reaction-local资源。
+因此panic路径不保证发送terminal/cleanup observation，原panic payload优先。
 
-处理规则是：
+唯一的production panic interception是不能自然跨栈传播的runtime/ownership边界：Tokio把spawned task panic编码为
+`JoinError`，supervisor取回原payload并在outer driver boundary调用`resume_unwind`；Drop catch只允许在正在销毁的
+future/reaction上仲裁primary payload。两者都不得转换成业务`Result`或恢复被处理对象。workspace不覆盖Rust默认
+`panic = "unwind"`profile；未来`extern "C"`边界若存在，必须阻止unwind跨ABI且不能冒充业务恢复。
 
-1. 完整 ToolCall 仍先进入 local history，并登记为 pending；
-2. Runtime 查找匹配 ToolCall Component；
-3. 模型调用了未声明工具时返回 `unsupported_tool_call`；
-4. 工具已经声明但本轮没有绑定 handler 时返回 `tool_binding_missing`；
-5. handler 正常返回但没有产生 ToolOutput 时返回 `tool_output_missing`；
-6. lane panic、取消或执行设施失败时返回对应的 `tool_lane_failure`；
-7. fault 发生后，ProviderPort 不发起下一次 HTTP 请求；当前 open history 不能作为 wire input；
-8. pending ToolCall 不得通过丢弃 continuation、Fresh、插入其他 input 或开始无关回合来绕过；
-9. 若该 call 无法被 Component 回答，本次 Provider session 终止，不能继续调用模型。
+本节冻结的是frame-driven Component/Application Runtime及上面列出的callback。legacy `AgentTurnObserver`的
+post-commit fire-and-forget contract不在本次Phase 8中暗改；它若迁移到同一panic policy，必须先引入可在outer
+boundary取回panic payload的supervised observer owner，不能从Drop启动callback或丢弃Tokio `JoinHandle`。
 
-工具执行失败若属于可表达的业务结果，应由 ToolCall Component 产生明确的失败 ToolOutput；
-基础设施失败才中止 reaction。
+### Component-scoped async lifecycle
 
-## 9. 取消、失败与 remount
+Component通过三种不同生命周期的primitive拥有业务sidecar；它们不属于Provider transport，也不属于一次
+reaction barrier：
 
-取消 reaction 时：
+```rust
+pub fn spawn<F>(future: F) -> Result<(), SpawnError>
+where
+    F: Future<Output = ()> + Send + 'static;
 
-- drop Provider stream；
-- 取消 Runtime 拥有的 pending lane futures；
-- 保留已经提交的 input、已经 item.done 的模型 items 和已经组装的 ToolOutputs；
-- 将尚未 item.done 的 inflight items 标记为 aborted；
-- 保留取消前已经成功的 Signal 写入；
-- 不自动发起重试或下一次模型调用。
+pub fn use_future<Factory, F>(factory: Factory)
+where
+    Factory: FnOnce() -> F + Send + 'static,
+    F: Future<Output = ()> + Send + 'static;
 
-Provider fault、Component handler fault、lane panic 和 terminal handler fault 都必须带明确 stage 和
-reason。清理完成是终止条件的一部分；Provider stream、handler future 和 ToolCall lane 等
-reaction-owned 工作不能遗留到下一次 reaction。`use_task` 提交的工作由 Component mount 拥有，
-不因一次 reaction 正常结束而取消；若 fault 导致 AgentLoop 停止，则随 Loop 一起取消。
+pub fn use_coroutine<Message, Factory, F>(
+    capacity: usize,
+    service: Factory,
+) -> Coroutine<Message>
+where
+    Message: Send + 'static,
+    Factory: FnOnce(CoroutineInbox<Message>) -> F + Send + 'static,
+    F: Future<Output = ()> + Send + 'static;
+```
 
-Component remount 会创建新的 runtime identity。旧 node 的 Provider history 不撤回；新 identity
-作为新的 projection node 参与后续 reconciliation。旧 mount 的 handler、lane 和 Signal handle
-不得写入新 mount；旧 mount 的 tasks 必须取消，旧 `TaskWakeHandle` 不得唤醒新 mount。
+- `spawn`用于一次性工作，只能从已经commit的provider-event handler、`use_future`/`use_coroutine` task或
+  其nested task调用；render期间或没有Component task context时返回typed `SpawnError`；
+- `use_future`是lexical hook。每个mount只调用一次factory并启动一个future；同一mount的rerender不重启，
+  新render传入但未使用的factory被丢弃；
+- `use_coroutine`也是lexical hook。每个mount只启动一个service，并跨rerender保留同一个bounded typed
+  sender。`capacity`是mount-time配置；`send(message).await`提供backpressure，stale/closed rejection归还
+  原message；
+- bootstrap和后续mount使用相同规则：完整projection和hook topology commit后立即注册task。注册本身不poll
+  Component future；supervisor随后异步执行；
+- 第一次task注册把supervisor绑定到当前Tokio runtime identity；后续start、retire、monitor wait和shutdown必须
+  在同一runtime执行。foreign runtime不能向原actor排队；首次检测到identity mismatch就同步fence为`Closed`、
+  关闭retirement waiter并在handoff前失败。owning runtime关闭导致actor future被drop时，RAII finalizer执行同一
+  fail-closed transition。`react()`、blocking demand wait和nonblocking demand take都在读取或消费driver state
+  前经过同一个outer-boundary arbiter；`Closed`不能返回`Ok(false)`或`Ok(true)`，也不能继续declare、render或submit；
+- unmount先关闭该mount的Signal、demand、handler、spawn和coroutine capability，再abort并await全部owned
+  tasks；只有retirement完成后才能发布replacement projection并提交引用新mount的Frame。永久stale authority
+  属于mount共享的`MountFence`：registration持有该fence直到`Start`入队，unmount先invalidate同一fence再发送
+  `Retire`，所以要么`Start`排在`Retire`之前，要么根本不会发送。core mutex串行化发送，actor单一FIFO receiver
+  保留该顺序；retirement完成后core/actor只需删除临时claim，不保留历史`ComponentId` watermark；
+- task正常完成不dirty、不request demand、不render、不submit。需要新turn时task先写Signal，再调用自己捕获的
+  `ReactionRequest::request()`；
+- framework不接管task的普通Result，也不显式`catch_unwind` user future。Component future在内部处理业务成功/
+  失败并写自己的Signal；Tokio task boundary把第一项未捕获task panic作为`JoinError`交给supervisor，后者保留
+  原payload，并在当前正在poll或下一个可用的outer driver boundary直接`resume_unwind`。如果当时
+  没有active driver，payload保留到下一次`react()`、driver demand wait或integration driver调用；
+- `react()`和两个driver demand入口在返回任何既有terminal classification前，必须再次仲裁尚未消费的task
+  panic。fresh payload优先于更早的post-handoff cancellation等typed terminal；payload已经传播后，后续调用只返回
+  task-panic terminal fault，不能二次unwind。最终仲裁之后才发生的panic由下一outer boundary传播；
+- supervisor观察panic后同步发起sibling abort，但不能把sibling drain或destructor完成作为开始unwind的前置条件。
+  unwind前Application进入terminal；caller若主动`catch_unwind`，后续API只允许确定fail closed，不承诺复用。
+  caller随后若consuming shutdown该terminal Application，shutdown仍要join已经abort的tasks并等待destructor，
+  再返回terminal fault；这不能反向阻塞最初的unwind。
 
-## 10. Observability
+hook order/kind是commit topology的一部分；`use_future`、`use_coroutine`与其他hook发生order、kind或count
+drift属于Component contract panic并直接unwind，candidate不publish，已commit mount和tasks保持不变。
+`use_resource`/`use_action`需要额外的
+reactive result与重复action policy，当前不属于本协议。
 
-Observer 观察与 Engine 相同的因果顺序，但不拥有或修改状态。至少应能记录：
+## 9. Unsupported ToolCall
 
-- reaction identity；
-- ProviderEvent ordinal；
-- lane / `call_id`；
+正常Frame只暴露当前Component tree声明的tool capability。即使target返回没有可用Component的ToolCall，
+Engine也不能伪造ToolOutput，更不能发送包含裸pending call的下一Frame。
+
+处理规则：
+
+1. 完整ToolCall先进入canonical history并登记pending；
+2. Runtime查找matching ToolCall Component；
+3. 未声明tool返回`unsupported_tool_call`；
+4. 已声明但本轮无binding返回`tool_binding_missing`；
+5. handler正常返回但无ToolOutput返回`tool_output_missing`；
+6. lane返回错误、取消或执行设施失败返回`tool_lane_failure`；user handler panic直接unwind；
+7. fault后不得提交下一Frame，open history不能作为合法wire input；
+8. pending call不得通过丢continuation、Fresh、context reset或插入无关input绕过；
+9. 无法回答的call终止当前logical target session。
+
+可表达的工具业务失败应由ToolCall Component产生明确失败ToolOutput；基础设施失败才中止reaction。
+
+## 10. 取消、失败与 remount
+
+取消发生在handoff前时，drop Pending submit future不推进任何state。取消发生在handoff后时：
+
+- drop fact stream和reaction-local bindings；
+- 取消Runtime拥有的pending lane futures；
+- 保留已经handoff的input、已经接纳或seal的facts和已经组装的ToolOutputs；
+- RAII guard把open public partial标记interrupted/aborted；
+- port按自己的guard处理已经seal或尚未seal的private output；
+- 保留取消前成功的Signal写入和不可逆外部副作用；
+- 将当前Application标记terminal；后续`react()`在declare/render/submit前fail closed；
+- 不自动retry、Full或开始下一reaction。需要继续运行时由外部driver创建新的Application。
+
+port fault、Component handler returned fault、lane returned fault和terminal fault必须带明确stage/reason；
+user panic不分类为fault。清理完成是终止
+条件的一部分；fact stream、handler future和reaction-owned lanes不能遗留到下一轮。Component-scoped
+long-lived tasks属于mount，正常reaction结束不取消；unmount或Application teardown时必须cancel并await。
+
+每个持有Application的production integration必须提供consuming async shutdown；普通Rust `Drop`只允许作为
+emergency best-effort abort，不能证明cleanup完成。External shutdown在API调用时立即把唯一owner移入专用cleanup
+task：先cancel并join active reaction、取回Application，再fence mounts并abort + await全部Component tasks。
+丢弃shutdown waiter不取消这个cleanup owner。CLI/daemon只能在该cleanup完成后回复shutdown成功；typed cleanup
+failure回复错误，不能先ACK再Drop state。Agent、Skill或Plugin在形成production Application owner时必须复用同一
+lifecycle contract，crate-private port role本身不是Application owner。
+
+Component remount创建新runtime identity。旧canonical facts不撤回；新identity作为新projection node参与
+后续reconciliation。旧mount的handler、lane、Signal、task和demand handle不能写入或唤醒新mount。
+
+## 11. Observability
+
+Observer观察与Engine相同的因果顺序，但不拥有或修改state。至少记录：
+
+- reaction identity、TargetIdentity、epoch和FrameRevision；
+- declaration结果、Full/Delta basis和handoff boundary；
+- ProviderFact/output ordinal与lane/call identity；
 - input submitted、partial committed、item sealed/aborted；
-- handler started/completed、ToolCall pending/closed；
-- wire snapshot accepted 或 blocked；
-- terminal stage、reason 和 cleanup outcome。
+- handler/lane started/completed和ToolCall pending/closed；
+- canonical budget与provider wire gate accepted/blocked；
+- terminal stage、reason和cleanup outcome。
 
-Event 不得先被 Observer 或 Component 看见、之后才写 local history。日志中的
-`response.completed` 只能表示 Provider terminal frame 已校验，不能把它写成整个 history 的
-commit。
+Fact不得先被Observer或Component看见、之后才commit canonical history。Provider的
+`response.completed`只表示adapter terminal frame已经校验，不能记录成整个history或reaction commit。
 
-## 11. 必须保持的不变量
+## 12. 必须保持的不变量
 
-1. Component state 是业务权威；Provider history 是私有、可丢弃的 execution context。
-2. 公共 ProviderPort 只接收完整 projection，只输出 provider-neutral Event stream。
-3. 每个 partial ProviderEvent 发布前，对应 partial record 已经提交到 local history。
-4. local history 可以暂时 open；wire snapshot 必须始终可以直接发送给具体 Provider。
-5. 任何下一次 Responses 请求都必须回答当前全部 pending ToolCall；不得把回答推迟到后续回合。
-6. 不同 ToolCall lanes 可以并发；同一 lane 和 history mutation 必须保序。
-7. Provider EOF 不等于 reaction 完成；所有 lanes、terminal handlers 和必要输出都必须完成。
-8. input 在 request submission 时推进；model output 的每个 visible partial 在 Event 发布前推进；
-   item done 只负责 sealed；ToolOutput 只在下一次 Input Gate handoff 的有序 submission 中推进。
-9. `response.completed`、normal EOF 和 Component reaction success 都不是 history commit gate。
-10. timeout、断流、取消和业务失败不回滚已经推进的 local history。
-11. ApplicationHost 不回滚已成功的 Component state 或外部副作用。
-12. 同一次 reaction 不自动 rerender，也不自动再次调用 Provider。
-13. Provider-specific response id、wire item 和 cache state 不得泄漏到 Component authoring API。
-14. AgentLoop 只根据 Component 显式给出的 `continue_now`，或 `continue_on_wake` 后观察到的新 wake，
-    推进下一次 reaction。
-15. Signal dirty、reaction disposition 和 wake epoch 是三个独立状态；任何一个都不能冒充另外两个。
-16. task completion 不隐式 wake；只有有效 `TaskWakeHandle::wake` 推进对应 mount 的 wake epoch。
-17. 每次交给 ProviderPort 的 projection 都是完整 projection；dirty tracking 只能用于内部 render 优化。
-18. Provider Event handler slot 属于 Component mount；每轮 dispatch binding 只属于当前 reaction generation。
-19. Skill / CLI 读取 latest 和调用 Component subcommand 都不隐式 render，也不拥有正常 loop policy。
+1. Component state是业务权威；canonical transcript是shared causal truth；Provider private continuation
+   不是业务数据库。
+2. `RenderedProjection`始终完整；dirty tracking只能用于内部reconcile优化。
+3. 一个Application固定一个logical target、一个FrameSession和一个ReactionPort；不公开替换port或mutable
+   session API。
+4. `declare()`是幂等snapshot read；相同declaration不推进state或invalidate Frame。
+5. TargetIdentity和FrameProfile在mount期间稳定；epoch在同一identity内单调且不得复用。
+6. Frame prepare不推进history、revision、diff baseline或ToolOutput receipt。
+7. submit返回Pending/Err都证明未handoff；crossing poll必须同poll Ready(Ok)。
+8. successful submit后的private commit同步、不可失败且无await；post-handoff fault不回滚。
+9. Full/Delta由private FrameSession决定；port不能读取complete checkpoint或自行重算semantic diff。
+10. matching head只是Delta必要条件；v1 replay view必须append-compatible，non-append view在缺少
+    occurrence provenance时fail closed；未来provenance-bearing replacement必须Full。scope变化会把旧scope
+    provider occurrences和未reconcile canonical tail转为持久ambiguity fence，value-only跨scope claim
+    必须typed fail closed。
+11. Component envelope、total canonical Frame和provider wire/token limits分别检查，且都不truncate。
+12. 每个visible fact先commit canonical history，再dispatch Component event。
+13. normal EOF必须有且只有一个valid ReactionCompleted；EOF本身不等于reaction成功。
+14. partial admission必须保证interrupted replay可编码；fault/drop物化已经发布的实际文本和中止事实。
+15. required port-private causal artifact不是可丢cache；丢失后只有proven rebuild或fail closed。
+16. ToolCall commit后立即启动lane；fact stream和lanes并发推进，不同lanes可以并发但mutation保序。
+17. ToolOutput只在下一Frame successful handoff时作为ordered input commit，receipt只消费一次。
+18. 下一Frame必须闭合全部pending ToolCall，不能以Fresh、Full或context reset绕过。
+19. 一次`react()`最多handoff一个Frame，不自动rerender、retry或开始下一reaction。
+20. Signal dirty、读取latest、Provider EOF和task completion都不自动调用`react()`。
+21. external driver拥有when-to-react policy；Component demand只表达sticky demand，不表达host disposition。
+22. Skill latest/subcommand不隐式render或react；late act/plugin message不能越过ingress generation。
+23. cancellation不回滚已commit Component state、canonical fact、sealed private artifact或外部副作用。
+24. mounted handler/task/demand capability受mount generation fence，旧mount不能影响新mount；unmount先fence，
+    再abort并await tasks，之后才能发布replacement projection。
+25. pre-handoff `react()` cancellation可重试；post-handoff `react()` cancellation终止Application，后续
+    `react()`不得再次declare、render或submit。
+26. Runtime不catch或吞掉Component/render/handler/tool/parser/observer panic。Tokio task panic是唯一无法自然跨栈
+    的user-code例外：必须在当前/下一outer driver boundary用原payload直接stack unwind。sibling abort立即发起，
+    但drain不能阻塞unwind。caller自行catch任何user panic后都不能恢复Application的业务执行，并必须丢弃可能已
+    mutate的user资源；Runtime不提供poisoned-state recovery。task panic在resume前额外把Application标记terminal，
+    仅允许后续API确定fail closed或consuming shutdown，不能重复传播、declare、render或handoff。
+27. task supervisor第一次启动actor后固定Tokio runtime identity；foreign/terminated runtime必须在下一次driver
+    observation或task operation时确定`Closed`，不能继续handoff或留下永久Pending retirement。
+28. production owner的shutdown acknowledgement必须发生在active reaction join、mount fence和全部task destructor
+    完成之后；取消shutdown waiter不能取消已经取得唯一Application ownership的cleanup。
 
-## 12. 非目标
+## 13. 非目标
 
 本文不规定：
 
 - Chess、裁判或其他业务领域规则；
-- 某个 ToolCall 的业务 schema 和执行实现；
-- LiteLLM 的内部 cache/session 命名；
-- UI 展示格式、JSONL 字段全集或测试计划；
+- 某个ToolCall的业务schema和执行实现；
+- concurrent multi-target writers、multi-checkpoint delta、fork或durable session recovery；
+- public mutable history/session API；
+- framework-owned AgentLoop、public Reactor trait或Component-owned scheduling policy；
+- task retry/backoff、durable jobs、unbounded coroutine inbox或resource/action最终API；
+- Skill subcommand schema、Plugin multiplexing wire syntax或UI/JSONL展示格式；
 - 实现顺序、迁移进度和发布里程碑。

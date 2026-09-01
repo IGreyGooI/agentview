@@ -1,30 +1,44 @@
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Condvar, Mutex,
+use std::{
+    future::Future,
+    num::{NonZeroU128, NonZeroU64},
+    panic::AssertUnwindSafe,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    task::{Context, Poll},
 };
 
-use crate::component::{prelude::*, ComponentHost};
-use futures::StreamExt;
+use crate::component::{
+    authoring::{InternalEventInput as EventInput, InternalEventListener as EventListener},
+    prelude::*,
+};
+use futures::{task::noop_waker, FutureExt, StreamExt};
 use tokio::sync::Notify;
 
 use super::{
-    super::{ApplicationHostFault, ProviderEvent, ProviderFault},
-    external_provider_events, ExternalAct, ExternalApplication, ExternalApplicationFault,
-    ExternalObservationKind, ExternalReaction, ExternalReactionState,
-    MAX_EXTERNAL_PROTOCOL_WIRE_BYTES, MAX_EXTERNAL_TEXT_BYTES,
+    ExternalAct, ExternalApplication, ExternalApplicationFault, ExternalControlFault,
+    ExternalObservationKind, ExternalProviderPort, ExternalSubmitBarrier,
+    MAX_EXTERNAL_PROTOCOL_FRAMES, MAX_EXTERNAL_PROTOCOL_WIRE_BYTES, MAX_EXTERNAL_TEXT_BYTES,
+};
+use crate::component::execution::{
+    application::{Application, ApplicationFault},
+    reaction::{
+        Frame, FrameBasis, FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact,
+        ReactionPort, ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason,
+        SubmitFault, TargetDeclaration, ToolCatalog,
+    },
+    ProviderEvent, ProviderFault,
 };
 
 #[derive(Clone)]
 struct ExternalProps {
     values: Arc<Mutex<Vec<String>>>,
     log: Arc<Mutex<Vec<String>>>,
-    renders: Arc<AtomicUsize>,
+    handler_started: Arc<Notify>,
+    handler_release: Arc<Notify>,
     pending_drops: Arc<AtomicUsize>,
-    first_started: Arc<Notify>,
-    first_release: Arc<Notify>,
-    block_next_render: Arc<AtomicBool>,
-    render_started: Arc<Notify>,
-    render_release: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl ExternalProps {
@@ -32,91 +46,153 @@ impl ExternalProps {
         Self {
             values: Arc::new(Mutex::new(Vec::new())),
             log: Arc::new(Mutex::new(Vec::new())),
-            renders: Arc::new(AtomicUsize::new(0)),
+            handler_started: Arc::new(Notify::new()),
+            handler_release: Arc::new(Notify::new()),
             pending_drops: Arc::new(AtomicUsize::new(0)),
-            first_started: Arc::new(Notify::new()),
-            first_release: Arc::new(Notify::new()),
-            block_next_render: Arc::new(AtomicBool::new(false)),
-            render_started: Arc::new(Notify::new()),
-            render_release: Arc::new((Mutex::new(false), Condvar::new())),
         }
     }
 }
 
-struct PendingHandlerDrop {
-    drops: Arc<AtomicUsize>,
+#[derive(Clone)]
+struct LateTaskPanicProps {
+    external: ExternalProps,
+    starts: Arc<AtomicUsize>,
+    release: Arc<Notify>,
+    sibling_dropped: Arc<AtomicBool>,
 }
 
-impl Drop for PendingHandlerDrop {
+struct LateTaskPanicSiblingDrop(Arc<AtomicBool>);
+
+impl Drop for LateTaskPanicSiblingDrop {
     fn drop(&mut self) {
-        self.drops.fetch_add(1, Ordering::SeqCst);
+        self.0.store(true, Ordering::Release);
     }
 }
 
 #[component]
-fn external_application(props: ExternalProps, events: EventInput<ProviderEvent>) -> Component {
-    props.renders.fetch_add(1, Ordering::SeqCst);
-    if props.block_next_render.swap(false, Ordering::SeqCst) {
-        props.render_started.notify_one();
-        let (released, release) = &*props.render_release;
-        let mut released = released.lock().unwrap();
+fn late_task_panic_root(props: LateTaskPanicProps, events: EventInput<ProviderEvent>) -> Component {
+    let primary_starts = Arc::clone(&props.starts);
+    let release = Arc::clone(&props.release);
+    use_future(move || async move {
+        primary_starts.fetch_add(1, Ordering::AcqRel);
+        release.notified().await;
+        panic!("external late Component task panic");
+    });
+
+    let sibling_starts = Arc::clone(&props.starts);
+    let sibling_dropped = Arc::clone(&props.sibling_dropped);
+    use_future(move || async move {
+        let _drop = LateTaskPanicSiblingDrop(sibling_dropped);
+        sibling_starts.fetch_add(1, Ordering::AcqRel);
+        std::future::pending::<()>().await;
+    });
+
+    external_root(props.external, events)
+}
+
+struct PendingHandlerDrop(Arc<AtomicUsize>);
+
+impl Drop for PendingHandlerDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct ShutdownTaskDrop {
+    dropped: Arc<AtomicBool>,
+    gate: Arc<ShutdownDropGate>,
+}
+
+impl Drop for ShutdownTaskDrop {
+    fn drop(&mut self) {
+        self.gate.entered.store(true, Ordering::Release);
+        let mut released = self.gate.released.lock().unwrap();
         while !*released {
-            released = release.wait(released).unwrap();
+            released = self.gate.changed.wait(released).unwrap();
+        }
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+
+struct ShutdownDropGate {
+    entered: AtomicBool,
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl ShutdownDropGate {
+    fn new() -> Self {
+        Self {
+            entered: AtomicBool::new(false),
+            released: Mutex::new(false),
+            changed: Condvar::new(),
         }
     }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct ShutdownProps {
+    exported: Arc<Mutex<Option<Signal<bool>>>>,
+    started: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+    gate: Arc<ShutdownDropGate>,
+}
+
+#[component]
+fn shutdown_root(props: ShutdownProps, _events: EventInput<ProviderEvent>) -> Component {
+    let visible = use_signal(|| true);
+    *props.exported.lock().unwrap() = Some(visible);
+    let started = Arc::clone(&props.started);
+    let dropped = Arc::clone(&props.dropped);
+    let gate = Arc::clone(&props.gate);
+    use_future(move || async move {
+        let _drop = ShutdownTaskDrop { dropped, gate };
+        started.store(true, Ordering::Release);
+        std::future::pending::<()>().await;
+    });
+    view! { shutdown_root { "mounted" } }
+}
+
+#[component]
+fn external_root(props: ExternalProps, events: EventInput<ProviderEvent>) -> Component {
     let rendered_values = format!("{:?}", *props.values.lock().unwrap());
-    let first_log = Arc::clone(&props.log);
-    let first_values = Arc::clone(&props.values);
+    let values = Arc::clone(&props.values);
+    let log = Arc::clone(&props.log);
+    let handler_started = Arc::clone(&props.handler_started);
+    let handler_release = Arc::clone(&props.handler_release);
     let pending_drops = Arc::clone(&props.pending_drops);
-    let first_started = Arc::clone(&props.first_started);
-    let first_release = Arc::clone(&props.first_release);
-    let second_log = Arc::clone(&props.log);
-    let text = events.select(ProviderEvent::TEXT);
-    let second_text = text.clone();
 
     view! {
         #[system_once]
         protocol { "External protocol." }
         state { "{rendered_values}" }
         {
-            EventListener::observe("test.external.first", "v1")
-                .listen_to(text)
+            EventListener::observe("test.external.text", "v1")
+                .listen_to(events.select(ProviderEvent::TEXT))
                 .on_event(move |event| {
-                    let log = Arc::clone(&first_log);
-                    let values = Arc::clone(&first_values);
+                    let values = Arc::clone(&values);
+                    let log = Arc::clone(&log);
+                    let handler_started = Arc::clone(&handler_started);
+                    let handler_release = Arc::clone(&handler_release);
                     let pending_drops = Arc::clone(&pending_drops);
-                    let started = Arc::clone(&first_started);
-                    let release = Arc::clone(&first_release);
                     async move {
-                        let (kind, value) = event_parts(event);
-                        log.lock()
-                            .unwrap()
-                            .push(format!("{kind}:{value}:first:start"));
-                        let _pending_drop = PendingHandlerDrop {
-                            drops: pending_drops,
+                        let (kind, value) = match event {
+                            TextTurnEvent::TextDelta(text) => ("delta", text),
+                            TextTurnEvent::TextComplete(text) => ("complete", text),
                         };
+                        log.lock().unwrap().push(format!("{kind}:{value}:start"));
+                        let _pending = PendingHandlerDrop(pending_drops);
                         if value == "blocked" {
-                            started.notify_one();
-                            release.notified().await;
+                            handler_started.notify_one();
+                            handler_release.notified().await;
                         }
                         values.lock().unwrap().push(value.clone());
-                        log.lock()
-                            .unwrap()
-                            .push(format!("{kind}:{value}:first:end"));
-                        Ok::<(), std::convert::Infallible>(())
-                    }
-                })
-        }
-        {
-            EventListener::observe("test.external.second", "v1")
-                .listen_to(second_text)
-                .on_event(move |event| {
-                    let log = Arc::clone(&second_log);
-                    async move {
-                        let (kind, value) = event_parts(event);
-                        log.lock()
-                            .unwrap()
-                            .push(format!("{kind}:{value}:second"));
+                        log.lock().unwrap().push(format!("{kind}:{value}:end"));
                         Ok::<(), std::convert::Infallible>(())
                     }
                 })
@@ -124,11 +200,166 @@ fn external_application(props: ExternalProps, events: EventInput<ProviderEvent>)
     }
 }
 
-fn event_parts(event: TextTurnEvent) -> (&'static str, String) {
-    match event {
-        TextTurnEvent::TextDelta(text) => ("delta", text),
-        TextTurnEvent::TextComplete(text) => ("complete", text),
-    }
+fn wrapper(props: &ExternalProps) -> ExternalApplication {
+    let props = props.clone();
+    ExternalApplication::new_with_event_input(move |events| external_root(props.clone(), events))
+        .unwrap()
+}
+
+type ShutdownWaiter =
+    Pin<Box<dyn Future<Output = Result<(), ExternalApplicationFault>> + Send + 'static>>;
+
+#[test]
+fn shutdown_waiter_fails_closed_when_moved_before_cleanup_is_polled() {
+    let runtime_a = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime_b = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let waiter: ShutdownWaiter = {
+        let _runtime = runtime_a.enter();
+        let props = ExternalProps::new();
+        Box::pin(wrapper(&props).shutdown())
+    };
+
+    let outcome = runtime_b.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_millis(100), waiter).await
+    });
+    assert!(matches!(
+        outcome,
+        Ok(Err(ExternalApplicationFault::ShutdownTaskFailed))
+    ));
+
+    runtime_a.block_on(async {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
+#[test]
+fn shutdown_waiter_fails_closed_when_moved_after_cleanup_is_pending() {
+    let runtime_a = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runtime_b = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cleanup_pending = Arc::new(Notify::new());
+    let reaction_release = Arc::new(Notify::new());
+    let pending_probe = Arc::clone(&cleanup_pending);
+    let reaction_gate = Arc::clone(&reaction_release);
+    let mut waiter: ShutdownWaiter = {
+        let _runtime = runtime_a.enter();
+        let props = ExternalProps::new();
+        let mut external = wrapper(&props);
+        let owner = external.owner.take().unwrap();
+        let (cancellation, cancelled) = tokio::sync::oneshot::channel();
+        external.reaction = Some(super::ExternalReaction {
+            state: super::ExternalReactionState::AwaitingObservation,
+            cancellation: Some(cancellation),
+            task: tokio::spawn(async move {
+                let _ = cancelled.await;
+                pending_probe.notify_one();
+                reaction_gate.notified().await;
+                super::ExternalReactionCompletion {
+                    owner,
+                    outcome: super::ExternalReactionOutcome::Cancelled,
+                }
+            }),
+        });
+        Box::pin(external.shutdown())
+    };
+
+    runtime_a.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cleanup_pending.notified(),
+        )
+        .await
+        .expect("cleanup must wait for the held reaction");
+        std::future::poll_fn(|context| {
+            assert!(matches!(waiter.as_mut().poll(context), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+    });
+
+    let outcome = runtime_b.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_millis(100), waiter).await
+    });
+    assert!(matches!(
+        outcome,
+        Ok(Err(ExternalApplicationFault::ShutdownTaskFailed))
+    ));
+
+    reaction_release.notify_one();
+    runtime_a.block_on(async {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_shutdown_waiter_still_fences_and_drains_an_active_application() {
+    let exported = Arc::new(Mutex::new(None));
+    let started = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(ShutdownDropGate::new());
+    let props = ShutdownProps {
+        exported: Arc::clone(&exported),
+        started: Arc::clone(&started),
+        dropped: Arc::clone(&dropped),
+        gate: Arc::clone(&gate),
+    };
+    let mut external = ExternalApplication::new_with_event_input(move |events| {
+        shutdown_root(props.clone(), events)
+    })
+    .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bootstrap task must start");
+    let observation = external.observe().await.unwrap();
+    let ingress = observation.ingress_generation();
+    let control = external.control();
+    let visible = exported.lock().unwrap().clone().unwrap();
+
+    let shutdown = external.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !gate.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cleanup must reach the mount task destructor");
+    assert!(matches!(visible.set(false), Err(SignalAccessError::Stale)));
+    assert_eq!(
+        control.complete(ingress).await,
+        Err(ExternalControlFault::StaleIngress),
+        "Application shutdown must begin only after the active reaction has returned its owner"
+    );
+    assert!(!dropped.load(Ordering::Acquire));
+    drop(shutdown);
+    gate.release();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !dropped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cleanup must outlive its cancelled waiter and drain the mount task");
 }
 
 fn text_protocol(events: Vec<TextTurnEvent>) -> ExternalAct {
@@ -143,140 +374,360 @@ fn json_lines_protocol(lines: &[&str]) -> ExternalAct {
     ExternalAct::__from_cli_json_lines(lines.join("\n"))
 }
 
-fn wrapper(props: &ExternalProps) -> ExternalApplication<ExternalProps> {
-    ExternalApplication::new(ComponentHost::new(external_application, props.clone()))
-}
-
-#[derive(Clone)]
-struct TerminalProps {
-    renders: Arc<AtomicUsize>,
-    finishes: Arc<AtomicUsize>,
-}
-
-#[component]
-fn terminal_application(props: TerminalProps, events: EventInput<ProviderEvent>) -> Component {
-    props.renders.fetch_add(1, Ordering::SeqCst);
-    let finishes = Arc::clone(&props.finishes);
-
-    view! {
-        terminal_protocol { "Return one value element." }
-        {
-            XmlStreamingToolCall::contract("test.external.terminal", "v1")
-                .empty_element("value")
-                .required_attribute::<usize>("number")
-                .exactly_one()
-                .listen_to(events.select(ProviderEvent::TEXT))
-                .on_decoded(|_| async { Ok::<(), std::convert::Infallible>(()) })
-                .on_invalid(|_| async { Ok::<(), std::convert::Infallible>(()) })
-                .on_finish(move || {
-                    let finishes = Arc::clone(&finishes);
-                    async move {
-                        finishes.fetch_add(1, Ordering::SeqCst);
-                        Ok::<(), std::convert::Infallible>(())
-                    }
-                })
-        }
+fn assert_panic_payload(payload: Box<dyn std::any::Any + Send>, expected: &str) {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        assert_eq!(*message, expected);
+        return;
     }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        assert_eq!(message, expected);
+        return;
+    }
+    panic!("unexpected non-string panic payload");
 }
 
-#[tokio::test]
-async fn reaction_task_failure_is_consumed_before_reporting_owner_loss() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
-    let owner = external.owner.take().unwrap();
-    let (cancellation, _cancelled) = tokio::sync::oneshot::channel();
-    external.reaction = Some(ExternalReaction {
-        state: ExternalReactionState::AwaitingObservation,
-        cancellation: Some(cancellation),
-        task: tokio::spawn(async move {
-            let _owner = owner;
-            panic!("external reaction task panic")
-        }),
-    });
-
-    let first = external.observe().await.unwrap_err();
-    assert!(matches!(
-        first,
-        ExternalApplicationFault::ReactionTaskFailed { .. }
-    ));
-
-    let second = external.observe().await.unwrap_err();
-    assert!(matches!(second, ExternalApplicationFault::OwnerUnavailable));
+fn test_frame(declaration: &TargetDeclaration, sequence: u64, payload: &str) -> Frame {
+    let epoch = declaration.continuity().epoch();
+    let revision = FrameRevision::new(
+        NonZeroU128::new(909).unwrap(),
+        declaration.identity(),
+        epoch,
+        NonZeroU64::new(sequence).unwrap(),
+    );
+    let basis = declaration
+        .continuity()
+        .accepted_revision()
+        .map(FrameBasis::DeltaFrom)
+        .unwrap_or(FrameBasis::Full);
+    Frame::from_compiled(
+        revision,
+        declaration.identity(),
+        epoch,
+        declaration.continuity().clone(),
+        declaration.profile().clone(),
+        basis,
+        FrameSubmission::from_compiled(
+            Vec::new(),
+            Vec::new(),
+            ProjectionSubmission::new(Vec::new()),
+            ToolCatalog::new(Vec::new()).unwrap(),
+            payload.as_bytes().to_vec(),
+        ),
+    )
+    .unwrap()
 }
 
-#[tokio::test]
-async fn observe_starts_one_reaction_and_returns_its_rendered_prompt() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
+#[test]
+fn crossing_poll_synchronously_enqueues_the_exact_frame() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, r#"{"exact":"full"}"#);
+    let expected_revision = frame.revision();
+    let mut submission = Box::pin(port.submit(frame));
+    let waker = noop_waker();
+    let mut context = Context::from_waker(&waker);
 
-    let observation = external.observe().await.unwrap();
+    let stream = match submission.as_mut().poll(&mut context) {
+        Poll::Ready(Ok(stream)) => stream,
+        Poll::Ready(Err(fault)) => panic!("crossing poll rejected exact Frame: {fault:?}"),
+        Poll::Pending => panic!("available external queue did not cross in one poll"),
+    };
+    drop(submission);
 
-    assert_eq!(props.renders.load(Ordering::SeqCst), 1);
-    assert_eq!(observation.kind(), ExternalObservationKind::Full);
-    assert_eq!(observation.base_generation(), None);
-    let protocol = observation.content().find("External protocol.").unwrap();
-    let state = observation.content().find("<state>").unwrap();
-    assert!(protocol < state, "projection order must survive rendering");
-    assert!(props.log.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn observe_rolls_over_the_current_reaction_before_returning_the_next_observation() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
-
-    let first = external.observe().await.unwrap();
-    let second = external.observe().await.unwrap();
-
-    assert_eq!(props.renders.load(Ordering::SeqCst), 2);
-    assert_eq!(first.kind(), ExternalObservationKind::Full);
-    assert_eq!(second.kind(), ExternalObservationKind::Delta);
-    assert_eq!(second.base_generation(), Some(first.generation()));
-    assert_ne!(second.generation(), first.generation());
-    assert!(props.log.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn act_dispatches_the_current_output_then_observes_the_updated_application() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
-    let first = external.observe().await.unwrap();
-
-    let next = external.act(completed_text("one")).await.unwrap();
-
-    assert_eq!(props.renders.load(Ordering::SeqCst), 2);
-    assert_eq!(next.kind(), ExternalObservationKind::Delta);
-    assert_eq!(next.base_generation(), Some(first.generation()));
-    assert!(next.content().contains("one"));
+    let observation = futures::executor::block_on(control.next_observation()).unwrap();
+    assert_eq!(observation.frame().revision(), expected_revision);
+    assert_eq!(observation.frame().basis(), FrameBasis::Full);
     assert_eq!(
-        *props.log.lock().unwrap(),
-        [
-            "complete:one:first:start",
-            "complete:one:first:end",
-            "complete:one:second"
-        ]
+        observation.frame().submission().canonical_bytes(),
+        br#"{"exact":"full"}"#
+    );
+    drop(stream);
+}
+
+#[test]
+fn pending_reserve_cancellation_is_zero_handoff_and_zero_acceptance() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let first_declaration = port.declare().unwrap();
+    let first = test_frame(&first_declaration, 1, "first");
+    let first_stream = futures::executor::block_on(port.submit(first)).unwrap();
+    drop(first_stream);
+
+    let pending_declaration = port.declare().unwrap();
+    assert!(pending_declaration
+        .continuity()
+        .accepted_revision()
+        .is_none());
+    let pending = test_frame(&pending_declaration, 2, "must-not-send");
+    let mut submission = Box::pin(port.submit(pending));
+    let waker = noop_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(
+        submission.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    drop(submission);
+
+    assert_eq!(port.declare().unwrap(), pending_declaration);
+    let stale_first = futures::executor::block_on(control.next_observation()).unwrap();
+    assert_eq!(stale_first.content(), "first");
+
+    let retry = test_frame(&pending_declaration, 2, "retry");
+    let retry_stream = futures::executor::block_on(port.submit(retry)).unwrap();
+    let accepted = futures::executor::block_on(control.next_observation()).unwrap();
+    assert_eq!(accepted.content(), "retry");
+    drop(retry_stream);
+}
+
+#[tokio::test]
+async fn receiver_failure_after_queue_acceptance_is_a_stream_fault() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, "accepted");
+    let mut facts = port.submit(frame).await.unwrap();
+
+    drop(control);
+    let fault = facts.next().await.unwrap().unwrap_err();
+    assert_eq!(fault.kind(), ReactionPortFaultKind::Terminal);
+    assert_eq!(fault.code(), ReactionPortFaultCode::Unavailable);
+    assert_eq!(fault.reason(), ReactionPortFaultReason::Declaration);
+    assert!(facts.next().await.is_none());
+    drop(facts);
+    assert_eq!(port.declare().unwrap_err(), fault);
+}
+
+#[test]
+fn dropping_control_before_mount_fails_declaration_without_rendering() {
+    let (port, control) = ExternalProviderPort::new().unwrap();
+    drop(control);
+    let renders = Arc::new(AtomicUsize::new(0));
+    let rendered = Arc::clone(&renders);
+
+    let mounted = Application::mount(
+        move || {
+            rendered.fetch_add(1, Ordering::SeqCst);
+            agentview_derive::view! {}
+        },
+        port,
+    );
+
+    assert!(mounted.is_err());
+    assert_eq!(renders.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn dropping_control_after_completed_reaction_is_sticky_terminal() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, "accepted");
+    let mut facts = port.submit(frame).await.unwrap();
+    let observation = control.next_observation().await.unwrap();
+    control
+        .act(observation.ingress_generation(), completed_text("done"))
+        .await
+        .unwrap();
+    while facts.next().await.is_some() {}
+    drop(facts);
+
+    drop(control);
+
+    let first = port.declare().unwrap_err();
+    let second = port.declare().unwrap_err();
+    assert_eq!(first, second);
+    assert_eq!(first.kind(), ReactionPortFaultKind::Terminal);
+    assert_eq!(first.code(), ReactionPortFaultCode::Unavailable);
+    assert_eq!(first.reason(), ReactionPortFaultReason::Declaration);
+}
+
+#[tokio::test]
+async fn cancelled_claimed_act_is_reported_as_a_stream_fault() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, "accepted");
+    let mut facts = port.submit(frame).await.unwrap();
+    let observation = control.next_observation().await.unwrap();
+    let protocol_started = Arc::new(Notify::new());
+    let started = Arc::clone(&protocol_started);
+    let act = ExternalAct::from_text_protocol(futures::stream::once(async move {
+        started.notify_one();
+        futures::future::pending::<Result<TextTurnEvent, ProviderFault>>().await
+    }));
+    let act_control = control.clone();
+    let act_task =
+        tokio::spawn(async move { act_control.act(observation.ingress_generation(), act).await });
+    protocol_started.notified().await;
+
+    act_task.abort();
+    assert!(act_task.await.unwrap_err().is_cancelled());
+
+    let fault = facts.next().await.unwrap().unwrap_err();
+    assert_eq!(fault.kind(), ReactionPortFaultKind::Retryable);
+    assert_eq!(fault.reason(), ReactionPortFaultReason::StreamTransport);
+    assert!(facts.next().await.is_none());
+    drop(facts);
+
+    let recovered = port.declare().unwrap();
+    assert!(recovered.continuity().accepted_revision().is_none());
+    assert!(
+        recovered.continuity().epoch().get() > declaration.continuity().epoch().get(),
+        "an interrupted ingress must advance target continuity"
     );
 }
 
 #[tokio::test]
-async fn consecutive_act_calls_each_target_the_wrapper_current_reaction() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
-    external.observe().await.unwrap();
+async fn cancelling_the_last_claimed_control_reports_the_sticky_terminal_fault() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, "accepted");
+    let mut facts = port.submit(frame).await.unwrap();
+    let observation = control.next_observation().await.unwrap();
+    let protocol_started = Arc::new(Notify::new());
+    let started = Arc::clone(&protocol_started);
+    let act = ExternalAct::from_text_protocol(futures::stream::once(async move {
+        started.notify_one();
+        futures::future::pending::<Result<TextTurnEvent, ProviderFault>>().await
+    }));
+    let act_task =
+        tokio::spawn(async move { control.act(observation.ingress_generation(), act).await });
+    protocol_started.notified().await;
 
-    let after_one = external.act(completed_text("one")).await.unwrap();
-    let after_two = external.act(completed_text("two")).await.unwrap();
+    act_task.abort();
+    assert!(act_task.await.unwrap_err().is_cancelled());
 
-    assert!(after_one.content().contains("one"));
-    assert!(!after_one.content().contains("two"));
-    assert!(after_two.content().contains("one"));
-    assert!(after_two.content().contains("two"));
-    assert_eq!(after_two.base_generation(), Some(after_one.generation()));
-    assert_eq!(props.renders.load(Ordering::SeqCst), 3);
+    let fault = facts.next().await.unwrap().unwrap_err();
+    assert_eq!(fault.kind(), ReactionPortFaultKind::Terminal);
+    assert_eq!(fault.code(), ReactionPortFaultCode::Unavailable);
+    assert_eq!(fault.reason(), ReactionPortFaultReason::Declaration);
+    assert!(facts.next().await.is_none());
+    drop(facts);
+    assert_eq!(port.declare().unwrap_err(), fault);
 }
 
 #[tokio::test]
-async fn one_act_dispatches_ordered_deltas_and_stops_after_text_complete() {
+async fn last_control_drop_after_reserve_rejects_before_handoff() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, "must-not-handoff");
+    let barrier = Arc::new(ExternalSubmitBarrier::default());
+    port.submit_barrier = Some(Arc::clone(&barrier));
+    let submit = tokio::spawn(async move {
+        let result = match port.submit(frame).await {
+            Ok(stream) => {
+                drop(stream);
+                Ok(())
+            }
+            Err(fault) => Err(fault),
+        };
+        (port, result)
+    });
+    barrier.reached.notified().await;
+
+    drop(control);
+    barrier.release.notify_one();
+
+    let (mut port, result) = tokio::time::timeout(std::time::Duration::from_secs(1), submit)
+        .await
+        .expect("submit must not hang after the last control closes")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(SubmitFault::Rejected(fault))
+            if fault.kind() == ReactionPortFaultKind::Terminal
+                && fault.code() == ReactionPortFaultCode::Unavailable
+                && fault.reason() == ReactionPortFaultReason::Declaration
+    ));
+    let terminal = port.declare().unwrap_err();
+    assert_eq!(terminal.kind(), ReactionPortFaultKind::Terminal);
+    assert_eq!(terminal.code(), ReactionPortFaultCode::Unavailable);
+    assert_eq!(terminal.reason(), ReactionPortFaultReason::Declaration);
+}
+
+#[tokio::test]
+async fn outstanding_submit_permit_keeps_observation_channel_open_until_handoff() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, "held-permit");
+    let barrier = Arc::new(ExternalSubmitBarrier::default());
+    port.submit_barrier = Some(Arc::clone(&barrier));
+
+    assert_eq!(control.inner.frames.lock().await.sender_strong_count(), 1);
+
+    let submit = tokio::spawn(async move {
+        let result = match port.submit(frame).await {
+            Ok(stream) => {
+                drop(stream);
+                Ok(())
+            }
+            Err(fault) => Err(fault),
+        };
+        (port, result)
+    });
+    barrier.reached.notified().await;
+
+    assert_eq!(
+        control.inner.frames.lock().await.sender_strong_count(),
+        2,
+        "the outstanding OwnedPermit must retain its submit-time sender clone"
+    );
+    let mut observation = Box::pin(control.next_observation());
+    let waker = noop_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(
+        observation.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+
+    barrier.release.notify_one();
+    let observation = tokio::time::timeout(std::time::Duration::from_secs(1), observation)
+        .await
+        .expect("handoff must wake the pending observation")
+        .unwrap();
+    assert_eq!(observation.content(), "held-permit");
+
+    let (port, result) = submit.await.unwrap();
+    result.unwrap();
+    assert_eq!(
+        control.inner.frames.lock().await.sender_strong_count(),
+        1,
+        "permit.send must synchronously release its temporary sender clone"
+    );
+    drop(port);
+    assert!(matches!(
+        control.next_observation().await,
+        Err(ExternalControlFault::ObservationChannelClosed)
+    ));
+}
+
+#[tokio::test]
+async fn observe_captures_full_then_act_captures_exact_delta_frame() {
+    let props = ExternalProps::new();
+    let mut external = wrapper(&props);
+
+    let first = external.observe().await.unwrap();
+    assert_eq!(first.kind(), ExternalObservationKind::Full);
+    assert_eq!(first.base_generation(), None);
+    assert_eq!(first.frame().basis(), FrameBasis::Full);
+    assert!(first.content().contains("External protocol."));
+    assert_eq!(
+        first.content().as_bytes(),
+        first.frame().submission().canonical_bytes()
+    );
+
+    let second = external.act(completed_text("one")).await.unwrap();
+    assert_eq!(second.kind(), ExternalObservationKind::Delta);
+    assert_eq!(second.base_generation(), Some(first.generation()));
+    assert_eq!(
+        second.frame().basis(),
+        FrameBasis::DeltaFrom(first.frame().revision())
+    );
+    assert!(second.content().contains("one"));
+    assert_eq!(
+        *props.log.lock().unwrap(),
+        ["complete:one:start", "complete:one:end"]
+    );
+}
+
+#[tokio::test]
+async fn one_act_publishes_ordered_facts_and_stops_after_explicit_completion() {
     let props = ExternalProps::new();
     let mut external = wrapper(&props);
     external.observe().await.unwrap();
@@ -290,39 +741,35 @@ async fn one_act_dispatches_ordered_deltas_and_stops_after_text_complete() {
     ]);
     let protocol = futures::stream::poll_fn(move |_| {
         observed_polls.fetch_add(1, Ordering::SeqCst);
-        std::task::Poll::Ready(events.pop_front())
+        Poll::Ready(events.pop_front())
     });
 
-    let next = external
+    external
         .act(ExternalAct::from_text_protocol(protocol))
         .await
         .unwrap();
 
-    assert!(next.content().contains("ab"));
     assert_eq!(polls.load(Ordering::SeqCst), 3);
     assert_eq!(
         *props.log.lock().unwrap(),
         [
-            "delta:a:first:start",
-            "delta:a:first:end",
-            "delta:a:second",
-            "delta:b:first:start",
-            "delta:b:first:end",
-            "delta:b:second",
-            "complete:ab:first:start",
-            "complete:ab:first:end",
-            "complete:ab:second",
+            "delta:a:start",
+            "delta:a:end",
+            "delta:b:start",
+            "delta:b:end",
+            "complete:ab:start",
+            "complete:ab:end",
         ]
     );
 }
 
 #[tokio::test]
-async fn input_eof_ends_one_act_after_all_ordered_deltas() {
+async fn normal_protocol_eof_seals_accumulated_text_before_completion() {
     let props = ExternalProps::new();
     let mut external = wrapper(&props);
     external.observe().await.unwrap();
 
-    let next = external
+    external
         .act(text_protocol(vec![
             TextTurnEvent::TextDelta(String::from("left")),
             TextTurnEvent::TextDelta(String::from("right")),
@@ -330,27 +777,58 @@ async fn input_eof_ends_one_act_after_all_ordered_deltas() {
         .await
         .unwrap();
 
-    assert!(next.content().contains("left"));
-    assert!(next.content().contains("right"));
-    assert_eq!(props.renders.load(Ordering::SeqCst), 2);
     assert_eq!(
         *props.log.lock().unwrap(),
         [
-            "delta:left:first:start",
-            "delta:left:first:end",
-            "delta:left:second",
-            "delta:right:first:start",
-            "delta:right:first:end",
-            "delta:right:second",
-            "complete:leftright:first:start",
-            "complete:leftright:first:end",
-            "complete:leftright:second",
+            "delta:left:start",
+            "delta:left:end",
+            "delta:right:start",
+            "delta:right:end",
+            "complete:leftright:start",
+            "complete:leftright:end",
         ]
     );
 }
 
 #[tokio::test]
-async fn abnormal_protocol_disconnect_remains_a_stream_error() {
+async fn late_act_is_explicitly_rejected_by_ingress_generation() {
+    let props = ExternalProps::new();
+    let mut external = wrapper(&props);
+    let observation = external.observe().await.unwrap();
+    let generation = observation.ingress_generation();
+    let control = external.control();
+
+    control
+        .act(generation, completed_text("one"))
+        .await
+        .unwrap();
+    let next = external.observe().await.unwrap();
+    assert_ne!(next.ingress_generation(), generation);
+    assert!(next.content().contains("one"));
+
+    assert_eq!(
+        control.act(generation, completed_text("late")).await,
+        Err(ExternalControlFault::StaleIngress)
+    );
+}
+
+#[tokio::test]
+async fn observe_full_uses_a_new_epoch_and_a_new_full_frame() {
+    let props = ExternalProps::new();
+    let mut external = wrapper(&props);
+    let first = external.observe().await.unwrap();
+
+    let full = external.observe_full().await.unwrap();
+
+    assert_eq!(full.kind(), ExternalObservationKind::Full);
+    assert_eq!(full.base_generation(), None);
+    assert_ne!(full.frame().epoch(), first.frame().epoch());
+    assert_ne!(full.generation(), first.generation());
+    assert_ne!(full.ingress_generation(), first.ingress_generation());
+}
+
+#[tokio::test]
+async fn abnormal_protocol_resets_continuity_for_the_next_explicit_reaction() {
     let props = ExternalProps::new();
     let mut external = wrapper(&props);
     external.observe().await.unwrap();
@@ -358,37 +836,310 @@ async fn abnormal_protocol_disconnect_remains_a_stream_error() {
     let fault = external
         .act(ExternalAct::from_text_protocol(futures::stream::iter([
             Ok(TextTurnEvent::TextDelta(String::from("partial"))),
-            Err(ProviderFault::retryable_transport(
-                "external disconnect sentinel",
-            )),
+            Err(ProviderFault::retryable_transport("disconnect")),
         ])))
         .await
         .unwrap_err();
+    assert!(matches!(fault, ExternalApplicationFault::Application));
 
-    let ExternalApplicationFault::Application(ApplicationHostFault::ProviderExecution(fault)) =
-        fault
-    else {
-        panic!("unexpected external stream fault: {fault:?}");
-    };
-    assert_eq!(fault.message(), "external disconnect sentinel");
+    let recovered = external.observe().await.unwrap();
+    assert_eq!(recovered.kind(), ExternalObservationKind::Full);
+    assert!(recovered.content().contains("partial"));
     assert_eq!(
         *props.log.lock().unwrap(),
-        [
-            "delta:partial:first:start",
-            "delta:partial:first:end",
-            "delta:partial:second"
-        ]
+        ["delta:partial:start", "delta:partial:end"]
     );
-    assert_eq!(props.renders.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn production_json_lines_adapter_preserves_order_and_complete_cutoff() {
+async fn cancelling_post_handoff_act_leaves_the_application_terminal() {
     let props = ExternalProps::new();
     let mut external = wrapper(&props);
     external.observe().await.unwrap();
 
-    let next = external
+    let mut act = Box::pin(external.act(completed_text("blocked")));
+    tokio::select! {
+        () = props.handler_started.notified() => {}
+        result = act.as_mut() => panic!("act completed before handler blocked: {result:?}"),
+    }
+    drop(act);
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while props.pending_drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let fault = external.observe().await.unwrap_err();
+    assert!(matches!(fault, ExternalApplicationFault::Application));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_component_task_panic_after_cancellation_crosses_external_boundary() {
+    let external_props = ExternalProps::new();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Notify::new());
+    let sibling_dropped = Arc::new(AtomicBool::new(false));
+    let root_props = LateTaskPanicProps {
+        external: external_props.clone(),
+        starts: Arc::clone(&starts),
+        release: Arc::clone(&release),
+        sibling_dropped: Arc::clone(&sibling_dropped),
+    };
+    let mut external = ExternalApplication::new_with_event_input(move |events| {
+        late_task_panic_root(root_props.clone(), events)
+    })
+    .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while starts.load(Ordering::Acquire) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both Component tasks must start");
+    external.observe().await.unwrap();
+
+    let mut act = Box::pin(external.act(completed_text("blocked")));
+    tokio::select! {
+        () = external_props.handler_started.notified() => {}
+        result = act.as_mut() => panic!("act completed before handler blocked: {result:?}"),
+    }
+    drop(act);
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while external_props.pending_drops.load(Ordering::Acquire) == 0
+            || !external
+                .reaction
+                .as_ref()
+                .is_some_and(|reaction| reaction.task.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-handoff cancellation must return the Application owner");
+    external.recover_finished_reaction().await.unwrap();
+
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !sibling_dropped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor must latch the panic and abort its sibling");
+
+    let panic = AssertUnwindSafe(external.observe())
+        .catch_unwind()
+        .await
+        .expect_err("ExternalApplication must resume the original task panic");
+    assert_panic_payload(panic, "external late Component task panic");
+    assert!(matches!(
+        external.observe().await,
+        Err(ExternalApplicationFault::OwnerUnavailable)
+    ));
+}
+
+#[tokio::test]
+async fn blocked_act_injection_is_interrupted_by_the_reaction_panic() {
+    let props = ExternalProps::new();
+    let mut external = wrapper(&props);
+    let owner = external.owner.take().unwrap();
+    let (fact_sender, _facts) = tokio::sync::mpsc::channel(1);
+    let generation = {
+        let mut shared = external
+            .control
+            .inner
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = shared.allocate_ingress().unwrap();
+        shared.ingress = Some(super::ExternalIngressState {
+            generation,
+            sender: Some(fact_sender),
+        });
+        generation
+    };
+    let protocol_started = Arc::new(Notify::new());
+    let reaction_trigger = Arc::clone(&protocol_started);
+    let act_trigger = Arc::clone(&protocol_started);
+    let act = ExternalAct::from_text_protocol(futures::stream::once(async move {
+        act_trigger.notify_one();
+        futures::future::pending::<Result<TextTurnEvent, ProviderFault>>().await
+    }));
+    let (cancellation, _cancelled) = tokio::sync::oneshot::channel();
+    external.reaction = Some(super::ExternalReaction {
+        state: super::ExternalReactionState::AwaitingInput(generation),
+        cancellation: Some(cancellation),
+        task: tokio::spawn(async move {
+            let _owner = owner;
+            reaction_trigger.notified().await;
+            panic!("blocked act reaction panic")
+        }),
+    });
+
+    let panic = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        AssertUnwindSafe(external.act(act)).catch_unwind(),
+    )
+    .await
+    .expect("reaction panic must interrupt a blocked act injection")
+    .expect_err("reaction panic must unwind through ExternalApplication::act");
+    assert_panic_payload(panic, "blocked act reaction panic");
+}
+
+#[tokio::test]
+async fn ready_reaction_panic_wins_ready_cancellation() {
+    async fn panic_reaction() -> Result<(), ApplicationFault> {
+        panic!("ready reaction panic")
+    }
+
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    cancel.send(()).unwrap();
+
+    let result = AssertUnwindSafe(super::await_reaction_or_cancellation(
+        panic_reaction(),
+        cancelled,
+    ))
+    .catch_unwind()
+    .await;
+    let panic = match result {
+        Ok(_) => panic!("a ready cancellation suppressed a ready reaction panic"),
+        Err(panic) => panic,
+    };
+    assert_panic_payload(panic, "ready reaction panic");
+}
+
+#[tokio::test]
+async fn act_without_a_current_reaction_fails_closed() {
+    let props = ExternalProps::new();
+    let mut external = wrapper(&props);
+
+    assert!(matches!(
+        external.act(completed_text("orphaned")).await,
+        Err(ExternalApplicationFault::NoActiveReaction)
+    ));
+}
+
+#[tokio::test]
+async fn closed_observation_waits_for_reaction_completion_before_classifying() {
+    let props = ExternalProps::new();
+    let mut external = wrapper(&props);
+    let owner = external.owner.take().unwrap();
+    let owner_dropped = Arc::new(Notify::new());
+    let release_panic = Arc::new(Notify::new());
+    let task_owner_dropped = Arc::clone(&owner_dropped);
+    let task_release_panic = Arc::clone(&release_panic);
+    let (cancellation, _cancelled) = tokio::sync::oneshot::channel();
+    external.reaction = Some(super::ExternalReaction {
+        state: super::ExternalReactionState::AwaitingObservation,
+        cancellation: Some(cancellation),
+        task: tokio::spawn(async move {
+            drop(owner);
+            task_owner_dropped.notify_one();
+            task_release_panic.notified().await;
+            panic!("delayed external reaction panic")
+        }),
+    });
+
+    owner_dropped.notified().await;
+    let mut observation = Box::pin(external.await_next_observation());
+    let waker = noop_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(
+        observation.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+
+    release_panic.notify_one();
+    let panic = AssertUnwindSafe(observation)
+        .catch_unwind()
+        .await
+        .expect_err("channel closure must wait for and propagate the reaction panic");
+    assert_panic_payload(panic, "delayed external reaction panic");
+    assert!(matches!(
+        external.observe().await,
+        Err(ExternalApplicationFault::OwnerUnavailable)
+    ));
+}
+
+#[tokio::test]
+async fn aborted_reaction_after_observation_closure_is_a_bounded_task_failure() {
+    let props = ExternalProps::new();
+    let mut external = wrapper(&props);
+    let owner = external.owner.take().unwrap();
+    let task_started = Arc::new(Notify::new());
+    let started = Arc::clone(&task_started);
+    let (cancellation, _cancelled) = tokio::sync::oneshot::channel();
+    external.reaction = Some(super::ExternalReaction {
+        state: super::ExternalReactionState::AwaitingObservation,
+        cancellation: Some(cancellation),
+        task: tokio::spawn(async move {
+            let _owner = owner;
+            started.notify_one();
+            std::future::pending::<super::ExternalReactionCompletion>().await
+        }),
+    });
+    task_started.notified().await;
+    external.reaction.as_ref().unwrap().task.abort();
+
+    let fault = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        external.await_next_observation(),
+    )
+    .await
+    .expect("an aborted reaction must not leave observation arbitration pending")
+    .unwrap_err();
+    assert!(matches!(
+        fault,
+        ExternalApplicationFault::ReactionTaskFailed
+    ));
+    assert!(matches!(
+        external.observe().await,
+        Err(ExternalApplicationFault::OwnerUnavailable)
+    ));
+}
+
+#[tokio::test]
+async fn ready_reaction_task_panic_wins_observation_and_resumes_original_payload() {
+    let props = ExternalProps::new();
+    let mut external = wrapper(&props);
+    let owner = external.owner.take().unwrap();
+    let (cancellation, _cancelled) = tokio::sync::oneshot::channel();
+    external.reaction = Some(super::ExternalReaction {
+        state: super::ExternalReactionState::AwaitingObservation,
+        cancellation: Some(cancellation),
+        task: tokio::spawn(async move {
+            let _owner = owner;
+            panic!("external reaction task panic")
+        }),
+    });
+
+    while !external.reaction.as_ref().unwrap().task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+
+    let panic = AssertUnwindSafe(external.await_next_observation())
+        .catch_unwind()
+        .await
+        .expect_err("the ready reaction task panic must win the closed observation channel");
+    assert_panic_payload(panic, "external reaction task panic");
+    assert!(matches!(
+        external.observe().await,
+        Err(ExternalApplicationFault::OwnerUnavailable)
+    ));
+}
+
+#[tokio::test]
+async fn cli_json_lines_preserve_order_and_completion_cutoff() {
+    let props = ExternalProps::new();
+    let mut external = wrapper(&props);
+    external.observe().await.unwrap();
+
+    external
         .act(json_lines_protocol(&[
             r#"{"type":"text_delta","text":"left"}"#,
             r#"{"type":"text_delta","text":"right"}"#,
@@ -398,369 +1149,162 @@ async fn production_json_lines_adapter_preserves_order_and_complete_cutoff() {
         .await
         .unwrap();
 
-    assert!(next.content().contains("leftright"));
     assert_eq!(
         *props.log.lock().unwrap(),
         [
-            "delta:left:first:start",
-            "delta:left:first:end",
-            "delta:left:second",
-            "delta:right:first:start",
-            "delta:right:first:end",
-            "delta:right:second",
-            "complete:leftright:first:start",
-            "complete:leftright:first:end",
-            "complete:leftright:second",
+            "delta:left:start",
+            "delta:left:end",
+            "delta:right:start",
+            "delta:right:end",
+            "complete:leftright:start",
+            "complete:leftright:end",
         ]
     );
 }
 
 #[tokio::test]
-async fn production_json_lines_adapter_uses_input_eof_for_completion_synthesis() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
-    external.observe().await.unwrap();
+async fn cli_protocol_limits_are_checked_before_ingress() {
+    let mut oversized =
+        ExternalAct::__from_cli_json_lines("x".repeat(MAX_EXTERNAL_PROTOCOL_WIRE_BYTES + 1));
+    assert!(oversized.protocol.next().await.unwrap().is_err());
 
-    external
-        .act(json_lines_protocol(&[
-            r#"{"type":"text_delta","text":"left"}"#,
-            r#"{"type":"text_delta","text":"right"}"#,
-        ]))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        *props.log.lock().unwrap(),
-        [
-            "delta:left:first:start",
-            "delta:left:first:end",
-            "delta:left:second",
-            "delta:right:first:start",
-            "delta:right:first:end",
-            "delta:right:second",
-            "complete:leftright:first:start",
-            "complete:leftright:first:end",
-            "complete:leftright:second",
-        ]
-    );
+    let protocol = "\n".repeat(MAX_EXTERNAL_PROTOCOL_FRAMES + 1);
+    let mut too_many = ExternalAct::__from_cli_json_lines(protocol);
+    assert!(too_many.protocol.next().await.unwrap().is_err());
 }
 
 #[tokio::test]
-async fn production_json_lines_adapter_keeps_disconnect_abnormal() {
+async fn mismatched_explicit_seal_fails_admission_and_forces_next_full() {
     let props = ExternalProps::new();
     let mut external = wrapper(&props);
     external.observe().await.unwrap();
 
     let fault = external
-        .act(json_lines_protocol(&[
-            r#"{"type":"text_delta","text":"partial"}"#,
-            r#"{"type":"disconnect"}"#,
+        .act(text_protocol(vec![
+            TextTurnEvent::TextDelta(String::from("partial")),
+            TextTurnEvent::TextComplete(String::from("different")),
         ]))
         .await
         .unwrap_err();
+    assert!(matches!(fault, ExternalApplicationFault::Application));
 
-    let ExternalApplicationFault::Application(ApplicationHostFault::ProviderExecution(fault)) =
-        fault
-    else {
-        panic!("unexpected external stream fault: {fault:?}");
-    };
-    assert_eq!(
-        fault.message(),
-        "external text protocol disconnected abnormally"
-    );
-    assert_eq!(
-        *props.log.lock().unwrap(),
-        [
-            "delta:partial:first:start",
-            "delta:partial:first:end",
-            "delta:partial:second",
-        ]
-    );
+    let next = external.observe().await.unwrap();
+    assert_eq!(next.frame().basis(), FrameBasis::Full);
 }
 
 #[tokio::test]
-async fn production_json_lines_adapter_rejects_malformed_frames_without_echoing_input() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
-    external.observe().await.unwrap();
-
-    let fault = external
-        .act(json_lines_protocol(&[
-            r#"{"type":"unknown","secret":"do-not-echo"}"#,
-        ]))
-        .await
-        .unwrap_err();
-
-    let ExternalApplicationFault::Application(ApplicationHostFault::ProviderExecution(fault)) =
-        fault
-    else {
-        panic!("unexpected external stream fault: {fault:?}");
-    };
-    assert_eq!(fault.message(), "external text protocol frame was invalid");
-    assert!(!fault.message().contains("do-not-echo"));
-    assert!(props.log.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn production_json_lines_adapter_bounds_wire_before_frame_decoding() {
-    let protocol = " ".repeat(MAX_EXTERNAL_PROTOCOL_WIRE_BYTES + 1);
-    let mut events = external_provider_events(ExternalAct::__from_cli_json_lines(protocol));
-
-    let fault = events.next().await.unwrap().unwrap_err();
-
-    assert_eq!(
-        fault.message(),
-        "external text protocol exceeded configured wire limit"
-    );
-    assert!(events.next().await.is_none());
-}
-
-#[tokio::test]
-async fn production_json_lines_adapter_bounds_protocol_frame_count() {
-    const MAX_PROTOCOL_FRAMES: usize = 65_536;
-    let frame = r#"{"type":"text_delta","text":""}"#;
-    let protocol = std::iter::repeat_n(frame, MAX_PROTOCOL_FRAMES + 1)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut events = external_provider_events(ExternalAct::__from_cli_json_lines(protocol));
-
-    let fault = events.next().await.unwrap().unwrap_err();
-
-    assert_eq!(
-        fault.message(),
-        "external text protocol exceeded configured frame limit"
-    );
-    assert!(events.next().await.is_none());
-}
-
-#[tokio::test]
-async fn production_json_lines_adapter_rejects_excess_empty_lines_before_decoding() {
-    const MAX_PROTOCOL_FRAMES: usize = 65_536;
-    let protocol = "\n".repeat(MAX_PROTOCOL_FRAMES + 1);
-    let mut events = external_provider_events(ExternalAct::__from_cli_json_lines(protocol));
-
-    let fault = events.next().await.unwrap().unwrap_err();
-
-    assert_eq!(
-        fault.message(),
-        "external text protocol exceeded configured frame limit"
-    );
-    assert!(events.next().await.is_none());
-}
-
-#[tokio::test]
-async fn cumulative_external_text_is_bounded_below_the_port() {
-    let first = "a".repeat(MAX_EXTERNAL_TEXT_BYTES / 2 + 1);
-    let second = "b".repeat(MAX_EXTERNAL_TEXT_BYTES / 2 + 1);
-    let mut events = external_provider_events(text_protocol(vec![
-        TextTurnEvent::TextDelta(first.clone()),
-        TextTurnEvent::TextDelta(second),
-    ]));
-
-    assert_eq!(
-        events.next().await.unwrap().unwrap(),
-        ProviderEvent::Text(TextTurnEvent::TextDelta(first))
-    );
-    let fault = events.next().await.unwrap().unwrap_err();
-    assert_eq!(
-        fault.message(),
-        "external output text exceeded configured output limit"
-    );
-    assert!(events.next().await.is_none());
-}
-
-#[tokio::test]
-async fn explicit_external_completion_is_bounded_below_the_port() {
-    let complete = "x".repeat(MAX_EXTERNAL_TEXT_BYTES + 1);
-    let mut events =
-        external_provider_events(text_protocol(vec![TextTurnEvent::TextComplete(complete)]));
-
-    let fault = events.next().await.unwrap().unwrap_err();
-    assert_eq!(
-        fault.message(),
-        "external output text exceeded configured output limit"
-    );
-    assert!(events.next().await.is_none());
-}
-
-#[tokio::test]
-async fn full_re_render_reuses_the_current_generation_and_pending_reaction() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
-    let first = external.observe().await.unwrap();
-
-    let full = external.full_re_render().unwrap();
-
-    assert_eq!(full.kind(), ExternalObservationKind::Full);
-    assert_eq!(full.generation(), first.generation());
-    assert_eq!(full.base_generation(), None);
-    assert_eq!(full.content(), first.content());
-    assert_eq!(props.renders.load(Ordering::SeqCst), 1);
-    assert!(props.log.lock().unwrap().is_empty());
-
-    let next = external.act(completed_text("same-reaction")).await.unwrap();
-    assert_eq!(next.base_generation(), Some(full.generation()));
-    assert_eq!(props.renders.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        *props.log.lock().unwrap(),
-        [
-            "complete:same-reaction:first:start",
-            "complete:same-reaction:first:end",
-            "complete:same-reaction:second"
-        ]
-    );
-}
-
-#[tokio::test]
-async fn full_re_render_rebuilds_the_baseline_after_a_delta() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
-    external.observe().await.unwrap();
-    let delta = external.act(completed_text("one")).await.unwrap();
-    assert_eq!(delta.kind(), ExternalObservationKind::Delta);
-
-    let full = external.full_re_render().unwrap();
-
-    assert_eq!(full.kind(), ExternalObservationKind::Full);
-    assert_eq!(full.generation(), delta.generation());
-    assert_eq!(full.base_generation(), None);
-    assert!(full.content().contains("External protocol."));
-    assert!(full.content().contains("one"));
-    assert_eq!(props.renders.load(Ordering::SeqCst), 2);
-
-    let next = external.act(completed_text("two")).await.unwrap();
-    assert_eq!(next.base_generation(), Some(full.generation()));
-    assert_eq!(props.renders.load(Ordering::SeqCst), 3);
-}
-
-#[tokio::test]
-async fn full_re_render_does_not_run_terminal_handlers() {
-    let renders = Arc::new(AtomicUsize::new(0));
-    let finishes = Arc::new(AtomicUsize::new(0));
-    let mut external = ExternalApplication::new(ComponentHost::new(
-        terminal_application,
-        TerminalProps {
-            renders: Arc::clone(&renders),
-            finishes: Arc::clone(&finishes),
-        },
-    ));
-    let first = external.observe().await.unwrap();
-
-    let full = external.full_re_render().unwrap();
-
-    assert_eq!(full.generation(), first.generation());
-    assert_eq!(renders.load(Ordering::SeqCst), 1);
-    assert_eq!(finishes.load(Ordering::SeqCst), 0);
-
-    let complete = String::from(r#"<value number="1" />"#);
-    external
-        .act(text_protocol(vec![TextTurnEvent::TextDelta(complete)]))
+async fn direct_control_fact_order_is_delta_seal_completion() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, "facts");
+    let mut facts = port.submit(frame).await.unwrap();
+    let observation = control.next_observation().await.unwrap();
+    control
+        .act(
+            observation.ingress_generation(),
+            text_protocol(vec![
+                TextTurnEvent::TextDelta(String::from("a")),
+                TextTurnEvent::TextComplete(String::from("a")),
+            ]),
+        )
         .await
         .unwrap();
-    assert_eq!(renders.load(Ordering::SeqCst), 2);
-    assert_eq!(finishes.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn act_waits_for_normal_serial_handler_dispatch_before_rendering_the_next_observation() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
-    external.observe().await.unwrap();
-
-    let mut act = Box::pin(external.act(completed_text("blocked")));
-    tokio::select! {
-        () = props.first_started.notified() => {}
-        result = act.as_mut() => panic!("act completed before its first handler blocked: {result:?}"),
-    }
-    assert_eq!(*props.log.lock().unwrap(), ["complete:blocked:first:start"]);
-
-    props.first_release.notify_one();
-    let next = act.await.unwrap();
-    assert!(next.content().contains("blocked"));
-    assert_eq!(
-        *props.log.lock().unwrap(),
-        [
-            "complete:blocked:first:start",
-            "complete:blocked:first:end",
-            "complete:blocked:second"
-        ]
-    );
-}
-
-#[tokio::test]
-async fn act_without_a_current_external_reaction_fails_closed() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
 
     assert!(matches!(
-        external.act(completed_text("orphaned")).await,
-        Err(ExternalApplicationFault::NoActiveReaction)
+        facts.next().await.unwrap().unwrap(),
+        ProviderFact::TextDelta { delta, .. } if delta == "a"
     ));
-    assert_eq!(props.renders.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        facts.next().await.unwrap().unwrap(),
+        ProviderFact::TextSealed { text, .. } if text == "a"
+    ));
+    assert!(matches!(
+        facts.next().await.unwrap().unwrap(),
+        ProviderFact::ReactionCompleted {
+            primary_text: Some(_)
+        }
+    ));
+    assert!(facts.next().await.is_none());
 }
 
 #[tokio::test]
-async fn cancelling_act_cancels_pending_dispatch_and_preserves_the_external_owner() {
-    let props = ExternalProps::new();
-    let mut external = wrapper(&props);
-    external.observe().await.unwrap();
+async fn public_text_constructor_emits_exact_seal_then_completion_and_claims_once() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, "typed-text");
+    let mut facts = port.submit(frame).await.unwrap();
+    let observation = control.next_observation().await.unwrap();
+    let generation = observation.ingress_generation();
 
-    let mut act = Box::pin(external.act(text_protocol(vec![
-        TextTurnEvent::TextDelta(String::from("retained")),
-        TextTurnEvent::TextComplete(String::from("blocked")),
-    ])));
-    tokio::select! {
-        () = props.first_started.notified() => {}
-        result = act.as_mut() => panic!("act completed before its handler blocked: {result:?}"),
-    }
-    let completed_handler_drops = props.pending_drops.load(Ordering::SeqCst);
-
-    drop(act);
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while props.pending_drops.load(Ordering::SeqCst) == completed_handler_drops {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("cancelling act must drop the pending handler future");
-
-    let recovered = external.observe().await.unwrap();
-    assert!(recovered.content().contains("retained"));
-    assert!(!recovered.content().contains("blocked"));
+    control
+        .act(generation, ExternalAct::text("typed"))
+        .await
+        .unwrap();
     assert_eq!(
-        *props.log.lock().unwrap(),
-        [
-            "delta:retained:first:start",
-            "delta:retained:first:end",
-            "delta:retained:second",
-            "complete:blocked:first:start",
-        ]
+        control.act(generation, ExternalAct::text("repeat")).await,
+        Err(ExternalControlFault::StaleIngress)
+    );
+
+    let output = match facts.next().await.unwrap().unwrap() {
+        ProviderFact::TextSealed { output, text, .. } => {
+            assert_eq!(text, "typed");
+            output
+        }
+        fact => panic!("typed text must seal first, got {fact:?}"),
+    };
+    assert!(matches!(
+        facts.next().await.unwrap().unwrap(),
+        ProviderFact::ReactionCompleted {
+            primary_text: Some(primary)
+        } if primary == output
+    ));
+    assert!(facts.next().await.is_none());
+}
+
+#[tokio::test]
+async fn public_empty_completion_emits_only_no_primary_terminal_and_claims_once() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, "empty");
+    let mut facts = port.submit(frame).await.unwrap();
+    let observation = control.next_observation().await.unwrap();
+    let generation = observation.ingress_generation();
+
+    control.complete(generation).await.unwrap();
+    assert_eq!(
+        control.complete(generation).await,
+        Err(ExternalControlFault::StaleIngress)
+    );
+    assert!(matches!(
+        facts.next().await.unwrap().unwrap(),
+        ProviderFact::ReactionCompleted { primary_text: None }
+    ));
+    assert!(facts.next().await.is_none());
+    assert_eq!(
+        control.complete(generation).await,
+        Err(ExternalControlFault::StaleIngress)
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelling_observe_while_starting_a_reaction_preserves_the_external_owner() {
-    let props = ExternalProps::new();
-    props.block_next_render.store(true, Ordering::SeqCst);
-    let mut external = wrapper(&props);
+#[tokio::test]
+async fn public_text_constructor_reuses_the_external_output_limit() {
+    let (mut port, control) = ExternalProviderPort::new().unwrap();
+    let declaration = port.declare().unwrap();
+    let frame = test_frame(&declaration, 1, "oversized");
+    let mut facts = port.submit(frame).await.unwrap();
+    let observation = control.next_observation().await.unwrap();
 
-    let mut observe = Box::pin(external.observe());
-    tokio::select! {
-        () = props.render_started.notified() => {}
-        result = observe.as_mut() => panic!("observe completed before its render blocked: {result:?}"),
-    }
-    drop(observe);
-    let (released, release) = &*props.render_release;
-    *released.lock().unwrap() = true;
-    release.notify_all();
-
-    let recovered = tokio::time::timeout(std::time::Duration::from_secs(1), external.observe())
+    control
+        .act(
+            observation.ingress_generation(),
+            ExternalAct::text("x".repeat(MAX_EXTERNAL_TEXT_BYTES + 1)),
+        )
         .await
-        .expect("a later observe must recover the external owner")
         .unwrap();
-    assert!(recovered.content().contains("External protocol."));
-    assert_eq!(props.renders.load(Ordering::SeqCst), 2);
 
-    let after_act = external.act(completed_text("after-cancel")).await.unwrap();
-    assert!(after_act.content().contains("after-cancel"));
+    let fault = facts.next().await.unwrap().unwrap_err();
+    assert_eq!(fault.kind(), ReactionPortFaultKind::Retryable);
+    assert_eq!(fault.code(), ReactionPortFaultCode::Limit);
+    assert_eq!(fault.reason(), ReactionPortFaultReason::OutputLimit);
+    assert!(facts.next().await.is_none());
 }

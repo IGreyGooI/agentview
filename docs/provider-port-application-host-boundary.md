@@ -1,5 +1,14 @@
 # ProviderPort 与 ApplicationHost 边界确定文档
 
+> **Status: superseded by [`engine.md`](engine.md) and
+> [`frame-driven-runtime-plan.md`](frame-driven-runtime-plan.md).** This body and the linked
+> [`component-provider-boundary.html`](component-provider-boundary.html) and
+> [`component-provider-boundary.architecture.json`](component-provider-boundary.architecture.json)
+> visual artifacts are retained only as a historical pre-Frame design snapshot.
+> `ProviderPort`, `ApplicationHost`, and `ComponentReactionRuntime` exist only in the temporary,
+> default-enabled, deprecated `legacy-provider-port` compatibility surface. New integrations use
+> `Application<P>`, `ReactionPort`, ordinary Component roots, and `use_provider_event_handler`.
+
 日期：2026-08-08
 
 本文只记录已确认的边界，不讨论实现步骤。
@@ -123,9 +132,12 @@ ApplicationHost 不把 tool result 当成业务状态，`RecordLog` 也不保存
 等待所有 lane 闭合或失败。这是 Host 对已经完成的 ToolCall handler 的内部调度，不是 Provider
 request 的 `parallel_tool_calls` policy。
 
-现有 `StreamingXml` 改名为 `XmlStreamingToolCall`。它继续消费 XML text stream，是用
-Component 实现的 XML Tool Call；它不是 Provider native ToolCall Event 的 consumer，二者
-是两条独立管线。
+Streaming XML authoring 现在有两个并存入口。`StreamingXml::tag(tag)` 是 prompt-free 的
+specific-tag lifecycle subscription，提供 `on_open`、`on_stream`、`on_complete` 和
+`on_invalid`；`XmlStreamingToolCall::contract(...)` 是 prompt-producing typed declaration，
+会投影 example syntax 并解码匹配的 empty element。相同 event route 上的两者注册到同一个
+parser hub，按 XML source order 分发。它们都消费 XML text stream，而不是 Provider native
+ToolCall Event；native ToolCall 仍是另一条独立管线。
 
 当前没有 public `ParallelToolCallComponent`，也没有 request-level `parallel_tool_calls`
 authoring；Responses request 当前将该字段保持为 `false`。未来如果增加这项 policy，它只控制

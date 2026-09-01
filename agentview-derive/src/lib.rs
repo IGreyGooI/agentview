@@ -19,6 +19,7 @@ pub fn view(input: TokenStream) -> TokenStream {
 }
 
 /// Generate typed route selectors for a root Component event enum.
+#[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
 #[proc_macro_derive(ComponentEvents)]
 pub fn derive_component_events(input: TokenStream) -> TokenStream {
     component_events::expand(input)

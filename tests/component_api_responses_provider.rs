@@ -1,3 +1,9 @@
+#![cfg(feature = "legacy-provider-port")]
+#![allow(
+    deprecated,
+    reason = "this compatibility test intentionally exercises the Responses ProviderPort adapter"
+)]
+
 use std::{
     convert::Infallible,
     io::{self, Write},
@@ -40,7 +46,7 @@ use axum::{
     routing::post,
     Router,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::instrument::WithSubscriber;
@@ -2967,18 +2973,19 @@ async fn responses_usage_rejects_untrusted_shapes_before_observer_delivery() {
 }
 
 #[tokio::test]
-async fn responses_usage_observer_panic_does_not_change_terminal_success() {
+async fn responses_usage_observer_panic_propagates() {
     let (api_base, attempts, _bodies, shutdown, server) =
         spawn_server(ServerReply::CompletedWithUsage).await;
     let mut provider = provider(api_base).with_response_usage_observer(|_| {
         panic!("observer panic must stay outside provider behavior");
     });
 
-    let events = execute_provider(&mut provider, default_sample_projection())
-        .await
-        .expect("observer panic is contained");
+    let panic =
+        std::panic::AssertUnwindSafe(execute_provider(&mut provider, default_sample_projection()))
+            .catch_unwind()
+            .await;
 
-    assert_eq!(text_trace(events).last().unwrap().0, "complete");
+    assert!(panic.is_err());
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     let _ = shutdown.send(());
     server.await.unwrap();

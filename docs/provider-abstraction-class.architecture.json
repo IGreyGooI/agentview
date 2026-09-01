@@ -2,19 +2,19 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "Provider 抽象与 HistoryPolicy",
-    "subtitle": "Trait 关系、协议降级，以及具体 Provider 的私有连续性状态",
+    "title": "Historical / Superseded pre-Frame：Provider 抽象与 HistoryPolicy",
+    "subtitle": "旧 ProviderPort::execute 快照仅作历史证据；当前权威：docs/engine.md + frame-driven-runtime.architecture.html",
     "output": "provider-abstraction-class.html",
-    "animation": "trace",
+    "animation": "none",
     "visual_preset": "classic",
     "quality_profile": "showcase",
     "viewBox": [1660, 980],
     "views": [
       {
         "id": "runtime-contract",
-        "label": "运行时中立接口",
+        "label": "Historical / Superseded runtime view",
         "focus": ["rendered-projection", "provider-port", "provider-events"],
-        "note": "Component 只依赖 ProviderPort，不感知具体 HTTP 协议。"
+        "note": "旧路径是 ProviderPort::execute(projection)；当前 Application<P> 持有 private FrameSession，并通过 ReactionPort declare/submit。"
       },
       {
         "id": "profile-lowering",
@@ -24,9 +24,9 @@
       },
       {
         "id": "private-state",
-        "label": "Provider 私有状态",
+        "label": "历史 Provider 私有状态",
         "focus": ["responses-provider", "responses-state", "chat-provider", "chat-state"],
-        "note": "连续性与 diff memo 都可丢弃；Component 投影始终是权威状态。"
+        "note": "在此 pre-Frame 快照中，连续性与 diff memo 可丢弃；该 ProviderPort 所有权模型现已取代。"
       }
     ]
   },
@@ -35,16 +35,16 @@
       "id": "rendered-projection",
       "type": "frontend",
       "label": "RenderedProjection",
-      "sublabel": "完整、Provider-neutral 状态",
+      "sublabel": "pre-Frame · 完整 Provider-neutral 状态",
       "pos": [60, 115],
       "size": [210, 72]
     },
     {
       "id": "provider-port",
       "type": "external",
-      "label": "ProviderPort",
-      "sublabel": "trait · execute(projection)",
-      "tag": "Send",
+      "label": "Legacy ProviderPort",
+      "sublabel": "superseded · execute(projection)",
+      "tag": "deprecated compatibility",
       "pos": [365, 110],
       "size": [230, 82]
     },
@@ -60,7 +60,7 @@
       "id": "responses-provider",
       "type": "backend",
       "label": "AsyncOpenAiResponsesProvider",
-      "sublabel": "impl ProviderPort · Responses API",
+      "sublabel": "legacy impl ProviderPort · Responses API",
       "pos": [90, 350],
       "size": [270, 82]
     },
@@ -77,7 +77,7 @@
       "id": "chat-provider",
       "type": "backend",
       "label": "AsyncOpenAiChatCompletionsProvider",
-      "sublabel": "impl ProviderPort · Chat API",
+      "sublabel": "legacy impl ProviderPort · Chat API",
       "pos": [90, 690],
       "size": [270, 82]
     },
@@ -152,13 +152,13 @@
   "boundaries": [
     {
       "kind": "region",
-      "label": "运行时中立契约",
+      "label": "HISTORICAL / SUPERSEDED pre-Frame · current authority: docs/engine.md + frame-driven-runtime.architecture.html",
       "wraps": ["rendered-projection", "provider-port", "provider-events"],
       "pad": 26
     },
     {
       "kind": "region",
-      "label": "具体 Provider：私有连续性与差分缓存",
+      "label": "历史兼容 Provider：私有连续性与差分缓存",
       "wraps": ["responses-provider", "responses-state", "chat-provider", "chat-state"],
       "pad": 28
     },
@@ -174,7 +174,7 @@
       "id": "projection-to-port",
       "from": "rendered-projection",
       "to": "provider-port",
-      "label": "execute(projection)",
+      "label": "legacy execute",
       "variant": "emphasis",
       "labelAt": [295, 206]
     },
@@ -315,11 +315,11 @@
     },
     {
       "dot": "emerald",
-      "title": "权威状态",
+      "title": "HISTORICAL / SUPERSEDED",
       "items": [
-        "RenderedProjection 是 Component 的完整当前状态",
-        "Provider 私有 continuation 可随时重建或丢弃",
-        "ProviderPort 隔离运行时与具体传输协议"
+        "pre-Frame ProviderPort::execute 拓扑仅作历史兼容证据",
+        "当前：Application<P> + private FrameSession + ReactionPort",
+        "权威：docs/engine.md + frame-driven-runtime.architecture.html"
       ]
     }
   ]

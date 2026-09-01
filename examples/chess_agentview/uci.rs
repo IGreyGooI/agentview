@@ -214,10 +214,12 @@ impl UciEngine {
         }
     }
 
+    #[allow(dead_code, reason = "queried by the separate live-acceptance target")]
     pub(crate) fn reads_are_bounded(&self) -> bool {
         self.io_timeout > Duration::ZERO && MAX_LINE_BYTES > 0 && MAX_RESPONSE_LINES > 0
     }
 
+    #[allow(dead_code, reason = "queried by the separate live-acceptance target")]
     pub(crate) fn sent_commands(&self) -> &[String] {
         &self.sent_commands
     }

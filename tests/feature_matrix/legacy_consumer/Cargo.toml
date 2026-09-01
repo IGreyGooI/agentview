@@ -1,0 +1,14 @@
+[package]
+name = "agentview-legacy-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+legacy-provider-port = ["agentview/legacy-provider-port"]
+
+[dependencies]
+agentview = { path = "../../..", default-features = false }

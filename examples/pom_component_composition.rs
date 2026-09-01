@@ -47,7 +47,7 @@ fn response_requirements() -> Component {
 }
 
 #[component]
-fn support_application(props: SupportCase, _events: EventInput<ProviderEvent>) -> Component {
+fn support_application(props: SupportCase) -> Component {
     view! {
         support_policy()
         account_context(props.account_id, props.plan)
@@ -62,7 +62,7 @@ fn render_support_case() -> anyhow::Result<RenderedProjection> {
         plan: "team".to_owned(),
         request: "Explain why yesterday's export is unavailable.".to_owned(),
     };
-    let mut components = ComponentHost::new(support_application, props);
+    let mut components = ComponentHost::new_root(support_application, props);
     Ok(components.render()?.projection().clone())
 }
 

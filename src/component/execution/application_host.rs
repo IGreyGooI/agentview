@@ -1,17 +1,17 @@
-use std::{
-    collections::HashSet,
-    future::Future,
-    panic::{catch_unwind, AssertUnwindSafe},
-    pin::Pin,
-};
+use std::{collections::HashSet, convert::Infallible, future::Future, pin::Pin};
 
 use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::component::{
-    authoring::ComponentAttemptFault, ComponentHost, ComponentHostFault, ComponentHostId,
+    authoring::{ComponentAttemptFault, RenderBindings},
+    ComponentHost, ComponentHostFault, ComponentHostId,
 };
 
-use super::{ProviderEvent, ProviderFault, ProviderPort};
+#[allow(
+    deprecated,
+    reason = "this feature-gated host implements the retained ProviderPort compatibility runtime"
+)]
+use super::{ProviderEvent, ProviderFault, ProviderPort, RenderedProjection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -58,9 +58,15 @@ struct CompletedLane {
 type ReactionLane =
     Pin<Box<dyn Future<Output = Result<CompletedLane, ApplicationHostFault>> + Send>>;
 
+/// One generation-exact legacy Component render ready for Provider dispatch.
+struct PreparedComponentReaction {
+    projection: RenderedProjection,
+    bindings: RenderBindings<ProviderEvent>,
+}
+
 /// Owns the terminal observation and deliberately outlives all reaction-local
-/// resources. Observer panics are public-side failures and cannot unwind the
-/// engine while it is dropping streams, lanes, or bindings.
+/// resources. During panic unwind its Drop does not re-enter user observer
+/// code, so the original payload propagates after later resources are dropped.
 struct ReactionLifecycle<'a> {
     observer: &'a mut Option<Box<dyn EngineObserver>>,
     stage: &'static str,
@@ -80,7 +86,7 @@ impl<'a> ReactionLifecycle<'a> {
 
     fn observe(&mut self, observation: EngineObservation) {
         if let Some(observer) = self.observer.as_mut() {
-            let _ = catch_unwind(AssertUnwindSafe(|| observer.observe(&observation)));
+            observer.observe(&observation);
         }
     }
 
@@ -95,6 +101,9 @@ impl<'a> ReactionLifecycle<'a> {
 
 impl Drop for ReactionLifecycle<'_> {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
         self.observe(EngineObservation::Terminal {
             stage: self.stage,
             reason: self.reason,
@@ -106,12 +115,17 @@ impl Drop for ReactionLifecycle<'_> {
 }
 
 /// Coordinates one retained Component application with one model backend.
+#[deprecated(note = "use `Application<P>` as the mounted runtime owner")]
 pub struct ApplicationHost<P> {
     provider: P,
     bound_host: Option<ComponentHostId>,
     observer: Option<Box<dyn EngineObserver>>,
 }
 
+#[allow(
+    deprecated,
+    reason = "methods implement the deprecated ApplicationHost compatibility type"
+)]
 impl<P> ApplicationHost<P> {
     pub fn new(provider: P) -> Self {
         Self {
@@ -127,19 +141,51 @@ impl<P> ApplicationHost<P> {
     }
 }
 
+#[allow(
+    deprecated,
+    reason = "dispatch preserves the feature-gated ProviderPort compatibility contract"
+)]
 impl<P> ApplicationHost<P>
 where
     P: ProviderPort,
 {
     /// Render and complete exactly one Provider reaction.
     ///
-    /// The returned future resolves only after Provider EOF and generation-local
-    /// terminal handlers. Dropping it cancels the reaction by dropping its
-    /// Provider stream and local bindings; successful Component updates remain.
+    /// The returned future resolves only after Provider EOF, owned tool work,
+    /// and generation-local EOF diagnostics. Dropping it cancels the reaction by
+    /// dropping its Provider stream and local bindings; successful Component
+    /// updates remain.
     pub async fn dispatch_llm_reaction<Props>(
         &mut self,
         components: &mut ComponentHost<Props>,
     ) -> Result<(), ApplicationHostFault>
+    where
+        Props: Clone + Send + 'static,
+    {
+        match self
+            .dispatch_llm_reaction_with_pre_reconcile_capture(
+                components,
+                || Ok::<_, Infallible>(()),
+            )
+            .await?
+        {
+            Ok(()) => Ok(()),
+            Err(never) => match never {},
+        }
+    }
+
+    /// Dispatch one reaction and capture compatibility state immediately before
+    /// the successful post-reconcile render.
+    ///
+    /// New frame-driven orchestration does not need this seam. The retained
+    /// `ComponentReactionRuntime` uses it to freeze its typed output selection
+    /// after handlers finish, while still allowing render-time publication to
+    /// remain valid during post-reconcile.
+    pub(crate) async fn dispatch_llm_reaction_with_pre_reconcile_capture<Props, T, E>(
+        &mut self,
+        components: &mut ComponentHost<Props>,
+        capture: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, ApplicationHostFault>
     where
         Props: Clone + Send + 'static,
     {
@@ -151,124 +197,31 @@ where
             return Err(fault);
         }
 
-        let prepared = match components.render() {
+        let prepared = match prepare_component_reaction(components) {
             Ok(prepared) => prepared,
             Err(fault) => {
                 lifecycle.terminal("render", "component_render");
+                return Err(fault);
+            }
+        };
+
+        dispatch_prepared_reaction(&mut self.provider, prepared, &mut lifecycle).await?;
+        let captured = match capture() {
+            Ok(captured) => captured,
+            Err(fault) => {
+                lifecycle.terminal("output_capture", "compatibility");
+                return Ok(Err(fault));
+            }
+        };
+
+        if components.is_dirty() {
+            if let Err(fault) = components.render() {
+                lifecycle.terminal("post_reconcile", "component_render");
                 return Err(fault.into());
             }
-        };
-        let (projection, mut bindings) = prepared.into_execution_parts();
-        let mut events = match self.provider.execute(projection).await {
-            Ok(events) => events,
-            Err(fault) => {
-                lifecycle.observe(EngineObservation::WireSnapshotBlocked {
-                    reason: "provider_setup",
-                });
-                lifecycle.terminal("provider_setup", "execute");
-                return Err(ApplicationHostFault::ProviderSetup(fault));
-            }
-        };
-        lifecycle.observe(EngineObservation::InputSubmitted);
-        lifecycle.observe(EngineObservation::WireSnapshotAccepted);
-        let mut lanes = FuturesUnordered::<ReactionLane>::new();
-        let mut tool_call_ids = HashSet::new();
-        let mut event_ordinal = 0_u64;
-
-        loop {
-            enum Next {
-                Event(Option<Result<ProviderEvent, ProviderFault>>),
-                Lane(Option<Result<CompletedLane, ApplicationHostFault>>),
-            }
-            let next = if lanes.is_empty() {
-                Next::Event(events.next().await)
-            } else {
-                tokio::select! {
-                    event = events.next() => Next::Event(event),
-                    lane = lanes.next() => Next::Lane(lane),
-                }
-            };
-            let event = match next {
-                Next::Lane(lane) => match finish_lane(lane, &mut lifecycle) {
-                    Ok(()) => continue,
-                    Err(fault) => return Err(fault),
-                },
-                Next::Event(None) => break,
-                Next::Event(Some(Err(fault))) => {
-                    lifecycle.terminal("provider_stream", "stream_fault");
-                    return Err(ApplicationHostFault::ProviderExecution(fault));
-                }
-                Next::Event(Some(Ok(event))) => event,
-            };
-            event_ordinal = event_ordinal.saturating_add(1);
-            lifecycle.observe(EngineObservation::ProviderEvent {
-                ordinal: event_ordinal,
-            });
-            match event {
-                ProviderEvent::Text(event) => {
-                    if matches!(event, crate::llm_call::TextTurnEvent::TextDelta(_)) {
-                        lifecycle.observe(EngineObservation::PartialCommitted);
-                    }
-                    if let Err(fault) = await_bindings_with_lanes(
-                        bindings.dispatch(ProviderEvent::Text(event)),
-                        &mut lanes,
-                        &mut lifecycle,
-                    )
-                    .await
-                    {
-                        lifecycle.terminal("binding", "event_handler");
-                        return Err(fault);
-                    }
-                }
-                ProviderEvent::ToolCall(call) => {
-                    if !tool_call_ids.insert(call.call_id().to_owned()) {
-                        lifecycle.terminal("provider_event", "duplicate_tool_call");
-                        return Err(ApplicationHostFault::DuplicateToolCall {
-                            call_id: call.call_id().to_owned(),
-                        });
-                    }
-                    lifecycle.observe(EngineObservation::ToolCallPending {
-                        call_id: call.call_id().to_owned(),
-                    });
-                    let lane_call = call.clone();
-                    let lane_call_id = lane_call.call_id().to_owned();
-                    let future = match bindings.start_native_tool(call) {
-                        Ok(future) => future,
-                        Err(fault) => {
-                            lifecycle.terminal("tool_binding", "start");
-                            return Err(ApplicationHostFault::Bindings(fault));
-                        }
-                    };
-                    lifecycle.observe(EngineObservation::HandlerStarted {
-                        call_id: lane_call_id.clone(),
-                    });
-                    lanes.push(Box::pin(async move {
-                        let output = future.await.map_err(|fault| {
-                            ApplicationHostFault::Bindings(ComponentAttemptFault::native_tool(
-                                fault,
-                            ))
-                        })?;
-                        Ok::<_, ApplicationHostFault>(CompletedLane {
-                            call: lane_call,
-                            output,
-                        })
-                    }));
-                }
-            }
-        }
-
-        drop(events);
-        while !lanes.is_empty() {
-            finish_lane(lanes.next().await, &mut lifecycle)?;
-        }
-        if let Err(fault) =
-            await_bindings_with_lanes(bindings.finish_normal(), &mut lanes, &mut lifecycle).await
-        {
-            lifecycle.terminal("terminal_handler", "finish");
-            return Err(fault);
         }
         lifecycle.terminal("provider_eof", "normal_eof");
-        Ok(())
+        Ok(Ok(captured))
     }
 
     fn bind_or_validate(
@@ -286,6 +239,145 @@ where
             }
         }
     }
+}
+
+fn prepare_component_reaction<Props>(
+    components: &mut ComponentHost<Props>,
+) -> Result<PreparedComponentReaction, ApplicationHostFault>
+where
+    Props: Clone + Send + 'static,
+{
+    let prepared = components.render()?;
+    let (projection, bindings) = prepared.into_execution_parts();
+    Ok(PreparedComponentReaction {
+        projection,
+        bindings,
+    })
+}
+
+#[allow(
+    deprecated,
+    reason = "dispatch executes the retained ProviderPort compatibility stream"
+)]
+async fn dispatch_prepared_reaction<P>(
+    provider: &mut P,
+    prepared: PreparedComponentReaction,
+    lifecycle: &mut ReactionLifecycle<'_>,
+) -> Result<(), ApplicationHostFault>
+where
+    P: ProviderPort,
+{
+    let PreparedComponentReaction {
+        projection,
+        mut bindings,
+    } = prepared;
+    let mut events = match provider.execute(projection).await {
+        Ok(events) => events,
+        Err(fault) => {
+            lifecycle.observe(EngineObservation::WireSnapshotBlocked {
+                reason: "provider_setup",
+            });
+            lifecycle.terminal("provider_setup", "execute");
+            return Err(ApplicationHostFault::ProviderSetup(fault));
+        }
+    };
+    lifecycle.observe(EngineObservation::InputSubmitted);
+    lifecycle.observe(EngineObservation::WireSnapshotAccepted);
+    let mut lanes = FuturesUnordered::<ReactionLane>::new();
+    let mut tool_call_ids = HashSet::new();
+    let mut event_ordinal = 0_u64;
+
+    loop {
+        enum Next {
+            Event(Option<Result<ProviderEvent, ProviderFault>>),
+            Lane(Option<Result<CompletedLane, ApplicationHostFault>>),
+        }
+        let next = if lanes.is_empty() {
+            Next::Event(events.next().await)
+        } else {
+            tokio::select! {
+                event = events.next() => Next::Event(event),
+                lane = lanes.next() => Next::Lane(lane),
+            }
+        };
+        let event = match next {
+            Next::Lane(lane) => match finish_lane(lane, lifecycle) {
+                Ok(()) => continue,
+                Err(fault) => return Err(fault),
+            },
+            Next::Event(None) => break,
+            Next::Event(Some(Err(fault))) => {
+                lifecycle.terminal("provider_stream", "stream_fault");
+                return Err(ApplicationHostFault::ProviderExecution(fault));
+            }
+            Next::Event(Some(Ok(event))) => event,
+        };
+        event_ordinal = event_ordinal.saturating_add(1);
+        lifecycle.observe(EngineObservation::ProviderEvent {
+            ordinal: event_ordinal,
+        });
+        match event {
+            ProviderEvent::Text(event) => {
+                if matches!(event, crate::llm_call::TextTurnEvent::TextDelta(_)) {
+                    lifecycle.observe(EngineObservation::PartialCommitted);
+                }
+                if let Err(fault) = await_bindings_with_lanes(
+                    bindings.dispatch(ProviderEvent::Text(event)),
+                    &mut lanes,
+                    lifecycle,
+                )
+                .await
+                {
+                    lifecycle.terminal("binding", "event_handler");
+                    return Err(fault);
+                }
+            }
+            ProviderEvent::ToolCall(call) => {
+                if !tool_call_ids.insert(call.call_id().to_owned()) {
+                    lifecycle.terminal("provider_event", "duplicate_tool_call");
+                    return Err(ApplicationHostFault::DuplicateToolCall {
+                        call_id: call.call_id().to_owned(),
+                    });
+                }
+                lifecycle.observe(EngineObservation::ToolCallPending {
+                    call_id: call.call_id().to_owned(),
+                });
+                let lane_call = call.clone();
+                let lane_call_id = lane_call.call_id().to_owned();
+                let future = match bindings.start_native_tool(call) {
+                    Ok(future) => future,
+                    Err(fault) => {
+                        lifecycle.terminal("tool_binding", "start");
+                        return Err(ApplicationHostFault::Bindings(fault));
+                    }
+                };
+                lifecycle.observe(EngineObservation::HandlerStarted {
+                    call_id: lane_call_id.clone(),
+                });
+                lanes.push(Box::pin(async move {
+                    let output = future.await.map_err(|fault| {
+                        ApplicationHostFault::Bindings(ComponentAttemptFault::native_tool(fault))
+                    })?;
+                    Ok::<_, ApplicationHostFault>(CompletedLane {
+                        call: lane_call,
+                        output,
+                    })
+                }));
+            }
+        }
+    }
+
+    drop(events);
+    while !lanes.is_empty() {
+        finish_lane(lanes.next().await, lifecycle)?;
+    }
+    if let Err(fault) =
+        await_bindings_with_lanes(bindings.finish_normal(), &mut lanes, lifecycle).await
+    {
+        lifecycle.terminal("terminal_handler", "finish");
+        return Err(fault);
+    }
+    Ok(())
 }
 
 fn finish_lane(
@@ -361,6 +453,10 @@ pub enum ApplicationHostFault {
 }
 
 #[cfg(test)]
+#[allow(
+    deprecated,
+    reason = "these tests exercise the feature-gated ApplicationHost and ProviderPort compatibility runtime"
+)]
 mod tests {
     use std::{
         collections::VecDeque,
@@ -418,10 +514,13 @@ mod tests {
         }
     }
 
-    struct PanickingObserver;
+    struct PanickingObserver {
+        calls: Arc<AtomicUsize>,
+    }
 
     impl EngineObserver for PanickingObserver {
         fn observe(&mut self, _observation: &EngineObservation) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             panic!("observer panic sentinel");
         }
     }
@@ -510,11 +609,9 @@ mod tests {
                 XmlStreamingToolCall::contract("test.owned-lane.finish", "v1")
                     .empty_element("done")
                     .required_attribute::<usize>("value")
-                    .exactly_one()
                     .listen_to(xml)
                     .on_decoded(|_| async { Ok::<(), Infallible>(()) })
-                    .on_invalid(|_| async { Ok::<(), Infallible>(()) })
-                    .on_finish(move || {
+                    .on_invalid(move |_| {
                         let terminal_runs = Arc::clone(&terminal_runs);
                         async move {
                             terminal_runs.fetch_add(1, Ordering::SeqCst);
@@ -617,14 +714,18 @@ mod tests {
     }
 
     #[test]
-    fn observer_panics_are_contained_and_terminal_cause_is_first_wins() {
-        let mut panicking: Option<Box<dyn EngineObserver>> = Some(Box::new(PanickingObserver));
-        {
+    fn observer_panic_propagates_without_reentering_the_observer_during_unwind() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut panicking: Option<Box<dyn EngineObserver>> = Some(Box::new(PanickingObserver {
+            calls: Arc::clone(&calls),
+        }));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut lifecycle = ReactionLifecycle::new(&mut panicking);
             lifecycle.observe(EngineObservation::InputSubmitted);
-            lifecycle.terminal("tool_lane", "handler");
-            lifecycle.terminal("binding", "event_handler");
-        }
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -673,7 +774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_lanes_run_concurrently_and_eof_waits_before_terminal_handlers() {
+    async fn owned_lanes_run_concurrently_and_eof_waits_before_parser_diagnostics() {
         let sink = Arc::new(RecordingSink::default());
         let sink_handle: Arc<dyn ToolOutputSink> = sink.clone();
         let first = ToolCall::new("call-first", "wait", "{}")
@@ -701,10 +802,10 @@ mod tests {
                 Ok(ProviderEvent::ToolCall(first)),
                 Ok(ProviderEvent::ToolCall(second)),
                 Ok(ProviderEvent::Text(TextTurnEvent::TextDelta(String::from(
-                    "<done value=\"1\"/>",
+                    "<done value=\"1\"",
                 )))),
                 Ok(ProviderEvent::Text(TextTurnEvent::TextComplete(
-                    String::from("<done value=\"1\"/>"),
+                    String::from("<done value=\"1\""),
                 ))),
             ]),
             keep_open: false,
@@ -734,7 +835,7 @@ mod tests {
         props.release.notify_waiters();
         reaction
             .await
-            .expect("both lane outputs stage before normal terminal handlers");
+            .expect("both lane outputs stage before normal EOF diagnostics");
 
         assert_eq!(sink.accepted.lock().unwrap().len(), 2);
         assert_eq!(props.terminal_runs.load(Ordering::SeqCst), 1);

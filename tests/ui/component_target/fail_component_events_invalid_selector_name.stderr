@@ -1,5 +1,5 @@
 error: ComponentEvents variant name cannot produce a valid SCREAMING_SNAKE_CASE selector
- --> tests/ui/component_target/fail_component_events_invalid_selector_name.rs:6:5
+ --> tests/ui/component_target/fail_component_events_invalid_selector_name.rs:8:5
   |
-6 |     __(String),
+8 |     __(String),
   |     ^^

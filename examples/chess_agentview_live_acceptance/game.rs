@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    panic::{resume_unwind, AssertUnwindSafe},
     path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -9,15 +10,17 @@ use std::{
 };
 
 use agentview::component::execution::{
-    ComponentReactionRuntime, ProviderEventStream, ProviderFault, ProviderPort, RenderedProjection,
+    Application, Frame, ProviderFactStream, ReactionPort, ReactionPortFault, SubmitFault,
+    TargetDeclaration,
 };
 use async_trait::async_trait;
 use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
+use futures::FutureExt;
 use tokio::time::{timeout_at, Instant};
 
 use crate::{
     chess_actions::{ChessAction, InvalidActionReason},
-    chess_agent::{chess_agent, ChessAgentProps, ChessAgentState, ChessSnapshot},
+    chess_agent::{chess_agent, ChessAgentState, ChessControl, ChessSnapshot},
     chess_feedback::ChessFeedback,
     chess_game_state::DrawState,
     model::{
@@ -398,14 +401,15 @@ fn terminal_event(
 }
 
 async fn play_game<P, O>(
-    white: &mut ComponentReactionRuntime<P, ChessAgentProps, ChessAgentState>,
+    white: &mut Application<P>,
+    control: &ChessControl,
     engine: &mut UciEngine,
     limits: GameLimits,
     progress: Arc<Mutex<GameProgress>>,
     observer: &mut O,
 ) -> PlayResult
 where
-    P: ProviderPort,
+    P: ReactionPort,
     O: GameObserver,
 {
     let mut board = Board::default();
@@ -449,9 +453,9 @@ where
             );
             match play_white_ply_observed(
                 white,
+                control,
                 snapshot.clone(),
                 turn_id,
-                accepted_moves.is_empty(),
                 limits.reaction_timeout,
                 |transition| {
                     observe_attempt_transition(transition, ply, &attempt_progress, observer)
@@ -837,6 +841,7 @@ pub struct GameEvidence {
     pub limits: GameLimits,
     pub engine_reads_bounded: bool,
     pub child_shutdown_observed: bool,
+    pub application_shutdown_observed: bool,
     pub(crate) trace_artifact_disposition: Option<super::observability::TraceArtifactDisposition>,
     pub(crate) status_output_complete: bool,
 }
@@ -850,7 +855,7 @@ pub(crate) async fn run_provider_game_with_observer_until<P, O>(
     observer: &mut O,
 ) -> anyhow::Result<GameEvidence>
 where
-    P: ProviderPort,
+    P: ReactionPort,
     O: GameObserver,
 {
     run_provider_game(
@@ -873,7 +878,7 @@ async fn run_provider_game<P, O>(
     observer: &mut O,
 ) -> anyhow::Result<GameEvidence>
 where
-    P: ProviderPort,
+    P: ReactionPort,
     O: GameObserver,
 {
     validate_limits(limits)?;
@@ -886,6 +891,9 @@ where
                 stage,
                 reason_code,
                 child_shutdown_observed: true,
+                application_shutdown_observed: true,
+                component_host_id_retained: false,
+                component_turn_executions: 0,
             },
             run_started_ms,
             0,
@@ -894,12 +902,96 @@ where
         )
         .await;
     }
+
     let provider_execute_count = Arc::new(AtomicUsize::new(0));
     let provider = CountingProvider::new(provider, Arc::clone(&provider_execute_count));
-    let spawned = UciEngine::spawn_until(engine_config, limits.engine_timeout, deadline).await;
+    let component_turn_executions = Arc::new(AtomicUsize::new(0));
+    let initial_snapshot = ChessSnapshot::in_progress(
+        Color::White,
+        Board::default(),
+        Vec::new(),
+        None,
+        ChessFeedback::initial(),
+    );
+    let initial_state = ChessAgentState::awaiting(
+        Arc::new(initial_snapshot),
+        ModelAttemptContext::initial(ModelTurnId::for_white_ply(0)),
+    );
+    let exported_control = Arc::new(Mutex::new(None));
+    let root_state = initial_state.clone();
+    let root_control = Arc::clone(&exported_control);
+    let root_turn_executions = Arc::clone(&component_turn_executions);
+    let mut white = match Application::mount(
+        move || {
+            chess_agent(
+                root_state.clone(),
+                Arc::clone(&root_control),
+                Arc::clone(&root_turn_executions),
+            )
+        },
+        provider,
+    ) {
+        Ok(application) => application,
+        Err(fault) => {
+            return finish_before_runtime(
+                limits,
+                BeforeRuntimeFailure {
+                    stage: InfrastructureStage::ModelReaction,
+                    reason_code: InfrastructureAbortReason::from_application(&fault),
+                    child_shutdown_observed: true,
+                    application_shutdown_observed: true,
+                    component_host_id_retained: false,
+                    component_turn_executions: 0,
+                },
+                run_started_ms,
+                provider_execute_count.load(Ordering::SeqCst),
+                effective_provider,
+                observer,
+            )
+            .await;
+        }
+    };
+    let control = lock(&exported_control).clone();
+    let Some(control) = control else {
+        let application_shutdown = AssertUnwindSafe(white.shutdown()).catch_unwind().await;
+        let application_shutdown_observed = match application_shutdown {
+            Ok(result) => result.is_ok(),
+            Err(payload) => resume_unwind(payload),
+        };
+        return finish_before_runtime(
+            limits,
+            BeforeRuntimeFailure {
+                stage: InfrastructureStage::AuthoritativeState,
+                reason_code: InfrastructureAbortReason::StateUnavailable,
+                child_shutdown_observed: true,
+                application_shutdown_observed,
+                component_host_id_retained: false,
+                component_turn_executions: component_turn_executions.load(Ordering::SeqCst),
+            },
+            run_started_ms,
+            provider_execute_count.load(Ordering::SeqCst),
+            effective_provider,
+            observer,
+        )
+        .await;
+    };
+
+    let spawned = AssertUnwindSafe(UciEngine::spawn_until(
+        engine_config,
+        limits.engine_timeout,
+        deadline,
+    ))
+    .catch_unwind()
+    .await;
     let mut engine = match spawned {
-        Ok(engine) => engine,
-        Err(failure) => {
+        Ok(Ok(engine)) => engine,
+        Ok(Err(failure)) => {
+            let component_host_id_retained = control.read_state().is_ok();
+            let application_shutdown = AssertUnwindSafe(white.shutdown()).catch_unwind().await;
+            let application_shutdown_observed = match application_shutdown {
+                Ok(result) => result.is_ok(),
+                Err(payload) => resume_unwind(payload),
+            };
             let (stage, reason_code) = if failure.deadline_exhausted() {
                 (
                     InfrastructureStage::WholeGame,
@@ -917,6 +1009,9 @@ where
                     stage,
                     reason_code,
                     child_shutdown_observed: failure.child_shutdown_observed(),
+                    application_shutdown_observed,
+                    component_host_id_retained,
+                    component_turn_executions: component_turn_executions.load(Ordering::SeqCst),
                 },
                 run_started_ms,
                 provider_execute_count.load(Ordering::SeqCst),
@@ -925,53 +1020,65 @@ where
             )
             .await;
         }
+        Err(operation_panic) => {
+            let _application_shutdown = AssertUnwindSafe(white.shutdown()).catch_unwind().await;
+            resume_unwind(operation_panic);
+        }
     };
-    let component_render_count = Arc::new(AtomicUsize::new(0));
-    let initial_snapshot = ChessSnapshot::in_progress(
-        Color::White,
-        Board::default(),
-        Vec::new(),
-        None,
-        ChessFeedback::initial(),
-    );
-    let mut white = ComponentReactionRuntime::new(
-        provider,
-        chess_agent,
-        ChessAgentProps::new(
-            initial_snapshot,
-            ModelAttemptContext::initial(ModelTurnId::for_white_ply(0)),
-            Arc::clone(&component_render_count),
-        ),
-    );
-    let component_host_id = white.component_host_id();
-    let progress = Arc::new(Mutex::new(GameProgress::new()));
 
-    let game = play_game(
-        &mut white,
-        &mut engine,
-        limits,
-        Arc::clone(&progress),
-        observer,
-    );
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let cleanup_reserve = std::cmp::min(limits.engine_timeout, remaining / 2);
-    let play_deadline = deadline
-        .checked_sub(cleanup_reserve)
-        .unwrap_or_else(Instant::now);
-    let game_result = timeout_at(play_deadline, game).await;
-    let timeout_observation = if game_result.is_err() {
-        observe_interrupted_work(&lock(&progress), observer)
-    } else {
-        Ok(())
+    let progress = Arc::new(Mutex::new(GameProgress::new()));
+    let operation = AssertUnwindSafe(async {
+        let game = play_game(
+            &mut white,
+            &control,
+            &mut engine,
+            limits,
+            Arc::clone(&progress),
+            observer,
+        );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let cleanup_reserve = std::cmp::min(limits.engine_timeout, remaining / 2);
+        let play_deadline = deadline
+            .checked_sub(cleanup_reserve)
+            .unwrap_or_else(Instant::now);
+        let game_result = timeout_at(play_deadline, game).await;
+        let timeout_observation = if game_result.is_err() {
+            observe_interrupted_work(&lock(&progress), observer)
+        } else {
+            Ok(())
+        };
+        (game_result, timeout_observation)
+    })
+    .catch_unwind()
+    .await;
+
+    let provider_execute_count = provider_execute_count.load(Ordering::SeqCst);
+    let component_turn_executions = component_turn_executions.load(Ordering::SeqCst);
+    let component_host_id_retained = control.read_state().is_ok();
+    let engine_reads_bounded = engine.reads_are_bounded();
+    let engine_shutdown = AssertUnwindSafe(engine.shutdown_until(deadline))
+        .catch_unwind()
+        .await;
+    let uci_commands = engine.sent_commands().to_vec();
+    let application_shutdown = AssertUnwindSafe(white.shutdown()).catch_unwind().await;
+
+    let (game_result, timeout_observation) = match operation {
+        Ok(operation) => operation,
+        Err(payload) => resume_unwind(payload),
     };
-    let shutdown = engine.shutdown_until(deadline).await;
+    let engine_shutdown = match engine_shutdown {
+        Ok(shutdown) => shutdown,
+        Err(payload) => resume_unwind(payload),
+    };
+    let application_shutdown = match application_shutdown {
+        Ok(shutdown) => shutdown,
+        Err(payload) => resume_unwind(payload),
+    };
     let child_shutdown_observed = matches!(
-        shutdown,
+        engine_shutdown,
         Ok(ShutdownDisposition::Graceful | ShutdownDisposition::ForcedReap)
     );
-    let provider_execute_count = provider_execute_count.load(Ordering::SeqCst);
-    let uci_commands = engine.sent_commands().to_vec();
-    let component_host_id_retained = white.component_host_id() == component_host_id;
+    let application_shutdown_observed = application_shutdown.is_ok();
     let deadline_exhausted = Instant::now() >= deadline;
     let result = match game_result {
         Ok(result) => result,
@@ -989,7 +1096,7 @@ where
             result.with_outcome(GameOutcome::InfrastructureAbort { stage, reason_code })
         }
     };
-    let result = if !child_shutdown_observed {
+    let result = if !child_shutdown_observed || !application_shutdown_observed {
         result.with_outcome(GameOutcome::InfrastructureAbort {
             stage: InfrastructureStage::Shutdown,
             reason_code: InfrastructureAbortReason::ShutdownFailure,
@@ -1004,6 +1111,7 @@ where
     };
     let cleanup = CleanupDisposition {
         engine_shutdown_observed: child_shutdown_observed,
+        application_shutdown_observed,
     };
     let result = finalize_observed_result(
         result,
@@ -1021,15 +1129,16 @@ where
         accepted_moves: result.accepted_moves,
         attempts: result.attempts,
         provider_execute_count,
-        component_turn_executions: component_render_count.load(Ordering::SeqCst),
+        component_turn_executions,
         effective_provider,
         provider_responses,
         component_host_id_retained,
         uci_commands,
         validated_black_moves: result.validated_black_moves,
         limits,
-        engine_reads_bounded: engine.reads_are_bounded(),
+        engine_reads_bounded,
         child_shutdown_observed,
+        application_shutdown_observed,
         trace_artifact_disposition: observer.trace_artifact_disposition(),
         status_output_complete: observer.status_output_complete(),
     })
@@ -1037,29 +1146,30 @@ where
 
 struct CountingProvider<P> {
     inner: P,
-    execute_count: Arc<AtomicUsize>,
+    submit_count: Arc<AtomicUsize>,
 }
 
 impl<P> CountingProvider<P> {
-    fn new(inner: P, execute_count: Arc<AtomicUsize>) -> Self {
+    fn new(inner: P, submit_count: Arc<AtomicUsize>) -> Self {
         Self {
             inner,
-            execute_count,
+            submit_count,
         }
     }
 }
 
 #[async_trait]
-impl<P> ProviderPort for CountingProvider<P>
+impl<P> ReactionPort for CountingProvider<P>
 where
-    P: ProviderPort,
+    P: ReactionPort,
 {
-    async fn execute<'a>(
-        &'a mut self,
-        projection: RenderedProjection,
-    ) -> Result<ProviderEventStream<'a>, ProviderFault> {
-        self.execute_count.fetch_add(1, Ordering::SeqCst);
-        self.inner.execute(projection).await
+    fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+        self.inner.declare()
+    }
+
+    async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
+        self.submit_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.submit(frame).await
     }
 }
 
@@ -1068,6 +1178,9 @@ struct BeforeRuntimeFailure {
     stage: InfrastructureStage,
     reason_code: InfrastructureAbortReason,
     child_shutdown_observed: bool,
+    application_shutdown_observed: bool,
+    component_host_id_retained: bool,
+    component_turn_executions: usize,
 }
 
 async fn finish_before_runtime<O>(
@@ -1081,7 +1194,7 @@ async fn finish_before_runtime<O>(
 where
     O: GameObserver,
 {
-    let outcome = if failure.child_shutdown_observed {
+    let outcome = if failure.child_shutdown_observed && failure.application_shutdown_observed {
         GameOutcome::InfrastructureAbort {
             stage: failure.stage,
             reason_code: failure.reason_code,
@@ -1094,6 +1207,7 @@ where
     };
     let cleanup = CleanupDisposition {
         engine_shutdown_observed: failure.child_shutdown_observed,
+        application_shutdown_observed: failure.application_shutdown_observed,
     };
     let outcome = finalize_outcome(
         TerminalSnapshot {
@@ -1115,15 +1229,16 @@ where
         accepted_moves: Vec::new(),
         attempts: Vec::new(),
         provider_execute_count,
-        component_turn_executions: 0,
+        component_turn_executions: failure.component_turn_executions,
         effective_provider,
         provider_responses,
-        component_host_id_retained: false,
+        component_host_id_retained: failure.component_host_id_retained,
         uci_commands: Vec::new(),
         validated_black_moves: Vec::new(),
         limits,
         engine_reads_bounded: false,
         child_shutdown_observed: failure.child_shutdown_observed,
+        application_shutdown_observed: failure.application_shutdown_observed,
         trace_artifact_disposition: observer.trace_artifact_disposition(),
         status_output_complete: observer.status_output_complete(),
     })
@@ -1344,4 +1459,612 @@ fn validate_limits(limits: GameLimits) -> anyhow::Result<()> {
         anyhow::bail!("all game bounds must be positive");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        fs,
+        num::{NonZeroU128, NonZeroU64},
+        panic::AssertUnwindSafe,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use agentview::component::execution::{
+        ApplicationFaultCode, ApplicationFaultKind, ApplicationFaultReason, ApplicationFaultStage,
+        Frame, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision, ProviderFact,
+        ProviderFactStream, ProviderOutputKey, ReactionPort, ReactionPortFault,
+        ReactionPortFaultCode, ReactionPortFaultReason, SubmitFault, TargetDeclaration,
+        TargetEpoch, TargetIdentity,
+    };
+    use async_trait::async_trait;
+    use futures::FutureExt;
+
+    use super::*;
+    use crate::observability::{
+        EffectiveProviderConfig, ObservationFailure, ProviderEndpointClass, RunEvent,
+    };
+
+    struct SetupPort {
+        identity: TargetIdentity,
+        epoch: TargetEpoch,
+        profile: FrameProfile,
+        accepted: Option<FrameRevision>,
+        submissions: Arc<AtomicUsize>,
+    }
+
+    impl SetupPort {
+        fn new(submissions: Arc<AtomicUsize>) -> Self {
+            Self {
+                identity: TargetIdentity::new(
+                    NonZeroU128::new((10_u128 << 64) | 1).expect("non-zero setup target identity"),
+                ),
+                epoch: TargetEpoch::new(NonZeroU64::MIN),
+                profile: FrameProfile::new(
+                    FrameConstraints {
+                        max_frame_bytes: 1024 * 1024,
+                        max_component_bytes: 256 * 1024,
+                        context_window_tokens: None,
+                        reserved_output_tokens: None,
+                    },
+                    FrameCapabilities::new(true),
+                ),
+                accepted: None,
+                submissions,
+            }
+        }
+
+        fn declaration(&self) -> TargetDeclaration {
+            match self.accepted {
+                Some(revision) => TargetDeclaration::resume(revision, self.profile.clone()),
+                None => TargetDeclaration::full(self.identity, self.epoch, self.profile.clone()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReactionPort for SetupPort {
+        fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+            Ok(self.declaration())
+        }
+
+        async fn submit<'a>(
+            &'a mut self,
+            frame: Frame,
+        ) -> Result<ProviderFactStream<'a>, SubmitFault> {
+            frame.check_handoff_precondition(&self.declaration())?;
+            self.accepted = Some(frame.revision());
+            self.submissions.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::once(async {
+                Ok(ProviderFact::ReactionCompleted { primary_text: None })
+            })))
+        }
+    }
+
+    #[derive(Default)]
+    struct OfflineObserver {
+        elapsed_ms: u64,
+        events: Vec<RunEvent>,
+        panic_on_model_reaction_started: bool,
+    }
+
+    impl GameObserver for OfflineObserver {
+        fn now_ms(&mut self) -> u64 {
+            self.elapsed_ms = self.elapsed_ms.saturating_add(1);
+            self.elapsed_ms
+        }
+
+        fn record(&mut self, event: RunEvent) -> Result<(), ObservationFailure> {
+            if self.panic_on_model_reaction_started
+                && matches!(event, RunEvent::ModelReactionStarted { .. })
+            {
+                std::panic::panic_any(String::from("task-5 operation panic"));
+            }
+            self.events.push(event);
+            Ok(())
+        }
+
+        fn trace_artifact_disposition(&self) -> Option<TraceArtifactDisposition> {
+            None
+        }
+
+        fn status_output_complete(&self) -> bool {
+            true
+        }
+    }
+
+    const GAME_TEXT_OUTPUT: ProviderOutputKey = ProviderOutputKey::new(1);
+    const GAME_TEST_TARGET_DOMAIN: u128 = 11_u128 << 64;
+    static NEXT_GAME_TEST_TARGET: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Clone, Copy)]
+    enum GameScript {
+        Text(&'static str),
+        PendingAfterHandoff,
+    }
+
+    struct ScriptedGamePort {
+        identity: TargetIdentity,
+        epoch: TargetEpoch,
+        profile: FrameProfile,
+        accepted: Option<FrameRevision>,
+        scripts: VecDeque<GameScript>,
+        submissions: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+        reject_before_handoff: Arc<AtomicBool>,
+        panic_on_drop: bool,
+    }
+
+    impl ScriptedGamePort {
+        fn new(
+            scripts: impl IntoIterator<Item = GameScript>,
+            submissions: Arc<AtomicUsize>,
+            dropped: Arc<AtomicBool>,
+            reject_before_handoff: Arc<AtomicBool>,
+            panic_on_drop: bool,
+        ) -> Self {
+            let instance = NEXT_GAME_TEST_TARGET.fetch_add(1, Ordering::Relaxed);
+            Self {
+                identity: TargetIdentity::new(
+                    NonZeroU128::new(GAME_TEST_TARGET_DOMAIN | u128::from(instance))
+                        .expect("non-zero game target identity"),
+                ),
+                epoch: TargetEpoch::new(NonZeroU64::MIN),
+                profile: FrameProfile::new(
+                    FrameConstraints {
+                        max_frame_bytes: 1024 * 1024,
+                        max_component_bytes: 256 * 1024,
+                        context_window_tokens: None,
+                        reserved_output_tokens: None,
+                    },
+                    FrameCapabilities::new(true),
+                ),
+                accepted: None,
+                scripts: scripts.into_iter().collect(),
+                submissions,
+                dropped,
+                reject_before_handoff,
+                panic_on_drop,
+            }
+        }
+
+        fn declaration(&self) -> TargetDeclaration {
+            match self.accepted {
+                Some(revision) => TargetDeclaration::resume(revision, self.profile.clone()),
+                None => TargetDeclaration::full(self.identity, self.epoch, self.profile.clone()),
+            }
+        }
+    }
+
+    impl Drop for ScriptedGamePort {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+            if self.panic_on_drop {
+                panic!("task-5 cleanup panic");
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReactionPort for ScriptedGamePort {
+        fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+            Ok(self.declaration())
+        }
+
+        async fn submit<'a>(
+            &'a mut self,
+            frame: Frame,
+        ) -> Result<ProviderFactStream<'a>, SubmitFault> {
+            frame.check_handoff_precondition(&self.declaration())?;
+            if self.reject_before_handoff.load(Ordering::SeqCst) {
+                return Err(SubmitFault::Rejected(ReactionPortFault::retryable(
+                    ReactionPortFaultCode::Unavailable,
+                    ReactionPortFaultReason::Transport,
+                )));
+            }
+            let script = self.scripts.front().copied().ok_or_else(|| {
+                SubmitFault::Rejected(ReactionPortFault::retryable(
+                    ReactionPortFaultCode::Unavailable,
+                    ReactionPortFaultReason::Other,
+                ))
+            })?;
+            let facts: ProviderFactStream<'a> = match script {
+                GameScript::Text(text) => Box::pin(futures::stream::iter([
+                    Ok(ProviderFact::TextDelta {
+                        output: GAME_TEXT_OUTPUT,
+                        phase: None,
+                        delta: text.to_owned(),
+                    }),
+                    Ok(ProviderFact::TextSealed {
+                        output: GAME_TEXT_OUTPUT,
+                        phase: None,
+                        text: text.to_owned(),
+                    }),
+                    Ok(ProviderFact::ReactionCompleted {
+                        primary_text: Some(GAME_TEXT_OUTPUT),
+                    }),
+                ])),
+                GameScript::PendingAfterHandoff => Box::pin(futures::stream::pending()),
+            };
+
+            self.scripts
+                .pop_front()
+                .expect("inspected scripted game response remains at the crossing poll");
+            self.accepted = Some(frame.revision());
+            self.submissions.fetch_add(1, Ordering::SeqCst);
+            Ok(facts)
+        }
+    }
+
+    #[cfg(unix)]
+    struct FakeUciProcess {
+        program: PathBuf,
+        quit_marker: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeUciProcess {
+        fn create() -> std::io::Result<Self> {
+            static NEXT_FAKE_UCI: AtomicU64 = AtomicU64::new(1);
+            let instance = NEXT_FAKE_UCI.fetch_add(1, Ordering::Relaxed);
+            let base = format!("agentview-task-5-uci-{}-{instance}", std::process::id());
+            let program = std::env::temp_dir().join(&base);
+            let quit_marker = std::env::temp_dir().join(format!("{base}.quit"));
+            let script = format!(
+                "#!/bin/sh\nwhile IFS= read -r command; do\n  case \"$command\" in\n    uci) printf '%s\\n' uciok ;;\n    isready) printf '%s\\n' readyok ;;\n    go*) printf '%s\\n' 'bestmove e7e5' ;;\n    quit) printf '%s\\n' quit > '{}'; exit 0 ;;\n  esac\ndone\n",
+                quit_marker.display()
+            );
+            fs::write(&program, script)?;
+            let mut permissions = fs::metadata(&program)?.permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&program, permissions)?;
+            Ok(Self {
+                program,
+                quit_marker,
+            })
+        }
+
+        fn config(&self) -> UciProcessConfig {
+            UciProcessConfig::stockfish(self.program.clone()).expect("fake UCI path is absolute")
+        }
+
+        fn quit_observed(&self) -> bool {
+            self.quit_marker.is_file()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeUciProcess {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.program);
+            let _ = fs::remove_file(&self.quit_marker);
+        }
+    }
+
+    fn game_test_limits(reaction_timeout: Duration) -> GameLimits {
+        GameLimits {
+            reaction_timeout,
+            engine_timeout: Duration::from_millis(250),
+            whole_game_deadline: Duration::from_secs(2),
+            ply_limit: 4,
+            engine_nodes: 1,
+        }
+    }
+
+    fn offline_effective_provider() -> EffectiveProviderConfig {
+        EffectiveProviderConfig::new(
+            "offline-script".to_owned(),
+            ProviderEndpointClass::LoopbackHttp,
+            "offline.invalid".to_owned(),
+        )
+    }
+
+    fn assert_complete_owner_cleanup(evidence: &GameEvidence, dropped: &AtomicBool) {
+        assert!(evidence.component_host_id_retained);
+        assert!(evidence.child_shutdown_observed);
+        assert!(evidence.application_shutdown_observed);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn uci_setup_failure_after_mount_consumes_application_without_submitting() {
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let provider = SetupPort::new(Arc::clone(&submissions));
+        let missing_uci = PathBuf::from(format!(
+            "/__agentview_task_5_missing_uci_{}",
+            std::process::id()
+        ));
+        let engine_config = UciProcessConfig::stockfish(missing_uci)
+            .expect("absolute missing UCI path is valid configuration");
+        let limits = GameLimits {
+            reaction_timeout: Duration::from_millis(100),
+            engine_timeout: Duration::from_millis(100),
+            whole_game_deadline: Duration::from_secs(1),
+            ply_limit: 2,
+            engine_nodes: 1,
+        };
+        let effective_provider = EffectiveProviderConfig::new(
+            "offline-script".to_owned(),
+            ProviderEndpointClass::LoopbackHttp,
+            "offline.invalid".to_owned(),
+        );
+        let mut observer = OfflineObserver::default();
+
+        let evidence = run_provider_game_with_observer_until(
+            provider,
+            engine_config,
+            limits,
+            Instant::now() + limits.whole_game_deadline,
+            effective_provider,
+            &mut observer,
+        )
+        .await
+        .expect("UCI setup failure produces terminal evidence");
+
+        assert!(matches!(
+            evidence.outcome,
+            GameOutcome::InfrastructureAbort {
+                stage: InfrastructureStage::Engine,
+                reason_code: InfrastructureAbortReason::EngineFailure,
+            }
+        ));
+        assert_eq!(submissions.load(Ordering::SeqCst), 0);
+        assert_eq!(evidence.provider_execute_count, 0);
+        assert_eq!(evidence.component_turn_executions, 0);
+        assert!(evidence.component_host_id_retained);
+        assert!(evidence.child_shutdown_observed);
+        assert!(evidence.application_shutdown_observed);
+        assert!(observer
+            .events
+            .iter()
+            .any(|event| matches!(event, RunEvent::Terminal { .. })));
+    }
+
+    #[cfg(unix)]
+    async fn run_completed_scripted_game(
+        scripts: impl IntoIterator<Item = GameScript>,
+        reaction_timeout: Duration,
+    ) -> (GameEvidence, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        run_completed_scripted_game_with_rejection(scripts, reaction_timeout, false).await
+    }
+
+    #[cfg(unix)]
+    async fn run_completed_scripted_game_with_rejection(
+        scripts: impl IntoIterator<Item = GameScript>,
+        reaction_timeout: Duration,
+        reject_before_handoff: bool,
+    ) -> (GameEvidence, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let fake_uci = FakeUciProcess::create().expect("fake UCI process installs");
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reject_before_handoff = Arc::new(AtomicBool::new(reject_before_handoff));
+        let provider = ScriptedGamePort::new(
+            scripts,
+            Arc::clone(&submissions),
+            Arc::clone(&dropped),
+            reject_before_handoff,
+            false,
+        );
+        let limits = game_test_limits(reaction_timeout);
+        let mut observer = OfflineObserver::default();
+        let evidence = run_provider_game_with_observer_until(
+            provider,
+            fake_uci.config(),
+            limits,
+            Instant::now() + limits.whole_game_deadline,
+            offline_effective_provider(),
+            &mut observer,
+        )
+        .await
+        .expect("offline scripted game produces evidence");
+        assert!(fake_uci.quit_observed());
+        (evidence, submissions, dropped)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_resignation_cleans_up_uci_and_application_owners() {
+        let (evidence, submissions, dropped) = run_completed_scripted_game(
+            [GameScript::Text("<resign />")],
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(matches!(
+            evidence.outcome,
+            GameOutcome::Resignation {
+                resigned: Color::White,
+                winner: Color::Black,
+            }
+        ));
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(evidence.provider_execute_count, 1);
+        assert_eq!(evidence.component_turn_executions, 1);
+        assert_eq!(evidence.attempts.len(), 1);
+        assert_eq!(evidence.uci_commands, ["uci", "isready", "quit"]);
+        assert_complete_owner_cleanup(&evidence, &dropped);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_game_preserves_legal_uci_turn_and_provider_call_counting() {
+        let (evidence, submissions, dropped) = run_completed_scripted_game(
+            [
+                GameScript::Text("<choose_move uci=\"e2e4\" />"),
+                GameScript::Text("<resign />"),
+            ],
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                evidence.outcome,
+                GameOutcome::Resignation {
+                    resigned: Color::White,
+                    winner: Color::Black,
+                }
+            ),
+            "unexpected multi-turn outcome: {:?}",
+            evidence.outcome
+        );
+        assert_eq!(
+            evidence
+                .accepted_moves
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["e2e4", "e7e5"]
+        );
+        assert_eq!(
+            evidence
+                .validated_black_moves
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["e7e5"]
+        );
+        assert_eq!(
+            evidence.uci_commands,
+            [
+                "uci",
+                "isready",
+                "position startpos moves e2e4",
+                "go nodes 1",
+                "quit",
+            ]
+        );
+        assert_eq!(submissions.load(Ordering::SeqCst), 2);
+        assert_eq!(evidence.provider_execute_count, 2);
+        assert_eq!(evidence.component_turn_executions, 2);
+        assert_eq!(evidence.attempts.len(), 2);
+        assert_complete_owner_cleanup(&evidence, &dropped);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_rejection_after_mount_still_cleans_up_both_owners() {
+        let (evidence, submissions, dropped) = run_completed_scripted_game_with_rejection(
+            [GameScript::Text("<resign />")],
+            Duration::from_millis(100),
+            true,
+        )
+        .await;
+
+        assert!(matches!(
+            evidence.outcome,
+            GameOutcome::InfrastructureAbort {
+                stage: InfrastructureStage::ModelReaction,
+                reason_code: InfrastructureAbortReason::Application {
+                    stage: ApplicationFaultStage::Submit,
+                    kind: ApplicationFaultKind::Retryable,
+                    code: ApplicationFaultCode::Unavailable,
+                    reason: ApplicationFaultReason::Port(ReactionPortFaultReason::Transport),
+                },
+            }
+        ));
+        assert_eq!(submissions.load(Ordering::SeqCst), 0);
+        assert_eq!(evidence.provider_execute_count, 1);
+        assert_eq!(evidence.component_turn_executions, 0);
+        assert_eq!(evidence.attempts.len(), 1);
+        assert_complete_owner_cleanup(&evidence, &dropped);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_reaction_timeout_cleans_up_uci_and_terminal_application_owner() {
+        let (evidence, submissions, dropped) = run_completed_scripted_game(
+            [GameScript::PendingAfterHandoff],
+            Duration::from_millis(25),
+        )
+        .await;
+
+        assert!(matches!(
+            evidence.outcome,
+            GameOutcome::InfrastructureAbort {
+                stage: InfrastructureStage::ModelReaction,
+                reason_code: InfrastructureAbortReason::ReactionTimeout,
+            }
+        ));
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(evidence.provider_execute_count, 1);
+        assert_eq!(evidence.component_turn_executions, 0);
+        assert_eq!(evidence.attempts.len(), 1);
+        assert_complete_owner_cleanup(&evidence, &dropped);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_retry_exhaustion_cleans_up_both_game_owners() {
+        let (evidence, submissions, dropped) = run_completed_scripted_game(
+            [
+                GameScript::Text("<bogus />"),
+                GameScript::Text("<bogus />"),
+                GameScript::Text("<bogus />"),
+            ],
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(matches!(
+            evidence.outcome,
+            GameOutcome::ModelForfeit {
+                final_reason: InvalidActionReason::InvalidXml,
+                attempts,
+            } if attempts == crate::model::MAX_MODEL_ATTEMPTS
+        ));
+        assert_eq!(submissions.load(Ordering::SeqCst), 3);
+        assert_eq!(evidence.provider_execute_count, 3);
+        assert_eq!(evidence.component_turn_executions, 3);
+        assert_eq!(evidence.attempts.len(), 3);
+        assert_complete_owner_cleanup(&evidence, &dropped);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operation_panic_outranks_cleanup_panic_after_both_cleanup_attempts() {
+        let fake_uci = FakeUciProcess::create().expect("fake UCI process installs");
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let provider = ScriptedGamePort::new(
+            [GameScript::Text("<resign />")],
+            Arc::clone(&submissions),
+            Arc::clone(&dropped),
+            Arc::new(AtomicBool::new(false)),
+            true,
+        );
+        let limits = game_test_limits(Duration::from_millis(100));
+        let mut observer = OfflineObserver {
+            panic_on_model_reaction_started: true,
+            ..OfflineObserver::default()
+        };
+
+        let panic = AssertUnwindSafe(run_provider_game_with_observer_until(
+            provider,
+            fake_uci.config(),
+            limits,
+            Instant::now() + limits.whole_game_deadline,
+            offline_effective_provider(),
+            &mut observer,
+        ))
+        .catch_unwind()
+        .await
+        .expect_err("operation panic must propagate after cleanup");
+
+        assert_eq!(
+            panic.downcast_ref::<String>().map(String::as_str),
+            Some("task-5 operation panic")
+        );
+        assert_eq!(submissions.load(Ordering::SeqCst), 0);
+        assert!(fake_uci.quit_observed());
+        assert!(dropped.load(Ordering::Acquire));
+    }
 }

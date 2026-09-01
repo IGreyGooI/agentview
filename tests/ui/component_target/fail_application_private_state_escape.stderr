@@ -1,0 +1,32 @@
+error[E0599]: no method named `port` found for struct `agentview::component::execution::Application<P>` in the current scope
+  --> tests/ui/component_target/fail_application_private_state_escape.rs:50:25
+   |
+50 |     let _ = application.port();
+   |                         ^^^^ private field, not a method
+   |
+help: there is a method `or` with a similar name, but with different arguments
+  --> $CARGO/tower-http-$VERSION/src/follow_redirect/policy/mod.rs
+   |
+   | /     fn or<P, B, E>(self, other: P) -> Or<Self, P>
+   | |     where
+   | |         Self: Policy<B, E> + Sized,
+   | |         P: Policy<B, E>;
+   | |________________________^
+
+error[E0599]: no method named `port_mut` found for struct `agentview::component::execution::Application<P>` in the current scope
+  --> tests/ui/component_target/fail_application_private_state_escape.rs:51:25
+   |
+51 |     let _ = application.port_mut();
+   |                         ^^^^^^^^ method not found in `agentview::component::execution::Application<Port>`
+
+error[E0599]: no method named `session` found for struct `agentview::component::execution::Application<P>` in the current scope
+  --> tests/ui/component_target/fail_application_private_state_escape.rs:52:25
+   |
+52 |     let _ = application.session();
+   |                         ^^^^^^^ private field, not a method
+
+error[E0599]: no method named `session_mut` found for struct `agentview::component::execution::Application<P>` in the current scope
+  --> tests/ui/component_target/fail_application_private_state_escape.rs:53:25
+   |
+53 |     let _ = application.session_mut();
+   |                         ^^^^^^^^^^^ method not found in `agentview::component::execution::Application<Port>`
