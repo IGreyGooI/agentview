@@ -826,10 +826,10 @@ fn ensure_pending_tool_calls_closed(
     for item in replay.iter().chain(staged_inputs) {
         match item {
             CanonicalInputItem::ToolCall { call_id, .. } => pending.push_back(call_id.as_str()),
-            CanonicalInputItem::ToolResult { call_id, .. } => {
-                if pending.front().copied() == Some(call_id.as_str()) {
-                    pending.pop_front();
-                }
+            CanonicalInputItem::ToolResult { call_id, .. }
+                if pending.front().copied() == Some(call_id.as_str()) =>
+            {
+                pending.pop_front();
             }
             _ => {}
         }
@@ -2030,7 +2030,7 @@ mod tests {
         let prepared = session.prepare(&resume, &complete).unwrap();
         assert_eq!(
             prepared.frame.submission().staged_inputs(),
-            &[expected.clone()]
+            std::slice::from_ref(&expected)
         );
         drop(prepared);
         assert_eq!(

@@ -610,10 +610,10 @@ impl OpenAiContinuation {
         for item in &self.unclaimed_provider_outputs {
             match item {
                 CanonicalInputItem::ToolCall { call_id, .. } => pending.push_back(call_id.as_str()),
-                CanonicalInputItem::ToolResult { call_id, .. } => {
-                    if pending.front().copied() == Some(call_id.as_str()) {
-                        pending.pop_front();
-                    }
+                CanonicalInputItem::ToolResult { call_id, .. }
+                    if pending.front().copied() == Some(call_id.as_str()) =>
+                {
+                    pending.pop_front();
                 }
                 _ => {}
             }
@@ -784,12 +784,11 @@ fn ensure_all_tool_calls_closed<'a>(
                 }
                 pending.push_back(call_id.as_str());
             }
-            CanonicalInputItem::ToolResult { call_id, .. } => {
+            CanonicalInputItem::ToolResult { call_id, .. }
                 if !seen_outputs.insert(call_id.as_str())
-                    || pending.pop_front() != Some(call_id.as_str())
-                {
-                    return Err(OpenAiContinuationError::InvalidEncodedRequest);
-                }
+                    || pending.pop_front() != Some(call_id.as_str()) =>
+            {
+                return Err(OpenAiContinuationError::InvalidEncodedRequest);
             }
             _ => {}
         }

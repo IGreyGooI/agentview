@@ -2254,9 +2254,7 @@ pub fn reconstruct_transcript(
 ) -> Result<CanonicalTranscript, TranscriptReconstructionError> {
     let mut transcript = CanonicalTranscript::new();
     let mut session_id: Option<&SessionId> = None;
-    let mut expected_log_revision = 1_u64;
-
-    for envelope in records {
+    for (expected_log_revision, envelope) in (1_u64..).zip(records) {
         if session_id.is_some_and(|session| session != envelope.session_id()) {
             return Err(TranscriptReconstructionError::MixedSessions);
         }
@@ -2267,8 +2265,6 @@ pub fn reconstruct_transcript(
                 actual: envelope.revision(),
             });
         }
-        expected_log_revision += 1;
-
         if let SessionRecord::CanonicalItemAppended {
             transcript_revision,
             item,
