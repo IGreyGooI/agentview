@@ -675,6 +675,12 @@ pub trait ReactionPort: Send {
     /// boundary. The first poll that causes real or ambiguous delivery must
     /// return `Ready(Ok(stream))` in that same poll; all failures after that
     /// boundary are yielded by the returned stream.
+    ///
+    /// Dropping an unfinished returned fact stream must synchronously leave a
+    /// later `declare()` truthful: compatible `Accepted` only when exact
+    /// continuation remains usable, higher-epoch `FullRequired` when recovery
+    /// invalidates continuity, or a terminal declaration fault. Stale
+    /// `Accepted` continuity is forbidden.
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault>;
 }
 

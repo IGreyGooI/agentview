@@ -7,7 +7,7 @@ use std::{
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     pin::Pin,
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
 };
@@ -50,7 +50,6 @@ fn render_root(root: RootFactory, events: EventInput<ProviderEvent>) -> Componen
 }
 
 const APPLICATION_READY: u8 = 0;
-const APPLICATION_TERMINATED_AFTER_CANCELLATION: u8 = 1;
 const APPLICATION_TERMINATED_AFTER_TASK_PANIC: u8 = 2;
 
 fn consume_supervised_task_panic(application_state: &Arc<AtomicU8>, monitor: &TaskPanicMonitor) {
@@ -78,11 +77,6 @@ fn application_terminal_state_fault(
 ) -> Option<ApplicationFault> {
     match state {
         APPLICATION_READY => None,
-        APPLICATION_TERMINATED_AFTER_CANCELLATION => Some(ApplicationFault::terminal(
-            stage,
-            ApplicationFaultCode::Unavailable,
-            ApplicationFaultReason::CancelledAfterHandoff,
-        )),
         APPLICATION_TERMINATED_AFTER_TASK_PANIC => Some(task_panic_terminal_fault(stage)),
         _ => Some(ApplicationFault::terminal(
             stage,
@@ -167,39 +161,59 @@ enum SubmissionAttempt {
     ContinuityChanged,
 }
 
-struct ReactionCancellationGuard {
-    application_state: Arc<AtomicU8>,
-    handed_off: bool,
-    returned: bool,
+#[derive(Clone)]
+struct ReactionCancellationControl {
+    suppressed: Arc<AtomicBool>,
+    monitor: TaskPanicMonitor,
 }
 
-impl ReactionCancellationGuard {
-    fn new(application_state: Arc<AtomicU8>) -> Self {
+impl ReactionCancellationControl {
+    fn new(monitor: TaskPanicMonitor) -> Self {
         Self {
-            application_state,
-            handed_off: false,
-            returned: false,
+            suppressed: Arc::new(AtomicBool::new(false)),
+            monitor,
         }
     }
 
-    fn mark_handoff(&mut self) {
-        self.handed_off = true;
+    fn suppress(&self) {
+        self.suppressed.store(true, Ordering::Release);
     }
 
-    fn mark_returned(&mut self) {
-        self.returned = true;
+    fn should_recover(&self) -> bool {
+        !self.suppressed.load(Ordering::Acquire)
+            && self.monitor.status() == TaskSupervisorStatus::Healthy
+            && !std::thread::panicking()
     }
 }
 
-impl Drop for ReactionCancellationGuard {
+struct ReactionCancellationRecovery<'a> {
+    admission: ReactionAdmissionGuard<'a>,
+    control: ReactionCancellationControl,
+    armed: bool,
+}
+
+impl<'a> ReactionCancellationRecovery<'a> {
+    fn new(admission: ReactionAdmissionGuard<'a>, control: ReactionCancellationControl) -> Self {
+        Self {
+            admission,
+            control,
+            armed: true,
+        }
+    }
+
+    fn admission_mut(&mut self) -> &mut ReactionAdmissionGuard<'a> {
+        &mut self.admission
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReactionCancellationRecovery<'_> {
     fn drop(&mut self) {
-        if self.handed_off && !self.returned {
-            let _ = self.application_state.compare_exchange(
-                APPLICATION_READY,
-                APPLICATION_TERMINATED_AFTER_CANCELLATION,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+        if self.armed && self.control.should_recover() {
+            self.admission.finish_cancelled();
         }
     }
 }
@@ -482,10 +496,12 @@ impl<P: ReactionPort> Application<P> {
         begin_outer_driver_boundary(&application_state, &monitor).map_err(|fault| {
             application_fault_from_outer_driver_boundary(ApplicationFaultStage::Reaction, fault)
         })?;
-        let mut reaction = Box::pin(self.react_with_cancellation_guard());
+        let cancellation = ReactionCancellationControl::new(monitor.clone());
+        let mut reaction = Box::pin(self.react_inner(&cancellation));
         let result = tokio::select! {
             biased;
             task = monitor.wait() => {
+                cancellation.suppress();
                 drop_reaction_before_panic_arbitration(reaction, &monitor);
                 return match task {
                     Ok(()) => {
@@ -514,22 +530,9 @@ impl<P: ReactionPort> Application<P> {
         }
     }
 
-    async fn react_with_cancellation_guard(&mut self) -> Result<(), ApplicationFault> {
-        if let Some(fault) = application_terminal_state_fault(
-            ApplicationFaultStage::Reaction,
-            self.state.load(Ordering::Acquire),
-        ) {
-            return Err(fault);
-        }
-        let mut cancellation = ReactionCancellationGuard::new(Arc::clone(&self.state));
-        let result = self.react_inner(&mut cancellation).await;
-        cancellation.mark_returned();
-        result
-    }
-
     async fn react_inner(
         &mut self,
-        cancellation: &mut ReactionCancellationGuard,
+        cancellation: &ReactionCancellationControl,
     ) -> Result<(), ApplicationFault> {
         let declaration = self.refresh_declaration()?;
         self.check_task_panic(ApplicationFaultStage::Declaration)?;
@@ -703,13 +706,12 @@ async fn run_submission_attempt<P: ReactionPort>(
     session: &mut FrameSession,
     bindings: &mut RenderBindings<ProviderEvent>,
     prepared: PreparedFrame,
-    cancellation: &mut ReactionCancellationGuard,
+    cancellation: &ReactionCancellationControl,
 ) -> Result<SubmissionAttempt, ApplicationFault> {
     let submission = submit_prepared_frame(port, session, prepared).await;
     match submission {
         Ok(facts) => {
-            cancellation.mark_handoff();
-            pump_provider_facts(session, bindings, facts).await?;
+            pump_provider_facts(session, bindings, facts, cancellation.clone()).await?;
             Ok(SubmissionAttempt::Completed)
         }
         Err(SubmitFault::ContinuityChanged) => Ok(SubmissionAttempt::ContinuityChanged),
@@ -720,87 +722,107 @@ async fn run_submission_attempt<P: ReactionPort>(
 async fn pump_provider_facts(
     session: &mut FrameSession,
     bindings: &mut RenderBindings<ProviderEvent>,
-    mut facts: ProviderFactStream<'_>,
+    facts: ProviderFactStream<'_>,
+    cancellation: ReactionCancellationControl,
 ) -> Result<(), ApplicationFault> {
     let budget = session.full_reserve_budget();
-    let mut admission = ReactionAdmissionGuard::with_budget(
+    let admission = ReactionAdmissionGuard::with_budget(
         &mut session.canonical_history.transcript,
         &mut session.target_delivery.tool_outputs,
         budget,
     )?;
+    let mut recovery = ReactionCancellationRecovery::new(admission, cancellation);
+    let mut facts = Some(facts);
     let mut lanes = FuturesUnordered::<ToolLane>::new();
 
-    let fact_stream_fault = loop {
-        enum Next {
-            Fact(Option<Result<super::reaction::ProviderFact, ReactionPortFault>>),
-            Lane(Option<Result<CompletedToolLane, ComponentAttemptFault>>),
-        }
-
-        let next = if lanes.is_empty() {
-            Next::Fact(facts.next().await)
-        } else {
-            tokio::select! {
-                fact = facts.next() => Next::Fact(fact),
-                lane = lanes.next() => Next::Lane(lane),
+    let result: Result<(), ApplicationFault> = async {
+        let fact_stream_fault = loop {
+            enum Next {
+                Fact(Option<Result<super::reaction::ProviderFact, ReactionPortFault>>),
+                Lane(Option<Result<CompletedToolLane, ComponentAttemptFault>>),
             }
-        };
 
-        match next {
-            Next::Lane(lane) => finish_tool_lane(lane, &mut admission)?,
-            Next::Fact(None) => break None,
-            Next::Fact(Some(Err(source))) => {
-                break Some(ApplicationFault::from_port(
-                    ApplicationFaultStage::FactStream,
-                    source,
-                ))
-            }
-            Next::Fact(Some(Ok(fact))) => {
-                let (event, ticket) = admission.admit(fact)?.into_parts();
-                match (event, ticket) {
-                    (Some(ProviderEvent::ToolCall(call)), Some(ticket)) => {
-                        let future = bindings.start_native_tool(call).map_err(|source| {
-                            ApplicationFault::from_attempt(ApplicationFaultStage::Binding, source)
-                        })?;
-                        lanes.push(Box::pin(async move {
-                            let output =
-                                future.await.map_err(ComponentAttemptFault::native_tool)?;
-                            Ok(CompletedToolLane { ticket, output })
-                        }));
-                    }
-                    (Some(event), None) => {
-                        await_binding_with_lanes(
-                            bindings.dispatch(event),
-                            &mut lanes,
-                            &mut admission,
-                        )
-                        .await?;
-                    }
-                    (None, None) => {}
-                    _ => {
-                        return Err(ApplicationFault::terminal(
-                            ApplicationFaultStage::Admission,
-                            ApplicationFaultCode::Internal,
-                            ApplicationFaultReason::FactProjectionInvariant,
-                        ))
+            let next = if lanes.is_empty() {
+                Next::Fact(
+                    facts
+                        .as_mut()
+                        .expect("the provider fact stream remains owned while pumping")
+                        .next()
+                        .await,
+                )
+            } else {
+                tokio::select! {
+                    fact = facts
+                        .as_mut()
+                        .expect("the provider fact stream remains owned while pumping")
+                        .next() => Next::Fact(fact),
+                    lane = lanes.next() => Next::Lane(lane),
+                }
+            };
+
+            match next {
+                Next::Lane(lane) => finish_tool_lane(lane, recovery.admission_mut())?,
+                Next::Fact(None) => break None,
+                Next::Fact(Some(Err(source))) => {
+                    break Some(ApplicationFault::from_port(
+                        ApplicationFaultStage::FactStream,
+                        source,
+                    ))
+                }
+                Next::Fact(Some(Ok(fact))) => {
+                    let (event, ticket) = recovery.admission_mut().admit(fact)?.into_parts();
+                    match (event, ticket) {
+                        (Some(ProviderEvent::ToolCall(call)), Some(ticket)) => {
+                            let future = bindings.start_native_tool(call).map_err(|source| {
+                                ApplicationFault::from_attempt(
+                                    ApplicationFaultStage::Binding,
+                                    source,
+                                )
+                            })?;
+                            lanes.push(Box::pin(async move {
+                                let output =
+                                    future.await.map_err(ComponentAttemptFault::native_tool)?;
+                                Ok(CompletedToolLane { ticket, output })
+                            }));
+                        }
+                        (Some(event), None) => {
+                            await_binding_with_lanes(
+                                bindings.dispatch(event),
+                                &mut lanes,
+                                recovery.admission_mut(),
+                            )
+                            .await?;
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(ApplicationFault::terminal(
+                                ApplicationFaultStage::Admission,
+                                ApplicationFaultCode::Internal,
+                                ApplicationFaultReason::FactProjectionInvariant,
+                            ))
+                        }
                     }
                 }
             }
-        }
-    };
+        };
 
-    drop(facts);
-    while !lanes.is_empty() {
-        finish_tool_lane(lanes.next().await, &mut admission)?;
+        drop(facts.take());
+        while !lanes.is_empty() {
+            finish_tool_lane(lanes.next().await, recovery.admission_mut())?;
+        }
+        if let Some(fault) = fact_stream_fault {
+            return Err(fault);
+        }
+        recovery.admission_mut().finish_normal()?;
+        bindings.finish_normal().await.map_err(|source| {
+            ApplicationFault::from_attempt(ApplicationFaultStage::Binding, source)
+        })?;
+        Ok(())
     }
-    if let Some(fault) = fact_stream_fault {
-        return Err(fault);
-    }
-    admission.finish_normal()?;
-    bindings
-        .finish_normal()
-        .await
-        .map_err(|source| ApplicationFault::from_attempt(ApplicationFaultStage::Binding, source))?;
-    Ok(())
+    .await;
+
+    recovery.disarm();
+    result
 }
 
 fn finish_tool_lane(
@@ -888,7 +910,6 @@ pub enum ApplicationFaultStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApplicationFaultReason {
-    CancelledAfterHandoff,
     Port(ReactionPortFaultReason),
     InvalidDeclaration,
     InvalidFrameProfile,
@@ -1211,7 +1232,7 @@ mod tests {
 
     use agentview_derive::{component, view};
     use async_trait::async_trait;
-    use futures::{stream, task::noop_waker, StreamExt};
+    use futures::{stream, task::noop_waker, FutureExt, StreamExt};
     use tokio::sync::Notify;
 
     use super::*;
@@ -1330,16 +1351,64 @@ mod tests {
     enum FactScript {
         Finite(Vec<Result<ProviderFact, ReactionPortFault>>),
         PendingAfter(Vec<Result<ProviderFact, ReactionPortFault>>),
+        PendingAfterFullReset(Vec<Result<ProviderFact, ReactionPortFault>>),
         PanicOnDropPending,
+        PanicOnDropAfter(Vec<Result<ProviderFact, ReactionPortFault>>),
     }
 
-    struct PanicOnDropFactStream;
+    struct FullResetFactStream<'a> {
+        facts: VecDeque<Result<ProviderFact, ReactionPortFault>>,
+        declaration: &'a mut TargetDeclaration,
+    }
+
+    impl futures::Stream for FullResetFactStream<'_> {
+        type Item = Result<ProviderFact, ReactionPortFault>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            match self.facts.pop_front() {
+                Some(fact) => Poll::Ready(Some(fact)),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl Drop for FullResetFactStream<'_> {
+        fn drop(&mut self) {
+            let next_epoch = self
+                .declaration
+                .continuity()
+                .epoch()
+                .get()
+                .get()
+                .checked_add(1)
+                .and_then(NonZeroU64::new)
+                .expect("test epoch space");
+            *self.declaration = TargetDeclaration::full(
+                self.declaration.identity(),
+                TargetEpoch::new(next_epoch),
+                self.declaration.profile().clone(),
+            );
+        }
+    }
+
+    struct PanicOnDropFactStream {
+        facts: VecDeque<Result<ProviderFact, ReactionPortFault>>,
+    }
 
     impl futures::Stream for PanicOnDropFactStream {
         type Item = Result<ProviderFact, ReactionPortFault>;
 
-        fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Pending
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            match self.facts.pop_front() {
+                Some(fact) => Poll::Ready(Some(fact)),
+                None => Poll::Pending,
+            }
         }
     }
 
@@ -1364,6 +1433,7 @@ mod tests {
         declaration: TargetDeclaration,
         scripts: VecDeque<FactScript>,
         continuity_rejections: usize,
+        submit_pending_polls: VecDeque<usize>,
         probe: Arc<ScriptProbe>,
         observed_task_drop: Option<Arc<std::sync::atomic::AtomicBool>>,
         before_stream: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1381,6 +1451,17 @@ mod tests {
             frame: Frame,
         ) -> Result<ProviderFactStream<'a>, SubmitFault> {
             self.probe.submissions.fetch_add(1, Ordering::Relaxed);
+            let mut pending_polls = self.submit_pending_polls.pop_front().unwrap_or(0);
+            poll_fn(|context| {
+                if pending_polls == 0 {
+                    Poll::Ready(())
+                } else {
+                    pending_polls -= 1;
+                    context.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
             if let Some(dropped) = &self.observed_task_drop {
                 self.probe
                     .task_drop_observed_at_submit
@@ -1436,7 +1517,16 @@ mod tests {
                     stream::iter(facts)
                         .chain(stream::pending::<Result<ProviderFact, ReactionPortFault>>()),
                 ),
-                FactScript::PanicOnDropPending => Box::pin(PanicOnDropFactStream),
+                FactScript::PendingAfterFullReset(facts) => Box::pin(FullResetFactStream {
+                    facts: facts.into(),
+                    declaration: &mut self.declaration,
+                }),
+                FactScript::PanicOnDropPending => Box::pin(PanicOnDropFactStream {
+                    facts: VecDeque::new(),
+                }),
+                FactScript::PanicOnDropAfter(facts) => Box::pin(PanicOnDropFactStream {
+                    facts: facts.into(),
+                }),
             };
             Ok(facts)
         }
@@ -1453,6 +1543,7 @@ mod tests {
                 declaration: target_declaration(profile),
                 scripts: scripts.into(),
                 continuity_rejections,
+                submit_pending_polls: VecDeque::new(),
                 probe: Arc::clone(&probe),
                 observed_task_drop: None,
                 before_stream: None,
@@ -1473,6 +1564,30 @@ mod tests {
             ordinal,
             call: ProviderToolCall::new(call_id, name, "{}").unwrap(),
         }
+    }
+
+    fn assert_tool_fallback_remains_hidden(
+        application: &mut Application<ScriptedPort>,
+        ordinal: u64,
+    ) {
+        assert_eq!(
+            application
+                .session
+                .target_delivery
+                .tool_outputs
+                .ordered_outputs()
+                .count(),
+            0
+        );
+        assert!(matches!(
+            application
+                .session
+                .target_delivery
+                .tool_outputs
+                .prepare_receipt(),
+            Err(ToolOutputStagingFault::UnresolvedOutput { ordinal: observed })
+                if observed == ordinal
+        ));
     }
 
     #[component]
@@ -1516,6 +1631,127 @@ mod tests {
             }
         });
         view! { state { "{rendered}" } }
+    }
+
+    #[component]
+    fn panicking_event_with_pending_tool() -> Component {
+        use_provider_event_handler(ProviderEvent::TEXT, |_event| async move {
+            panic!("provider handler panic after tool admission");
+            #[allow(unreachable_code)]
+            Ok::<(), String>(())
+        });
+        NativeToolCall::named("pending-during-handler-panic").on_call(|call| async move {
+            std::future::pending::<()>().await;
+            Ok::<_, String>(call.output("unreachable"))
+        })
+    }
+
+    #[component]
+    fn panicking_tool_lane_component() -> Component {
+        NativeToolCall::named("panicking-tool-lane").on_call(|_call| async move {
+            panic!("native tool lane panic");
+            #[allow(unreachable_code)]
+            Err::<ToolOutput, _>("unreachable")
+        })
+    }
+
+    struct CallbackCancellationProbe {
+        invocations: AtomicUsize,
+        cancelled_drops: AtomicUsize,
+        post_await: AtomicUsize,
+        first_started: Notify,
+        first_release: Notify,
+    }
+
+    impl CallbackCancellationProbe {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                invocations: AtomicUsize::new(0),
+                cancelled_drops: AtomicUsize::new(0),
+                post_await: AtomicUsize::new(0),
+                first_started: Notify::new(),
+                first_release: Notify::new(),
+            })
+        }
+    }
+
+    struct CallbackDropProbe {
+        dropped: Arc<CallbackCancellationProbe>,
+    }
+
+    impl Drop for CallbackDropProbe {
+        fn drop(&mut self) {
+            self.dropped.cancelled_drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    async fn run_cancellable_callback(probe: Arc<CallbackCancellationProbe>) -> Result<(), String> {
+        let invocation = probe.invocations.fetch_add(1, Ordering::AcqRel);
+        if invocation == 0 {
+            let _drop = CallbackDropProbe {
+                dropped: Arc::clone(&probe),
+            };
+            probe.first_started.notify_one();
+            probe.first_release.notified().await;
+        }
+        probe.post_await.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    #[component]
+    fn cancellable_event_handler_component(probe: Arc<CallbackCancellationProbe>) -> Component {
+        let state = use_signal(|| String::from("before"));
+        let rendered = state.with(Clone::clone).expect("mounted state");
+        use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+            let probe = Arc::clone(&probe);
+            let state = state.clone();
+            async move {
+                if probe.invocations.load(Ordering::Acquire) == 0 {
+                    state
+                        .set(String::from("written-before-cancellation"))
+                        .map_err(|fault| fault.to_string())?;
+                }
+                run_cancellable_callback(probe).await
+            }
+        });
+        view! { callback_state { "{rendered}" } }
+    }
+
+    #[derive(Clone)]
+    struct StreamingCancellationProps {
+        stream: Arc<CallbackCancellationProbe>,
+        completions: Arc<AtomicUsize>,
+    }
+
+    #[component]
+    fn cancellable_streaming_xml_component(props: StreamingCancellationProps) -> Component {
+        let stream_probe = Arc::clone(&props.stream);
+        let completions = Arc::clone(&props.completions);
+        StreamingXml::tag("item")
+            .on_stream(move |_element| run_cancellable_callback(Arc::clone(&stream_probe)))
+            .on_complete(move |_element| {
+                let completions = Arc::clone(&completions);
+                async move {
+                    completions.fetch_add(1, Ordering::AcqRel);
+                    Ok::<(), String>(())
+                }
+            })
+            .into_component()
+    }
+
+    #[component]
+    fn cancellable_xml_invalid_component(probe: Arc<CallbackCancellationProbe>) -> Component {
+        StreamingXml::tag("item")
+            .on_invalid(move |_diagnostic| run_cancellable_callback(Arc::clone(&probe)))
+            .into_component()
+    }
+
+    #[component]
+    fn cancellable_reaction_completion_component(
+        probe: Arc<CallbackCancellationProbe>,
+    ) -> Component {
+        use_reaction_completion(move || run_cancellable_callback(Arc::clone(&probe)));
+        __private::fragment(Vec::new())
     }
 
     #[component]
@@ -1820,6 +2056,34 @@ mod tests {
             panic!("deferred bootstrap task panic");
         });
         view! { deferred_panic { "mounted" } }
+    }
+
+    #[derive(Clone)]
+    struct TaskPanicWithPendingToolProps {
+        task_started: Arc<std::sync::atomic::AtomicBool>,
+        task_release: Arc<Notify>,
+        lane_started: Arc<Notify>,
+    }
+
+    #[component]
+    fn task_panic_with_pending_tool(props: TaskPanicWithPendingToolProps) -> Component {
+        let task_started = Arc::clone(&props.task_started);
+        let task_release = Arc::clone(&props.task_release);
+        use_future(move || async move {
+            task_started.store(true, Ordering::Release);
+            task_release.notified().await;
+            panic!("latched task panic before reaction drop");
+        });
+
+        let lane_started = Arc::clone(&props.lane_started);
+        NativeToolCall::named("pending-during-task-panic").on_call(move |call| {
+            let lane_started = Arc::clone(&lane_started);
+            async move {
+                lane_started.notify_one();
+                std::future::pending::<()>().await;
+                Ok::<_, String>(call.output("unreachable"))
+            }
+        })
     }
 
     #[component]
@@ -2710,16 +2974,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_handoff_cancellation_terminates_application_before_next_declaration() {
+    async fn post_handoff_cancellation_materializes_tool_fallback_and_application_is_reusable() {
         let lane_started = Arc::new(Notify::new());
         let observed_start = Arc::clone(&lane_started);
         let (port, probe) = scripted_port(
-            vec![FactScript::PendingAfter(vec![Ok(tool_fact(
-                11,
-                1,
-                "call-cancelled",
-                "never-finishes",
-            ))])],
+            vec![
+                FactScript::PendingAfter(vec![Ok(tool_fact(
+                    11,
+                    1,
+                    "call-cancelled",
+                    "never-finishes",
+                ))]),
+                completed_reaction(),
+            ],
             0,
         );
         let mut application = Application::mount(
@@ -2751,20 +3018,808 @@ mod tests {
         .expect("tool lane start");
         drop(reaction);
 
-        let declarations = probe.declarations.load(Ordering::Relaxed);
-        let submissions = probe.submissions.load(Ordering::Relaxed);
-        let fault = application.react().await.unwrap_err();
+        {
+            let staged = application
+                .session
+                .target_delivery
+                .tool_outputs
+                .ordered_outputs()
+                .collect::<Vec<_>>();
+            assert_eq!(staged.len(), 1);
+            assert_eq!(
+                staged[0].1,
+                &CanonicalInputItem::tool_result(
+                    "call-cancelled",
+                    "Tool execution was cancelled; its outcome is unknown.",
+                )
+                .unwrap()
+            );
+        }
 
-        assert_eq!(fault.stage(), ApplicationFaultStage::Reaction);
-        assert_eq!(fault.kind(), ApplicationFaultKind::Terminal);
-        assert_eq!(fault.code(), ApplicationFaultCode::Unavailable);
+        application.react().await.unwrap();
+
+        assert_eq!(probe.declarations.load(Ordering::Relaxed), 3);
+        assert_eq!(probe.submissions.load(Ordering::Relaxed), 2);
+        assert_eq!(probe.handoffs.load(Ordering::Relaxed), 2);
+        assert!(matches!(
+            probe.bases.lock().unwrap().as_slice(),
+            [FrameBasis::Full, FrameBasis::DeltaFrom(_)]
+        ));
+        assert_eq!(*probe.staged_input_counts.lock().unwrap(), [0, 1]);
         assert_eq!(
-            fault.reason(),
-            ApplicationFaultReason::CancelledAfterHandoff
+            application
+                .session
+                .target_delivery
+                .tool_outputs
+                .ordered_outputs()
+                .count(),
+            0
         );
-        assert_eq!(probe.declarations.load(Ordering::Relaxed), declarations);
-        assert_eq!(probe.submissions.load(Ordering::Relaxed), submissions);
+    }
+
+    #[tokio::test]
+    async fn retained_continuity_sends_cancelled_tool_output_in_delta() {
+        let lane_started = Arc::new(Notify::new());
+        let observed_start = Arc::clone(&lane_started);
+        let (port, probe) = scripted_port(
+            vec![
+                FactScript::PendingAfter(vec![Ok(tool_fact(
+                    12,
+                    1,
+                    "call-retained-continuity",
+                    "retained-pending",
+                ))]),
+                completed_reaction(),
+            ],
+            0,
+        );
+        let mut application = Application::mount(
+            move || {
+                let lane_started = Arc::clone(&observed_start);
+                NativeToolCall::named("retained-pending").on_call(move |call| {
+                    let lane_started = Arc::clone(&lane_started);
+                    async move {
+                        lane_started.notify_one();
+                        std::future::pending::<()>().await;
+                        Ok::<_, String>(call.output("unreachable"))
+                    }
+                })
+            },
+            port,
+        )
+        .unwrap();
+        let started = lane_started.notified();
+        tokio::pin!(started);
+        let mut cancelled = Box::pin(application.react());
+
+        tokio::select! {
+            result = &mut cancelled => panic!("pending reaction ended: {result:?}"),
+            _ = &mut started => {}
+        }
+        drop(cancelled);
+
+        application.react().await.unwrap();
+
+        assert!(matches!(
+            probe.bases.lock().unwrap().as_slice(),
+            [FrameBasis::Full, FrameBasis::DeltaFrom(_)]
+        ));
+        assert_eq!(*probe.staged_input_counts.lock().unwrap(), [0, 1]);
+        let frames = probe.canonical_frames.lock().unwrap();
+        let delta = std::str::from_utf8(&frames[1]).unwrap();
+        assert_eq!(delta.matches("call-retained-continuity").count(), 2);
+        assert_eq!(
+            delta
+                .matches("Tool execution was cancelled; its outcome is unknown.")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn post_handoff_cancellation_without_facts_recovers_with_a_higher_epoch_full() {
+        let (port, probe) = scripted_port(
+            vec![
+                FactScript::PendingAfterFullReset(Vec::new()),
+                completed_reaction(),
+            ],
+            0,
+        );
+        let mut application = Application::mount(|| __private::fragment(Vec::new()), port).unwrap();
+        let mut reaction = Box::pin(application.react());
+
+        assert!(poll_once(reaction.as_mut()).is_pending());
+        drop(reaction);
+
+        application.react().await.unwrap();
+
+        assert_eq!(probe.handoffs.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            probe.bases.lock().unwrap().as_slice(),
+            [FrameBasis::Full, FrameBasis::Full]
+        );
+    }
+
+    #[tokio::test]
+    async fn post_handoff_cancellation_replays_interrupted_text_once() {
+        let output = ProviderOutputKey::new(17);
+        let (port, probe) = scripted_port(
+            vec![
+                FactScript::PendingAfterFullReset(vec![Ok(ProviderFact::TextDelta {
+                    output,
+                    phase: None,
+                    delta: String::from("partial"),
+                })]),
+                completed_reaction(),
+            ],
+            0,
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = Arc::clone(&events);
+        let mut application = Application::mount(
+            move || stateful_provider_handler(Arc::clone(&observed_events)),
+            port,
+        )
+        .unwrap();
+        let mut reaction = Box::pin(application.react());
+
+        assert!(poll_once(reaction.as_mut()).is_pending());
+        drop(reaction);
+
+        assert_eq!(*events.lock().unwrap(), ["delta"]);
+        assert_eq!(
+            application
+                .session
+                .canonical_history
+                .transcript
+                .items()
+                .last(),
+            Some(&CanonicalInputItem::interrupted_assistant_text(
+                "partial", None
+            ))
+        );
+
+        application.react().await.unwrap();
+
+        assert_eq!(*events.lock().unwrap(), ["delta"]);
+        assert_eq!(
+            application
+                .session
+                .canonical_history
+                .transcript
+                .items()
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    CanonicalInputItem::AssistantText {
+                        text,
+                        status: AssistantTextStatus::Interrupted,
+                        ..
+                    } if text == "partial"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            probe.bases.lock().unwrap().as_slice(),
+            [FrameBasis::Full, FrameBasis::Full]
+        );
+        let frames = probe.canonical_frames.lock().unwrap();
+        let recovery = std::str::from_utf8(&frames[1]).unwrap();
+        assert_eq!(recovery.matches("partial").count(), 1);
+        assert_eq!(recovery.matches("interrupted").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_fallback_survives_a_later_pre_handoff_submit_cancellation() {
+        let lane_started = Arc::new(Notify::new());
+        let observed_start = Arc::clone(&lane_started);
+        let (port, probe) = scripted_port(
+            vec![
+                FactScript::PendingAfter(vec![Ok(tool_fact(
+                    23,
+                    1,
+                    "call-retry-cancel",
+                    "never-finishes",
+                ))]),
+                completed_reaction(),
+            ],
+            0,
+        );
+        let mut application = Application::mount(
+            move || {
+                let lane_started = Arc::clone(&observed_start);
+                NativeToolCall::named("never-finishes").on_call(move |call| {
+                    let lane_started = Arc::clone(&lane_started);
+                    async move {
+                        lane_started.notify_one();
+                        std::future::pending::<()>().await;
+                        Ok::<_, String>(call.output("unreachable"))
+                    }
+                })
+            },
+            port,
+        )
+        .unwrap();
+        let started = lane_started.notified();
+        tokio::pin!(started);
+        let mut first = Box::pin(application.react());
+        tokio::select! {
+            result = &mut first => panic!("pending reaction ended: {result:?}"),
+            _ = &mut started => {}
+        }
+        drop(first);
+        assert_eq!(
+            application
+                .session
+                .target_delivery
+                .tool_outputs
+                .ordered_outputs()
+                .count(),
+            1
+        );
+
+        application.port.submit_pending_polls.push_back(1);
+        let mut recovery = Box::pin(application.react());
+        assert!(poll_once(recovery.as_mut()).is_pending());
+        drop(recovery);
+
         assert_eq!(probe.handoffs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            application
+                .session
+                .target_delivery
+                .tool_outputs
+                .ordered_outputs()
+                .count(),
+            1
+        );
+
+        application.react().await.unwrap();
+        assert_eq!(probe.handoffs.load(Ordering::Relaxed), 2);
+        assert_eq!(*probe.staged_input_counts.lock().unwrap(), [0, 1]);
+        assert_eq!(
+            application
+                .session
+                .target_delivery
+                .tool_outputs
+                .ordered_outputs()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn two_cancellation_recovery_cycles_leave_no_stale_tool_slots() {
+        let lane_started = Arc::new(Notify::new());
+        let observed_start = Arc::clone(&lane_started);
+        let (port, probe) = scripted_port(
+            vec![
+                FactScript::PendingAfter(vec![Ok(tool_fact(
+                    31,
+                    1,
+                    "call-cycle-one",
+                    "never-finishes",
+                ))]),
+                completed_reaction(),
+                FactScript::PendingAfter(vec![Ok(tool_fact(
+                    32,
+                    1,
+                    "call-cycle-two",
+                    "never-finishes",
+                ))]),
+                completed_reaction(),
+            ],
+            0,
+        );
+        let mut application = Application::mount(
+            move || {
+                let lane_started = Arc::clone(&observed_start);
+                NativeToolCall::named("never-finishes").on_call(move |call| {
+                    let lane_started = Arc::clone(&lane_started);
+                    async move {
+                        lane_started.notify_one();
+                        std::future::pending::<()>().await;
+                        Ok::<_, String>(call.output("unreachable"))
+                    }
+                })
+            },
+            port,
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let started = lane_started.notified();
+            tokio::pin!(started);
+            let mut cancelled = Box::pin(application.react());
+            tokio::select! {
+                result = &mut cancelled => panic!("pending reaction ended: {result:?}"),
+                _ = &mut started => {}
+            }
+            drop(cancelled);
+            assert_eq!(
+                application
+                    .session
+                    .target_delivery
+                    .tool_outputs
+                    .ordered_outputs()
+                    .count(),
+                1
+            );
+
+            application.react().await.unwrap();
+            assert_eq!(
+                application
+                    .session
+                    .target_delivery
+                    .tool_outputs
+                    .ordered_outputs()
+                    .count(),
+                0
+            );
+        }
+
+        assert_eq!(probe.handoffs.load(Ordering::Relaxed), 4);
+        assert_eq!(*probe.staged_input_counts.lock().unwrap(), [0, 1, 0, 1]);
+        let frames = probe.canonical_frames.lock().unwrap();
+        let first_recovery = std::str::from_utf8(&frames[1]).unwrap();
+        let second_recovery = std::str::from_utf8(&frames[3]).unwrap();
+        assert_eq!(first_recovery.matches("call-cycle-one").count(), 2);
+        assert_eq!(first_recovery.matches("call-cycle-two").count(), 0);
+        assert_eq!(second_recovery.matches("call-cycle-one").count(), 0);
+        assert_eq!(second_recovery.matches("call-cycle-two").count(), 2);
+        assert_eq!(
+            first_recovery
+                .matches("Tool execution was cancelled; its outcome is unknown.")
+                .count(),
+            1
+        );
+        assert_eq!(
+            second_recovery
+                .matches("Tool execution was cancelled; its outcome is unknown.")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_event_handler_panic_keeps_admitted_tool_fallback_hidden() {
+        let (port, _) = scripted_port(
+            vec![FactScript::PendingAfter(vec![
+                Ok(tool_fact(
+                    41,
+                    1,
+                    "call-handler-panic",
+                    "pending-during-handler-panic",
+                )),
+                Ok(ProviderFact::TextDelta {
+                    output: ProviderOutputKey::new(42),
+                    phase: None,
+                    delta: String::from("panic"),
+                }),
+            ])],
+            0,
+        );
+        let mut application = Application::mount(panicking_event_with_pending_tool, port).unwrap();
+
+        let panic = AssertUnwindSafe(application.react())
+            .catch_unwind()
+            .await
+            .expect_err("the provider event handler must panic");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"provider handler panic after tool admission")
+        );
+        assert_tool_fallback_remains_hidden(&mut application, 1);
+        drop(application);
+    }
+
+    #[tokio::test]
+    async fn native_tool_lane_panic_keeps_admitted_tool_fallback_hidden() {
+        let (port, _) = scripted_port(
+            vec![FactScript::PendingAfter(vec![Ok(tool_fact(
+                43,
+                1,
+                "call-lane-panic",
+                "panicking-tool-lane",
+            ))])],
+            0,
+        );
+        let mut application = Application::mount(panicking_tool_lane_component, port).unwrap();
+
+        let panic = AssertUnwindSafe(application.react())
+            .catch_unwind()
+            .await
+            .expect_err("the native tool lane must panic");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"native tool lane panic")
+        );
+        assert_tool_fallback_remains_hidden(&mut application, 1);
+        drop(application);
+    }
+
+    #[tokio::test]
+    async fn provider_stream_destructor_panic_keeps_admitted_tool_fallback_hidden() {
+        let lane_started = Arc::new(Notify::new());
+        let observed_start = Arc::clone(&lane_started);
+        let (port, _) = scripted_port(
+            vec![FactScript::PanicOnDropAfter(vec![Ok(tool_fact(
+                44,
+                1,
+                "call-stream-drop-panic",
+                "pending-stream-drop-panic",
+            ))])],
+            0,
+        );
+        let mut application = Application::mount(
+            move || {
+                let lane_started = Arc::clone(&observed_start);
+                NativeToolCall::named("pending-stream-drop-panic").on_call(move |call| {
+                    let lane_started = Arc::clone(&lane_started);
+                    async move {
+                        lane_started.notify_one();
+                        std::future::pending::<()>().await;
+                        Ok::<_, String>(call.output("unreachable"))
+                    }
+                })
+            },
+            port,
+        )
+        .unwrap();
+        let started = lane_started.notified();
+        tokio::pin!(started);
+        let mut reaction = Box::pin(application.react());
+        tokio::select! {
+            result = &mut reaction => panic!("pending reaction ended: {result:?}"),
+            _ = &mut started => {}
+        }
+
+        let panic = std::panic::catch_unwind(AssertUnwindSafe(|| drop(reaction)))
+            .expect_err("dropping the provider fact stream must panic");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"provider fact stream drop panic")
+        );
+        assert_tool_fallback_remains_hidden(&mut application, 1);
+        drop(application);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervised_task_panic_suppresses_tool_fallback_and_is_sticky_terminal() {
+        let task_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_release = Arc::new(Notify::new());
+        let lane_started = Arc::new(Notify::new());
+        let component_task_started = Arc::clone(&task_started);
+        let component_task_release = Arc::clone(&task_release);
+        let component_lane_started = Arc::clone(&lane_started);
+        let (port, _) = scripted_port(
+            vec![FactScript::PendingAfter(vec![Ok(tool_fact(
+                45,
+                1,
+                "call-supervised-panic",
+                "pending-during-task-panic",
+            ))])],
+            0,
+        );
+        let mut application = Application::mount(
+            move || {
+                task_panic_with_pending_tool(TaskPanicWithPendingToolProps {
+                    task_started: Arc::clone(&component_task_started),
+                    task_release: Arc::clone(&component_task_release),
+                    lane_started: Arc::clone(&component_lane_started),
+                })
+            },
+            port,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !task_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supervised task must start");
+        let started = lane_started.notified();
+        tokio::pin!(started);
+        let mut reaction = Box::pin(application.react());
+        tokio::select! {
+            result = &mut reaction => panic!("pending reaction ended: {result:?}"),
+            _ = &mut started => {}
+        }
+        task_release.notify_one();
+
+        let panic = AssertUnwindSafe(reaction)
+            .catch_unwind()
+            .await
+            .expect_err("the supervised task panic must escape the reaction");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"latched task panic before reaction drop")
+        );
+        assert_tool_fallback_remains_hidden(&mut application, 1);
+        assert_eq!(
+            application.state.load(Ordering::Acquire),
+            APPLICATION_TERMINATED_AFTER_TASK_PANIC
+        );
+        let terminal = application.react().await.unwrap_err();
+        assert_eq!(terminal.reason(), ApplicationFaultReason::ComponentRuntime);
+        drop(application);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn latched_task_panic_suppresses_recovery_when_react_is_dropped_without_another_poll() {
+        let task_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_release = Arc::new(Notify::new());
+        let lane_started = Arc::new(Notify::new());
+        let component_task_started = Arc::clone(&task_started);
+        let component_task_release = Arc::clone(&task_release);
+        let component_lane_started = Arc::clone(&lane_started);
+        let (port, _) = scripted_port(
+            vec![FactScript::PendingAfter(vec![Ok(tool_fact(
+                46,
+                1,
+                "call-latched-unpolled-panic",
+                "pending-during-task-panic",
+            ))])],
+            0,
+        );
+        let mut application = Application::mount(
+            move || {
+                task_panic_with_pending_tool(TaskPanicWithPendingToolProps {
+                    task_started: Arc::clone(&component_task_started),
+                    task_release: Arc::clone(&component_task_release),
+                    lane_started: Arc::clone(&component_lane_started),
+                })
+            },
+            port,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !task_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supervised task must start");
+        let monitor = application.tasks.panic_monitor();
+        let started = lane_started.notified();
+        tokio::pin!(started);
+        let mut reaction = Box::pin(application.react());
+        tokio::select! {
+            result = &mut reaction => panic!("pending reaction ended: {result:?}"),
+            _ = &mut started => {}
+        }
+
+        task_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), monitor.wait())
+            .await
+            .expect("task panic must latch without polling react")
+            .expect("task supervisor remains observable");
+        assert_eq!(monitor.status(), TaskSupervisorStatus::Panicked);
+        drop(reaction);
+
+        let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = application.take_driver_demand();
+        }))
+        .expect_err("the next Application boundary must resume the task panic");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"latched task panic before reaction drop")
+        );
+        assert_tool_fallback_remains_hidden(&mut application, 1);
+        assert_eq!(
+            application.state.load(Ordering::Acquire),
+            APPLICATION_TERMINATED_AFTER_TASK_PANIC
+        );
+        drop(application);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_event_handler_drops_once_and_later_invokes_fresh_handler() {
+        let probe = CallbackCancellationProbe::new();
+        let component_probe = Arc::clone(&probe);
+        let first_output = ProviderOutputKey::new(51);
+        let second_output = ProviderOutputKey::new(52);
+        let (port, _) = scripted_port(
+            vec![
+                FactScript::PendingAfterFullReset(vec![Ok(ProviderFact::TextDelta {
+                    output: first_output,
+                    phase: None,
+                    delta: String::from("cancelled"),
+                })]),
+                FactScript::Finite(vec![
+                    Ok(ProviderFact::TextDelta {
+                        output: second_output,
+                        phase: None,
+                        delta: String::from("fresh"),
+                    }),
+                    Ok(ProviderFact::TextSealed {
+                        output: second_output,
+                        phase: None,
+                        text: String::from("fresh"),
+                    }),
+                    Ok(ProviderFact::ReactionCompleted {
+                        primary_text: Some(second_output),
+                    }),
+                ]),
+            ],
+            0,
+        );
+        let mut application = Application::mount(
+            move || cancellable_event_handler_component(Arc::clone(&component_probe)),
+            port,
+        )
+        .unwrap();
+        let started = probe.first_started.notified();
+        tokio::pin!(started);
+        let mut reaction = Box::pin(application.react());
+        tokio::select! {
+            result = &mut reaction => panic!("pending reaction ended: {result:?}"),
+            _ = &mut started => {}
+        }
+        drop(reaction);
+
+        assert_eq!(probe.invocations.load(Ordering::Acquire), 1);
+        assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
+        assert_eq!(probe.post_await.load(Ordering::Acquire), 0);
+
+        application.react().await.unwrap();
+
+        assert_eq!(probe.invocations.load(Ordering::Acquire), 3);
+        assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
+        assert_eq!(probe.post_await.load(Ordering::Acquire), 2);
+        assert!(rendered_text(application.current_projection().projection())
+            .contains("written-before-cancellation"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_streaming_xml_callback_drops_once_and_closing_tag_completes() {
+        let probe = CallbackCancellationProbe::new();
+        let completions = Arc::new(AtomicUsize::new(0));
+        let component_probe = Arc::clone(&probe);
+        let component_completions = Arc::clone(&completions);
+        let first_output = ProviderOutputKey::new(53);
+        let second_output = ProviderOutputKey::new(54);
+        let (port, _) = scripted_port(
+            vec![
+                FactScript::PendingAfterFullReset(vec![Ok(ProviderFact::TextDelta {
+                    output: first_output,
+                    phase: None,
+                    delta: String::from("<item>cancelled"),
+                })]),
+                FactScript::Finite(vec![
+                    Ok(ProviderFact::TextDelta {
+                        output: second_output,
+                        phase: None,
+                        delta: String::from("<item>fresh"),
+                    }),
+                    Ok(ProviderFact::TextDelta {
+                        output: second_output,
+                        phase: None,
+                        delta: String::from("</item>"),
+                    }),
+                    Ok(ProviderFact::TextSealed {
+                        output: second_output,
+                        phase: None,
+                        text: String::from("<item>fresh</item>"),
+                    }),
+                    Ok(ProviderFact::ReactionCompleted {
+                        primary_text: Some(second_output),
+                    }),
+                ]),
+            ],
+            0,
+        );
+        let mut application = Application::mount(
+            move || {
+                cancellable_streaming_xml_component(StreamingCancellationProps {
+                    stream: Arc::clone(&component_probe),
+                    completions: Arc::clone(&component_completions),
+                })
+            },
+            port,
+        )
+        .unwrap();
+        let started = probe.first_started.notified();
+        tokio::pin!(started);
+        let mut reaction = Box::pin(application.react());
+        tokio::select! {
+            result = &mut reaction => panic!("pending reaction ended: {result:?}"),
+            _ = &mut started => {}
+        }
+        drop(reaction);
+
+        assert_eq!(probe.invocations.load(Ordering::Acquire), 1);
+        assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
+        assert_eq!(probe.post_await.load(Ordering::Acquire), 0);
+        assert_eq!(completions.load(Ordering::Acquire), 0);
+
+        application.react().await.unwrap();
+
+        assert_eq!(probe.invocations.load(Ordering::Acquire), 2);
+        assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
+        assert_eq!(probe.post_await.load(Ordering::Acquire), 1);
+        assert_eq!(completions.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_xml_eof_invalid_drops_once_and_later_invokes_fresh_handler() {
+        let probe = CallbackCancellationProbe::new();
+        let component_probe = Arc::clone(&probe);
+        let first_output = ProviderOutputKey::new(55);
+        let second_output = ProviderOutputKey::new(56);
+        let incomplete = |output| {
+            FactScript::Finite(vec![
+                Ok(ProviderFact::TextDelta {
+                    output,
+                    phase: None,
+                    delta: String::from("<item>unfinished"),
+                }),
+                Ok(ProviderFact::TextSealed {
+                    output,
+                    phase: None,
+                    text: String::from("<item>unfinished"),
+                }),
+                Ok(ProviderFact::ReactionCompleted {
+                    primary_text: Some(output),
+                }),
+            ])
+        };
+        let (port, _) = scripted_port(vec![incomplete(first_output), incomplete(second_output)], 0);
+        let mut application = Application::mount(
+            move || cancellable_xml_invalid_component(Arc::clone(&component_probe)),
+            port,
+        )
+        .unwrap();
+        let started = probe.first_started.notified();
+        tokio::pin!(started);
+        let mut reaction = Box::pin(application.react());
+        tokio::select! {
+            result = &mut reaction => panic!("pending reaction ended: {result:?}"),
+            _ = &mut started => {}
+        }
+        drop(reaction);
+
+        assert_eq!(probe.invocations.load(Ordering::Acquire), 1);
+        assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
+        assert_eq!(probe.post_await.load(Ordering::Acquire), 0);
+
+        application.react().await.unwrap();
+
+        assert_eq!(probe.invocations.load(Ordering::Acquire), 2);
+        assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
+        assert_eq!(probe.post_await.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_reaction_completion_drops_once_and_later_invokes_fresh_callback() {
+        let probe = CallbackCancellationProbe::new();
+        let component_probe = Arc::clone(&probe);
+        let (port, _) = scripted_port(vec![completed_reaction(), completed_reaction()], 0);
+        let mut application = Application::mount(
+            move || cancellable_reaction_completion_component(Arc::clone(&component_probe)),
+            port,
+        )
+        .unwrap();
+        let started = probe.first_started.notified();
+        tokio::pin!(started);
+        let mut reaction = Box::pin(application.react());
+        tokio::select! {
+            result = &mut reaction => panic!("pending reaction ended: {result:?}"),
+            _ = &mut started => {}
+        }
+        drop(reaction);
+
+        assert_eq!(probe.invocations.load(Ordering::Acquire), 1);
+        assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
+        assert_eq!(probe.post_await.load(Ordering::Acquire), 0);
+
+        application.react().await.unwrap();
+
+        assert_eq!(probe.invocations.load(Ordering::Acquire), 2);
+        assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
+        assert_eq!(probe.post_await.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
@@ -3685,10 +4740,7 @@ mod tests {
         assert!(poll_once(reaction.as_mut()).is_pending());
         drop(reaction);
         assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
-        assert_eq!(
-            application.state.load(Ordering::Acquire),
-            APPLICATION_TERMINATED_AFTER_CANCELLATION
-        );
+        assert_eq!(application.state.load(Ordering::Acquire), APPLICATION_READY);
 
         let monitor = application.tasks.panic_monitor();
         release.notify_one();
