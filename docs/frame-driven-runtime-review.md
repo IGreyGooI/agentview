@@ -249,6 +249,10 @@ Resolution：
 
 ### FDR-010 High: post-handoff `react()` cancellation 会遗留无 owner 的 pending ToolCall lane
 
+> **Historical finding:** 以下证据与要求记录引入cancellation fallback之前的缺陷和当时可接受的
+> terminal/resumable二选一。terminal mitigation后来曾落地，但现已由admission-time fallback reserve和
+> reusable `react()` cancellation取代；当前结论见本页FDR-010 response与implementation ledger。
+
 证据：
 
 - ToolCall admission 会在 session-owned staging 中创建 `output: None` slot，但 lane future 仅由
@@ -942,6 +946,10 @@ surface的独立review。
 ### FDR-041 High: 已有terminal state会遮蔽随后锁存且尚未传播的Component task panic
 
 状态：**resolved；direct Application与External production closure均已获独立focused签收。**
+
+> **Historical trigger:** 以下cancellation-created terminal交错描述的是已被取代的实现。FDR-041仍保留的
+> 通用结论是outer driver必须优先传播尚未消费的task panic；当前cancellation recovery还必须在monitor已经
+> 锁存panic时保持fallback hidden，而不是创建cancellation terminal。
 
 证据：
 
@@ -1771,8 +1779,10 @@ append item保持直接提交。Phase 4 v1 gate可以关闭。
 ### Phase 5
 
 private `Application::react()` 已接通 declare、reconcile、prepare、same-poll commit、fact/lane pump 和
-post-reconcile。FDR-010 已用 terminal cancellation guard 闭合：handoff前取消可重试，handoff后取消
-终止当前Application；FDR-020保证该取消路径不会静默丢失已发布canonical tail。Phase 5 gate 可以关闭。
+post-reconcile。FDR-010最初由terminal cancellation guard闭合；该mitigation现已被admission-time exact
+fallback reserve和reusable cancellation取代。handoff前后取消都保持Application ready；handoff后保留已发布
+canonical tail，并为unresolved admitted ToolCall物化预留的unknown-outcome ToolOutput。FDR-020继续保证
+Drop恢复不会静默丢失已发布tail。Phase 5 gate 可以关闭。
 Phase 6不由Phase 5自动关闭；其当前进展与剩余target见下一节。
 
 ### Phase 6
@@ -1938,7 +1948,7 @@ Phase 9总gate关闭。
 | Phase 4 next-Full budget closure | resolved | exact reserve at `frame.rs:112`, incremental tracker at `frame.rs:531`; equivalence test at `frame.rs:1016`, admission tests at `admission.rs:2062` through `admission.rs:2160` |
 | Phase 4 projection reconciliation ledger | resolved | diff/reconciliation split at `projection_diff.rs:17`, `projection_diff.rs:32`; ordered claims and ambiguity fence at `projection_diff.rs:141`; tests at `projection_diff.rs:966` through `projection_diff.rs:1046` |
 | FDR-009 Full replay/projection duplicate | resolved | compiler at `frame.rs:241`; Full reset test at `frame.rs:1223`; contract at `engine.md:403` |
-| FDR-010 post-handoff reaction cancellation | resolved | RAII terminal guard at `application.rs:61`; pre/post tests at `application.rs:1478`, `application.rs:1954`; contract at `engine.md:487` |
+| FDR-010 post-handoff reaction cancellation | resolved; terminal mitigation superseded | exact fallback construction/materialization at `admission.rs:32`, `admission.rs:531`, `admission.rs:629`; atomic reserve accounting at `frame.rs:670`, `frame.rs:699`; monitor-aware recovery and Drop order at `application.rs:165`, `application.rs:189`, `application.rs:734`; reuse/Delta regressions at `application.rs:2977`, `application.rs:3061`; contract at `engine.md:527`, `engine.md:879` |
 | FDR-011 nested ToolOutput classification | resolved | exact delegation at `application.rs:737`; classification test at `application.rs:1407` |
 | Phase 5 private structured pipeline | resolved | `Application::react()` at `application.rs:187`; concurrent fact/lane pump at `application.rs:316`; integration tests at `application.rs:1700` through `application.rs:1954` |
 | FDR-012 Responses private compaction coverage | resolved | versioned canonical count/digest and System binding at `frame_request.rs:27`, `frame_request.rs:40`, `frame_request.rs:154`, `frame_request.rs:289`; recovery tests at `frame_request.rs:797`, `frame_request.rs:824`, `frame_request.rs:876`, `frame_request.rs:934` |
@@ -1976,7 +1986,7 @@ Phase 9总gate关闭。
 | FDR-038 immediate Component task-panic unwind | resolved | immediate payload take at `task.rs:417`, Application arbiter at `application.rs:54`, sibling abort at `task.rs:973`; regressions at `application.rs:3389`, `application.rs:3471`, `application.rs:3547`, `application.rs:3682`; reviewer focused closure accepted |
 | FDR-039 supervisor shutdown runtime migration | resolved | extracted-runtime per-poll fence at `task.rs:190`; A-to-B pending regression at `task.rs:1653`; reviewer focused closure accepted |
 | FDR-040 External shutdown waiter runtime migration | resolved | public waiter per-poll runtime fence and detached cleanup at `external.rs:924`; before/after-Pending regressions at `external/tests.rs:209`, `external/tests.rs:240`; reviewer focused closure accepted |
-| FDR-041 fresh task panic behind terminal state | resolved | direct preflight at `application.rs:99`; External closure joins reaction at `external.rs:1153`; deterministic ownership/classification regressions at `external/tests.rs:639`, `external/tests.rs:1021`, `external/tests.rs:1063`; reviewer External 30/30 and stress 100/100 accepted |
+| FDR-041 fresh task panic arbitration | resolved; cancellation-terminal setup superseded | outer-boundary arbiter at `application.rs:99`; recovery suppression at `application.rs:182`, `application.rs:503`; direct/drop-without-repoll regressions at `application.rs:3489`, `application.rs:3551`; boundary-priority regression at `application.rs:4756`; External owner recovery at `external.rs:1022`, `external.rs:1234` and regression at `external/tests.rs:960`; historical reviewer External 30/30 and stress 100/100 accepted |
 | FDR-042 public Component-demand consumption | resolved | public consumers at `application.rs:338`, `application.rs:379`; deterministic downstream panic/request tests at `component_api_application_demand.rs:114`; real Agent scheduling at `examples/frame_agent.rs:35`; reviewer 3/3 + Application 52/52 + demand stress 50/50 + Agent stress 50/50 accepted |
 | FDR-043 legacy EventInput surface isolation | resolved | feature boundary at `Cargo.toml:12`, `authoring.rs:27`, `component/mod.rs:21`, `execution/mod.rs:10`; native/legacy constructors at `host.rs:69`, `host.rs:75`, `external.rs:904`, `external.rs:920`; isolated matrix 4/4 plus no-default 430/430, all-features 475/475 and dual strict Clippy accepted |
 | FDR-044 no-default compile-harness topology | resolved | dynamic discovery/filter at `component_api_component_compile.rs:17`; native static fixture at `pass_static_component.rs:43`; reviewer default 16+43 and no-default 13+34 fixtures, full 475/475 + 430/430 accepted |
@@ -2112,13 +2122,24 @@ FDR 编号；实现方随后在本节追加同编号 response，并同步第 7 �
 
 ### FDR-010 response: resolved
 
-v1 采用明确 terminal contract，不把 reaction-local ToolCall lanes 改造成跨 invocation resumable
-services。`ReactionCancellationGuard` 在 crossing handoff 后 armed；正常 return 会 disarm，future drop则
-原子地把 Application标记为 terminal（`application.rs:61`, `application.rs:307`）。后续`react()`在
-declare/render/submit前返回 payload-free `Reaction/Unavailable/CancelledAfterHandoff` fault
-（`application.rs:187`）。pre-handoff cancellation 可重试 test 在 `application.rs:1478`；pending lane
-期间 post-handoff cancellation 的第二次调用保持零declare/零submit，测试在 `application.rs:1954`。
-权威 contract 已同步到 `engine.md:487` 和 plan ordering/tool test gates。
+历史v1曾采用明确terminal contract，不把reaction-local ToolCall lanes改造成跨invocation resumable
+services；crossing handoff后的future Drop会poison Application，并以`CancelledAfterHandoff`阻止后续
+declare/render/submit。该方案解决了finding中的无owner pending slot，但把“取消一次reaction”扩大成了
+“终止整个Application”。
+
+当前resolution取代了该terminal mitigation：ToolCall admission在发布event之前同时构造、验证并精确预留
+unknown-outcome ToolOutput（`admission.rs:32`, `admission.rs:531`, `frame.rs:670`）；real ToolOutput原子替换
+而不是叠加该reserve（`admission.rs:580`, `frame.rs:699`）。post-handoff普通Drop按callback -> lanes -> provider
+stream -> recovery owner的顺序销毁资源，最后只为本attempt尚未完成的registration物化预验证fallback
+（`application.rs:734`, `admission.rs:629`）。Application保持ready；下一次显式`react()`依赖port如实返回兼容
+`Accepted`、更高epoch `FullRequired`或terminal declaration。task/direct panic则抑制recovery并保持fallback
+hidden（`application.rs:182`, `application.rs:503`）。
+
+回归覆盖reusable Full/Delta、interrupted text、fallback跨prepare/submit cancellation持久性、重复取消、
+callback不resume/replay和panic排除（`application.rs:2977`起）；External next-`observe()` Full recovery、旧
+ingress fencing与第三方port Drop contract位于`external/tests.rs:473`和`external/tests.rs:928`，Skill/Plugin
+wrapper证据位于`integration/tests.rs:154`。权威contract已同步到`engine.md` Poll-level cancellation section和
+plan ordering/tool test gates。
 
 ### FDR-011 response: resolved
 
@@ -2522,22 +2543,24 @@ payload transport（`task.rs:785`）、queued-future Drop仲裁（`task.rs:958`�
 usage observer panic确实离开production API；candidate render panic另验证不会publish projection/topology。
 focused gate与`cargo test --all-features --no-fail-fast`完整gate均已通过；独立review仍待完成。
 
-### FDR-041 response: implementation candidate
+### FDR-041 response: resolved; cancellation-terminal setup superseded
 
-三个outer driver入口现在共用`begin_outer_driver_boundary()`（`application.rs:93-110`）。helper先仲裁已经锁存且
+三个outer driver入口共用`begin_outer_driver_boundary()`（`application.rs:99`）。helper先仲裁已经锁存且
 尚未消费的task panic，再读取Application terminal state；若准备返回既有terminal classification，会在返回前用
-同一个monitor再仲裁一次，并重新读取最终state。`react()`、driver demand wait和nonblocking demand take分别接入于
-`application.rs:416-422`、`:300-305`、`:332-336`。READY路径原有的biased wait/operation后status check保持不变；
+同一个monitor再仲裁一次，并重新读取最终state。READY路径原有的biased wait/operation后status check保持不变；
 最终检查之后才发生的panic可线性化为发生在本次返回之后，由下一outer boundary传播。
 
-确定性Application回归先完成一次handoff并drop reaction，使state成为post-handoff cancellation terminal；随后才
-释放mount task并等待supervisor锁存panic。三个入口都传播exact原payload，catch后再次调用只返回typed
-`ComponentRuntime`/`StaleMount`，`react()`还验证declaration和submission计数不再推进
-（`application.rs:3443-3543`）。External integration通过blocked handler取消已handoff reaction，等待owner返回后
-触发mount task panic，并以sibling task Drop证明supervisor已经锁存payload；下一次public `observe()`传播原payload，
-catch后的再次调用返回`OwnerUnavailable`（`external/tests.rs:817-880`）。
+当前cancellation recovery control持有同一个panic monitor；biased task-panic分支在drop reaction之前显式suppress，
+而Recovery Drop还同步检查monitor status，覆盖panic已经锁存但caller不再poll、直接drop `react()`的交错
+（`application.rs:165`, `application.rs:182`, `application.rs:503`）。因此panic不会被误报为cancellation，也不会
+发布unknown-outcome fallback。确定性Application回归先取消已handoff reaction并保持Application ready，随后释放
+mount task并等待supervisor锁存panic；三个入口都传播exact原payload，catch后再次调用只返回typed
+`ComponentRuntime`/`StaleMount`（`application.rs:3551`, `application.rs:4756`起）。External integration同样在
+blocked handler取消后取回owner，再触发task panic并由下一次public `observe()`传播原payload
+（`external/tests.rs:960`）。
 
-focused gate为3个Application regressions和1个External integration regression；实现方单次门禁和
+以下保留的是原terminal mitigation时期的历史gate记录。第一版focused gate为3个Application regressions和1个
+External integration regression；实现方单次门禁和
 `cargo test --all-features --no-fail-fast`通过，library 468/468、CLI 20 passed和1项既有ignored，其余
 integration/trybuild suites无失败；`cargo check --all-targets --all-features`、不带waiver的strict Clippy、format和
 `git diff --check`也全部通过。
@@ -2546,7 +2569,7 @@ reviewer独立复核接受三个direct Application边界，但External regressio
 返回`ObservationChannelClosed`而不是原panic payload。该response尚未闭合production integration requirement，
 FDR-041保持open，详见第3节reviewer复核结果。
 
-### FDR-041 follow-up: External closure/completion arbitration candidate
+### FDR-041 follow-up: External closure/completion arbitration（historical implementation record）
 
 `ExternalApplication::await_next_observation()`不再把`ObservationChannelClosed`立即分类为control fault。该分支保留
 当前`ExternalReaction`和armed cancellation guard，await同一个reaction `JoinHandle`，然后与select中的
@@ -2583,6 +2606,8 @@ integration、trybuild和doc tests无失败；`cargo check --all-targets --all-f
 reviewer独立确认sender ownership证明、共享completion classifier和三个新增确定性边界；External完整surface
 30/30通过，原production竞态回归独立重复100轮为100/100。panic payload、abort typed classification、permit
 liveness与catch后的owner fence均未退化。FDR-041接受resolved；该结论不替代Phase 8其余surface review。
+后续reusable cancellation实现保留这项sign-off，并新增“锁存panic后不再poll而直接drop reaction”的保护回归；
+cancellation不再创建terminal state，但尚未传播的task panic仍优先且会抑制fallback recovery。
 
 ## 9. Responses Phase 6 migration contract and closure
 
@@ -2675,8 +2700,10 @@ target migration gate可以关闭。
   同poll返回fact stream（`external.rs:503`）。pre-handoff reserve cancellation与普通receiver failure已有
   direct poll tests（`external/tests.rs:149`, `external/tests.rs:176`, `external/tests.rs:210`）。
 - ingress generation由adapter分配，control在注入前一次性claim sender；正常stream结束后的late act返回
-  `StaleIngress`（`external.rs:180`, `external.rs:346`, `external/tests.rs:392`）。post-handoff
-  `ExternalApplication` cancellation沿用Application terminal fence（`external/tests.rs:453`）。
+  `StaleIngress`（`external.rs:180`, `external.rs:346`, `external/tests.rs:392`）。后续reusable cancellation
+  supersession让post-handoff `ExternalApplication` cancellation归还Application owner；下一次显式`observe()`
+  驱动更高epoch Full recovery，cancelled generation的late ingress仍返回`StaleIngress`
+  （`external/tests.rs:928`）。
 - internal driver demand使用mount-owned pending bit和`Notify::enable()`关闭wait-before/request竞态；request
   sticky、coalesce、wait cancellation、mount Drop fence均有unit test，Signal write后request的下一Frame也有
   Application integration test（`driver_demand.rs:62`, `driver_demand.rs:111`, `application.rs:2085`）。

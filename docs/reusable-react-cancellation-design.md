@@ -2,18 +2,18 @@
 
 ## Status
 
-Approved direction, pending written-design review.
+Implemented; final verification pending.
 
 ## Problem
 
-Dropping `Application::react()` currently has two outcomes. A pre-handoff drop
-leaves the Application reusable, while a post-handoff drop sets a sticky
-`CancelledAfterHandoff` terminal state. The terminal rule was introduced by
-FDR-010 because a post-handoff cancellation can drop a reaction-local native
-tool lane after its ToolCall has entered canonical history, leaving the
-session-owned ToolOutput slot unresolved.
+Before this design was implemented, dropping `Application::react()` had two
+outcomes. A pre-handoff drop left the Application reusable, while a post-handoff
+drop set a sticky `CancelledAfterHandoff` terminal state. That historical rule
+was introduced by FDR-010 because a post-handoff cancellation could drop a
+reaction-local native tool lane after its ToolCall entered canonical history,
+leaving the session-owned ToolOutput slot unresolved.
 
-The intended contract is stronger: dropping `react()` cancels only that
+The implemented contract is stronger: dropping `react()` cancels only that
 reaction. The same `Application` remains usable after both pre-handoff and
 post-handoff cancellation. A later reaction is still explicit; cancellation
 must never auto-retry or auto-submit.
@@ -26,7 +26,7 @@ Dropping a pending `react()` future:
    completion callbacks, and runtime-owned tool lanes.
 2. Preserves the already committed outbound Frame, admitted canonical facts,
    completed ToolOutputs, Component writes, and external side effects.
-3. Leaves admitted open assistant text represented as interrupted.
+3. Leaves admitted open assistant text represented as `Interrupted`.
 4. Closes every admitted ToolCall whose runtime-owned lane did not produce a
    ToolOutput with a fixed runtime-generated cancellation ToolOutput.
 5. Leaves the `Application` reusable. The next `react()` performs its normal
@@ -101,12 +101,14 @@ infallible:
    dropped. If the enclosing future is instead dropped while pending,
    materialize fallbacks for only that attempt's unresolved registrations
    before restoring canonical history.
-6. Do not materialize cancellation fallbacks during panic unwind. A Drop guard
-   checks `std::thread::panicking()` and leaves the unresolved slots fail-closed
-   while preserving the runtime's existing panic propagation semantics. A
-   caller that catches a user-code panic must still discard the Application;
-   the runtime does not make that unsupported reuse safe. This intentionally
-   differs from a future cancelled by ordinary Drop.
+6. Do not materialize cancellation fallbacks during panic unwind. Direct panic
+   recovery observes `std::thread::panicking()`; supervised task-panic
+   arbitration explicitly suppresses cancellation recovery and the Drop guard
+   also checks the shared panic monitor. Both paths leave unresolved slots
+   fail-closed while preserving the runtime's existing panic propagation
+   semantics. A caller that catches any user-code panic must still discard the
+   Application; the runtime does not make that unsupported reuse safe. This
+   intentionally differs from a future cancelled by ordinary Drop.
 
 The fallback is a reserve, not a visible ToolOutput while the lane is alive.
 Normal completion still requires every lane to resolve normally. No allocation,
@@ -115,13 +117,14 @@ materialize a fallback during `Drop` beyond moving already owned values.
 
 If a real ToolOutput is produced but cannot replace the fallback reservation,
 for example because its exact encoded size exceeds the Full reserve, the
-reaction returns its existing typed fault and fails closed. The hidden fallback
-remains unmaterialized: the runtime must not report the completed tool as
-cancelled merely because its real result was invalid or too large.
+reaction returns its existing real-output validation fault and fails closed.
+The hidden fallback remains unmaterialized: the runtime must not report the
+completed tool as cancelled merely because its real result was invalid or too
+large.
 
 ## Application Lifecycle
 
-Remove the post-handoff cancellation poison path:
+The implementation removes the post-handoff cancellation poison path:
 
 - `ReactionCancellationGuard` and
   `APPLICATION_TERMINATED_AFTER_CANCELLATION` are no longer needed;
@@ -187,7 +190,7 @@ underlying unresolved-ToolCall finding.
 
 ## Verification
 
-Add focused tests for:
+Focused regression coverage verifies:
 
 1. Pre-handoff cancellation remains zero-handoff and reusable.
 2. Post-handoff cancellation before any fact is reusable and the next Frame is

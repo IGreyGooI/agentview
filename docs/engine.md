@@ -195,7 +195,6 @@ pub enum ApplicationFaultStage {
 
 #[non_exhaustive]
 pub enum ApplicationFaultReason {
-    CancelledAfterHandoff,
     Port(ReactionPortFaultReason),
     InvalidDeclaration,
     InvalidFrameProfile,
@@ -248,9 +247,10 @@ parser或observer panic不进入`ApplicationFault`，而是保留原payload沿ca
 Phase 9 curated public export前保持crate-private，不允许携带任意字符串或底层source。
 详细诊断属于integration-private observability。`ContinuityChanged`与`ProfileChanged`都保证pre-handoff；
 前者允许Application重新declare/reprepare一次，后者在当前mount内terminal fail closed。
-post-handoff `Retryable` fault或没有terminal proof的stream cancellation会丢失continuity并推进epoch；
-post-handoff `Terminal` fault必须成为logical target的sticky terminal state，后续`declare()`不能把它降级成
-新epoch `FullRequired`。
+post-handoff `Retryable` fault或未完成stream的Drop可按port策略丢失continuity并推进epoch；后续
+`declare()`只能如实给出仍可使用exact continuation的兼容`Accepted`、更高epoch的`FullRequired`或terminal
+declaration fault，不能在required private state已经丢失后继续声明stale `Accepted`。post-handoff
+`Terminal` fault必须成为logical target的sticky terminal state，不能降级成新epoch `FullRequired`。
 
 port 只拥有 integration-specific protocol state：
 
@@ -524,10 +524,14 @@ submit poll -> Ready(Ok(stream)) Frame已经handoff
 
 drop一个返回Pending的submit future必须是零handoff、零FrameSession commit、零receipt consumption。
 drop一个已经成功返回但尚未poll的stream属于post-handoff，不回滚outbound segment或diff baseline。
-drop整个`Application::react()` future时，handoff前取消仍允许之后显式重试；handoff后取消会终止当前
-Application。RAII cancellation guard在future drop时设置terminal state，后续`react()`必须在
-`declare()`、render和submit之前返回typed `CancelledAfterHandoff` fault。v1不把reaction-local lanes
-提升为跨invocation resumable service；继续运行必须创建新的Application/logical target session。
+drop整个`Application::react()` future时，handoff前和handoff后取消都保持Application ready，但handoff仍决定
+哪些state已经成为权威事实：handoff前candidate不commit；handoff后保留已commit Frame、已接纳facts、已完成
+ToolOutputs、Component/Signal写入和外部副作用。当前callback、reaction-owned lanes和provider stream按该顺序
+drop且永不resume或replay；open assistant text保留为`Interrupted`，每个尚未完成的已接纳ToolCall物化一个预留的
+`Tool execution was cancelled; its outcome is unknown.` ToolOutput。取消不会自动发起下一reaction；只有下一次
+显式`react()`才重新declare，并接受兼容`Accepted`、更高epoch `FullRequired`或terminal fault。direct panic和
+supervised task panic都不属于cancellation且不得发布fallback recovery；caller catch user panic后仍必须丢弃
+Application。
 
 External/Skill adapter可以先异步reserve outbound queue capacity；取得permit后必须在crossing poll同步
 send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame，不是下游业务callback最终读取。
@@ -838,7 +842,7 @@ where
   原payload，并在当前正在poll或下一个可用的outer driver boundary直接`resume_unwind`。如果当时
   没有active driver，payload保留到下一次`react()`、driver demand wait或integration driver调用；
 - `react()`和两个driver demand入口在返回任何既有terminal classification前，必须再次仲裁尚未消费的task
-  panic。fresh payload优先于更早的post-handoff cancellation等typed terminal；payload已经传播后，后续调用只返回
+  panic。fresh payload优先于其他更早存在的typed terminal；payload已经传播后，后续调用只返回
   task-panic terminal fault，不能二次unwind。最终仲裁之后才发生的panic由下一outer boundary传播；
 - supervisor观察panic后同步发起sibling abort，但不能把sibling drain或destructor完成作为开始unwind的前置条件。
   unwind前Application进入terminal；caller若主动`catch_unwind`，后续API只允许确定fail closed，不承诺复用。
@@ -862,7 +866,8 @@ Engine也不能伪造ToolOutput，更不能发送包含裸pending call的下一F
 3. 未声明tool返回`unsupported_tool_call`；
 4. 已声明但本轮无binding返回`tool_binding_missing`；
 5. handler正常返回但无ToolOutput返回`tool_output_missing`；
-6. lane返回错误、取消或执行设施失败返回`tool_lane_failure`；user handler panic直接unwind；
+6. 普通reaction中lane future返回错误、取消或执行设施失败时返回`tool_lane_failure`；drop整个`react()`则按下节
+   物化unknown-outcome fallback；user handler panic直接unwind；
 7. fault后不得提交下一Frame，open history不能作为合法wire input；
 8. pending call不得通过丢continuation、Fresh、context reset或插入无关input绕过；
 9. 无法回答的call终止当前logical target session。
@@ -873,14 +878,16 @@ Engine也不能伪造ToolOutput，更不能发送包含裸pending call的下一F
 
 取消发生在handoff前时，drop Pending submit future不推进任何state。取消发生在handoff后时：
 
-- drop fact stream和reaction-local bindings；
-- 取消Runtime拥有的pending lane futures；
+- 先drop当前callback future，再drop Runtime拥有的pending lane futures，最后drop fact stream；
 - 保留已经handoff的input、已经接纳或seal的facts和已经组装的ToolOutputs；
-- RAII guard把open public partial标记interrupted/aborted；
+- recovery guard把open public partial标记`Interrupted`，并为每个未完成的已接纳ToolCall物化exactly one
+  `Tool execution was cancelled; its outcome is unknown.` ToolOutput；
 - port按自己的guard处理已经seal或尚未seal的private output；
 - 保留取消前成功的Signal写入和不可逆外部副作用；
-- 将当前Application标记terminal；后续`react()`在declare/render/submit前fail closed；
-- 不自动retry、Full或开始下一reaction。需要继续运行时由外部driver创建新的Application。
+- callback和lane future一旦drop就不resume、不replay；
+- Application保持ready，但不自动retry、Full或开始下一reaction；外部driver显式调用下一次`react()`后，port必须
+  声明兼容`Accepted`、更高epoch `FullRequired`或terminal fault；
+- direct/supervised panic不走上述cancellation recovery且不物化fallback；catch user panic后仍不得复用Application。
 
 port fault、Component handler returned fault、lane returned fault和terminal fault必须带明确stage/reason；
 user panic不分类为fault。清理完成是终止
@@ -944,8 +951,10 @@ Fact不得先被Observer或Component看见、之后才commit canonical history�
 23. cancellation不回滚已commit Component state、canonical fact、sealed private artifact或外部副作用。
 24. mounted handler/task/demand capability受mount generation fence，旧mount不能影响新mount；unmount先fence，
     再abort并await tasks，之后才能发布replacement projection。
-25. pre-handoff `react()` cancellation可重试；post-handoff `react()` cancellation终止Application，后续
-    `react()`不得再次declare、render或submit。
+25. pre-handoff和post-handoff `react()` cancellation都保持Application ready且不自动开始reaction；post-handoff
+    保留已commit/admit的state，把open text标记`Interrupted`，并以exactly one预留
+    `Tool execution was cancelled; its outcome is unknown.` ToolOutput闭合每个未完成的已接纳ToolCall。下一次
+    显式`react()`必须从port的truthful continuity declaration继续。
 26. Runtime不catch或吞掉Component/render/handler/tool/parser/observer panic。Tokio task panic是唯一无法自然跨栈
     的user-code例外：必须在当前/下一outer driver boundary用原payload直接stack unwind。sibling abort立即发起，
     但drain不能阻塞unwind。caller自行catch任何user panic后都不能恢复Application的业务执行，并必须丢弃可能已

@@ -4763,7 +4763,7 @@ mod tests {
         let panic = AssertUnwindSafe(application.react())
             .catch_unwind()
             .await
-            .expect_err("fresh task panic must override the cancellation terminal fault");
+            .expect_err("fresh task panic must override cancellation recovery");
         assert_eq!(
             panic.downcast_ref::<&str>(),
             Some(&"deferred bootstrap task panic")

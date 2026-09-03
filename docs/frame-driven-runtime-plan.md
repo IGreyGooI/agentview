@@ -376,7 +376,6 @@ pub enum ApplicationFaultStage {
 
 #[non_exhaustive]
 pub enum ApplicationFaultReason {
-    CancelledAfterHandoff,
     Port(ReactionPortFaultReason),
     InvalidDeclaration,
     InvalidFrameProfile,
@@ -435,8 +434,10 @@ impl<P: ReactionPort> Application<P> {
 poll都证明 Frame 尚未 handoff；第一个可能造成真实或 ambiguous delivery 的 poll必须在同一个 poll
 返回 `Ready(Ok(stream))`。`Application::react()` 紧接着做一次同步、已预验证、不可失败的 private
 commit；`Ok(stream)` 和 commit 之间没有 `.await`。boundary 后的 fault只能由 stream yield。
-post-handoff `Retryable` fault或无terminal proof的stream cancellation推进epoch；post-handoff
-`Terminal` fault成为sticky logical-target fault，后续`declare()`不能重新给出`FullRequired`。
+post-handoff `Retryable` fault或unfinished stream Drop可推进epoch；Drop后的下一次`declare()`必须如实给出
+仍可使用exact continuation的兼容`Accepted`、更高epoch `FullRequired`或terminal declaration fault，不能继续
+声明stale `Accepted`。post-handoff `Terminal` fault成为sticky logical-target fault，后续`declare()`不能重新
+给出`FullRequired`。
 
 `Frame` 携带 declaration 的 target identity、epoch、exact `prepared_against` continuity和选定 basis。
 port必须在 real delivery 前把 identity、prepared-against和完整`prepared_profile`同自己的当前 snapshot
@@ -614,8 +615,10 @@ reconcile”。读取不会自行 reconcile 或 react。
 
 正常 reaction 结束前必须再次 reconcile，把 handlers 和 ToolCall lanes 产生的 Signal 更新提交为
 新的 complete DOM。fault或handoff前 cancellation 可以保留 dirty state和上一版 committed rendering；
-下一次 reconcile/react 会先处理 dirty state。handoff后 drop `react()` future则终止当前Application，
-保留的 committed state只供观测/诊断；继续运行必须mount新的Application。
+下一次 reconcile/react 会先处理 dirty state。handoff后 drop `react()` future保留已commit Frame、已接纳facts、
+已完成ToolOutputs、Component写入和外部副作用，以`Interrupted`保留open text，并为每个unresolved admitted
+ToolCall物化预留的`Tool execution was cancelled; its outcome is unknown.` ToolOutput；Application保持ready，
+只有下一次显式`react()`才继续运行。
 
 ## 5. 一次 reaction 的精确顺序
 
@@ -1033,8 +1036,9 @@ supervisor取回第一项原payload，并在当前/下一可用outer driver boun
 caller随后consuming shutdown时仍join已经abort的tasks并等待destructor，再返回terminal fault；该cleanup不阻塞
 最初的unwind。
 `react()`、driver demand wait和nonblocking demand take在返回既有terminal fault前都再次检查同一个panic monitor；
-因此post-handoff cancellation不能遮蔽后来已经锁存且尚未传播的task panic。已经传播的payload只对应一次unwind，
-后续调用不重新declare/render/submit，只返回task-panic terminal或执行consuming shutdown。
+因此已经锁存且尚未传播的task panic会抑制post-handoff cancellation fallback recovery并以原payload优先传播；
+已经传播的payload只对应一次unwind，后续调用不重新declare/render/submit，只返回task-panic terminal或执行
+consuming shutdown。
 Drop catch只用于正在销毁资源的primary-payload仲裁。workspace与下游均保留Rust `panic = "unwind"`语义。
 本阶段只覆盖frame-driven Component/Application Runtime；legacy `AgentTurnObserver`的post-commit fire-and-forget
 语义保持独立，未来统一时需要supervised observer owner，不能从Drop调用callback或丢弃observer task handle。
@@ -1089,11 +1093,14 @@ FDR-035至FDR-037的implementation candidate与回归已经完成；完整gate�
   `Ready(Ok(stream))`；`Ready(Err)` 必须确定未交付；
 - successful submit 后 commit 无 await、无 failure；
 - successful submit后尚未 poll stream就 drop属于 post-handoff，不回滚 commit；
-- drop整个`react()` future：handoff前Application可重试；handoff后Application进入terminal state，下一次
-  `react()`在declare/render/submit前返回typed cancellation fault；
-- post-handoff cancellation后再锁存task panic：下一次`react()`、driver demand wait和nonblocking demand take
-  分别传播同一个原payload；caller catch后的再次调用只返回typed terminal/stale且不发生新handoff；External
-  integration的下一次`observe()`同样传播payload，catch后的再次调用typed fail closed；
+- drop整个`react()` future：handoff前和handoff后Application都保持ready且不自动开始reaction；handoff后
+  无fact continuity loss要求下一次显式reaction使用更高epoch Full，open text只replay一次，unresolved admitted
+  ToolCall以一个预留`Tool execution was cancelled; its outcome is unknown.` ToolOutput闭合；只有port仍保留
+  exact compatible continuation时才允许Delta；
+- post-handoff cancellation不会resume或replay已经drop的ordinary/XML/EOF/reaction-completion callback；
+- post-handoff cancellation与task panic交错时，已锁存panic抑制fallback recovery，并在`react()`、driver demand
+  wait、nonblocking demand take和External边界传播同一个原payload；caller catch后的再次调用仍只返回typed
+  task-panic terminal/stale且不发生新handoff；
 - post-submit first stream error仍保留 outbound submission和 diff baseline；
 - fact 先 commit history，再进入 Component handler；handler returned fault不回滚 fact；handler panic直接unwind；
 - root/render、sync/async handler、native tool、streaming decoder和observer panic均由test harness证明原样传播，
@@ -1144,8 +1151,9 @@ FDR-035至FDR-037的implementation candidate与回归已经完成；完整gate�
   ordinal保留，后续 stream fault不回滚；
 - ToolCall history commit后在同一 pump iteration启动 lane；stream保持 pending时lane仍能推进；ToolOutput
   按 ordinal staging；
-- pending ToolCall lane期间drop post-handoff `react()`会终止Application；第二次`react()`零declare、
-  零submit，不能用新Frame绕过unresolved call；
+- pending ToolCall lane期间drop post-handoff `react()`会取消lane，并在下一次显式提交的Frame中为该call发送
+  exactly one预留`Tool execution was cancelled; its outcome is unknown.` ToolOutput；fallback必须跨失败prepare和
+  pre-handoff submit cancellation保留，不能用Full、Delta或新reaction绕过unresolved call，也不能留下stale slot；
 - local prepare failure后 exact ToolOutput receipt可重试；submit成功后只消费一次。
 
 ### Rendering and integrations
