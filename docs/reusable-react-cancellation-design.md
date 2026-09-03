@@ -174,9 +174,9 @@ not a recovery entry point because there is no active observation generation
 to accept its payload. Existing ingress generation fencing prevents late input
 from the cancelled stream from entering the new reaction.
 
-## Documentation Changes
+## Documentation Alignment
 
-Update `docs/engine.md` so all cancellation sections agree:
+`docs/engine.md` now keeps all cancellation sections aligned:
 
 - both pre- and post-handoff cancellation leave Application reusable;
 - handoff still determines which Frame and facts remain committed;
@@ -185,8 +185,8 @@ Update `docs/engine.md` so all cancellation sections agree:
 - no automatic reaction is started;
 - provider recovery remains port-specific and may fail closed.
 
-Record that this supersedes the terminal choice in FDR-010 while retaining its
-underlying unresolved-ToolCall finding.
+The historical review records that this supersedes the terminal choice in
+FDR-010 while retaining its underlying unresolved-ToolCall finding.
 
 ## Verification
 
