@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented; final verification pending.
+Implemented and verified.
 
 ## Problem
 
