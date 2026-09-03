@@ -724,7 +724,9 @@ mod tests {
                     "agentview-chess-application-{}-{sequence}.sh",
                     std::process::id()
                 ));
-            let transcript = PathBuf::from(format!("{}.commands", path.display()));
+            let mut transcript = path.as_os_str().to_os_string();
+            transcript.push(".commands");
+            let transcript = PathBuf::from(transcript);
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)

@@ -1389,7 +1389,8 @@ fn validate_limits(limits: GameLimits) -> anyhow::Result<()> {
 mod tests {
     use std::{
         collections::VecDeque,
-        fs,
+        fs::{self, OpenOptions},
+        io::Write,
         num::{NonZeroU128, NonZeroU64},
         panic::AssertUnwindSafe,
         path::PathBuf,
@@ -1695,12 +1696,32 @@ mod tests {
                 .expect("Cargo example test executable has a parent")
                 .to_owned();
             let program = target_dir.join(&base);
-            let quit_marker = target_dir.join(format!("{base}.quit"));
-            let script = format!(
-                "#!/bin/sh\nwhile IFS= read -r command; do\n  case \"$command\" in\n    uci) printf '%s\\n' uciok ;;\n    isready) printf '%s\\n' readyok ;;\n    go*) printf '%s\\n' 'bestmove e7e5' ;;\n    quit) printf '%s\\n' quit > '{}'; exit 0 ;;\n  esac\ndone\n",
-                quit_marker.display()
-            );
-            fs::write(&program, script)?;
+            let mut quit_marker = program.as_os_str().to_os_string();
+            quit_marker.push(".quit");
+            let quit_marker = PathBuf::from(quit_marker);
+            match fs::remove_file(&quit_marker) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&program)?;
+            file.write_all(
+                br#"#!/bin/sh
+quit_marker="${0}.quit"
+while IFS= read -r command; do
+  case "$command" in
+    uci) printf '%s\n' uciok ;;
+    isready) printf '%s\n' readyok ;;
+    go*) printf '%s\n' 'bestmove e7e5' ;;
+    quit) printf '%s\n' quit > "$quit_marker"; exit 0 ;;
+  esac
+done
+"#,
+            )?;
+            file.flush()?;
             let mut permissions = fs::metadata(&program)?.permissions();
             permissions.set_mode(0o700);
             fs::set_permissions(&program, permissions)?;

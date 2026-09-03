@@ -35,10 +35,17 @@ fn disabled_diagnostic_matches(
     surface: &str,
     required_diagnostics: &[&str],
 ) -> bool {
-    output_diagnostics.contains(surface)
-        && required_diagnostics
-            .iter()
-            .all(|required| output_diagnostics.contains(required))
+    if required_diagnostics.is_empty() {
+        return output_diagnostics.contains(surface);
+    }
+
+    output_diagnostics.lines().any(|line| {
+        line.starts_with("error[E0599]:")
+            && line.contains(surface)
+            && required_diagnostics
+                .iter()
+                .all(|required| line.contains(required))
+    })
 }
 
 #[test]
@@ -61,6 +68,38 @@ fn disabled_constructor_diagnostic_rejects_an_incompatible_public_new() {
             incompatible_new,
             owner,
             MISSING_NEW_DIAGNOSTICS
+        ));
+    }
+}
+
+#[test]
+fn disabled_constructor_diagnostic_rejects_cross_diagnostic_matches() {
+    let unrelated_missing_new =
+        "error[E0599]: no associated function or constant named `new` found for struct \
+         `Unrelated` in the current scope\n\
+         note: `ComponentHost` remains available through another API";
+
+    assert!(!disabled_diagnostic_matches(
+        unrelated_missing_new,
+        "ComponentHost",
+        MISSING_NEW_DIAGNOSTICS,
+    ));
+}
+
+#[test]
+fn disabled_constructor_diagnostic_accepts_supported_missing_new_phrases() {
+    let diagnostics = [
+        "error[E0599]: no function or associated item named `new` found for struct \
+         `ComponentHost<Props>` in the current scope",
+        "error[E0599]: no associated function or constant named `new` found for struct \
+         `ComponentHost<Props>` in the current scope",
+    ];
+
+    for diagnostic in diagnostics {
+        assert!(disabled_diagnostic_matches(
+            diagnostic,
+            "ComponentHost",
+            MISSING_NEW_DIAGNOSTICS,
         ));
     }
 }
