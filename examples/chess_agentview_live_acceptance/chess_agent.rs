@@ -31,7 +31,6 @@ pub(crate) struct ChessSnapshot {
     agent_side: Color,
     board: Board,
     committed_moves: Vec<ChessMove>,
-    pending_draw_offer: Option<Color>,
     draw_state: DrawState,
     match_phase: MatchPhase,
     feedback: ChessFeedback,
@@ -42,7 +41,6 @@ impl ChessSnapshot {
         agent_side: Color,
         board: Board,
         committed_moves: Vec<ChessMove>,
-        pending_draw_offer: Option<Color>,
         feedback: ChessFeedback,
     ) -> Self {
         let draw_state = DrawState::from_history(&committed_moves);
@@ -50,7 +48,6 @@ impl ChessSnapshot {
             agent_side,
             board,
             committed_moves,
-            pending_draw_offer,
             draw_state,
             match_phase: MatchPhase::InProgress,
             feedback,
@@ -74,10 +71,6 @@ impl ChessSnapshot {
 
     pub(crate) fn committed_moves(&self) -> &[ChessMove] {
         &self.committed_moves
-    }
-
-    pub(crate) fn pending_draw_offer(&self) -> Option<Color> {
-        self.pending_draw_offer
     }
 
     pub(crate) fn draw_state(&self) -> DrawState {
@@ -142,7 +135,7 @@ impl ChessAgentState {
     }
 
     pub(crate) fn diagnostic(&self) -> Option<InvalidActionReason> {
-        self.diagnostic
+        self.diagnostic.clone()
     }
 
     pub(crate) fn text_complete(&self) -> bool {
@@ -180,7 +173,7 @@ fn chess_attempt_context(context: ModelAttemptContext) -> Component {
     let attempt_index = context.attempt_index;
     let corrective_reason = context
         .corrective_reason
-        .map(InvalidActionReason::code)
+        .map(|reason| reason.code())
         .unwrap_or("none");
 
     view! {

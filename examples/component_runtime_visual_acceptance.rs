@@ -1,4 +1,4 @@
-//! Native Responses acceptance for complete Component DOM and private wire history.
+//! Component runtime acceptance for complete DOM and private provider history.
 
 use std::{
     fmt::Write as _,
@@ -35,7 +35,7 @@ mod visual_diff_shapes;
 
 use responses_acceptance_server::ResponsesAcceptanceServer;
 
-const BINDING: &str = "provider-port-visual-acceptance";
+const BINDING: &str = "component-runtime-visual-acceptance";
 const RESPONSE_STATES: [&str; 6] = ["B", "B", "A", "B", "B", "B"];
 const POLICY_TITLE: &str = "Visual acceptance policy";
 const POLICY_INSTRUCTION: &str =

@@ -9,7 +9,6 @@ mod chess_draw_state;
 mod chess_feedback;
 mod chess_game_state;
 mod chess_player;
-#[allow(dead_code)]
 mod entry;
 mod game;
 mod live;

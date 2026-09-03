@@ -58,8 +58,8 @@ name = "signal_reaction"
 path = "examples/signal_reaction.rs"
 
 [[example]]
-name = "provider_port_visual_acceptance"
-path = "examples/provider_port_visual_acceptance.rs"
+name = "component_runtime_visual_acceptance"
+path = "examples/component_runtime_visual_acceptance.rs"
 
 [[example]]
 name = "chess_agentview"

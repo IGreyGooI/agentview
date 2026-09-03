@@ -12,6 +12,7 @@ mod event_listener;
 mod handler;
 mod native_tool;
 mod provider_event_handler;
+mod reaction_completion;
 mod reaction_request;
 mod render_context;
 mod signal;
@@ -36,6 +37,8 @@ pub(crate) use event_listener::EventListener as InternalEventListener;
 pub type EventListener = event_listener::EventListener;
 pub use native_tool::NativeToolCall;
 pub use provider_event_handler::{use_provider_event_handler, ProviderEventSelector};
+pub use reaction_completion::use_reaction_completion;
+pub(crate) use reaction_completion::ReactionCompletionDeclaration;
 pub use reaction_request::{use_reaction_request, ReactionRequest, ReactionRequestError};
 pub use signal::{use_signal, Signal};
 pub use streaming_xml::{

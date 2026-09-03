@@ -1181,7 +1181,7 @@ compatibility contract，后续删除compatibility feature时没有可靠迁移�
 - Responses acceptance只用真实public `Application<AsyncOpenAiResponsesProvider>`与loopback request bodies；旧owner
   shutdown后才从explicit phase B mount distinct fresh target且first Frame为Full。old/fresh/error三类owner均在task-start
   barrier后执行，consuming shutdown完成后Drop probe才为true；success/error server均join，operation panic在cleanup后按
-  原payload恢复（`provider_port_visual_acceptance.rs:601`, `:753`, `:807`, `:949`）；
+  原payload恢复（`component_runtime_visual_acceptance.rs:601`, `:753`, `:807`, `:949`）；
 - 双配置workspace all-target check、无waiverstrict Clippy、format和diff均独立通过；matrix生成lockfiles已清理。
 
 因此FDR-044接受resolved，Task 3 native signal/provider acceptance slice关闭。该closure本身不提前签收Task 4；
@@ -1980,7 +1980,7 @@ Phase 9总gate关闭。
 | FDR-042 public Component-demand consumption | resolved | public consumers at `application.rs:338`, `application.rs:379`; deterministic downstream panic/request tests at `component_api_application_demand.rs:114`; real Agent scheduling at `examples/frame_agent.rs:35`; reviewer 3/3 + Application 52/52 + demand stress 50/50 + Agent stress 50/50 accepted |
 | FDR-043 legacy EventInput surface isolation | resolved | feature boundary at `Cargo.toml:12`, `authoring.rs:27`, `component/mod.rs:21`, `execution/mod.rs:10`; native/legacy constructors at `host.rs:69`, `host.rs:75`, `external.rs:904`, `external.rs:920`; isolated matrix 4/4 plus no-default 430/430, all-features 475/475 and dual strict Clippy accepted |
 | FDR-044 no-default compile-harness topology | resolved | dynamic discovery/filter at `component_api_component_compile.rs:17`; native static fixture at `pass_static_component.rs:43`; reviewer default 16+43 and no-default 13+34 fixtures, full 475/475 + 430/430 accepted |
-| Phase 9 native signal/provider examples | resolved | native scripted port at `scripted_provider.rs:205`; signal lifecycle at `signal_reaction.rs:194`; Responses cleanup/fresh target at `provider_port_visual_acceptance.rs:601`; reviewer signal 8/8 + stress 50/50, provider 4/4 + stress 30/30 accepted |
+| Phase 9 native signal/provider examples | resolved | native scripted port at `scripted_provider.rs:205`; signal lifecycle at `signal_reaction.rs:194`; Responses cleanup/fresh target at `component_runtime_visual_acceptance.rs:601`; reviewer signal 8/8 + stress 50/50, provider 4/4 + stress 30/30 accepted |
 | FDR-045 public External completion surface | resolved | public `ExternalAct::text` at `external.rs:706`, `ExternalControl::complete` at `external.rs:345`; exact grammar/limit regressions at `external/tests.rs:1231`, `:1265`, `:1290`; downstream no-default lifecycle at `component_api_external_completion.rs:85`; reviewer focused/stress/full dual-config gates accepted |
 | Phase 9 Task 4 public Agent/Skill/Plugin executables | resolved | shared exact bytes at `frame_workflow_golden.rs:10`; real public paths at `frame_agent.rs:77`, `frame_skill.rs:223`, `frame_plugin.rs:430`; Skill passive frontend at `frame_skill.rs:240`; Plugin ownership/cleanup/panic gates at `frame_plugin.rs:447`, `:489`, `:529`, `:559`; reviewer Task 4 sign-off accepted |
 | Phase 9 Task 5 native Chess migration | resolved | ordinary root and exported `ChessControl` at `chess_agent.rs:158`; explicit state-write/react/read at `model.rs:186`; native owner cleanup/panic arbitration at `game.rs:872`; offline lifecycle/game gates at `model.rs:671`, `game.rs:1773`; reviewer default/no-default 11/11 plus full dual-config gates accepted |

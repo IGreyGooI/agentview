@@ -10,7 +10,7 @@ use super::{
     async_task::{ComponentTaskContext, MountTaskStart},
     event_input::{EventInputOrigin, EventSelector},
     event_listener::EventListenerDeclaration,
-    Coroutine, CoroutineInbox, ReactionRequest, Signal,
+    Coroutine, CoroutineInbox, ReactionCompletionDeclaration, ReactionRequest, Signal,
 };
 
 /// Runtime hook authority passed only to repeatable Component renderers.
@@ -19,6 +19,7 @@ pub struct HookRenderContext<'render> {
     signals: &'render mut signal_kernel::SignalRenderScope,
     event_origin: EventInputOrigin,
     provider_handlers: &'render mut Vec<EventListenerDeclaration>,
+    reaction_completions: &'render mut Vec<ReactionCompletionDeclaration>,
     task_starts: &'render mut Vec<MountTaskStart>,
     driver_demand: Option<&'render DriverDemandHandle>,
     tasks: Option<&'render MountTaskHandle>,
@@ -30,6 +31,7 @@ impl<'render> HookRenderContext<'render> {
         signals: &'render mut signal_kernel::SignalRenderScope,
         event_origin: EventInputOrigin,
         provider_handlers: &'render mut Vec<EventListenerDeclaration>,
+        reaction_completions: &'render mut Vec<ReactionCompletionDeclaration>,
         task_starts: &'render mut Vec<MountTaskStart>,
         driver_demand: Option<&'render DriverDemandHandle>,
         tasks: Option<&'render MountTaskHandle>,
@@ -38,6 +40,7 @@ impl<'render> HookRenderContext<'render> {
             signals,
             event_origin,
             provider_handlers,
+            reaction_completions,
             task_starts,
             driver_demand,
             tasks,
@@ -49,6 +52,7 @@ impl<'render> HookRenderContext<'render> {
         signals: &'render mut signal_kernel::SignalRenderScope,
         event_origin: EventInputOrigin,
         provider_handlers: &'render mut Vec<EventListenerDeclaration>,
+        reaction_completions: &'render mut Vec<ReactionCompletionDeclaration>,
         task_starts: &'render mut Vec<MountTaskStart>,
         driver_demand: Option<&'render DriverDemandHandle>,
         tasks: Option<&'render MountTaskHandle>,
@@ -57,11 +61,41 @@ impl<'render> HookRenderContext<'render> {
             signals,
             event_origin,
             provider_handlers,
+            reaction_completions,
             task_starts,
             driver_demand,
             tasks,
             attempt_local_allowed: false,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn use_reaction_completion_at<Handler, HandlerFuture, Error>(
+        &mut self,
+        site: u32,
+        handler: Handler,
+    ) where
+        Handler: FnOnce() -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        if !self.attempt_local_allowed {
+            panic!("System component declared generation-local reaction completion handler");
+        }
+        let mount = self
+            .signals
+            .use_marker_at(site, HookKind::ReactionCompletion)
+            .unwrap_or_else(|fault| panic!("{fault}"));
+        let task_context = self
+            .tasks
+            .cloned()
+            .map(|tasks| ComponentTaskContext::new(mount.clone(), tasks));
+        self.reaction_completions
+            .push(ReactionCompletionDeclaration::new(
+                handler,
+                mount,
+                task_context,
+            ));
     }
 
     #[doc(hidden)]

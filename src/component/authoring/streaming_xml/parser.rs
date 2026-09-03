@@ -85,6 +85,7 @@ pub(crate) struct MountedStreamingRoute {
     pending_offset: usize,
     incomplete_scan: Option<IncompleteScan>,
     namespace_stack: Vec<NamespaceFrame>,
+    text_event_seen: bool,
     text_complete: bool,
     finished: bool,
 }
@@ -100,6 +101,7 @@ impl MountedStreamingRoute {
             pending_offset: 0,
             incomplete_scan: None,
             namespace_stack: Vec::new(),
+            text_event_seen: false,
             text_complete: false,
             finished: false,
         }
@@ -148,7 +150,7 @@ impl MountedStreamingRoute {
         if self.finished {
             return Err(StreamingXmlDispatchFault::RouteAlreadyFinished);
         }
-        if !self.text_complete {
+        if self.text_event_seen && !self.text_complete {
             return Err(StreamingXmlDispatchFault::RouteMissingTextComplete);
         }
 
@@ -179,6 +181,7 @@ impl MountedStreamingRoute {
         if self.finished || self.text_complete {
             return Err(StreamingXmlDispatchFault::RouteTextAfterCompletion);
         }
+        self.text_event_seen = true;
         let appended = match event {
             TextTurnEvent::TextDelta(chunk) => self.append(chunk)?,
             TextTurnEvent::TextComplete(output) => {

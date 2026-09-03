@@ -1,6 +1,6 @@
 # AgentView Chess Examples
 
-Last reviewed: 2026-09-01
+Last reviewed: 2026-09-03
 
 The repository exposes two Chess binaries with different jobs:
 
@@ -23,8 +23,9 @@ thin chess_agentview binary
         |     |     |-- Signal<ChessState> (business authority)
         |     |     |-- pure reduce(ChessState, ChessEvent) -> ChessEffect
         |     |     |-- chess_action_component
-        |     |     |     |-- five sibling XmlStreamingToolCall Components
-        |     |     |     `-- decoded/invalid callbacks await ChessAttemptInput handling
+        |     |     |     |-- two sibling XmlStreamingToolCall Components
+        |     |     |     |-- reaction-local action-result collector
+        |     |     |     `-- use_reaction_completion sends one ChessAttemptInput
         |     |     |-- use_coroutine actor owning Stockfish
         |     |     `-- use_reaction_request for the next model turn
         |     |-- private FrameSession and canonical history
@@ -34,13 +35,13 @@ thin chess_agentview binary
 ```
 
 `ChessState` owns the authoritative board, committed move history, retry state,
-feedback, draw state, phase, and terminal outcome. Model actions carry a typed
+feedback, phase, and terminal outcome. Model actions carry a typed
 attempt key, so a duplicate or late action cannot consume the next
 attempt. Stockfish requests carry the committed position revision and history.
 
 The reducer owns Chess policy. It validates actions, applies legal moves,
 enforces the model retry budget, selects the next side, detects terminal
-positions and draw conditions, and emits one of three effects:
+positions and automatic draw conditions, and emits one of three effects:
 
 - request another model reaction;
 - request a Stockfish move;
@@ -51,9 +52,8 @@ owns `UciEngine`, reads the authoritative history from reducer effects, feeds
 Stockfish results back as typed events, and shuts the engine down before
 publishing a normal terminal result.
 
-`chess_action_component` mounts five prompt-producing, typed
-`XmlStreamingToolCall` declarations:
-`choose_move`, `move_and_offer_draw`, `resign`, `accept_draw`, and `claim_draw`.
+`chess_action_component` mounts two prompt-producing, typed
+`XmlStreamingToolCall` declarations: `choose_move` and `resign`.
 They register with one parser hub for the mounted reaction's provider text route;
 the example passes neither a route nor an `EventInput`. Every matching element
 occurrence is dispatched, including repeated occurrences and occurrences for
@@ -64,14 +64,38 @@ The prompt-free `StreamingXml::tag(...)` API uses that same per-route hub when
 a Component needs `on_open`, cumulative `on_stream`, `on_complete`, or
 `on_invalid` lifecycle events without adding another action shape to the prompt.
 
-Each decoded or invalid occurrence sends one attempt-keyed `ChessAttemptInput`
+The two binaries share the same action names and XML shapes, but intentionally
+use different surrounding-text policies. The readable example counts registered
+action occurrences and allows text outside exactly one action. The live
+acceptance harness retains its stricter whole-output parser: outside its one
+empty action element, only whitespace is accepted.
+
+Each decoded or invalid occurrence appends one typed result to a collector owned
+by that rendered reaction. After all provider events, derived XML events, and
+normal-EOF diagnostics have been handled, `use_reaction_completion` settles the
+collector exactly once:
+
+- no registered action becomes `MissingAction`;
+- one occurrence keeps its decoded action or validation error;
+- more than one occurrence becomes `MultipleActions`.
+
+The completion callback sends that single attempt-keyed `ChessAttemptInput`
 into the Component-owned FIFO coroutine and awaits its handling receipt. The
-coroutine lowers that input to `ChessEvent::ModelAction`, runs the reducer and
-its immediate effect chain, then acknowledges the handler. There is no attempt
-collector, sibling completion barrier, or frame cardinality rule. The reducer's
-current business state decides whether a later action is still applicable. The
-XML Components do not own the board, legality policy, retry loop, or scheduling
-policy.
+coroutine lowers the input to `ChessEvent::ModelAction`, runs the reducer and
+its immediate effect chain, then acknowledges the callback. The XML Components
+still do not own the board, legality policy, retry loop, or scheduling policy.
+
+The actor is event-driven, not self-ticking. `Start` requests the first model
+reaction; every later transition requires a `ChessEvent`. The completion hook
+is what turns an otherwise eventless model response, including an empty
+reaction, prose, or unknown XML, into the typed `MissingAction` event instead of
+leaving the actor blocked on its inbox.
+
+`MissingAction` and `MultipleActions` follow the same reducer-owned corrective
+path as other invalid model actions. `ChessState.feedback` records the rejection,
+the next Frame exposes it through `previous_decision`, `previous_reason`, and
+`corrective_reason`, and the actor requests another reaction. The third
+consecutive rejected attempt completes with `ModelForfeit`.
 
 If the provider or driver fails, the facade requests actor stop and waits for
 the actor's bounded UCI cleanup result before consuming `Application`.
@@ -181,7 +205,8 @@ provider configuration.
 - [`chess_application.rs`](../examples/chess_agentview/chess_application.rs):
   facade, Component root, actor, mechanical driver, and projection.
 - [`chess_action_component.rs`](../examples/chess_agentview/chess_action_component.rs):
-  five direct, unbounded streaming XML action Components.
+  two streaming XML action Components, reaction-local collection, and
+  cardinality settlement at normal reaction completion.
 - [`chess_action.rs`](../examples/chess_agentview/chess_action.rs): typed Chess
   actions shared by the readable example and acceptance binary.
 - [`application_state.rs`](../examples/chess_agentview/application_state.rs):

@@ -48,24 +48,8 @@ impl DrawState {
         self.current_position_repetitions
     }
 
-    pub(crate) fn claimable(self) -> bool {
-        self.halfmove_clock >= 100 || self.current_position_repetitions >= 3
-    }
-
     pub(crate) fn automatic_draw(self) -> bool {
         self.halfmove_clock >= 150 || self.current_position_repetitions >= 5
-    }
-
-    pub(crate) fn claim_basis(self) -> &'static str {
-        match (
-            self.current_position_repetitions >= 3,
-            self.halfmove_clock >= 100,
-        ) {
-            (true, true) => "threefold_repetition_and_fifty_move_rule",
-            (true, false) => "threefold_repetition",
-            (false, true) => "fifty_move_rule",
-            (false, false) => "none",
-        }
     }
 }
 

@@ -197,7 +197,7 @@ projection 只保留 ordered `Vec<RenderedProjectionNode>`；每个 node 内的 
 canonical renderer 捕获当前完整 projection 的可读 prompt preview。它不冒充 Responses/Chat
 私有 retained wire history，也不会自动打印可能包含敏感业务内容的 prompt。
 
-人工验收入口是 `cargo run --example provider_port_visual_acceptance`。它用本地 mock endpoint
+人工验收入口是 `cargo run --example component_runtime_visual_acceptance`。它用本地 mock endpoint
 执行真实 Responses ProviderPort，同时并排显示每轮 Debug complete prompt 与新增 wire
 submission，覆盖 typed multi-field state 的 field patch、append insert、omit、append fallback、
 重复 delta 和新 Provider Fresh full，并明确展示稳定 `objective` 被 delta 省略。报告同时声明

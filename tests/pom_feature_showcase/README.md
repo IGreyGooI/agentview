@@ -1,6 +1,6 @@
-# POM feature showcase
+# POM compatibility regression
 
-> 范围说明：这是当前 POM AST/diff/renderer 的 compatibility showcase，不是
+> 范围说明：这是当前 POM AST/diff/renderer 的 compatibility test，不是
 > replacement Component authoring 或 Provider request 规格。下文的两份 System/User
 > `Document` 与 prompt golden 只验证 renderer 输出，不是 canonical transcript 或
 > Codex HTTP body oracle。当前语义边界见
@@ -28,23 +28,10 @@ typed UserView                   │
   + candidate UserDocumentCursor
 ```
 
-默认运行会打印紧凑的 POM 结构摘要和完整 provider prompt：
+运行 golden 验证：
 
 ```bash
-cargo run --example pom_feature_showcase
-```
-
-需要查看每一阶段完整的 authored/resolved AST 和 candidate cursor JSON 时：
-
-```bash
-cargo run --example pom_feature_showcase -- --diagnostic-json
-```
-
-JSON `Serialize` 只用于诊断，不是稳定 wire format，也不应被反序列化成
-持久状态。Golden 验证：
-
-```bash
-cargo test --example pom_feature_showcase
+cargo test --test pom_feature_showcase
 ```
 
 ## 一个最小的端到端对照
@@ -183,7 +170,7 @@ attribute、element、text、flatten、root、code span、skip、Option、Vec、
    baseline。
 
 `resolve_user_document` 只返回 candidate cursor，不会自行提交。真实 runtime
-应在自己的成功边界发布它；这个离线 example 把每一个展示阶段视为成功。
+应在自己的成功边界发布它；此测试把每一个验证阶段视为成功。
 普通 title/task/artifact 每轮照常发送，而且不进入 cursor。
 
 精确 provider prompts：
@@ -213,20 +200,13 @@ rollback 的完整矩阵由
 [`tests/context_preparation.rs`](../../tests/context_preparation.rs) 锁定，不在
 这个可读输出里逐一重复。
 
-## Derive、typed builder 与 streaming tool 的边界
+## Derive 与 typed builder 的边界
 
 正常 prompt authoring 由 derive 生成 POM。现有 POM 中还没有 derive field
 mode 的四种形状是 `StrongNode`、`CodeBlockNode`、`ThematicBreak` 和
 multi-block `ListItem`。`RichMarkdownView` 只为它们调用 typed builders；
 它没有拼接或渲染 Markdown/XML。
 
-同一个 derived `InspectEdgeTool` 同时：
-
-- 作为 system/user prompt 中的 typed XML contract；
-- 让 `StreamingToolRunner` 从 `<tool name="inspect_edge">` 派生 parser
-  dispatch identity；
-- 在 example 中真实 dispatch 一次 `<inspect_edge ... />` 到 `on_open`。
-
-contract identity 不会自动验证参数；`edge_id` 的 runtime validation 仍由
-`StreamingTool` callback 明确实现。这样 prompt contract、dispatch identity
-和 handler 类型来自同一个 POM root，但业务验证边界仍然清晰。
+Derived `InspectEdgeTool` 只作为 system/user prompt 中的 typed XML shape。
+Streaming action 的 prompt、lifecycle 和 handler 由 Component authoring API 的专门测试覆盖，
+不在这个 lower-level POM regression 中混合第二套 authoring 路径。

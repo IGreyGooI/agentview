@@ -43,6 +43,7 @@ impl RunnerStatus {
 pub(crate) struct ChessFeedback {
     previous_action: Option<ChessAction>,
     previous_action_kind: Option<ChessActionKind>,
+    previous_submitted_uci: Option<String>,
     decision: FeedbackDecision,
     reason: String,
     retry_permitted: bool,
@@ -55,6 +56,7 @@ impl ChessFeedback {
         Self {
             previous_action: None,
             previous_action_kind: None,
+            previous_submitted_uci: None,
             decision: FeedbackDecision::None,
             reason: "No previous agent action exists for the opening reaction.".to_owned(),
             retry_permitted: false,
@@ -67,6 +69,7 @@ impl ChessFeedback {
         Self {
             previous_action: Some(action),
             previous_action_kind: Some(action.kind()),
+            previous_submitted_uci: None,
             decision: FeedbackDecision::Accepted,
             reason: reason.into(),
             retry_permitted: false,
@@ -76,9 +79,16 @@ impl ChessFeedback {
     }
 
     pub(crate) fn rejected(reason: InvalidActionReason) -> Self {
+        let previous_submitted_uci = reason.rejected_uci().map(|(submitted, truncated)| {
+            format!(
+                "{submitted}{}",
+                if truncated { "; truncated=true" } else { "" }
+            )
+        });
         Self {
             previous_action: reason.rejected_action(),
             previous_action_kind: reason.action_kind(),
+            previous_submitted_uci,
             decision: FeedbackDecision::Rejected,
             reason: reason.description().to_owned(),
             retry_permitted: true,
@@ -96,9 +106,14 @@ pub(crate) fn chess_feedback(snapshot: Arc<ChessSnapshot>) -> Component {
         .map(ChessActionKind::code)
         .unwrap_or("none");
     let previous_move = feedback
-        .previous_action
-        .and_then(ChessAction::move_candidate)
-        .map(|candidate| candidate.to_string())
+        .previous_submitted_uci
+        .clone()
+        .or_else(|| {
+            feedback
+                .previous_action
+                .and_then(ChessAction::move_candidate)
+                .map(|candidate| candidate.to_string())
+        })
         .unwrap_or_else(|| "none".to_owned());
     let decision = feedback.decision.code();
     let reason = &feedback.reason;

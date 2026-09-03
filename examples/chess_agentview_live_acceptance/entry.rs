@@ -28,13 +28,6 @@ pub(crate) fn write_entry_failure(output: &mut impl Write, failure: EntryFailure
     }
 }
 
-pub(crate) fn write_help(output: &mut impl Write) -> Result<(), EntryFailure> {
-    output
-        .write_all(b"Usage: chess_agentview\n")
-        .and_then(|()| output.flush())
-        .map_err(|_| EntryFailure::StdoutWrite)
-}
-
 pub(crate) fn write_live_game_summary(
     output: &mut impl Write,
     evidence: &game::GameEvidence,
@@ -64,8 +57,6 @@ fn live_game_summary(evidence: &game::GameEvidence) -> serde_json::Value {
                 Color::Black => "black",
             }),
         ),
-        game::GameOutcome::DrawAccepted => ("draw_accepted", None),
-        game::GameOutcome::DrawClaimed { .. } => ("draw_claimed", None),
         game::GameOutcome::AutomaticDraw { .. } => ("automatic_draw", None),
         game::GameOutcome::ModelForfeit { .. } => ("model_forfeit", None),
         game::GameOutcome::InfrastructureAbort { .. } => ("infrastructure_abort", None),

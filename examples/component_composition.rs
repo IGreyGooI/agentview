@@ -1,4 +1,4 @@
-//! Ordered canonical input contributed by several business Components.
+//! Ordered canonical input composed by several business Components.
 
 use agentview::{
     component::{execution::RenderedProjection, prelude::*, ComponentHost},

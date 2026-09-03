@@ -163,15 +163,21 @@ These commands require no credentials or external network access:
 
 ```bash
 cargo run --no-default-features --example hello_world
+cargo run --no-default-features --example component_composition
 cargo run --no-default-features --example frame_agent
 cargo run --no-default-features --example frame_skill
 cargo run --no-default-features --example frame_plugin
 cargo run --no-default-features --example signal_reaction
-cargo run --no-default-features --example provider_port_visual_acceptance
+cargo run --no-default-features --example component_runtime_visual_acceptance
 ```
 
-The executables prove different driver behavior over the same runtime:
+The examples start from Component roots and cover composition plus different
+driver behavior over the same runtime:
 
+- [`hello_world`](examples/hello_world.rs): the smallest nested Component tree,
+  rendered without provider I/O.
+- [`component_composition`](examples/component_composition.rs): several
+  business Components contribute ordered canonical input to one root.
 - [`frame_agent`](examples/frame_agent.rs): Component demand wakes the external
   driver for a later Full-to-Delta reaction after state publication.
 - [`frame_skill`](examples/frame_skill.rs): latest-read and a typed command stay
@@ -182,7 +188,7 @@ The executables prove different driver behavior over the same runtime:
 - [`signal_reaction`](examples/signal_reaction.rs): native text facts update a
   Signal, while the updated state reaches the target only on the second
   explicit reaction.
-- [`provider_port_visual_acceptance`](examples/provider_port_visual_acceptance.rs):
+- [`component_runtime_visual_acceptance`](examples/component_runtime_visual_acceptance.rs):
   a loopback Responses server validates complete Component state, Full/Delta
   lowering, provider-private wire history, fresh-target Full behavior, and
   cleanup. It ends with `ACCEPTANCE PASSED` only after every assertion passes.

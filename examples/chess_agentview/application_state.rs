@@ -15,7 +15,7 @@ pub(crate) enum ChessPhase {
     Finished,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RetryState {
     attempts: u8,
     last_rejection: Option<InvalidActionReason>,
@@ -44,7 +44,7 @@ pub(crate) struct ModelAttemptKey {
     pub(crate) attempt_index: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ChessFeedback {
     Initial,
     Accepted(ChessAction),
@@ -57,13 +57,6 @@ pub(crate) enum StockfishFailure {
     TimedOut,
     Protocol,
     IllegalMove(ChessMove),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DrawClaimBasis {
-    ThreefoldRepetition,
-    FiftyMoveRule,
-    ThreefoldRepetitionAndFiftyMoveRule,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,10 +76,6 @@ pub(crate) enum ChessOutcome {
         resigned: Color,
         winner: Color,
     },
-    DrawAccepted,
-    DrawClaimed {
-        basis: DrawClaimBasis,
-    },
     AutomaticDraw {
         reason: AutomaticDrawReason,
     },
@@ -105,7 +94,6 @@ pub(crate) struct ChessState {
     committed_moves: Vec<ChessMove>,
     retry: RetryState,
     feedback: ChessFeedback,
-    pending_draw_offer: Option<Color>,
     phase: ChessPhase,
     outcome: Option<ChessOutcome>,
     ply_limit: usize,
@@ -123,7 +111,6 @@ impl ChessState {
             committed_moves: Vec::new(),
             retry: RetryState::fresh(),
             feedback: ChessFeedback::Initial,
-            pending_draw_offer: None,
             phase: ChessPhase::Ready,
             outcome: None,
             ply_limit,
@@ -143,11 +130,11 @@ impl ChessState {
     }
 
     pub(crate) fn retry(&self) -> RetryState {
-        self.retry
+        self.retry.clone()
     }
 
     pub(crate) fn feedback(&self) -> ChessFeedback {
-        self.feedback
+        self.feedback.clone()
     }
 
     pub(crate) fn current_attempt(&self) -> Option<ModelAttemptKey> {
@@ -155,10 +142,6 @@ impl ChessState {
             ply: self.committed_moves.len(),
             attempt_index: self.retry.attempts,
         })
-    }
-
-    pub(crate) fn pending_draw_offer(&self) -> Option<Color> {
-        self.pending_draw_offer
     }
 
     pub(crate) fn phase(&self) -> ChessPhase {
@@ -236,14 +219,7 @@ fn complete_model(
     state.retry = RetryState::fresh();
     state.feedback = ChessFeedback::Accepted(action);
     match action {
-        ChessAction::ChooseMove(candidate) => {
-            state.pending_draw_offer = None;
-            commit_move(state, candidate)
-        }
-        ChessAction::MoveAndOfferDraw(candidate) => {
-            state.pending_draw_offer = Some(state.agent_side);
-            commit_move(state, candidate)
-        }
+        ChessAction::ChooseMove(candidate) => commit_move(state, candidate),
         ChessAction::Resign => {
             let resigned = state.agent_side;
             finish(
@@ -253,11 +229,6 @@ fn complete_model(
                     winner: opposite(resigned),
                 },
             )
-        }
-        ChessAction::AcceptDraw => finish(state, ChessOutcome::DrawAccepted),
-        ChessAction::ClaimDraw => {
-            let basis = draw_claim_basis(DrawState::from_history(&state.committed_moves));
-            finish(state, ChessOutcome::DrawClaimed { basis })
         }
     }
 }
@@ -277,8 +248,6 @@ fn complete_stockfish(
         Err(failure) => return finish(state, ChessOutcome::StockfishFailed(failure)),
     };
 
-    // Playing a move declines and expires the opponent's pending draw offer.
-    state.pending_draw_offer = None;
     commit_move(state, candidate)
 }
 
@@ -312,9 +281,9 @@ fn request_next_actor(state: &mut ChessState) -> Vec<ChessEffect> {
 fn reject_model_action(state: &mut ChessState, reason: InvalidActionReason) -> Vec<ChessEffect> {
     state.retry = RetryState {
         attempts: state.retry.attempts.saturating_add(1),
-        last_rejection: Some(reason),
+        last_rejection: Some(reason.clone()),
     };
-    state.feedback = ChessFeedback::Rejected(reason);
+    state.feedback = ChessFeedback::Rejected(reason.clone());
     if state.retry.attempts < MAX_MODEL_ATTEMPTS {
         vec![ChessEffect::RequestReaction]
     } else {
@@ -349,39 +318,20 @@ fn validate_model_action(
     }
 
     match action {
-        ChessAction::ChooseMove(_) | ChessAction::MoveAndOfferDraw(_)
-            if MoveGen::new_legal(&state.board).next().is_none() =>
-        {
+        ChessAction::ChooseMove(_) if MoveGen::new_legal(&state.board).next().is_none() => {
             Err(unavailable(ActionUnavailableReason::NoLegalMoves))
         }
-        ChessAction::ChooseMove(candidate) | ChessAction::MoveAndOfferDraw(candidate)
-            if !is_legal(&state.board, candidate) =>
-        {
+        ChessAction::ChooseMove(candidate) if !is_legal(&state.board, candidate) => {
             Err(InvalidActionReason::IllegalMove(action))
         }
-        ChessAction::AcceptDraw if state.pending_draw_offer != Some(opposite(state.agent_side)) => {
-            Err(unavailable(
-                ActionUnavailableReason::NoPendingOpponentDrawOffer,
-            ))
-        }
-        ChessAction::ClaimDraw if !DrawState::from_history(&state.committed_moves).claimable() => {
-            Err(unavailable(ActionUnavailableReason::PositionNotClaimable))
-        }
-        ChessAction::ChooseMove(_)
-        | ChessAction::MoveAndOfferDraw(_)
-        | ChessAction::Resign
-        | ChessAction::AcceptDraw
-        | ChessAction::ClaimDraw => Ok(action),
+        ChessAction::ChooseMove(_) | ChessAction::Resign => Ok(action),
     }
 }
 
 fn action_kind(action: ChessAction) -> ChessActionKind {
     match action {
         ChessAction::ChooseMove(_) => ChessActionKind::ChooseMove,
-        ChessAction::MoveAndOfferDraw(_) => ChessActionKind::MoveAndOfferDraw,
         ChessAction::Resign => ChessActionKind::Resign,
-        ChessAction::AcceptDraw => ChessActionKind::AcceptDraw,
-        ChessAction::ClaimDraw => ChessActionKind::ClaimDraw,
     }
 }
 
@@ -422,18 +372,6 @@ fn position_outcome(state: &ChessState) -> Option<ChessOutcome> {
     }
 }
 
-fn draw_claim_basis(draw_state: DrawState) -> DrawClaimBasis {
-    match (
-        draw_state.current_position_repetitions() >= 3,
-        draw_state.halfmove_clock() >= 100,
-    ) {
-        (true, true) => DrawClaimBasis::ThreefoldRepetitionAndFiftyMoveRule,
-        (true, false) => DrawClaimBasis::ThreefoldRepetition,
-        (false, true) => DrawClaimBasis::FiftyMoveRule,
-        (false, false) => unreachable!("validated draw claim must have a legal basis"),
-    }
-}
-
 fn is_dead_position(board: &Board) -> bool {
     if board.pieces(Piece::Pawn).popcnt() > 0
         || board.pieces(Piece::Rook).popcnt() > 0
@@ -469,6 +407,8 @@ fn opposite(color: Color) -> Color {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     fn move_(uci: &str) -> ChessMove {
@@ -492,6 +432,51 @@ mod tests {
             attempt: state.current_attempt().expect("model turn is active"),
             result,
         }
+    }
+
+    fn play(state: &mut ChessState, candidate: ChessMove) -> Vec<ChessEffect> {
+        if state.board().side_to_move() == state.agent_side() {
+            let event = model_event(state, Ok(ChessAction::ChooseMove(candidate)));
+            reduce(state, event)
+        } else {
+            reduce(state, ChessEvent::StockfishCompleted(Ok(candidate)))
+        }
+    }
+
+    fn quiet_history(plies: usize) -> Vec<ChessMove> {
+        let mut board = Board::default();
+        let mut visits = HashMap::from([(board.get_hash(), 1_usize)]);
+        let mut history = Vec::with_capacity(plies);
+
+        for _ in 0..plies {
+            let mut candidates = MoveGen::new_legal(&board)
+                .filter(|candidate| {
+                    board.piece_on(candidate.get_source()) != Some(Piece::Pawn)
+                        && board.piece_on(candidate.get_dest()).is_none()
+                })
+                .filter_map(|candidate| {
+                    let next = board.make_move_new(candidate);
+                    let previous_visits = visits.get(&next.get_hash()).copied().unwrap_or(0);
+                    (next.status() == BoardStatus::Ongoing && previous_visits < 4).then_some((
+                        previous_visits,
+                        candidate.to_string(),
+                        candidate,
+                        next,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+            let (_, _, candidate, next) = candidates
+                .into_iter()
+                .next()
+                .expect("a quiet legal continuation exists for the test history");
+
+            *visits.entry(next.get_hash()).or_default() += 1;
+            history.push(candidate);
+            board = next;
+        }
+
+        history
     }
 
     #[test]
@@ -549,7 +534,7 @@ mod tests {
         let mut state = started();
         let white = move_("e2e4");
         let black = move_("e7e5");
-        let event = model_event(&state, Ok(ChessAction::MoveAndOfferDraw(white)));
+        let event = model_event(&state, Ok(ChessAction::ChooseMove(white)));
         assert_eq!(
             reduce(&mut state, event),
             vec![ChessEffect::RequestStockfish(StockfishRequest {
@@ -557,16 +542,90 @@ mod tests {
                 committed_moves: vec![white],
             })]
         );
-        assert_eq!(state.pending_draw_offer(), Some(Color::White));
 
         assert_eq!(
             reduce(&mut state, ChessEvent::StockfishCompleted(Ok(black))),
             vec![ChessEffect::RequestReaction]
         );
         assert_eq!(state.committed_moves(), &[white, black]);
-        assert_eq!(state.pending_draw_offer(), None);
         assert_eq!(state.phase(), ChessPhase::AwaitingModel);
         assert_eq!(state.retry().attempts(), 0);
+    }
+
+    #[test]
+    fn referee_completes_stalemate_and_dead_positions_before_requesting_a_turn() {
+        let cases = [
+            ("7k/5K2/6Q1/8/8/8/8/8 b - - 0 1", ChessOutcome::Stalemate),
+            (
+                "7k/8/8/8/8/8/8/K7 w - - 0 1",
+                ChessOutcome::AutomaticDraw {
+                    reason: AutomaticDrawReason::DeadPosition,
+                },
+            ),
+        ];
+
+        for (fen, outcome) in cases {
+            let mut state = ChessState::new(200);
+            state.board = fen.parse().expect("test FEN is valid");
+
+            assert_eq!(
+                reduce(&mut state, ChessEvent::Start),
+                vec![ChessEffect::Complete(outcome.clone())]
+            );
+            assert_eq!(state.phase(), ChessPhase::Finished);
+            assert_eq!(state.outcome(), Some(&outcome));
+        }
+    }
+
+    #[test]
+    fn fifth_position_repetition_is_an_automatic_draw() {
+        let cycle = [move_("g1f3"), move_("g8f6"), move_("f3g1"), move_("f6g8")];
+        let history = cycle.into_iter().cycle().take(16).collect::<Vec<_>>();
+        let mut state = ChessState::new(200);
+        assert_eq!(
+            reduce(&mut state, ChessEvent::Start),
+            vec![ChessEffect::RequestReaction]
+        );
+
+        for candidate in history.iter().copied().take(15) {
+            let effects = play(&mut state, candidate);
+            assert_eq!(effects.len(), 1);
+            assert_ne!(state.phase(), ChessPhase::Finished);
+        }
+
+        let outcome = ChessOutcome::AutomaticDraw {
+            reason: AutomaticDrawReason::FivefoldRepetition,
+        };
+        assert_eq!(
+            play(&mut state, *history.last().unwrap()),
+            vec![ChessEffect::Complete(outcome.clone())]
+        );
+        assert_eq!(state.outcome(), Some(&outcome));
+    }
+
+    #[test]
+    fn one_hundred_fifty_quiet_halfmoves_trigger_the_seventy_five_move_rule() {
+        let history = quiet_history(150);
+        let mut state = ChessState::new(200);
+        assert_eq!(
+            reduce(&mut state, ChessEvent::Start),
+            vec![ChessEffect::RequestReaction]
+        );
+
+        for candidate in history.iter().copied().take(149) {
+            let effects = play(&mut state, candidate);
+            assert_eq!(effects.len(), 1);
+            assert_ne!(state.phase(), ChessPhase::Finished);
+        }
+
+        let outcome = ChessOutcome::AutomaticDraw {
+            reason: AutomaticDrawReason::SeventyFiveMoveRule,
+        };
+        assert_eq!(
+            play(&mut state, *history.last().unwrap()),
+            vec![ChessEffect::Complete(outcome.clone())]
+        );
+        assert_eq!(state.outcome(), Some(&outcome));
     }
 
     #[test]

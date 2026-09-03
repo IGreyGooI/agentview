@@ -1,6 +1,6 @@
-//! Complete, offline Prompt Object Model showcase.
+//! Prompt Object Model compatibility regression coverage.
 //!
-//! This example is an executable specification for the pipeline:
+//! This integration test preserves the lower-level typed-view pipeline:
 //!
 //! ```text
 //! typed Rust view
@@ -13,29 +13,22 @@
 //! Run it with:
 //!
 //! ```bash
-//! cargo run --example pom_feature_showcase
+//! cargo test --test pom_feature_showcase
 //! ```
-//!
-//! Add `--diagnostic-json` to print the complete authored and resolved POM AST
-//! for every stage. The default output keeps the same pipeline visible through
-//! compact AST summaries plus the exact provider prompts.
 //!
 //! The derive macro covers the normal authoring path. `RichMarkdownView` is the
 //! one deliberately small low-level adapter in this file: strong text, fenced
 //! code blocks, thematic breaks, and multi-block list items are typed POM
 //! primitives that do not yet have derive field modes. It builds AST nodes; it
-//! never serializes prompt markup by hand.
-//!
-//! The `StreamingToolRunner` section is retained as an independent legacy
-//! parser example. It is not the current Component authoring API.
+//! never serializes prompt markup by hand. Public examples remain
+//! Component-first; direct POM resolution belongs in regression coverage.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use agentview::prelude::*;
-use serde::Serialize;
 
-// ── Scalar and streaming-tool roots ──────────────────────────────────────────
+// ── Scalar and XML roots ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AgentView)]
 #[agent_view(display)]
@@ -75,51 +68,6 @@ fn inspect_edge_tool() -> InspectEdgeTool {
         name: "inspect_edge",
         edge_id: "...",
         purpose: "Read one semantic edge before deciding whether to update it.",
-    }
-}
-
-#[derive(Default)]
-struct ShowcaseParseContext {
-    raw_output: String,
-    artifacts: Vec<TurnArtifact>,
-    inspected_edge_ids: Vec<String>,
-}
-
-impl ParseContext for ShowcaseParseContext {
-    fn raw_output(&self) -> &str {
-        &self.raw_output
-    }
-
-    fn set_raw_output(&mut self, output: String) {
-        self.raw_output = output;
-    }
-
-    fn add_artifact(&mut self, artifact: TurnArtifact) {
-        self.artifacts.push(artifact);
-    }
-
-    fn artifacts(&self) -> &[TurnArtifact] {
-        &self.artifacts
-    }
-}
-
-#[async_trait::async_trait]
-impl StreamingTool<ShowcaseParseContext> for InspectEdgeTool {
-    async fn on_open(
-        &mut self,
-        element: &XmlElement,
-        context: &mut ShowcaseParseContext,
-    ) -> Result<(), StreamingToolError> {
-        let edge_id =
-            element
-                .attr("edge_id")
-                .ok_or_else(|| StreamingToolError::InvalidAttribute {
-                    tag: "inspect_edge",
-                    attr: "edge_id",
-                    reason: "required by the derived contract".to_owned(),
-                })?;
-        context.inspected_edge_ids.push(edge_id.to_owned());
-        Ok(())
     }
 }
 
@@ -858,97 +806,8 @@ fn unchanged_user_view() -> ShowcaseUserDocument {
     }
 }
 
-// ── Pipeline and executable output ───────────────────────────────────────────
+// ── Regression helpers ───────────────────────────────────────────────────────
 
-fn print_json(label: &str, value: &impl Serialize) -> anyhow::Result<()> {
-    println!("\n=== {label} ===\n");
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
-}
-
-fn outer_slot_summary(document: &Document) -> String {
-    let slots = document
-        .children()
-        .iter()
-        .filter_map(|edge| match edge {
-            ContentRef::DiffSlot(slot) => Some(format!(
-                "{}:{:?}:{}",
-                slot.role(),
-                slot.strategy(),
-                if slot.is_present() {
-                    "present"
-                } else {
-                    "absent"
-                }
-            )),
-            ContentRef::Node(_) => None,
-        })
-        .collect::<Vec<_>>();
-    if slots.is_empty() {
-        "none".to_owned()
-    } else {
-        slots.join(", ")
-    }
-}
-
-fn print_authored_pom(
-    label: &str,
-    document: &Document,
-    diagnostic_json: bool,
-) -> anyhow::Result<()> {
-    let title = format!("{label}: AUTHORED POM AST (Document, DiffSlots retained)");
-    if diagnostic_json {
-        print_json(&title, document)
-    } else {
-        println!("\n=== {title} ===\n");
-        println!(
-            "Document {{ block_edges: {}, outer_diff_slots: [{}] }}",
-            document.children().len(),
-            outer_slot_summary(document)
-        );
-        Ok(())
-    }
-}
-
-fn print_resolved_pom(
-    label: &str,
-    document: &ResolvedDocument,
-    diagnostic_json: bool,
-) -> anyhow::Result<()> {
-    let title = format!("{label}: RESOLVED POM AST (slot-free)");
-    if diagnostic_json {
-        print_json(&title, document)
-    } else {
-        println!("\n=== {title} ===\n");
-        println!(
-            "ResolvedDocument {{ block_edges: {} }}",
-            document.children().len()
-        );
-        Ok(())
-    }
-}
-
-fn print_candidate_cursor(
-    label: &str,
-    cursor: &UserDocumentCursor,
-    diagnostic_json: bool,
-) -> anyhow::Result<()> {
-    let title = format!("{label}: CANDIDATE USER CURSOR (not yet committed)");
-    if diagnostic_json {
-        print_json(&title, cursor)
-    } else {
-        println!("\n=== {title} ===\n");
-        println!("UserDocumentCursor {{ slot_baselines: {} }}", cursor.len());
-        Ok(())
-    }
-}
-
-fn print_prompt(label: &str, prompt: &str) {
-    println!("\n=== {label}: CANONICAL PROVIDER PROMPT ===\n");
-    println!("{prompt}");
-}
-
-#[cfg(test)]
 fn resolve_and_render_system(document: Document) -> anyhow::Result<String> {
     let resolved = resolve_system_document(document);
     Ok(render_pom_document(&resolved)?)
@@ -961,83 +820,6 @@ fn resolve_and_render_user(
     let (resolved, candidate_cursor) = resolve_user_document(document, cursor)?;
     let prompt = render_pom_document(&resolved)?;
     Ok((resolved, prompt, candidate_cursor))
-}
-
-fn emit_user_stage(
-    label: &str,
-    document: Document,
-    cursor: &UserDocumentCursor,
-    diagnostic_json: bool,
-) -> anyhow::Result<UserDocumentCursor> {
-    print_authored_pom(label, &document, diagnostic_json)?;
-    let (resolved, prompt, candidate_cursor) = resolve_and_render_user(document, cursor)?;
-    print_resolved_pom(label, &resolved, diagnostic_json)?;
-    print_candidate_cursor(label, &candidate_cursor, diagnostic_json)?;
-    print_prompt(label, &prompt);
-
-    // A real Agent publishes this candidate only after its turn commit
-    // boundary. The offline example treats each stage as a successful commit.
-    Ok(candidate_cursor)
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let diagnostic_json = std::env::args()
-        .skip(1)
-        .any(|arg| arg == "--diagnostic-json");
-
-    // The same derived XML root is both prompt schema and streaming-parser
-    // registration identity (`<tool name="inspect_edge">`).
-    let mut runner =
-        StreamingToolRunner::new(ShowcaseParseContext::default()).with_tool(inspect_edge_tool());
-    runner
-        .feed(r#"<inspect_edge edge_id="edge.ownership" />"#)
-        .await;
-    runner.finalize().await;
-    let parser_context = runner.into_context().await;
-    assert_eq!(parser_context.inspected_edge_ids, ["edge.ownership"]);
-
-    let system = system_view().build_root()?;
-    print_authored_pom("SYSTEM", &system, diagnostic_json)?;
-    let resolved_system = resolve_system_document(system);
-    print_resolved_pom("SYSTEM", &resolved_system, diagnostic_json)?;
-    print_prompt("SYSTEM", &render_pom_document(&resolved_system)?);
-
-    let mut cursor = UserDocumentCursor::default();
-    cursor = emit_user_stage(
-        "USER TURN 1 / CONTEXT FIRST-SEEN / FULL",
-        first_user_view().build_root()?,
-        &cursor,
-        diagnostic_json,
-    )?;
-    cursor = emit_user_stage(
-        "USER TURN 2 / CONTEXT CHANGED / DELTA",
-        second_user_view()?.build_root()?,
-        &cursor,
-        diagnostic_json,
-    )?;
-    cursor = emit_user_stage(
-        "USER TURN 3 / CONTEXT UNCHANGED / SLOT OMITTED",
-        unchanged_user_view().build_root()?,
-        &cursor,
-        diagnostic_json,
-    )?;
-    cursor = emit_user_stage(
-        "USER TURN 4 / CONTEXT EXPLICITLY ABSENT / DELETE",
-        deletion_user_view().build_root()?,
-        &cursor,
-        diagnostic_json,
-    )?;
-
-    assert!(
-        cursor.is_empty(),
-        "the explicit outer context deletion removes its committed baseline"
-    );
-    println!(
-        "\n=== STREAMING TOOL DISPATCH ===\n\ncontract identity `inspect_edge` dispatched edge ids: {:?}",
-        parser_context.inspected_edge_ids
-    );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1132,18 +914,5 @@ mod tests {
                 "missing `{expected_fragment}` in:\n{delta}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn derived_tool_contract_is_also_the_parser_dispatch_identity() {
-        let mut runner = StreamingToolRunner::new(ShowcaseParseContext::default())
-            .with_tool(inspect_edge_tool());
-        runner.feed(r#"<inspect_edge edge_id="edge.test" />"#).await;
-        runner.finalize().await;
-
-        assert_eq!(
-            runner.into_context().await.inspected_edge_ids,
-            ["edge.test"]
-        );
     }
 }

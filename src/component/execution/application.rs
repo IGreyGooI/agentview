@@ -1127,6 +1127,7 @@ impl ApplicationFault {
             }
             ComponentAttemptFault::Signal { .. } => ApplicationFaultReason::ComponentRuntime,
             ComponentAttemptFault::ListenerDispatch { .. }
+            | ComponentAttemptFault::ReactionCompletion { .. }
             | ComponentAttemptFault::StreamingInput { .. } => ApplicationFaultReason::EventHandler,
             ComponentAttemptFault::NativeToolBinding { .. } => ApplicationFaultReason::ToolBinding,
             ComponentAttemptFault::NativeToolLane { .. } => ApplicationFaultReason::ToolLane,
@@ -1515,6 +1516,18 @@ mod tests {
             }
         });
         view! { state { "{rendered}" } }
+    }
+
+    #[component]
+    fn empty_primary_completion_component(completions: Arc<AtomicUsize>) -> Component {
+        use_reaction_completion(move || async move {
+            completions.fetch_add(1, Ordering::AcqRel);
+            Ok::<(), String>(())
+        });
+        XmlStreamingToolCall::contract("test.empty-primary", "v1")
+            .empty_element("choice")
+            .on_decoded(|| async { Ok::<(), String>(()) })
+            .on_invalid(|_| async { Ok::<(), String>(()) })
     }
 
     #[derive(Clone)]
@@ -2852,6 +2865,23 @@ mod tests {
             application.session.canonical_history.transcript.items().last(),
             Some(CanonicalInputItem::AssistantText { text, .. }) if text == "after"
         ));
+    }
+
+    #[tokio::test]
+    async fn reaction_without_primary_text_reaches_completion_with_an_xml_binding() {
+        let (port, probe) = scripted_port(vec![completed_reaction()], 0);
+        let completions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&completions);
+        let mut application = Application::mount(
+            move || empty_primary_completion_component(Arc::clone(&observed)),
+            port,
+        )
+        .unwrap();
+
+        application.react().await.unwrap();
+
+        assert_eq!(completions.load(Ordering::Acquire), 1);
+        assert_eq!(probe.handoffs.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

@@ -160,6 +160,228 @@ async fn provider_hook_handlers_are_awaited_in_hook_order() {
 }
 
 #[component]
+fn normal_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
+    use_reaction_completion(move || {
+        log.lock().unwrap().push(String::from("reaction:complete"));
+        ready(Ok::<(), Infallible>(()))
+    });
+    view! {}
+}
+
+#[tokio::test]
+async fn normal_finish_invokes_reaction_completion_once() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let signals = SignalRuntime::new();
+    let mut bindings =
+        render_provider_handlers(normal_reaction_completion(Arc::clone(&log)), &signals);
+
+    bindings.finish_normal().await.unwrap();
+    assert!(matches!(
+        bindings.finish_normal().await,
+        Err(ComponentAttemptFault::AfterStreamFinish)
+    ));
+
+    assert_eq!(*log.lock().unwrap(), ["reaction:complete"]);
+}
+
+#[component]
+fn empty_stream_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
+    let completion_log = Arc::clone(&log);
+    use_reaction_completion(move || {
+        completion_log
+            .lock()
+            .unwrap()
+            .push(String::from("reaction:complete"));
+        ready(Ok::<(), Infallible>(()))
+    });
+    XmlStreamingToolCall::contract("test.empty-reaction", "v1")
+        .empty_element("choice")
+        .on_decoded(|| ready(Ok::<(), Infallible>(())))
+        .on_invalid(move |diagnostic| {
+            log.lock().unwrap().push(format!("invalid:{diagnostic:?}"));
+            ready(Ok::<(), Infallible>(()))
+        })
+}
+
+#[tokio::test]
+async fn empty_stream_without_text_complete_reaches_reaction_completion() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let signals = SignalRuntime::new();
+    let mut bindings =
+        render_provider_handlers(empty_stream_reaction_completion(Arc::clone(&log)), &signals);
+
+    bindings.finish_normal().await.unwrap();
+
+    assert_eq!(*log.lock().unwrap(), ["reaction:complete"]);
+}
+
+#[component]
+fn ordered_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
+    let raw_log = Arc::clone(&log);
+    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+        let log = Arc::clone(&raw_log);
+        async move {
+            if matches!(event, TextTurnEvent::TextComplete(_)) {
+                log.lock().unwrap().push(String::from("raw"));
+            }
+            Ok::<(), Infallible>(())
+        }
+    });
+
+    let first_completion_log = Arc::clone(&log);
+    use_reaction_completion(move || async move {
+        first_completion_log
+            .lock()
+            .unwrap()
+            .push(String::from("completion:first:start"));
+        tokio::task::yield_now().await;
+        first_completion_log
+            .lock()
+            .unwrap()
+            .push(String::from("completion:first:end"));
+        Ok::<(), Infallible>(())
+    });
+    let second_completion_log = Arc::clone(&log);
+    use_reaction_completion(move || {
+        second_completion_log
+            .lock()
+            .unwrap()
+            .push(String::from("completion:second"));
+        ready(Ok::<(), Infallible>(()))
+    });
+
+    let decoded_log = Arc::clone(&log);
+    let invalid_log = Arc::clone(&log);
+    view! {
+        {
+            XmlStreamingToolCall::contract("test.completion-decoded", "v1")
+                .empty_element("choice")
+                .on_decoded(move || {
+                    decoded_log.lock().unwrap().push(String::from("decoded"));
+                    ready(Ok::<(), Infallible>(()))
+                })
+                .on_invalid(|_| ready(Ok::<(), Infallible>(())))
+        }
+        {
+            XmlStreamingToolCall::contract("test.completion-eof", "v1")
+                .empty_element("unfinished")
+                .on_decoded(|| ready(Ok::<(), Infallible>(())))
+                .on_invalid(move |_| {
+                    invalid_log.lock().unwrap().push(String::from("eof:invalid"));
+                    ready(Ok::<(), Infallible>(()))
+                })
+        }
+    }
+}
+
+#[tokio::test]
+async fn reaction_completion_runs_after_raw_derived_and_eof_handlers_in_hook_order() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let signals = SignalRuntime::new();
+    let mut bindings =
+        render_provider_handlers(ordered_reaction_completion(Arc::clone(&log)), &signals);
+
+    bindings
+        .dispatch(ProviderEvent::Text(TextTurnEvent::TextComplete(
+            String::from("<choice /><unfinished"),
+        )))
+        .await
+        .unwrap();
+    bindings.finish_normal().await.unwrap();
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "raw",
+            "decoded",
+            "eof:invalid",
+            "completion:first:start",
+            "completion:first:end",
+            "completion:second",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn nonempty_delta_without_text_complete_stays_a_protocol_fault() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let signals = SignalRuntime::new();
+    let mut bindings =
+        render_provider_handlers(empty_stream_reaction_completion(Arc::clone(&log)), &signals);
+    bindings
+        .dispatch(ProviderEvent::Text(TextTurnEvent::TextDelta(String::from(
+            "partial",
+        ))))
+        .await
+        .unwrap();
+
+    let fault = bindings.finish_normal().await.unwrap_err();
+
+    assert!(matches!(
+        fault,
+        ComponentAttemptFault::StreamingInput { message }
+            if message.contains("finished without TextComplete")
+    ));
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn empty_delta_without_text_complete_stays_a_protocol_fault() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let signals = SignalRuntime::new();
+    let mut bindings =
+        render_provider_handlers(empty_stream_reaction_completion(Arc::clone(&log)), &signals);
+    bindings
+        .dispatch(ProviderEvent::Text(TextTurnEvent::TextDelta(String::new())))
+        .await
+        .unwrap();
+
+    let fault = bindings.finish_normal().await.unwrap_err();
+
+    assert!(matches!(
+        fault,
+        ComponentAttemptFault::StreamingInput { message }
+            if message.contains("finished without TextComplete")
+    ));
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[component]
+fn failing_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
+    use_reaction_completion(|| {
+        ready(Err::<(), _>(HandlerError(
+            "reaction completion returned error",
+        )))
+    });
+    use_reaction_completion(move || {
+        log.lock().unwrap().push(String::from("must-not-run"));
+        ready(Ok::<(), Infallible>(()))
+    });
+    view! {}
+}
+
+#[tokio::test]
+async fn reaction_completion_error_stops_later_callbacks_and_faults_bindings_closed() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let signals = SignalRuntime::new();
+    let mut bindings =
+        render_provider_handlers(failing_reaction_completion(Arc::clone(&log)), &signals);
+
+    let fault = bindings.finish_normal().await.unwrap_err();
+
+    assert!(matches!(
+        fault,
+        ComponentAttemptFault::ReactionCompletion { message }
+            if message.contains("reaction completion returned error")
+    ));
+    assert!(matches!(
+        bindings.finish_normal().await,
+        Err(ComponentAttemptFault::AttemptInactive)
+    ));
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[component]
 fn provider_order_leaf(label: String, log: Arc<Mutex<Vec<String>>>) -> Component {
     use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
         let label = label.clone();

@@ -246,8 +246,6 @@ pub(crate) fn validate_live_evidence(evidence: &GameEvidence) -> Result<(), Live
         GameOutcome::Checkmate { .. }
             | GameOutcome::Stalemate
             | GameOutcome::Resignation { .. }
-            | GameOutcome::DrawAccepted
-            | GameOutcome::DrawClaimed { .. }
             | GameOutcome::AutomaticDraw { .. }
             | GameOutcome::ModelForfeit { .. }
     ) {
@@ -345,12 +343,7 @@ fn attempt_chronology_matches(
 ) -> bool {
     let committed_white_plies = white_boards.len();
     let has_forfeit_group = matches!(evidence.outcome, GameOutcome::ModelForfeit { .. });
-    let has_terminal_action_group = matches!(
-        evidence.outcome,
-        GameOutcome::Resignation { .. }
-            | GameOutcome::DrawAccepted
-            | GameOutcome::DrawClaimed { .. }
-    );
+    let has_terminal_action_group = matches!(evidence.outcome, GameOutcome::Resignation { .. });
     if has_forfeit_group
         && (!evidence.accepted_moves.len().is_multiple_of(2)
             || replayed.side_to_move() != Color::White)
@@ -389,8 +382,8 @@ fn attempt_group_matches(
     let lineage_matches = group.iter().enumerate().all(|(attempt_index, attempt)| {
         let corrective_reason = match attempt_index.checked_sub(1) {
             None => None,
-            Some(previous) => match group[previous].result {
-                AttemptResult::Correctable(reason) => Some(reason),
+            Some(previous) => match &group[previous].result {
+                AttemptResult::Correctable(reason) => Some(reason.clone()),
                 AttemptResult::ActionAccepted(_) | AttemptResult::InfrastructureAbort { .. } => {
                     return false;
                 }
@@ -416,12 +409,7 @@ fn attempt_group_matches(
                     (Some(AttemptResult::ActionAccepted(action)), Some(committed))
                         if action.move_candidate() == Some(*committed)
                 )
-        } else if matches!(
-            evidence.outcome,
-            GameOutcome::Resignation { .. }
-                | GameOutcome::DrawAccepted
-                | GameOutcome::DrawClaimed { .. }
-        ) {
+        } else if matches!(evidence.outcome, GameOutcome::Resignation { .. }) {
             terminal_action_group_matches(group, evidence.outcome.clone())
         } else {
             forfeit_group_matches(group, evidence.outcome.clone())
@@ -437,12 +425,6 @@ fn terminal_action_group_matches(group: &[AttemptEvidence], outcome: GameOutcome
             (
                 Some(AttemptResult::ActionAccepted(ChessAction::Resign)),
                 GameOutcome::Resignation { .. }
-            ) | (
-                Some(AttemptResult::ActionAccepted(ChessAction::AcceptDraw)),
-                GameOutcome::DrawAccepted
-            ) | (
-                Some(AttemptResult::ActionAccepted(ChessAction::ClaimDraw)),
-                GameOutcome::DrawClaimed { .. }
             )
         )
 }
@@ -508,11 +490,6 @@ fn terminal_matches_board(
             board.status() == BoardStatus::Ongoing
                 && resigned == board.side_to_move()
                 && winner == !resigned
-        }
-        GameOutcome::DrawAccepted => board.status() == BoardStatus::Ongoing,
-        GameOutcome::DrawClaimed { .. } => {
-            board.status() == BoardStatus::Ongoing
-                && DrawState::from_history(accepted_moves).claimable()
         }
         GameOutcome::AutomaticDraw { reason } => {
             let draw_state = DrawState::from_history(accepted_moves);
@@ -673,4 +650,65 @@ fn optional_unicode(value: Option<OsString>, fallback: &str) -> Result<String, L
         .transpose()
         .map_err(|_| LiveConfigError::InvalidApiBase)
         .map(|value| value.unwrap_or_else(|| fallback.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use chess::ChessMove;
+
+    use super::*;
+
+    fn repeated_knight_history(plies: usize) -> (Board, Vec<ChessMove>) {
+        let cycle = ["g1f3", "g8f6", "f3g1", "f6g8"]
+            .map(|uci| uci.parse::<ChessMove>().expect("test move is valid UCI"));
+        let mut board = Board::default();
+        let mut history = Vec::with_capacity(plies);
+        for candidate in cycle.into_iter().cycle().take(plies) {
+            assert!(MoveGen::new_legal(&board).any(|legal| legal == candidate));
+            board = board.make_move_new(candidate);
+            history.push(candidate);
+        }
+        (board, history)
+    }
+
+    #[test]
+    fn terminal_evidence_accepts_all_referee_owned_draws() {
+        let stalemate = "7k/5K2/6Q1/8/8/8/8/8 b - - 0 1"
+            .parse::<Board>()
+            .expect("test stalemate FEN is valid");
+        assert!(terminal_matches_board(
+            GameOutcome::Stalemate,
+            stalemate,
+            &[]
+        ));
+
+        let dead = "7k/8/8/8/8/8/8/K7 w - - 0 1"
+            .parse::<Board>()
+            .expect("test dead-position FEN is valid");
+        assert!(terminal_matches_board(
+            GameOutcome::AutomaticDraw {
+                reason: AutomaticDrawReason::DeadPosition,
+            },
+            dead,
+            &[],
+        ));
+
+        let (fivefold_board, fivefold_history) = repeated_knight_history(16);
+        assert!(terminal_matches_board(
+            GameOutcome::AutomaticDraw {
+                reason: AutomaticDrawReason::FivefoldRepetition,
+            },
+            fivefold_board,
+            &fivefold_history,
+        ));
+
+        let (seventy_five_board, seventy_five_history) = repeated_knight_history(150);
+        assert!(terminal_matches_board(
+            GameOutcome::AutomaticDraw {
+                reason: AutomaticDrawReason::SeventyFiveMoveRule,
+            },
+            seventy_five_board,
+            &seventy_five_history,
+        ));
+    }
 }

@@ -19,15 +19,6 @@ use agentview::{
 };
 use async_trait::async_trait;
 
-#[cfg(feature = "legacy-provider-port")]
-#[allow(
-    deprecated,
-    reason = "the compatibility implementation remains feature-gated"
-)]
-use agentview::component::execution::{
-    ProviderEvent, ProviderEventStream, ProviderFault, ProviderPort, RenderedProjection,
-};
-
 static NEXT_SCRIPTED_TARGET: AtomicU64 = AtomicU64::new(1);
 const SCRIPTED_TARGET_DOMAIN: u128 = 4_u128 << 64;
 const TEXT_OUTPUT: ProviderOutputKey = ProviderOutputKey::new(1);
@@ -131,8 +122,6 @@ pub struct ScriptedProvider {
     terminal_fault: Option<ReactionPortFault>,
     #[cfg(test)]
     fail_next_capture: bool,
-    #[cfg(feature = "legacy-provider-port")]
-    legacy_scripts: VecDeque<Vec<ProviderEvent>>,
 }
 
 impl ScriptedProvider {
@@ -159,8 +148,6 @@ impl ScriptedProvider {
                 terminal_fault: None,
                 #[cfg(test)]
                 fail_next_capture: false,
-                #[cfg(feature = "legacy-provider-port")]
-                legacy_scripts: VecDeque::new(),
             },
             capture,
         ))
@@ -187,16 +174,6 @@ impl ScriptedProvider {
     ) -> Result<(Self, ScriptedCapture), ReactionPortFault> {
         let (mut provider, capture) = Self::new(scripts)?;
         provider.fail_next_capture = true;
-        Ok((provider, capture))
-    }
-
-    #[cfg(feature = "legacy-provider-port")]
-    #[allow(dead_code, reason = "available only to retained legacy examples")]
-    pub fn new_legacy(
-        scripts: impl IntoIterator<Item = Vec<ProviderEvent>>,
-    ) -> Result<(Self, ScriptedCapture), ReactionPortFault> {
-        let (mut provider, capture) = Self::new([])?;
-        provider.legacy_scripts = scripts.into_iter().collect();
         Ok((provider, capture))
     }
 }
@@ -287,24 +264,6 @@ fn declaration_fault() -> ReactionPortFault {
         ReactionPortFaultCode::Internal,
         ReactionPortFaultReason::Declaration,
     )
-}
-
-#[cfg(feature = "legacy-provider-port")]
-#[allow(
-    deprecated,
-    reason = "legacy ProviderPort remains isolated behind its compatibility feature"
-)]
-#[async_trait]
-impl ProviderPort for ScriptedProvider {
-    async fn execute<'a>(
-        &'a mut self,
-        _projection: RenderedProjection,
-    ) -> Result<ProviderEventStream<'a>, ProviderFault> {
-        let events = self.legacy_scripts.pop_front().ok_or_else(|| {
-            ProviderFault::retryable_transport("scripted legacy provider has no reaction script")
-        })?;
-        Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
-    }
 }
 
 #[cfg(test)]

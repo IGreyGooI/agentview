@@ -416,7 +416,6 @@ where
     let mut accepted_moves = Vec::new();
     let mut validated_black_moves = Vec::new();
     let mut attempts = Vec::new();
-    let mut pending_draw_offer = None;
     let mut feedback = ChessFeedback::initial();
 
     loop {
@@ -448,7 +447,6 @@ where
                 Color::White,
                 board,
                 accepted_moves.clone(),
-                pending_draw_offer,
                 feedback.clone(),
             );
             match play_white_ply_observed(
@@ -474,15 +472,6 @@ where
                                 action,
                                 "The referee accepted the legal move and committed it.",
                             );
-                            pending_draw_offer = None;
-                            candidate
-                        }
-                        ChessAction::MoveAndOfferDraw(candidate) => {
-                            feedback = ChessFeedback::accepted(
-                                action,
-                                "The referee accepted the legal move and delivered the draw offer to the opponent.",
-                            );
-                            pending_draw_offer = Some(Color::White);
                             candidate
                         }
                         ChessAction::Resign => {
@@ -496,38 +485,6 @@ where
                                 validated_black_moves,
                                 attempts,
                             };
-                        }
-                        ChessAction::AcceptDraw
-                            if snapshot.pending_draw_offer() == Some(Color::Black) =>
-                        {
-                            return PlayResult {
-                                outcome: GameOutcome::DrawAccepted,
-                                final_board: board,
-                                accepted_moves,
-                                validated_black_moves,
-                                attempts,
-                            };
-                        }
-                        ChessAction::ClaimDraw if snapshot.draw_state().claimable() => {
-                            return PlayResult {
-                                outcome: GameOutcome::DrawClaimed {
-                                    basis: draw_claim_basis(snapshot.draw_state()),
-                                },
-                                final_board: board,
-                                accepted_moves,
-                                validated_black_moves,
-                                attempts,
-                            };
-                        }
-                        ChessAction::AcceptDraw | ChessAction::ClaimDraw => {
-                            return infrastructure_result(
-                                board,
-                                accepted_moves,
-                                validated_black_moves,
-                                attempts,
-                                InfrastructureStage::AuthoritativeState,
-                                InfrastructureAbortReason::StateMismatch,
-                            );
                         }
                     }
                 }
@@ -622,15 +579,6 @@ where
             }
             let candidate = candidate.expect("successful engine result has one candidate");
             validated_black_moves = appended(&validated_black_moves, candidate);
-            if pending_draw_offer == Some(Color::White) {
-                if let Some(offered_move) = accepted_moves.last().copied() {
-                    feedback = ChessFeedback::accepted(
-                        ChessAction::MoveAndOfferDraw(offered_move),
-                        "The move and draw offer were accepted by the referee; the opponent played a move, so the draw offer expired.",
-                    );
-                }
-            }
-            pending_draw_offer = None;
             candidate
         };
 
@@ -793,10 +741,6 @@ pub enum GameOutcome {
         resigned: Color,
         winner: Color,
     },
-    DrawAccepted,
-    DrawClaimed {
-        basis: DrawClaimBasis,
-    },
     AutomaticDraw {
         reason: AutomaticDrawReason,
     },
@@ -809,13 +753,6 @@ pub enum GameOutcome {
         reason_code: InfrastructureAbortReason,
     },
     PlyLimitReached,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DrawClaimBasis {
-    ThreefoldRepetition,
-    FiftyMoveRule,
-    ThreefoldRepetitionAndFiftyMoveRule,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -910,7 +847,6 @@ where
         Color::White,
         Board::default(),
         Vec::new(),
-        None,
         ChessFeedback::initial(),
     );
     let initial_state = ChessAgentState::awaiting(
@@ -1404,18 +1340,6 @@ fn terminal_outcome(board: &Board, history: &[ChessMove]) -> Option<GameOutcome>
     }
 }
 
-fn draw_claim_basis(draw_state: DrawState) -> DrawClaimBasis {
-    match (
-        draw_state.current_position_repetitions() >= 3,
-        draw_state.halfmove_clock() >= 100,
-    ) {
-        (true, true) => DrawClaimBasis::ThreefoldRepetitionAndFiftyMoveRule,
-        (true, false) => DrawClaimBasis::ThreefoldRepetition,
-        (false, true) => DrawClaimBasis::FiftyMoveRule,
-        (false, false) => unreachable!("a validated draw claim has one legal basis"),
-    }
-}
-
 pub(crate) fn is_dead_position(board: &Board) -> bool {
     if board.pieces(Piece::Pawn).popcnt() > 0
         || board.pieces(Piece::Rook).popcnt() > 0
@@ -1492,6 +1416,56 @@ mod tests {
     use crate::observability::{
         EffectiveProviderConfig, ObservationFailure, ProviderEndpointClass, RunEvent,
     };
+
+    fn repeated_knight_history(plies: usize) -> (Board, Vec<ChessMove>) {
+        let cycle = ["g1f3", "g8f6", "f3g1", "f6g8"]
+            .map(|uci| uci.parse::<ChessMove>().expect("test move is valid UCI"));
+        let mut board = Board::default();
+        let mut history = Vec::with_capacity(plies);
+        for candidate in cycle.into_iter().cycle().take(plies) {
+            assert!(MoveGen::new_legal(&board).any(|legal| legal == candidate));
+            board = board.make_move_new(candidate);
+            history.push(candidate);
+        }
+        (board, history)
+    }
+
+    #[test]
+    fn terminal_outcome_keeps_all_referee_owned_draws() {
+        let stalemate = "7k/5K2/6Q1/8/8/8/8/8 b - - 0 1"
+            .parse::<Board>()
+            .expect("test stalemate FEN is valid");
+        assert_eq!(
+            terminal_outcome(&stalemate, &[]),
+            Some(GameOutcome::Stalemate)
+        );
+
+        let dead = "7k/8/8/8/8/8/8/K7 w - - 0 1"
+            .parse::<Board>()
+            .expect("test dead-position FEN is valid");
+        assert_eq!(
+            terminal_outcome(&dead, &[]),
+            Some(GameOutcome::AutomaticDraw {
+                reason: AutomaticDrawReason::DeadPosition,
+            })
+        );
+
+        let (fivefold_board, fivefold_history) = repeated_knight_history(16);
+        assert_eq!(
+            terminal_outcome(&fivefold_board, &fivefold_history),
+            Some(GameOutcome::AutomaticDraw {
+                reason: AutomaticDrawReason::FivefoldRepetition,
+            })
+        );
+
+        let (seventy_five_board, seventy_five_history) = repeated_knight_history(150);
+        assert_eq!(
+            terminal_outcome(&seventy_five_board, &seventy_five_history),
+            Some(GameOutcome::AutomaticDraw {
+                reason: AutomaticDrawReason::SeventyFiveMoveRule,
+            })
+        );
+    }
 
     struct SetupPort {
         identity: TargetIdentity,

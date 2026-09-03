@@ -360,6 +360,7 @@ impl fmt::Display for HookSite {
 pub(crate) enum HookKind {
     Signal,
     ProviderEventHandler,
+    ReactionCompletion,
     ReactionRequest,
     Future,
     Coroutine,
@@ -397,6 +398,7 @@ impl fmt::Display for HookKind {
         let name = match self {
             Self::Signal => "signal",
             Self::ProviderEventHandler => "provider-event-handler",
+            Self::ReactionCompletion => "reaction-completion",
             Self::ReactionRequest => "reaction-request",
             Self::Future => "future",
             Self::Coroutine => "coroutine",

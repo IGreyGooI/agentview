@@ -20,7 +20,7 @@ use agentview::provider::async_openai::OpenAiResponsesUsage;
 
 use crate::{
     chess_actions::InvalidActionReason,
-    game::{AutomaticDrawReason, DrawClaimBasis, GameOutcome},
+    game::{AutomaticDrawReason, GameOutcome},
     model::{AttemptResult, InfrastructureAbortReason, InfrastructureStage},
 };
 
@@ -58,10 +58,7 @@ pub(crate) enum ObservedInvalidActionReason {
     InvalidUci,
     IllegalMove,
     ChooseMoveUnavailable,
-    MoveAndOfferDrawUnavailable,
     ResignUnavailable,
-    AcceptDrawUnavailable,
-    ClaimDrawUnavailable,
 }
 
 impl ObservedInvalidActionReason {
@@ -73,10 +70,7 @@ impl ObservedInvalidActionReason {
             Self::InvalidUci => "invalid_uci",
             Self::IllegalMove => "illegal_move",
             Self::ChooseMoveUnavailable => "choose_move_unavailable",
-            Self::MoveAndOfferDrawUnavailable => "move_and_offer_draw_unavailable",
             Self::ResignUnavailable => "resign_unavailable",
-            Self::AcceptDrawUnavailable => "accept_draw_unavailable",
-            Self::ClaimDrawUnavailable => "claim_draw_unavailable",
         }
     }
 }
@@ -87,16 +81,11 @@ impl From<InvalidActionReason> for ObservedInvalidActionReason {
             InvalidActionReason::InvalidXml => Self::InvalidXml,
             InvalidActionReason::MissingAction => Self::MissingAction,
             InvalidActionReason::MultipleActions => Self::MultipleActions,
-            InvalidActionReason::InvalidUci(_) => Self::InvalidUci,
+            InvalidActionReason::InvalidUci { .. } => Self::InvalidUci,
             InvalidActionReason::IllegalMove(_) => Self::IllegalMove,
             InvalidActionReason::ActionUnavailable { action, .. } => match action {
                 crate::chess_actions::ChessActionKind::ChooseMove => Self::ChooseMoveUnavailable,
-                crate::chess_actions::ChessActionKind::MoveAndOfferDraw => {
-                    Self::MoveAndOfferDrawUnavailable
-                }
                 crate::chess_actions::ChessActionKind::Resign => Self::ResignUnavailable,
-                crate::chess_actions::ChessActionKind::AcceptDraw => Self::AcceptDrawUnavailable,
-                crate::chess_actions::ChessActionKind::ClaimDraw => Self::ClaimDrawUnavailable,
             },
         }
     }
@@ -327,10 +316,6 @@ pub(crate) enum ObservedTerminal {
         resigned: ObservedSide,
         winner: ObservedSide,
     },
-    DrawAccepted,
-    DrawClaimed {
-        basis: ObservedDrawClaimBasis,
-    },
     AutomaticDraw {
         reason: ObservedAutomaticDrawReason,
     },
@@ -345,36 +330,6 @@ pub(crate) enum ObservedTerminal {
     PlyLimitReached {
         max_plies: usize,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ObservedDrawClaimBasis {
-    ThreefoldRepetition,
-    FiftyMoveRule,
-    ThreefoldRepetitionAndFiftyMoveRule,
-}
-
-impl From<DrawClaimBasis> for ObservedDrawClaimBasis {
-    fn from(value: DrawClaimBasis) -> Self {
-        match value {
-            DrawClaimBasis::ThreefoldRepetition => Self::ThreefoldRepetition,
-            DrawClaimBasis::FiftyMoveRule => Self::FiftyMoveRule,
-            DrawClaimBasis::ThreefoldRepetitionAndFiftyMoveRule => {
-                Self::ThreefoldRepetitionAndFiftyMoveRule
-            }
-        }
-    }
-}
-
-impl ObservedDrawClaimBasis {
-    fn code(self) -> &'static str {
-        match self {
-            Self::ThreefoldRepetition => "threefold_repetition",
-            Self::FiftyMoveRule => "fifty_move_rule",
-            Self::ThreefoldRepetitionAndFiftyMoveRule => "threefold_repetition_and_fifty_move_rule",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -415,10 +370,6 @@ impl ObservedTerminal {
             GameOutcome::Resignation { resigned, winner } => Self::Resignation {
                 resigned: resigned.into(),
                 winner: winner.into(),
-            },
-            GameOutcome::DrawAccepted => Self::DrawAccepted,
-            GameOutcome::DrawClaimed { basis } => Self::DrawClaimed {
-                basis: basis.into(),
             },
             GameOutcome::AutomaticDraw { reason } => Self::AutomaticDraw {
                 reason: reason.into(),
@@ -1219,10 +1170,6 @@ fn report_terminal(
             resigned.code(),
             winner.code()
         ),
-        ObservedTerminal::DrawAccepted => "terminal draw_accepted".to_owned(),
-        ObservedTerminal::DrawClaimed { basis } => {
-            format!("terminal draw_claimed basis={}", basis.code())
-        }
         ObservedTerminal::AutomaticDraw { reason } => {
             format!("terminal automatic_draw reason={}", reason.code())
         }

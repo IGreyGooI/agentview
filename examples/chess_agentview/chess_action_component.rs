@@ -1,4 +1,9 @@
-use std::str::FromStr;
+use std::{
+    convert::Infallible,
+    future::ready,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use agentview::component::prelude::*;
 use anyhow::Context as _;
@@ -51,13 +56,10 @@ pub(crate) struct ChessAttemptInput {
 
 fn invalid_action(kind: ChessActionKind, diagnostic: XmlContractDiagnostic) -> InvalidActionReason {
     match diagnostic {
-        XmlContractDiagnostic::InvalidAttributeValue { .. }
-            if matches!(
-                kind,
-                ChessActionKind::ChooseMove | ChessActionKind::MoveAndOfferDraw
-            ) =>
+        XmlContractDiagnostic::InvalidAttributeValue { value, .. }
+            if matches!(kind, ChessActionKind::ChooseMove) =>
         {
-            InvalidActionReason::InvalidUci(kind)
+            InvalidActionReason::invalid_uci(kind, &value)
         }
         _ => InvalidActionReason::InvalidXml,
     }
@@ -68,16 +70,25 @@ pub(crate) fn chess_action_component(
     attempt: ModelAttemptKey,
     workflow: Coroutine<ChessAttemptInput>,
 ) -> Component {
-    let choose_move_decoded = workflow.clone();
-    let choose_move_invalid = workflow.clone();
-    let move_and_offer_draw_decoded = workflow.clone();
-    let move_and_offer_draw_invalid = workflow.clone();
-    let resign_decoded = workflow.clone();
-    let resign_invalid = workflow.clone();
-    let accept_draw_decoded = workflow.clone();
-    let accept_draw_invalid = workflow.clone();
-    let claim_draw_decoded = workflow.clone();
-    let claim_draw_invalid = workflow;
+    let collected: Arc<Mutex<Vec<Result<ChessAction, InvalidActionReason>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let completion_collected = Arc::clone(&collected);
+    use_reaction_completion(move || async move {
+        let result = {
+            let mut collected = completion_collected.lock().unwrap();
+            match collected.len() {
+                0 => Err(InvalidActionReason::MissingAction),
+                1 => collected.pop().expect("one collected Chess action result"),
+                _ => Err(InvalidActionReason::MultipleActions),
+            }
+        };
+        send_model_action(workflow, attempt, result).await
+    });
+
+    let choose_move_decoded = Arc::clone(&collected);
+    let choose_move_invalid = Arc::clone(&collected);
+    let resign_decoded = Arc::clone(&collected);
+    let resign_invalid = collected;
 
     view! {
         {
@@ -85,93 +96,36 @@ pub(crate) fn chess_action_component(
                 .empty_element("choose_move")
                 .required_attribute::<StrictUciMove>("uci")
                 .on_decoded(move |candidate| {
-                    send_model_action(
-                        choose_move_decoded.clone(),
-                        attempt,
-                        Ok(ChessAction::ChooseMove(candidate.0)),
-                    )
+                    choose_move_decoded
+                        .lock()
+                        .unwrap()
+                        .push(Ok(ChessAction::ChooseMove(candidate.0)));
+                    ready(Ok::<(), Infallible>(()))
                 })
                 .on_invalid(move |diagnostic| {
-                    send_model_action(
-                        choose_move_invalid.clone(),
-                        attempt,
-                        Err(invalid_action(ChessActionKind::ChooseMove, diagnostic)),
-                    )
-                })
-        }
-        {
-            XmlStreamingToolCall::contract(
-                "chess.move_and_offer_draw",
-                ACTION_CONTRACT_VERSION,
-            )
-            .empty_element("move_and_offer_draw")
-            .required_attribute::<StrictUciMove>("uci")
-            .on_decoded(move |candidate| {
-                send_model_action(
-                    move_and_offer_draw_decoded.clone(),
-                    attempt,
-                    Ok(ChessAction::MoveAndOfferDraw(candidate.0)),
-                )
-            })
-            .on_invalid(move |diagnostic| {
-                send_model_action(
-                    move_and_offer_draw_invalid.clone(),
-                    attempt,
-                    Err(invalid_action(
-                        ChessActionKind::MoveAndOfferDraw,
+                    choose_move_invalid.lock().unwrap().push(Err(invalid_action(
+                        ChessActionKind::ChooseMove,
                         diagnostic,
-                    )),
-                )
-            })
+                    )));
+                    ready(Ok::<(), Infallible>(()))
+                })
         }
         {
             XmlStreamingToolCall::contract("chess.resign", ACTION_CONTRACT_VERSION)
                 .empty_element("resign")
                 .on_decoded(move || {
-                    send_model_action(resign_decoded.clone(), attempt, Ok(ChessAction::Resign))
+                    resign_decoded
+                        .lock()
+                        .unwrap()
+                        .push(Ok(ChessAction::Resign));
+                    ready(Ok::<(), Infallible>(()))
                 })
                 .on_invalid(move |diagnostic| {
-                    send_model_action(
-                        resign_invalid.clone(),
-                        attempt,
-                        Err(invalid_action(ChessActionKind::Resign, diagnostic)),
-                    )
-                })
-        }
-        {
-            XmlStreamingToolCall::contract("chess.accept_draw", ACTION_CONTRACT_VERSION)
-                .empty_element("accept_draw")
-                .on_decoded(move || {
-                    send_model_action(
-                        accept_draw_decoded.clone(),
-                        attempt,
-                        Ok(ChessAction::AcceptDraw),
-                    )
-                })
-                .on_invalid(move |diagnostic| {
-                    send_model_action(
-                        accept_draw_invalid.clone(),
-                        attempt,
-                        Err(invalid_action(ChessActionKind::AcceptDraw, diagnostic)),
-                    )
-                })
-        }
-        {
-            XmlStreamingToolCall::contract("chess.claim_draw", ACTION_CONTRACT_VERSION)
-                .empty_element("claim_draw")
-                .on_decoded(move || {
-                    send_model_action(
-                        claim_draw_decoded.clone(),
-                        attempt,
-                        Ok(ChessAction::ClaimDraw),
-                    )
-                })
-                .on_invalid(move |diagnostic| {
-                    send_model_action(
-                        claim_draw_invalid.clone(),
-                        attempt,
-                        Err(invalid_action(ChessActionKind::ClaimDraw, diagnostic)),
-                    )
+                    resign_invalid
+                        .lock()
+                        .unwrap()
+                        .push(Err(invalid_action(ChessActionKind::Resign, diagnostic)));
+                    ready(Ok::<(), Infallible>(()))
                 })
         }
     }
@@ -199,7 +153,7 @@ mod tests {
 
         assert_eq!(
             invalid_action(ChessActionKind::ChooseMove, diagnostic),
-            InvalidActionReason::InvalidUci(ChessActionKind::ChooseMove)
+            InvalidActionReason::invalid_uci(ChessActionKind::ChooseMove, "E2E4")
         );
     }
 

@@ -157,7 +157,7 @@ impl DispatchedAttempt {
         AttemptEvidence {
             turn_id: self.turn_id.clone(),
             attempt_index: self.attempt_index,
-            corrective_reason: self.corrective_reason,
+            corrective_reason: self.corrective_reason.clone(),
             board: self.board,
             committed_moves: self.committed_moves.clone(),
             start: self.start,
@@ -199,10 +199,14 @@ where
     let mut corrective_reason = None;
 
     for attempt_index in 0..MAX_MODEL_ATTEMPTS {
-        let context =
-            ModelAttemptContext::for_attempt(turn_id.clone(), attempt_index, corrective_reason);
+        let context = ModelAttemptContext::for_attempt(
+            turn_id.clone(),
+            attempt_index,
+            corrective_reason.clone(),
+        );
         let attempt_snapshot = corrective_reason
-            .map(|reason| snapshot.for_retry(reason))
+            .as_ref()
+            .map(|reason| snapshot.for_retry(reason.clone()))
             .unwrap_or_else(|| snapshot.clone());
         let start = AttemptStart::StateWrite;
         if control
@@ -221,7 +225,7 @@ where
             dispatched: DispatchedAttempt {
                 turn_id: context.turn_id.clone(),
                 attempt_index,
-                corrective_reason,
+                corrective_reason: corrective_reason.clone(),
                 board: attempt_snapshot.board(),
                 committed_moves: attempt_snapshot.committed_moves().to_vec(),
                 start,
@@ -272,7 +276,7 @@ where
         let evidence = AttemptEvidence {
             turn_id: context.turn_id.clone(),
             attempt_index,
-            corrective_reason,
+            corrective_reason: corrective_reason.clone(),
             board: attempt_snapshot.board(),
             committed_moves: attempt_snapshot.committed_moves().to_vec(),
             start,
@@ -346,18 +350,15 @@ fn classify_completed_state(
                     .expect("guarded unavailable action has one reason"),
             )
         }
-        Some(
-            action
-            @ (ChessAction::ChooseMove(candidate) | ChessAction::MoveAndOfferDraw(candidate)),
-        ) if MoveGen::new_legal(&snapshot.board()).any(|legal| legal == candidate) => {
+        Some(action @ ChessAction::ChooseMove(candidate))
+            if MoveGen::new_legal(&snapshot.board()).any(|legal| legal == candidate) =>
+        {
             AttemptResult::ActionAccepted(action)
         }
-        Some(action @ (ChessAction::ChooseMove(_) | ChessAction::MoveAndOfferDraw(_))) => {
+        Some(action @ ChessAction::ChooseMove(_)) => {
             AttemptResult::Correctable(InvalidActionReason::IllegalMove(action))
         }
-        Some(action @ (ChessAction::Resign | ChessAction::AcceptDraw | ChessAction::ClaimDraw)) => {
-            AttemptResult::ActionAccepted(action)
-        }
+        Some(action @ ChessAction::Resign) => AttemptResult::ActionAccepted(action),
         None => AttemptResult::Correctable(InvalidActionReason::MissingAction),
     }
 }
@@ -389,7 +390,7 @@ where
     let evidence = AttemptEvidence {
         turn_id: context.turn_id.clone(),
         attempt_index: context.attempt_index,
-        corrective_reason: context.corrective_reason,
+        corrective_reason: context.corrective_reason.clone(),
         board: snapshot.board(),
         committed_moves: snapshot.committed_moves().to_vec(),
         start,
@@ -454,7 +455,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        chess_actions::InvalidActionReason,
+        chess_actions::{ChessActionKind, InvalidActionReason},
         chess_agent::{chess_agent, ChessAgentState, ChessControl},
         chess_feedback::ChessFeedback,
     };
@@ -671,7 +672,6 @@ mod tests {
             Color::White,
             board,
             committed_moves,
-            Some(Color::Black),
             ChessFeedback::initial(),
         )
         .for_retry(InvalidActionReason::InvalidXml);
@@ -695,7 +695,6 @@ mod tests {
             Color::White,
             Board::default(),
             Vec::new(),
-            None,
             ChessFeedback::initial(),
         );
         let initial_context = ModelAttemptContext::initial(ModelTurnId::for_white_ply(0));
@@ -769,8 +768,17 @@ mod tests {
         assert!(submitted.contains("<attempt_index>1</attempt_index>"));
         assert!(submitted.contains("e2e4"));
         assert!(submitted.contains("e7e5"));
-        assert!(submitted.contains("<pending_draw_offer offered_by=\"black\" />"));
+        assert!(!submitted.contains("pending_draw_offer"));
         assert!(submitted.contains("invalid\\_xml"));
+        assert_eq!(submitted.matches("<choose_move>").count(), 1, "{submitted}");
+        assert_eq!(submitted.matches("<resign>").count(), 1, "{submitted}");
+        for removed_action in ["move_and_offer_draw", "accept_draw", "claim_draw"] {
+            assert!(!submitted.contains(removed_action), "{submitted}");
+        }
+        assert!(
+            submitted.contains("exactly one of the two empty XML elements"),
+            "{submitted}"
+        );
 
         let completed = control
             .read_state()
@@ -785,6 +793,44 @@ mod tests {
             .await
             .expect("normal Chess owner shutdown completes");
         assert!(control.read_state().is_err());
+    }
+
+    #[tokio::test]
+    async fn offline_retry_projection_exposes_invalid_uci_submission() {
+        let (mut application, control, capture) =
+            mount_scripted_application([Script::Text("<resign />")]);
+        let rejection = InvalidActionReason::invalid_uci(ChessActionKind::ChooseMove, "E2E4");
+        let snapshot = ChessSnapshot::in_progress(
+            Color::White,
+            Board::default(),
+            Vec::new(),
+            ChessFeedback::initial(),
+        )
+        .for_retry(rejection.clone());
+        let context =
+            ModelAttemptContext::for_attempt(ModelTurnId::for_white_ply(0), 1, Some(rejection));
+
+        control
+            .begin_attempt(snapshot, context)
+            .expect("retry state writes atomically");
+        application
+            .react()
+            .await
+            .expect("retry projection reaches the provider");
+
+        let submitted = capture
+            .projections
+            .lock()
+            .expect("scripted Chess projection lock")
+            .first()
+            .cloned()
+            .expect("retry submits one frame");
+        assert!(submitted.contains("E2E4"), "{submitted}");
+
+        application
+            .shutdown()
+            .await
+            .expect("retry application shuts down");
     }
 
     #[tokio::test]
@@ -944,7 +990,6 @@ mod tests {
             Color::White,
             Board::default(),
             Vec::new(),
-            None,
             ChessFeedback::initial(),
         );
         let lifecycle_on_dispatch = Arc::clone(&capture.lifecycle);

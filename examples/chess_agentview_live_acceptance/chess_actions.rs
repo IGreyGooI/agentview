@@ -55,13 +55,7 @@ fn parse_element(
     match name {
         "choose_move" => parse_move_attribute(&attributes, ChessActionKind::ChooseMove)
             .map(ChessAction::ChooseMove),
-        "move_and_offer_draw" => {
-            parse_move_attribute(&attributes, ChessActionKind::MoveAndOfferDraw)
-                .map(ChessAction::MoveAndOfferDraw)
-        }
         "resign" if attributes.is_empty() => Ok(ChessAction::Resign),
-        "accept_draw" if attributes.is_empty() => Ok(ChessAction::AcceptDraw),
-        "claim_draw" if attributes.is_empty() => Ok(ChessAction::ClaimDraw),
         _ => Err(InvalidActionReason::InvalidXml),
     }
 }
@@ -76,9 +70,8 @@ fn parse_move_attribute(
     if attribute.key.as_ref() != b"uci" {
         return Err(InvalidActionReason::InvalidXml);
     }
-    let value =
-        from_utf8(attribute.value.as_ref()).map_err(|_| InvalidActionReason::InvalidUci(kind))?;
-    parse_strict_uci_move(value).map_err(|_| InvalidActionReason::InvalidUci(kind))
+    let value = from_utf8(attribute.value.as_ref()).map_err(|_| InvalidActionReason::InvalidXml)?;
+    parse_strict_uci_move(value).map_err(|_| InvalidActionReason::invalid_uci(kind, value))
 }
 
 #[component]
@@ -89,21 +82,11 @@ pub(crate) fn chess_actions(
     component_turn_executions: Arc<AtomicUsize>,
 ) -> Component {
     let choose_move = availability(&snapshot, ChessActionKind::ChooseMove);
-    let move_and_offer_draw = availability(&snapshot, ChessActionKind::MoveAndOfferDraw);
     let resign = availability(&snapshot, ChessActionKind::Resign);
-    let accept_draw = availability(&snapshot, ChessActionKind::AcceptDraw);
-    let claim_draw = availability(&snapshot, ChessActionKind::ClaimDraw);
     let choose_move_available = choose_move.available;
     let choose_move_reason = choose_move.reason;
-    let move_and_offer_draw_available = move_and_offer_draw.available;
-    let move_and_offer_draw_reason = move_and_offer_draw.reason;
     let resign_available = resign.available;
     let resign_reason = resign.reason;
-    let accept_draw_available = accept_draw.available;
-    let accept_draw_reason = accept_draw.reason;
-    let claim_draw_available = claim_draw.available;
-    let claim_draw_reason = claim_draw.reason;
-    let claim_basis = snapshot.draw_state().claim_basis();
     let event_state = state;
     let event_attempt_state = attempt_state;
     use_provider_event_handler(ProviderEvent::TEXT, move |event| {
@@ -131,30 +114,13 @@ pub(crate) fn chess_actions(
                 unavailable_reason { "{choose_move_reason}" }
                 format { "<choose_move uci=\"e2e4\" />" }
             }
-            move_and_offer_draw {
-                available { "{move_and_offer_draw_available}" }
-                unavailable_reason { "{move_and_offer_draw_reason}" }
-                format { "<move_and_offer_draw uci=\"e2e4\" />" }
-                meaning { "Make the legal move and offer a draw to the opponent with that move." }
-            }
             resign {
                 available { "{resign_available}" }
                 unavailable_reason { "{resign_reason}" }
                 format { "<resign />" }
             }
-            accept_draw {
-                available { "{accept_draw_available}" }
-                unavailable_reason { "{accept_draw_reason}" }
-                format { "<accept_draw />" }
-            }
-            claim_draw {
-                available { "{claim_draw_available}" }
-                unavailable_reason { "{claim_draw_reason}" }
-                current_claim_basis { "{claim_basis}" }
-                format { "<claim_draw />" }
-            }
             output_contract {
-                "Return exactly one of the five empty XML elements shown above and nothing else: no prose, Markdown, analysis, or additional elements. A move action's uci attribute must be one value from chess_game_state.legal_moves. Promotions append exactly one lowercase q, r, b, or n suffix."
+                "Return exactly one of the two empty XML elements shown above and nothing else: no prose, Markdown, analysis, or additional elements. A move action's uci attribute must be one value from chess_game_state.legal_moves. Promotions append exactly one lowercase q, r, b, or n suffix."
             }
         }
     }
@@ -198,26 +164,10 @@ pub(crate) fn unavailable_reason(
         return Some(unavailable(ActionUnavailableReason::NotAgentTurn));
     }
     match kind {
-        ChessActionKind::ChooseMove | ChessActionKind::MoveAndOfferDraw
-            if MoveGen::new_legal(&board).next().is_none() =>
-        {
+        ChessActionKind::ChooseMove if MoveGen::new_legal(&board).next().is_none() => {
             Some(unavailable(ActionUnavailableReason::NoLegalMoves))
         }
-        ChessActionKind::AcceptDraw
-            if snapshot.pending_draw_offer() != Some(!snapshot.agent_side()) =>
-        {
-            Some(unavailable(
-                ActionUnavailableReason::NoPendingOpponentDrawOffer,
-            ))
-        }
-        ChessActionKind::ClaimDraw if !snapshot.draw_state().claimable() => {
-            Some(unavailable(ActionUnavailableReason::PositionNotClaimable))
-        }
-        ChessActionKind::ChooseMove
-        | ChessActionKind::MoveAndOfferDraw
-        | ChessActionKind::Resign
-        | ChessActionKind::AcceptDraw
-        | ChessActionKind::ClaimDraw => None,
+        ChessActionKind::ChooseMove | ChessActionKind::Resign => None,
     }
 }
 
@@ -230,6 +180,17 @@ mod tests {
         assert_eq!(
             parse_action("<choose_move uci=\"e2e4\" />"),
             Ok(ChessAction::ChooseMove("e2e4".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn retains_the_invalid_uci_value_for_retry_feedback() {
+        assert_eq!(
+            parse_action("<choose_move uci=\"E2E4\" />"),
+            Err(InvalidActionReason::invalid_uci(
+                ChessActionKind::ChooseMove,
+                "E2E4"
+            ))
         );
     }
 

@@ -26,6 +26,7 @@ use super::{
     event_input::EventInputOrigin,
     event_listener::EventListenerDispatchFault,
     native_tool::{await_output, NativeToolCallDeclaration, NativeToolDispatchFault},
+    reaction_completion::{ReactionCompletionDeclaration, ReactionCompletionDispatchFault},
     render_context::HookRenderContext,
     streaming_xml::{
         MountedStreamingRoute, ParsedContractEvent, StreamingXmlDispatchFault,
@@ -169,6 +170,7 @@ where
         tasks: Option<&MountTaskHandle>,
     ) -> Result<(Self, Option<ResolvedDocument>), ComponentAttemptFault> {
         let mut listeners = Vec::new();
+        let mut reaction_completions = Vec::new();
         let mut native_tools = Vec::new();
         let mut task_starts = Vec::new();
         let root_id = ComponentId::root();
@@ -188,6 +190,7 @@ where
             tasks,
             signal_render,
             &mut listeners,
+            &mut reaction_completions,
             &mut native_tools,
             &mut task_starts,
             &mut capture,
@@ -212,6 +215,7 @@ where
                 projection,
                 bindings: RenderBindings {
                     listeners,
+                    reaction_completions,
                     native_tools,
                     streaming_routes,
                     finished: false,
@@ -250,6 +254,7 @@ where
 /// and dispatches diagnostics discovered at EOF.
 pub(crate) struct RenderBindings<Root> {
     listeners: Vec<MountedListener>,
+    reaction_completions: Vec<ReactionCompletionDeclaration>,
     native_tools: Vec<NativeToolCallDeclaration>,
     streaming_routes: Vec<MountedStreamingRoute>,
     finished: bool,
@@ -345,6 +350,12 @@ where
         for parsed in parsed_events {
             dispatch_parsed_at(&mut self.listeners, parsed).await?;
         }
+        for completion in &mut self.reaction_completions {
+            completion
+                .dispatch()
+                .await
+                .map_err(ComponentAttemptFault::reaction_completion)?;
+        }
         Ok(())
     }
 
@@ -412,6 +423,7 @@ fn visit_render(
     tasks: Option<&MountTaskHandle>,
     signal_render: &mut SignalRenderTransaction<'_>,
     listeners: &mut Vec<MountedListener>,
+    reaction_completions: &mut Vec<ReactionCompletionDeclaration>,
     native_tools: &mut Vec<NativeToolCallDeclaration>,
     task_starts: &mut Vec<MountTaskStart>,
     capture: &mut RenderCapture,
@@ -434,6 +446,7 @@ fn visit_render(
                     tasks,
                     signal_render,
                     listeners,
+                    reaction_completions,
                     native_tools,
                     task_starts,
                     capture,
@@ -479,6 +492,7 @@ fn visit_render(
                         driver_demand,
                         tasks,
                         listeners,
+                        reaction_completions,
                         task_starts,
                     },
                 )?,
@@ -498,6 +512,7 @@ fn visit_render(
                 tasks,
                 signal_render,
                 listeners,
+                reaction_completions,
                 native_tools,
                 task_starts,
                 capture,
@@ -527,6 +542,7 @@ fn visit_render(
                 tasks,
                 signal_render,
                 listeners,
+                reaction_completions,
                 native_tools,
                 task_starts,
                 capture,
@@ -563,6 +579,7 @@ fn visit_render(
                     tasks,
                     signal_render,
                     listeners,
+                    reaction_completions,
                     native_tools,
                     task_starts,
                     capture,
@@ -627,6 +644,7 @@ struct HookInvocationContext<'render> {
     driver_demand: Option<&'render DriverDemandHandle>,
     tasks: Option<&'render MountTaskHandle>,
     listeners: &'render mut Vec<MountedListener>,
+    reaction_completions: &'render mut Vec<ReactionCompletionDeclaration>,
     task_starts: &'render mut Vec<MountTaskStart>,
 }
 
@@ -642,9 +660,11 @@ fn invoke_repeatable(
         driver_demand,
         tasks,
         listeners,
+        reaction_completions,
         task_starts,
     } = context;
     let mut provider_handlers = Vec::new();
+    let mut local_reaction_completions = Vec::new();
     let rendered = signals
         .render_component(component, |signal_scope| {
             let mut hooks = if attempt_local_allowed {
@@ -652,6 +672,7 @@ fn invoke_repeatable(
                     signal_scope,
                     event_origin,
                     &mut provider_handlers,
+                    &mut local_reaction_completions,
                     task_starts,
                     driver_demand,
                     tasks,
@@ -661,6 +682,7 @@ fn invoke_repeatable(
                     signal_scope,
                     event_origin,
                     &mut provider_handlers,
+                    &mut local_reaction_completions,
                     task_starts,
                     driver_demand,
                     tasks,
@@ -672,6 +694,7 @@ fn invoke_repeatable(
     for declaration in provider_handlers {
         listeners.push(MountedListener::new_event(declaration, event_origin)?);
     }
+    reaction_completions.extend(local_reaction_completions);
     Ok(rendered)
 }
 
@@ -917,6 +940,8 @@ pub enum ComponentAttemptFault {
     Signal { message: String },
     #[error("event listener dispatch fault: {message}")]
     ListenerDispatch { message: String },
+    #[error("reaction completion dispatch fault: {message}")]
+    ReactionCompletion { message: String },
     #[error("streaming input fault: {message}")]
     StreamingInput { message: String },
     #[error("streaming contract mount fault: {message}")]
@@ -944,6 +969,12 @@ impl ComponentAttemptFault {
 
     fn listener_dispatch(fault: EventListenerDispatchFault) -> Self {
         Self::ListenerDispatch {
+            message: fault.to_string(),
+        }
+    }
+
+    fn reaction_completion(fault: ReactionCompletionDispatchFault) -> Self {
+        Self::ReactionCompletion {
             message: fault.to_string(),
         }
     }

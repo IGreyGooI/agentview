@@ -66,12 +66,6 @@ struct DrawStateView {
 }
 
 #[derive(AgentView)]
-#[agent_view(kind = "pending_draw_offer")]
-struct PendingDrawOfferView {
-    offered_by: &'static str,
-}
-
-#[derive(AgentView)]
 #[agent_view(kind = "clocks")]
 struct ClocksView {
     available: &'static str,
@@ -101,8 +95,6 @@ pub(crate) struct ChessGameStateView {
     history: HistoryView,
     #[view(root, diff(replace))]
     draw_state: DrawStateView,
-    #[view(root, diff(replace))]
-    pending_draw_offer: PendingDrawOfferView,
     #[view(root)]
     clocks: ClocksView,
 }
@@ -119,10 +111,6 @@ impl ChessGameStateView {
         let opponent_side = side_name(!snapshot.agent_side());
         let legal_moves = legal_uci_moves(&board).join(" ");
         let history = move_history(snapshot.committed_moves());
-        let pending_draw_offer = snapshot
-            .pending_draw_offer()
-            .map(side_name)
-            .unwrap_or("none");
         let draw_state = snapshot.draw_state();
 
         Self {
@@ -153,9 +141,6 @@ impl ChessGameStateView {
             draw_state: DrawStateView {
                 halfmove_clock: draw_state.halfmove_clock(),
                 current_position_repetitions: draw_state.current_position_repetitions(),
-            },
-            pending_draw_offer: PendingDrawOfferView {
-                offered_by: pending_draw_offer,
             },
             clocks: ClocksView {
                 available: "false",

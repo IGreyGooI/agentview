@@ -443,7 +443,7 @@ fn chess_projection(state: ChessState) -> Component {
     let phase = phase_name(state.phase());
     let side_to_move = side_name(board.side_to_move());
     let agent_side = side_name(state.agent_side());
-    let fen = board.to_string();
+    let fen = standard_fen(&board, state.committed_moves());
     let legal_moves = legal_moves(&board);
     let history = move_history(state.committed_moves());
     let attempt_index = state
@@ -454,16 +454,18 @@ fn chess_projection(state: ChessState) -> Component {
         .current_attempt()
         .map(attempt_name)
         .unwrap_or_else(|| "none".to_owned());
-    let (feedback_decision, feedback_reason) = feedback(state.feedback());
+    let FeedbackProjection {
+        previous_decision,
+        previous_action,
+        previous_uci,
+        previous_uci_truncated,
+        previous_reason,
+    } = feedback(state.feedback());
     let corrective_reason = state
         .retry()
         .last_rejection()
         .map(|reason| reason.code())
         .unwrap_or("none");
-    let pending_draw_offer = state.pending_draw_offer().map(side_name).unwrap_or("none");
-    let accept_draw_available = pending_draw_offer != "none";
-    let draw_claimable = DrawState::from_history(state.committed_moves()).claimable();
-    let draw_claim_basis = DrawState::from_history(state.committed_moves()).claim_basis();
 
     view! {
         #[system_once]
@@ -471,37 +473,69 @@ fn chess_projection(state: ChessState) -> Component {
             identity { "You are the chess agent playing {agent_side}." }
             objective { "Choose one legal action for the authoritative position." }
             private_reasoning {
-                "Reason privately about checks, captures, threats, king safety, tactics, strategy, and draw implications. Return no analysis or commentary."
+                "Reason privately about checks, captures, threats, king safety, tactics, strategy, and automatic draw conditions."
             }
         }
         #[developer]
         chess_game_state {
+            phase: phase,
             authority { "ChessState in the mounted Component is authoritative." }
-            phase { "{phase}" }
             side_to_move { "{side_to_move}" }
             fen { "{fen}" }
             legal_moves { notation: "canonical_lowercase_uci", values: "{legal_moves}", }
             history { notation: "uci", values: "{history}", }
-            pending_draw_offer { offered_by: "{pending_draw_offer}", }
         }
         #[developer]
         model_attempt {
+            previous_decision: previous_decision,
+            corrective_reason: corrective_reason,
             turn_id { "{turn_id}" }
             attempt_index { "{attempt_index}" }
-            previous_decision { "{feedback_decision}" }
-            previous_reason { "{feedback_reason}" }
-            corrective_reason { "{corrective_reason}" }
+            previous_action {
+                kind: previous_action,
+                uci: previous_uci,
+                uci_truncated: previous_uci_truncated,
+            }
+            previous_reason { "{previous_reason}" }
         }
         #[developer]
         chess_action_policy {
-            accept_draw_available { "{accept_draw_available}" }
-            claim_draw_available { "{draw_claimable}" }
-            claim_draw_basis { "{draw_claim_basis}" }
-            output_contract {
-                "Return exactly one registered XML action element. A move must be one value from chess_game_state.legal_moves."
+            chess_action_instructions {
+                response {
+                    "Your response must contain exactly one registered self-closing XML action element. Text outside that action element is allowed. The rule elements below are instructions, not valid output."
+                }
+                action_rule {
+                    output_element: "choose_move",
+                    purpose { "Play one legal move." }
+                    attribute {
+                        name: "uci",
+                        source {
+                            xml_path: "/chess_game_state/legal_moves/@values",
+                        }
+                        requirement {
+                            "Choose exactly one space-delimited canonical lowercase UCI token from this XML attribute and copy it unchanged into the action's uci attribute."
+                        }
+                    }
+                }
+                action_rule {
+                    output_element: "resign",
+                    purpose { "Concede the game immediately." }
+                }
             }
         }
     }
+}
+
+fn standard_fen(board: &Board, committed_moves: &[ChessMove]) -> String {
+    let position = board
+        .to_string()
+        .split_whitespace()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let halfmove_clock = DrawState::from_history(committed_moves).halfmove_clock();
+    let fullmove_number = committed_moves.len() / 2 + 1;
+    format!("{position} {halfmove_clock} {fullmove_number}")
 }
 
 fn phase_name(phase: ChessPhase) -> &'static str {
@@ -524,33 +558,59 @@ fn attempt_name(attempt: ModelAttemptKey) -> String {
     format!("white-ply-{}", attempt.ply)
 }
 
-fn feedback(feedback: ChessFeedback) -> (String, String) {
+struct FeedbackProjection {
+    previous_decision: String,
+    previous_action: &'static str,
+    previous_uci: String,
+    previous_uci_truncated: bool,
+    previous_reason: &'static str,
+}
+
+fn feedback(feedback: ChessFeedback) -> FeedbackProjection {
     match feedback {
-        ChessFeedback::Initial => ("none".to_owned(), "No previous model action.".to_owned()),
+        ChessFeedback::Initial => FeedbackProjection {
+            previous_decision: "none".to_owned(),
+            previous_action: "none",
+            previous_uci: "none".to_owned(),
+            previous_uci_truncated: false,
+            previous_reason: "No previous model action.",
+        },
         ChessFeedback::Accepted(action) => {
             let candidate = action
                 .move_candidate()
                 .map(|move_| move_.to_string())
                 .unwrap_or_else(|| "none".to_owned());
-            (
-                format!("accepted:{}", action.kind().code()),
-                format!("The previous action was accepted; uci={candidate}."),
-            )
+            FeedbackProjection {
+                previous_decision: format!("accepted:{}", action.kind().code()),
+                previous_action: action.kind().code(),
+                previous_uci: candidate,
+                previous_uci_truncated: false,
+                previous_reason: "The previous action was accepted.",
+            }
         }
         ChessFeedback::Rejected(reason) => {
             let action = reason
                 .action_kind()
                 .map(|kind| kind.code())
                 .unwrap_or("none");
-            let candidate = reason
-                .rejected_action()
-                .and_then(|action| action.move_candidate())
-                .map(|move_| move_.to_string())
-                .unwrap_or_else(|| "none".to_owned());
-            (
-                format!("rejected:{}", reason.code()),
-                format!("{} action={action}; uci={candidate}", reason.description()),
-            )
+            let (candidate, truncated) = match reason.rejected_uci() {
+                Some((submitted, truncated)) => (submitted.to_owned(), truncated),
+                None => (
+                    reason
+                        .rejected_action()
+                        .and_then(|action| action.move_candidate())
+                        .map(|move_| move_.to_string())
+                        .unwrap_or_else(|| "none".to_owned()),
+                    false,
+                ),
+            };
+            FeedbackProjection {
+                previous_decision: format!("rejected:{}", reason.code()),
+                previous_action: action,
+                previous_uci: candidate,
+                previous_uci_truncated: truncated,
+                previous_reason: reason.description(),
+            }
         }
     }
 }
@@ -580,8 +640,6 @@ pub(crate) fn outcome_name(outcome: &ChessOutcome) -> &'static str {
         ChessOutcome::Checkmate { .. } => "checkmate",
         ChessOutcome::Stalemate => "stalemate",
         ChessOutcome::Resignation { .. } => "resignation",
-        ChessOutcome::DrawAccepted => "draw_accepted",
-        ChessOutcome::DrawClaimed { .. } => "draw_claimed",
         ChessOutcome::AutomaticDraw { .. } => "automatic_draw",
         ChessOutcome::ModelForfeit { .. } => "model_forfeit",
         ChessOutcome::StockfishFailed(_) => "stockfish_failed",
@@ -599,10 +657,56 @@ mod tests {
     };
 
     use super::*;
+    use crate::chess_action::{ChessAction, InvalidActionReason};
     use crate::scripted_provider::{ScriptedProvider, ScriptedReaction};
-    use agentview::component::execution::FrameBasis;
+    use agentview::{
+        component::{execution::FrameBasis, ComponentHost},
+        pom_renderer::render_pom_document,
+        transcript::CanonicalInputItem,
+    };
 
     static NEXT_FAKE_UCI: AtomicU64 = AtomicU64::new(1);
+
+    fn render_chess_prompt(state: ChessState) -> String {
+        let mut components = ComponentHost::new_root(chess_projection, state);
+        let rendered = components.render().expect("Chess projection renders");
+        rendered
+            .projection()
+            .nodes()
+            .iter()
+            .flat_map(|node| node.items())
+            .filter_map(|item| match item {
+                CanonicalInputItem::Instruction { pom, .. }
+                | CanonicalInputItem::Message { pom, .. } => {
+                    Some(render_pom_document(pom).expect("Chess POM renders"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn state_after_committed_moves(moves: &[&str]) -> ChessState {
+        let mut state = ChessState::new(moves.len() + 1);
+        assert_eq!(
+            reduce(&mut state, ChessEvent::Start),
+            vec![ChessEffect::RequestReaction]
+        );
+
+        for uci in moves {
+            let candidate = uci.parse().expect("test move is valid UCI");
+            let event = match state.board().side_to_move() {
+                Color::White => ChessEvent::ModelAction {
+                    attempt: state.current_attempt().expect("model turn is active"),
+                    result: Ok(ChessAction::ChooseMove(candidate)),
+                },
+                Color::Black => ChessEvent::StockfishCompleted(Ok(candidate)),
+            };
+            reduce(&mut state, event);
+        }
+
+        state
+    }
 
     struct FakeUciProgram {
         program: PathBuf,
@@ -705,21 +809,157 @@ done
         assert_eq!(frames.len(), 2);
         assert!(matches!(frames[0].basis, FrameBasis::Full));
         assert!(matches!(frames[1].basis, FrameBasis::DeltaFrom(_)));
+        assert!(frames[0]
+            .text
+            .contains("fen>rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"));
+        assert!(frames[1]
+            .text
+            .contains("fen>rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2"));
+        assert_eq!(
+            frames[1]
+                .text
+                .matches(
+                    "Your response must contain exactly one registered self-closing XML action element. Text outside that action element is allowed. The rule elements below are instructions, not valid output."
+                )
+                .count(),
+            1,
+            "a delta repeats the policy without relying on stable action examples"
+        );
+        assert!(!frames[1].text.contains("shown after this policy"));
         assert!(frames[1].text.contains("d2d4"));
-        for action_syntax in [
-            "<choose_move uci=\"...\" />",
-            "<move_and_offer_draw uci=\"...\" />",
-            "<resign />",
-            "<accept_draw />",
-            "<claim_draw />",
-        ] {
+        for action_syntax in ["<choose_move uci=\"...\" />", "<resign />"] {
             assert_eq!(
                 frames[0].text.matches(action_syntax).count(),
                 1,
                 "typed action syntax should be projected exactly once: {action_syntax}"
             );
         }
+        for removed_action_syntax in [
+            "<move_and_offer_draw uci=\"...\" />",
+            "<accept_draw />",
+            "<claim_draw />",
+        ] {
+            assert!(!frames[0].text.contains(removed_action_syntax));
+        }
         assert!(frames[0].text.contains("<chess_action_policy>"));
+        assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
+    }
+
+    #[test]
+    fn chess_prompt_policy_allows_text_without_stable_action_examples() {
+        let prompt = render_chess_prompt(ChessState::new(1));
+
+        assert_eq!(prompt.matches("<chess_action_instructions>").count(), 1);
+        assert!(!prompt.contains("Return no analysis or commentary."));
+        assert_eq!(
+            prompt
+                .matches(
+                    "Your response must contain exactly one registered self-closing XML action element. Text outside that action element is allowed. The rule elements below are instructions, not valid output."
+                )
+                .count(),
+            1
+        );
+        assert!(!prompt.contains("shown after this policy"));
+        assert!(!prompt.contains("Output no other text."));
+        for action_name in ["choose_move", "resign"] {
+            let action = format!("<action_rule output_element=\"{action_name}\">");
+            assert_eq!(
+                prompt.matches(&action).count(),
+                1,
+                "each XML action should have one prompt rule naming its output element: {action_name}"
+            );
+        }
+        for action_purpose in ["Play one legal move.", "Concede the game immediately."] {
+            assert_eq!(
+                prompt.matches(action_purpose).count(),
+                1,
+                "each XML action should explain its purpose exactly once: {action_purpose}"
+            );
+        }
+        assert_eq!(
+            prompt
+                .matches("<source xml_path=\"/chess_game_state/legal_moves/@values\" />")
+                .count(),
+            1,
+            "the move action should identify the exact legal-move prompt field"
+        );
+        assert_eq!(
+            prompt
+                .matches(
+                    "Choose exactly one space-delimited canonical lowercase UCI token from this XML attribute and copy it unchanged into the action's uci attribute."
+                )
+                .count(),
+            1,
+            "the move action should explain how the XML source maps to the output attribute"
+        );
+        for removed_draw_contract in [
+            "move_and_offer_draw",
+            "accept_draw",
+            "claim_draw",
+            "pending_draw_offer",
+            "claim_draw_basis",
+            "offering a draw",
+        ] {
+            assert!(
+                !prompt.contains(removed_draw_contract),
+                "the prompt must not advertise voluntary draw behavior: {removed_draw_contract}"
+            );
+        }
+    }
+
+    #[test]
+    fn chess_prompt_fen_uses_history_derived_halfmove_and_fullmove_counters() {
+        let prompt = render_chess_prompt(state_after_committed_moves(&[
+            "e2e4", "e7e5", "g1f3", "b8c6",
+        ]));
+
+        assert!(prompt.contains(
+            "<fen>r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3</fen>"
+        ));
+    }
+
+    #[test]
+    fn chess_prompt_renders_code_like_retry_values_as_unescaped_attributes() {
+        let mut state = state_after_committed_moves(&[]);
+        let rejected = ChessEvent::ModelAction {
+            attempt: state.current_attempt().expect("model turn is active"),
+            result: Err(InvalidActionReason::MultipleActions),
+        };
+        assert_eq!(
+            reduce(&mut state, rejected),
+            vec![ChessEffect::RequestReaction]
+        );
+
+        let prompt = render_chess_prompt(state);
+
+        assert!(prompt.contains("<chess_game_state phase=\"awaiting_model\""));
+        assert!(prompt.contains("<model_attempt previous_decision=\"rejected:multiple_actions\""));
+        assert!(prompt.contains("corrective_reason=\"multiple_actions\""));
+        assert!(!prompt.contains("awaiting\\_model"));
+        assert!(!prompt.contains("multiple\\_actions"));
+    }
+
+    #[tokio::test]
+    async fn text_outside_one_registered_action_is_allowed() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) = ScriptedProvider::new([ScriptedReaction::text([
+            "I will play the king's pawn. ",
+            "<choose_move uci=\"e2e4\" />",
+            " Your turn.",
+        ])])
+        .unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 1).unwrap();
+
+        let result = ChessApplication::mount(config, provider)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, ChessOutcome::PlyLimitReached);
+        assert_eq!(result.committed_moves, vec!["e2e4".parse().unwrap()]);
+        assert_eq!(capture.frames().len(), 1);
         assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
     }
 
@@ -746,20 +986,30 @@ done
         assert_eq!(frames.len(), 2);
         assert!(matches!(frames[0].basis, FrameBasis::Full));
         assert!(matches!(frames[1].basis, FrameBasis::DeltaFrom(_)));
+        assert!(
+            frames[1].text.contains(
+                "<previous_action kind=\"choose_move\" uci=\"E2E4\" uci_truncated=\"false\" />"
+            ),
+            "{}",
+            frames[1].text
+        );
+        assert!(
+            !frames[1].text.contains("choose\\_move"),
+            "{}",
+            frames[1].text
+        );
         assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
     }
 
     #[tokio::test]
-    async fn multiple_model_actions_are_reduced_in_xml_source_order() {
+    async fn oversized_invalid_uci_is_bounded_in_retry_feedback() {
         let fake_uci = FakeUciProgram::create();
-        let (provider, _) = ScriptedProvider::new([ScriptedReaction::text([concat!(
-            "<resign />",
-            "<choose_move uci=\"e2e4\" />",
-            "<move_and_offer_draw uci=\"d2d4\" />",
-            "<accept_draw />",
-            "<claim_draw />",
-            "<resign />",
-        )])])
+        let oversized = "x".repeat(256);
+        let invalid_action = format!("<choose_move uci=\"{oversized}\" />");
+        let (provider, capture) = ScriptedProvider::new([
+            ScriptedReaction::text([invalid_action]),
+            ScriptedReaction::text(["<choose_move uci=\"e2e4\" />"]),
+        ])
         .unwrap();
         let config =
             ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 1).unwrap();
@@ -770,14 +1020,153 @@ done
             .await
             .unwrap();
 
+        assert_eq!(result.outcome, ChessOutcome::PlyLimitReached);
+        let retry = &capture.frames()[1].text;
+        assert!(
+            retry.contains("<previous_action kind=\"choose_move\""),
+            "{retry}"
+        );
+        assert!(retry.contains("uci=\"xxxxxxxx"), "{retry}");
+        assert!(retry.contains("uci_truncated=\"true\""), "{retry}");
+        assert!(!retry.contains(&oversized), "{retry}");
+    }
+
+    #[tokio::test]
+    async fn missing_action_is_rejected_and_requests_a_fresh_model_attempt() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) = ScriptedProvider::new([
+            ScriptedReaction::empty(),
+            ScriptedReaction::text(["<choose_move uci=\"e2e4\" />"]),
+        ])
+        .unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 1).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            ChessApplication::mount(config, provider).unwrap().run(),
+        )
+        .await
+        .expect("a missing action must request another model reaction")
+        .unwrap();
+
+        assert_eq!(result.outcome, ChessOutcome::PlyLimitReached);
+        assert_eq!(result.committed_moves, vec!["e2e4".parse().unwrap()]);
+        let frames = capture.frames();
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames[1]
+                .text
+                .contains("previous_decision=\"rejected:missing_action\""),
+            "{}",
+            frames[1].text
+        );
+        assert!(
+            frames[1]
+                .text
+                .contains("corrective_reason=\"missing_action\""),
+            "{}",
+            frames[1].text
+        );
+        assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_action_is_rejected_after_eof_before_completion_settlement() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) = ScriptedProvider::new([
+            ScriptedReaction::text(["<choose_move uci=\"e2e4\""]),
+            ScriptedReaction::text(["<choose_move uci=\"e2e4\" />"]),
+        ])
+        .unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 1).unwrap();
+
+        let result = ChessApplication::mount(config, provider)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, ChessOutcome::PlyLimitReached);
+        assert_eq!(result.committed_moves, vec!["e2e4".parse().unwrap()]);
+        let frames = capture.frames();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[1]
+            .text
+            .contains("previous_decision=\"rejected:invalid_xml\""));
+        assert!(!frames[1]
+            .text
+            .contains("previous_decision=\"rejected:missing_action\""));
+        assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
+    }
+
+    #[tokio::test]
+    async fn multiple_model_actions_are_rejected_as_one_attempt() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) = ScriptedProvider::new([
+            ScriptedReaction::text([concat!("<resign />", "<choose_move uci=\"d2d4\" />",)]),
+            ScriptedReaction::text(["<choose_move uci=\"e2e4\" />"]),
+        ])
+        .unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 1).unwrap();
+
+        let result = ChessApplication::mount(config, provider)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, ChessOutcome::PlyLimitReached);
+        assert_eq!(result.committed_moves, vec!["e2e4".parse().unwrap()]);
+        let frames = capture.frames();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[1]
+            .text
+            .contains("previous_decision=\"rejected:multiple_actions\""));
+        assert!(frames[1]
+            .text
+            .contains("corrective_reason=\"multiple_actions\""));
+        assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
+    }
+
+    #[tokio::test]
+    async fn three_reactions_without_registered_actions_forfeit_the_model() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) = ScriptedProvider::new([
+            ScriptedReaction::empty(),
+            ScriptedReaction::text(["I cannot choose a move."]),
+            ScriptedReaction::text(["<unknown />"]),
+        ])
+        .unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 1).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            ChessApplication::mount(config, provider).unwrap().run(),
+        )
+        .await
+        .expect("missing actions must exhaust the bounded retry policy")
+        .unwrap();
+
         assert_eq!(
             result.outcome,
-            ChessOutcome::Resignation {
-                resigned: Color::White,
-                winner: Color::Black,
+            ChessOutcome::ModelForfeit {
+                final_reason: InvalidActionReason::MissingAction,
+                attempts: 3,
             }
         );
         assert!(result.committed_moves.is_empty());
+        let frames = capture.frames();
+        assert_eq!(frames.len(), 3);
+        assert!(frames[1]
+            .text
+            .contains("previous_decision=\"rejected:missing_action\""));
+        assert!(frames[2]
+            .text
+            .contains("previous_decision=\"rejected:missing_action\""));
         assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
     }
 
