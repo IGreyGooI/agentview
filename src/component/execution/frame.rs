@@ -532,10 +532,7 @@ impl FullReserveBudget {
         transcript: &CanonicalTranscript,
         staging: &ToolOutputStaging,
     ) -> Result<(), FrameBudgetFault> {
-        let staged_inputs = staging
-            .ordered_outputs()
-            .map(|(_, output)| output.clone())
-            .collect::<Vec<_>>();
+        let staged_inputs = staging.reserve_outputs().cloned().collect::<Vec<_>>();
         FrameMeter::validate_full_reserve(transcript.items(), &staged_inputs, &self.constraints)
     }
 
@@ -545,10 +542,7 @@ impl FullReserveBudget {
         staging: &ToolOutputStaging,
     ) -> Result<FullReserveTracker, FrameBudgetFault> {
         let replay_item_bytes = canonical_items_total(transcript.items())?;
-        let staged = staging
-            .ordered_outputs()
-            .map(|(_, output)| output)
-            .collect::<Vec<_>>();
+        let staged = staging.reserve_outputs().collect::<Vec<_>>();
         let staged_item_bytes = canonical_item_refs_total(&staged)?;
         let usage = FullReserveUsage {
             replay_count: transcript.items().len(),
@@ -671,6 +665,53 @@ impl FullReserveTracker {
             .ok_or(FrameBudgetFault::ArithmeticOverflow)?;
         self.budget.validate_usage(usage)?;
         Ok(FullReserveCandidate { usage, item_bytes })
+    }
+
+    pub(super) fn prepare_replay_and_staged_item(
+        &self,
+        replay_item_bytes: usize,
+        staged_item_bytes: usize,
+    ) -> Result<FullReserveCandidate, FrameBudgetFault> {
+        let mut usage = self.usage;
+        usage.replay_item_bytes = usage
+            .replay_item_bytes
+            .checked_add(replay_item_bytes)
+            .ok_or(FrameBudgetFault::ArithmeticOverflow)?;
+        usage.replay_count = usage
+            .replay_count
+            .checked_add(1)
+            .ok_or(FrameBudgetFault::ArithmeticOverflow)?;
+        usage.staged_item_bytes = usage
+            .staged_item_bytes
+            .checked_add(staged_item_bytes)
+            .ok_or(FrameBudgetFault::ArithmeticOverflow)?;
+        usage.staged_count = usage
+            .staged_count
+            .checked_add(1)
+            .ok_or(FrameBudgetFault::ArithmeticOverflow)?;
+        self.budget.validate_usage(usage)?;
+        Ok(FullReserveCandidate {
+            usage,
+            item_bytes: replay_item_bytes,
+        })
+    }
+
+    pub(super) fn prepare_replace_staged_item(
+        &self,
+        previous_item_bytes: usize,
+        next_item_bytes: usize,
+    ) -> Result<FullReserveCandidate, FrameBudgetFault> {
+        let mut usage = self.usage;
+        usage.staged_item_bytes = replace_contribution(
+            usage.staged_item_bytes,
+            Some(previous_item_bytes),
+            next_item_bytes,
+        )?;
+        self.budget.validate_usage(usage)?;
+        Ok(FullReserveCandidate {
+            usage,
+            item_bytes: next_item_bytes,
+        })
     }
 
     pub(super) fn commit(&mut self, candidate: FullReserveCandidate) {
@@ -1298,6 +1339,103 @@ mod tests {
     }
 
     #[test]
+    fn atomic_tool_call_reserve_tracks_replay_and_fallback() {
+        const COMPONENT_BYTES: usize = 128;
+        let tool_call =
+            CanonicalInputItem::tool_call("call-1", "lookup", r#"{"query":"value"}"#).unwrap();
+        let fallback = CanonicalInputItem::tool_result(
+            "call-1",
+            "Tool execution was cancelled; its outcome is unknown.",
+        )
+        .unwrap();
+        let replay = vec![tool_call.clone()];
+        let staged = vec![fallback.clone()];
+        let probe = constraints(COMPONENT_BYTES, 0);
+        let required_full_bytes = match FrameMeter::validate_full_reserve(&replay, &staged, &probe)
+        {
+            Err(FrameBudgetFault::FullReserveTooLarge {
+                required_full_bytes,
+                ..
+            }) => required_full_bytes,
+            result => panic!("expected exact Full reserve probe, got {result:?}"),
+        };
+        let budget = FullReserveBudget {
+            constraints: constraints(COMPONENT_BYTES, required_full_bytes),
+        };
+        let transcript = CanonicalTranscript::new();
+        let staging = super::ToolOutputStaging::default();
+        let mut tracker = budget.begin(&transcript, &staging).unwrap();
+        let tool_call_bytes = budget.canonical_item_bytes(&tool_call).unwrap();
+        let fallback_bytes = budget.canonical_item_bytes(&fallback).unwrap();
+
+        let candidate = tracker
+            .prepare_replay_and_staged_item(tool_call_bytes, fallback_bytes)
+            .unwrap();
+        tracker.commit(candidate);
+        assert_eq!(tracker.usage.replay_count, 1);
+        assert_eq!(tracker.usage.replay_item_bytes, tool_call_bytes);
+        assert_eq!(tracker.usage.staged_count, 1);
+        assert_eq!(tracker.usage.staged_item_bytes, fallback_bytes);
+        FrameMeter::validate_full_reserve(
+            &replay,
+            &staged,
+            &constraints(COMPONENT_BYTES, required_full_bytes),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn replacing_a_staged_fallback_reservation_keeps_one_staged_slot() {
+        const COMPONENT_BYTES: usize = 128;
+        let tool_call =
+            CanonicalInputItem::tool_call("call-1", "lookup", r#"{"query":"value"}"#).unwrap();
+        let fallback = CanonicalInputItem::tool_result(
+            "call-1",
+            "Tool execution was cancelled; its outcome is unknown.",
+        )
+        .unwrap();
+        let real_output = CanonicalInputItem::tool_result("call-1", "done").unwrap();
+        let replay = vec![tool_call.clone()];
+        let reserved_staged = vec![fallback.clone()];
+        let staged = vec![real_output.clone()];
+        let probe = constraints(COMPONENT_BYTES, 0);
+        let required_full_bytes =
+            match FrameMeter::validate_full_reserve(&replay, &reserved_staged, &probe) {
+                Err(FrameBudgetFault::FullReserveTooLarge {
+                    required_full_bytes,
+                    ..
+                }) => required_full_bytes,
+                result => panic!("expected exact Full reserve probe, got {result:?}"),
+            };
+        let budget = FullReserveBudget {
+            constraints: constraints(COMPONENT_BYTES, required_full_bytes),
+        };
+        let transcript = CanonicalTranscript::new();
+        let staging = super::ToolOutputStaging::default();
+        let mut tracker = budget.begin(&transcript, &staging).unwrap();
+        let tool_call_bytes = budget.canonical_item_bytes(&tool_call).unwrap();
+        let fallback_bytes = budget.canonical_item_bytes(&fallback).unwrap();
+        let real_output_bytes = budget.canonical_item_bytes(&real_output).unwrap();
+        let candidate = tracker
+            .prepare_replay_and_staged_item(tool_call_bytes, fallback_bytes)
+            .unwrap();
+        tracker.commit(candidate);
+
+        let replacement = tracker
+            .prepare_replace_staged_item(fallback_bytes, real_output_bytes)
+            .unwrap();
+        tracker.commit(replacement);
+        assert_eq!(tracker.usage.staged_count, 1);
+        assert_eq!(tracker.usage.staged_item_bytes, real_output_bytes);
+        FrameMeter::validate_full_reserve(
+            &replay,
+            &staged,
+            &constraints(COMPONENT_BYTES, required_full_bytes),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn first_frame_is_full_and_prepare_is_side_effect_free_until_commit() {
         let declaration = full(profile(true), 1);
         let mut session = FrameSession::new(&declaration).unwrap();
@@ -1858,6 +1996,119 @@ mod tests {
             Some(CanonicalInputItem::ToolResult { call_id, content })
                 if call_id == "call-7" && content == "result"
         ));
+    }
+
+    #[test]
+    fn cancelled_tool_fallback_is_retryable_and_consumed_only_by_commit() {
+        let profile = profile(true);
+        let declaration = full(profile.clone(), 1);
+        let mut session = FrameSession::new(&declaration).unwrap();
+        let complete = projection(None);
+        let head = commit_first(&mut session, &declaration, &complete);
+
+        {
+            let mut guard = ReactionAdmissionGuard::new(
+                &mut session.canonical_history.transcript,
+                &mut session.target_delivery.tool_outputs,
+            );
+            guard
+                .admit(ProviderFact::ToolCall {
+                    output: ProviderOutputKey::new(7),
+                    ordinal: 3,
+                    call: ProviderToolCall::new("call-7", "lookup", "{}").unwrap(),
+                })
+                .unwrap();
+            guard.finish_cancelled();
+        }
+
+        let resume = TargetDeclaration::resume(head, profile);
+        let expected = CanonicalInputItem::tool_result(
+            "call-7",
+            "Tool execution was cancelled; its outcome is unknown.",
+        )
+        .unwrap();
+        let prepared = session.prepare(&resume, &complete).unwrap();
+        assert_eq!(
+            prepared.frame.submission().staged_inputs(),
+            &[expected.clone()]
+        );
+        drop(prepared);
+        assert_eq!(
+            session
+                .target_delivery
+                .tool_outputs
+                .ordered_outputs()
+                .map(|(_, item)| item)
+                .collect::<Vec<_>>(),
+            vec![&expected]
+        );
+
+        let prepared = session.prepare(&resume, &complete).unwrap();
+        assert_eq!(prepared.frame.submission().staged_inputs(), &[expected]);
+        let (_, commit) = prepared.into_parts();
+        session.commit(commit);
+        assert!(session
+            .target_delivery
+            .tool_outputs
+            .prepare_frame_candidate()
+            .unwrap()
+            .0
+            .is_empty());
+    }
+
+    #[test]
+    fn cancelled_tool_fallback_survives_a_later_frame_prepare_fault() {
+        let declaration = full(profile(true), 1);
+        let mut session = FrameSession::new(&declaration).unwrap();
+        {
+            let mut guard = ReactionAdmissionGuard::new(
+                &mut session.canonical_history.transcript,
+                &mut session.target_delivery.tool_outputs,
+            );
+            guard
+                .admit(ProviderFact::ToolCall {
+                    output: ProviderOutputKey::new(7),
+                    ordinal: 3,
+                    call: ProviderToolCall::new("call-7", "lookup", "{}").unwrap(),
+                })
+                .unwrap();
+            guard.finish_cancelled();
+        }
+
+        let oversized_text = "x".repeat(4_096);
+        let oversized = projection(Some(&oversized_text));
+        assert!(matches!(
+            session.prepare(&declaration, &oversized),
+            Err(FrameSessionFault::Budget(
+                FrameBudgetFault::ComponentTooLarge { .. }
+            ))
+        ));
+        let expected = CanonicalInputItem::tool_result(
+            "call-7",
+            "Tool execution was cancelled; its outcome is unknown.",
+        )
+        .unwrap();
+        assert_eq!(
+            session
+                .target_delivery
+                .tool_outputs
+                .ordered_outputs()
+                .map(|(_, item)| item)
+                .collect::<Vec<_>>(),
+            vec![&expected]
+        );
+
+        let prepared = session.prepare(&declaration, &projection(None)).unwrap();
+        assert_eq!(prepared.frame.submission().staged_inputs(), &[expected]);
+        let (_, commit) = prepared.into_parts();
+        session.commit(commit);
+        assert!(session
+            .target_delivery
+            .tool_outputs
+            .prepare_frame_candidate()
+            .unwrap()
+            .0
+            .is_empty());
     }
 
     #[test]

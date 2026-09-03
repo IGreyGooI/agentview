@@ -29,6 +29,8 @@ use super::{
     reaction::{ProviderFact, ProviderOutputKey, ProviderToolCall},
 };
 
+const CANCELLATION_FALLBACK_CONTENT: &str = "Tool execution was cancelled; its outcome is unknown.";
+
 #[cfg(test)]
 thread_local! {
     static ADMISSION_CONSTRUCTION_WORK: Cell<usize> = const { Cell::new(0) };
@@ -130,6 +132,8 @@ struct ToolOutputSlot {
     ordinal: u64,
     call_id: String,
     output: Option<CanonicalInputItem>,
+    cancellation_fallback: Option<CanonicalInputItem>,
+    reserved_item_bytes: Option<usize>,
 }
 
 /// Session-owned ToolOutput table. Results iterate in canonical call-admission
@@ -147,6 +151,8 @@ impl ToolOutputStaging {
         &mut self,
         ordinal: u64,
         call_id: &str,
+        cancellation_fallback: CanonicalInputItem,
+        reserved_item_bytes: Option<usize>,
     ) -> Result<ToolLaneTicket, ToolOutputStagingFault> {
         let registration = self
             .next_registration
@@ -160,6 +166,8 @@ impl ToolOutputStaging {
                 ordinal,
                 call_id: call_id.to_owned(),
                 output: None,
+                cancellation_fallback: Some(cancellation_fallback),
+                reserved_item_bytes,
             },
         );
         Ok(ToolLaneTicket {
@@ -175,8 +183,8 @@ impl ToolOutputStaging {
         ticket: ToolLaneTicket,
         output: ToolOutput,
     ) -> Result<(), ToolOutputStagingFault> {
-        let item = self.prepare_stage(&ticket, &output)?;
-        self.commit_stage(ticket, item);
+        let (item, reserved_item_bytes) = self.prepare_stage(&ticket, &output)?;
+        self.commit_stage(ticket, item, reserved_item_bytes);
         Ok(())
     }
 
@@ -184,7 +192,7 @@ impl ToolOutputStaging {
         &self,
         ticket: &ToolLaneTicket,
         output: &ToolOutput,
-    ) -> Result<CanonicalInputItem, ToolOutputStagingFault> {
+    ) -> Result<(CanonicalInputItem, Option<usize>), ToolOutputStagingFault> {
         if !Arc::ptr_eq(&self.owner, &ticket.owner) {
             return Err(ToolOutputStagingFault::ForeignTicket {
                 ordinal: ticket.ordinal,
@@ -217,22 +225,52 @@ impl ToolOutputStaging {
         }
 
         CanonicalInputItem::tool_result(output.call_id(), output.content())
+            .map(|item| (item, slot.reserved_item_bytes))
             .map_err(sanitize_staging_canonical_fault)
     }
 
-    fn commit_stage(&mut self, ticket: ToolLaneTicket, item: CanonicalInputItem) {
+    fn commit_stage(
+        &mut self,
+        ticket: ToolLaneTicket,
+        item: CanonicalInputItem,
+        reserved_item_bytes: Option<usize>,
+    ) {
         let slot = self
             .slots
             .get_mut(&ticket.registration)
             .expect("a prepared ToolOutput registration remains present until commit");
         debug_assert!(slot.output.is_none());
         slot.output = Some(item);
+        slot.cancellation_fallback = None;
+        slot.reserved_item_bytes = reserved_item_bytes;
     }
 
     pub(super) fn ordered_outputs(&self) -> impl Iterator<Item = (u64, &CanonicalInputItem)> + '_ {
         self.slots
             .values()
             .filter_map(|slot| slot.output.as_ref().map(|output| (slot.ordinal, output)))
+    }
+
+    pub(super) fn reserve_outputs(&self) -> impl Iterator<Item = &CanonicalInputItem> + '_ {
+        self.slots
+            .values()
+            .filter_map(|slot| slot.output.as_ref().or(slot.cancellation_fallback.as_ref()))
+    }
+
+    fn materialize_cancellation_fallbacks(&mut self, registrations: &[u64]) {
+        for registration in registrations {
+            let slot = self
+                .slots
+                .get_mut(registration)
+                .expect("admitted tool registration remains staged until handoff");
+            if slot.output.is_none() {
+                slot.output = Some(
+                    slot.cancellation_fallback
+                        .take()
+                        .expect("unresolved admitted tool slots retain a cancellation fallback"),
+                );
+            }
+        }
     }
 
     /// Build the exact staged input segment and the post-handoff staging
@@ -490,8 +528,32 @@ impl<'a> ReactionAdmissionGuard<'a> {
                     call.raw_arguments(),
                 )
                 .map_err(sanitize_reaction_canonical_fault)?;
-                let budget_candidate = self.prepare_replay_budget(None, &canonical_call)?;
-                let ticket = self.staging.register(ordinal, call.call_id())?;
+                let cancellation_fallback =
+                    CanonicalInputItem::tool_result(call.call_id(), CANCELLATION_FALLBACK_CONTENT)
+                        .map_err(sanitize_reaction_canonical_fault)?;
+                let (budget_candidate, reserved_item_bytes) = match self.budget.as_ref() {
+                    Some(tracker) => {
+                        let replay_item_bytes = tracker
+                            .budget()
+                            .canonical_item_bytes(&canonical_call)
+                            .map_err(sanitize_budget_fault)?;
+                        let staged_item_bytes = tracker
+                            .budget()
+                            .canonical_item_bytes(&cancellation_fallback)
+                            .map_err(sanitize_budget_fault)?;
+                        let candidate = tracker
+                            .prepare_replay_and_staged_item(replay_item_bytes, staged_item_bytes)
+                            .map_err(sanitize_budget_fault)?;
+                        (Some(candidate), Some(staged_item_bytes))
+                    }
+                    None => (None, None),
+                };
+                let ticket = self.staging.register(
+                    ordinal,
+                    call.call_id(),
+                    cancellation_fallback,
+                    reserved_item_bytes,
+                )?;
                 let budget_item_bytes = budget_candidate.map(FullReserveCandidate::item_bytes);
                 self.commit_budget(budget_candidate);
                 Self::commit_tool_call(&mut self.state, output, ordinal, call, budget_item_bytes);
@@ -520,7 +582,7 @@ impl<'a> ReactionAdmissionGuard<'a> {
         ticket: ToolLaneTicket,
         output: ToolOutput,
     ) -> Result<(), ToolOutputStagingFault> {
-        let item = self.staging.prepare_stage(&ticket, &output)?;
+        let (item, reserved_item_bytes) = self.staging.prepare_stage(&ticket, &output)?;
         let budget_candidate = match self.budget.as_ref() {
             Some(tracker) => {
                 let item_bytes = tracker
@@ -529,27 +591,49 @@ impl<'a> ReactionAdmissionGuard<'a> {
                     .map_err(sanitize_staging_budget_fault)?;
                 Some(
                     tracker
-                        .prepare_staged_item(item_bytes)
+                        .prepare_replace_staged_item(
+                            reserved_item_bytes.expect(
+                                "budgeted tool slots reserve their cancellation fallback bytes",
+                            ),
+                            item_bytes,
+                        )
                         .map_err(sanitize_staging_budget_fault)?,
                 )
             }
             None => None,
         };
-        self.staging.commit_stage(ticket, item);
+        self.staging.commit_stage(
+            ticket,
+            item,
+            budget_candidate.map(FullReserveCandidate::item_bytes),
+        );
         self.commit_budget(budget_candidate);
         Ok(())
     }
 
     /// Finish a grammatically complete reaction and restore canonical history.
-    pub(super) fn finish_normal(mut self) -> Result<(), ReactionAdmissionFault> {
+    pub(super) fn finish_normal(&mut self) -> Result<(), ReactionAdmissionFault> {
         if self.state.terminal.is_none() {
             return Err(ReactionAdmissionFault::MissingCompletion);
         }
         self.staging.ensure_resolved(&self.tool_registrations)?;
+        if self.finished {
+            return Ok(());
+        }
 
         self.restore_transcript();
         self.finished = true;
         Ok(())
+    }
+
+    pub(super) fn finish_cancelled(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.staging
+            .materialize_cancellation_fallbacks(&self.tool_registrations);
+        self.restore_transcript();
+        self.finished = true;
     }
 
     #[cfg(test)]
@@ -1217,7 +1301,7 @@ mod tests {
 
     use crate::{
         component::execution::{
-            frame::FrameSession,
+            frame::{FrameMeter, FrameSession},
             reaction::{
                 FrameCapabilities, FrameConstraints, FrameProfile, TargetDeclaration, TargetEpoch,
                 TargetIdentity,
@@ -1237,6 +1321,10 @@ mod tests {
 
     fn call(call_id: &str) -> ProviderToolCall {
         ProviderToolCall::new(call_id, "lookup", r#"{"query":"value"}"#).unwrap()
+    }
+
+    fn cancellation_fallback(call_id: &str) -> CanonicalInputItem {
+        CanonicalInputItem::tool_result(call_id, CANCELLATION_FALLBACK_CONTENT).unwrap()
     }
 
     fn delta(output: u64, phase: Option<AssistantPhase>, text: &str) -> ProviderFact {
@@ -1482,6 +1570,7 @@ mod tests {
             guard.finish_normal(),
             Err(ReactionAdmissionFault::MissingCompletion)
         );
+        drop(guard);
         assert_text(
             &transcript.items()[0],
             "partial",
@@ -1557,6 +1646,7 @@ mod tests {
         );
         assert!(ticket.is_none());
         guard.finish_normal().unwrap();
+        drop(guard);
         assert_text(
             &transcript.items()[0],
             "answer",
@@ -1621,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_keeps_completed_tool_output_and_fails_closed_on_open_lane() {
+    fn cancellation_keeps_completed_output_and_materializes_open_lane_fallback() {
         let mut transcript = CanonicalTranscript::new();
         let mut staging = ToolOutputStaging::default();
         {
@@ -1636,6 +1726,7 @@ mod tests {
                 .stage_tool_output(first_ticket.unwrap(), first_call.output("done"))
                 .unwrap();
             drop(open_ticket);
+            guard.finish_cancelled();
         }
 
         assert!(matches!(
@@ -1646,17 +1737,18 @@ mod tests {
             &transcript.items()[1],
             CanonicalInputItem::ToolCall { call_id, .. } if call_id == "open"
         ));
-        assert!(matches!(
-            staging.prepare_receipt(),
-            Err(ToolOutputStagingFault::UnresolvedOutput { ordinal: 2 })
-        ));
-        let staged = staging.ordered_outputs().collect::<Vec<_>>();
-        assert_eq!(staged.len(), 1);
-        assert!(matches!(
-            staged[0].1,
-            CanonicalInputItem::ToolResult { call_id, content }
-                if call_id == "finished" && content == "done"
-        ));
+        let receipt = staging.prepare_receipt().unwrap();
+        assert_eq!(
+            receipt.outputs(),
+            &[
+                CanonicalInputItem::tool_result("finished", "done").unwrap(),
+                CanonicalInputItem::tool_result(
+                    "open",
+                    "Tool execution was cancelled; its outcome is unknown.",
+                )
+                .unwrap(),
+            ]
+        );
     }
 
     #[test]
@@ -1731,6 +1823,7 @@ mod tests {
         guard.admit(sealed(1, None, "ab")).unwrap();
         guard.admit(completed(Some(1))).unwrap();
         guard.finish_normal().unwrap();
+        drop(guard);
 
         assert_text(
             &transcript.items()[0],
@@ -1864,7 +1957,9 @@ mod tests {
             Err(ToolOutputStagingFault::UnknownTicket { ordinal: 9 })
         );
 
-        let ticket = staging.register(3, "expected").unwrap();
+        let ticket = staging
+            .register(3, "expected", cancellation_fallback("expected"), None)
+            .unwrap();
         let owner = Arc::clone(&ticket.owner);
         let registration = ticket.registration;
         let mismatched_call = ToolCall::new("observed", "lookup", "{}").unwrap();
@@ -1904,11 +1999,15 @@ mod tests {
     #[test]
     fn staging_rejects_a_ticket_from_another_owner() {
         let mut first = ToolOutputStaging::default();
-        let foreign = first.register(1, "same-call").unwrap();
+        let foreign = first
+            .register(1, "same-call", cancellation_fallback("same-call"), None)
+            .unwrap();
         let call = ToolCall::new("same-call", "lookup", "{}").unwrap();
 
         let mut second = ToolOutputStaging::default();
-        let _local = second.register(1, "same-call").unwrap();
+        let _local = second
+            .register(1, "same-call", cancellation_fallback("same-call"), None)
+            .unwrap();
         assert_eq!(
             second.stage(foreign, call.output("late")),
             Err(ToolOutputStagingFault::ForeignTicket { ordinal: 1 })
@@ -1951,7 +2050,14 @@ mod tests {
     fn exact_receipt_is_retryable_until_commit_and_consumed_once() {
         let mut staging = ToolOutputStaging::default();
         let call = ToolCall::new("call-1", "lookup", "{}").unwrap();
-        let ticket = staging.register(2, call.call_id()).unwrap();
+        let ticket = staging
+            .register(
+                2,
+                call.call_id(),
+                cancellation_fallback(call.call_id()),
+                None,
+            )
+            .unwrap();
         staging.stage(ticket, call.output("result")).unwrap();
 
         {
@@ -1989,7 +2095,9 @@ mod tests {
         drop(guard);
 
         let mut staging = ToolOutputStaging::default();
-        let ticket = staging.register(4, EXPECTED_CALL).unwrap();
+        let ticket = staging
+            .register(4, EXPECTED_CALL, cancellation_fallback(EXPECTED_CALL), None)
+            .unwrap();
         let observed = ToolCall::new(OBSERVED_CALL, "lookup", "{}").unwrap();
         let mismatch = staging
             .stage(ticket, observed.output("result"))
@@ -1998,7 +2106,9 @@ mod tests {
         assert_fault_does_not_contain(&mismatch, &[EXPECTED_CALL, OBSERVED_CALL]);
 
         let mut unresolved_staging = ToolOutputStaging::default();
-        let _unresolved = unresolved_staging.register(8, EXPECTED_CALL).unwrap();
+        let _unresolved = unresolved_staging
+            .register(8, EXPECTED_CALL, cancellation_fallback(EXPECTED_CALL), None)
+            .unwrap();
         let unresolved = unresolved_staging.prepare_frame_candidate().unwrap_err();
         assert_eq!(
             unresolved.reason(),
@@ -2009,7 +2119,12 @@ mod tests {
         let mut duplicate_staging = ToolOutputStaging::default();
         let duplicate_call = ToolCall::new("duplicate-call", "lookup", "{}").unwrap();
         let ticket = duplicate_staging
-            .register(9, duplicate_call.call_id())
+            .register(
+                9,
+                duplicate_call.call_id(),
+                cancellation_fallback(duplicate_call.call_id()),
+                None,
+            )
             .unwrap();
         let registration = ticket.registration;
         let owner = Arc::clone(&ticket.owner);
@@ -2112,6 +2227,57 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_rejects_admission_when_its_cancellation_reserve_does_not_fit() {
+        let call = call("reserved");
+        let canonical_call =
+            CanonicalInputItem::tool_call(call.call_id(), call.name(), call.raw_arguments())
+                .unwrap();
+        let fallback = CanonicalInputItem::tool_result(
+            call.call_id(),
+            "Tool execution was cancelled; its outcome is unknown.",
+        )
+        .unwrap();
+        let required_full_bytes = match FrameMeter::validate_full_reserve(
+            &[canonical_call],
+            &[fallback],
+            &FrameConstraints {
+                max_frame_bytes: 0,
+                max_component_bytes: 128,
+                context_window_tokens: None,
+                reserved_output_tokens: None,
+            },
+        ) {
+            Err(FrameBudgetFault::FullReserveTooLarge {
+                required_full_bytes,
+                ..
+            }) => required_full_bytes,
+            result => panic!("expected exact Full reserve probe, got {result:?}"),
+        };
+        let mut transcript = CanonicalTranscript::new();
+        let mut staging = ToolOutputStaging::default();
+        {
+            let mut guard = ReactionAdmissionGuard::with_budget(
+                &mut transcript,
+                &mut staging,
+                full_reserve(128, required_full_bytes - 1),
+            )
+            .unwrap();
+            let fault = guard
+                .admit(ProviderFact::ToolCall {
+                    output: key(1),
+                    ordinal: 1,
+                    call,
+                })
+                .unwrap_err();
+            assert_eq!(fault.reason(), ReactionAdmissionReason::Budget);
+            assert_eq!(guard.committed_output_count(), 0);
+            assert!(guard.staging.slots.is_empty());
+        }
+        assert!(transcript.items().is_empty());
+        assert!(staging.slots.is_empty());
+    }
+
+    #[test]
     fn oversized_tool_output_leaves_the_original_slot_retryable() {
         let mut transcript = CanonicalTranscript::new();
         let mut staging = ToolOutputStaging::default();
@@ -2144,6 +2310,13 @@ mod tests {
             .unwrap()
             .output
             .is_none());
+        assert!(guard
+            .staging
+            .slots
+            .get(&retry.registration)
+            .unwrap()
+            .cancellation_fallback
+            .is_some());
 
         guard
             .stage_tool_output(retry, call.output("small"))
@@ -2156,6 +2329,14 @@ mod tests {
             .unwrap()
             .output
             .is_some());
+        assert!(guard
+            .staging
+            .slots
+            .values()
+            .next()
+            .unwrap()
+            .cancellation_fallback
+            .is_none());
     }
 
     #[test]
@@ -2201,6 +2382,7 @@ mod tests {
         guard.admit(sealed(1, None, &complete)).unwrap();
         guard.admit(completed(Some(1))).unwrap();
         guard.finish_normal().unwrap();
+        drop(guard);
 
         let transcript_work = take_construction_work();
         let admission_work = take_admission_work();
