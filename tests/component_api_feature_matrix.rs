@@ -65,8 +65,7 @@ fn disabled_constructor_diagnostic_rejects_an_incompatible_public_new() {
     }
 }
 
-const MISSING_NEW_DIAGNOSTICS: &[&str] =
-    &["error[E0599]", "no function or associated item named `new`"];
+const MISSING_NEW_DIAGNOSTICS: &[&str] = &["error[E0599]", "named `new`"];
 
 const LEGACY_PROBES: &[(&str, &str, &str, &[&str])] = &[
     ("provider_port", "ProviderPort", "ProviderPort", &[]),

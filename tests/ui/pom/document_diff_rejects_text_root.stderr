@@ -4,7 +4,7 @@ error[E0271]: type mismatch resolving `<String as AgentView>::Root == XmlNode`
 3 | #[derive(AgentView)]
   |          ^^^^^^^^^ expected `XmlNode`, found `TextNode`
   |
-  = note: required for `std::string::String` to implement `DocumentDiffValue`
+  = note: required for `std::string::String` to implement `agentview::agent_view::DocumentDiffValue`
 note: required by a bound in `agentview::agent_view::build_document_diff_slot`
  --> src/agent_view.rs
   |

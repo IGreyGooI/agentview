@@ -1,4 +1,4 @@
-error[E0433]: failed to resolve: could not find `view` in `agentview`
+error[E0433]: cannot find `view` in `agentview`
  --> tests/ui/component_target/fail_legacy_view_attribute.rs:3:14
   |
 3 | #[agentview::view(component)]

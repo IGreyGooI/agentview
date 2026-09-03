@@ -716,10 +716,14 @@ mod tests {
     impl FakeUciProgram {
         fn create() -> Self {
             let sequence = NEXT_FAKE_UCI.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "agentview-chess-application-{}-{sequence}.sh",
-                std::process::id()
-            ));
+            let path = std::env::current_exe()
+                .expect("resolve Cargo example test executable")
+                .parent()
+                .expect("Cargo example test executable has a parent")
+                .join(format!(
+                    "agentview-chess-application-{}-{sequence}.sh",
+                    std::process::id()
+                ));
             let transcript = PathBuf::from(format!("{}.commands", path.display()));
             let mut file = OpenOptions::new()
                 .write(true)

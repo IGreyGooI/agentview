@@ -9,7 +9,7 @@ note: expected this to be `XmlNode`
    |
  3 | #[derive(AgentView)]
    |          ^^^^^^^^^
-   = note: required for `NestedDocument` to implement `DocumentDiffValue`
+   = note: required for `NestedDocument` to implement `agentview::agent_view::DocumentDiffValue`
 note: required by a bound in `agentview::agent_view::build_document_diff_slot`
   --> src/agent_view.rs
    |
@@ -20,18 +20,18 @@ note: required by a bound in `agentview::agent_view::build_document_diff_slot`
    |        ^^^^^^^^^^^^^^^^^ required by this bound in `build_document_diff_slot`
    = note: this error originates in the derive macro `AgentView` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: the trait bound `NestedDocument: DocumentDiffValue` is not satisfied
+error[E0277]: the trait bound `NestedDocument: agentview::agent_view::DocumentDiffValue` is not satisfied
   --> tests/ui/pom/document_diff_rejects_document_root.rs:10:10
    |
 10 | #[derive(AgentView)]
    |          ^^^^^^^^^ unsatisfied trait bound
    |
-help: the trait `AgentViewValue` is not implemented for `NestedDocument`
+help: the trait `agentview::agent_view::AgentViewValue` is not implemented for `NestedDocument`
   --> tests/ui/pom/document_diff_rejects_document_root.rs:5:1
    |
  5 | struct NestedDocument {
    | ^^^^^^^^^^^^^^^^^^^^^
-   = help: the following other types implement trait `AgentViewValue`:
+   = help: the following other types implement trait `agentview::agent_view::AgentViewValue`:
              &T
              BTreeMap<K, V>
              Option<T>
@@ -41,7 +41,7 @@ help: the trait `AgentViewValue` is not implemented for `NestedDocument`
              bool
              char
            and $N others
-   = note: required for `NestedDocument` to implement `DocumentDiffValue`
+   = note: required for `NestedDocument` to implement `agentview::agent_view::DocumentDiffValue`
 note: required by a bound in `agentview::agent_view::build_document_diff_slot`
   --> src/agent_view.rs
    |

@@ -6,8 +6,8 @@ error[E0308]: mismatched types
    |                    |
    |                    arguments to this method are incorrect
    |
-   = note: expected struct `EventSelector<FirstEvent, _>`
-              found struct `EventSelector<SecondEvent, u64>`
+   = note: expected struct `agentview::component::authoring::__private::EventSelector<FirstEvent, _>`
+              found struct `agentview::component::authoring::__private::EventSelector<SecondEvent, u64>`
 note: method defined here
   --> src/component/authoring/event_input.rs
    |

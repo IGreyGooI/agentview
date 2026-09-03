@@ -1,5 +1,5 @@
-error[E0599]: no function or associated item named `contract` found for struct `StreamingXml` in the current scope
+error[E0599]: no associated function or constant named `contract` found for struct `StreamingXml` in the current scope
  --> tests/ui/component_target/fail_legacy_streaming_xml_name.rs:4:35
   |
 4 |     let _contract = StreamingXml::contract("compile.legacy-streaming-xml", "v1");
-  |                                   ^^^^^^^^ function or associated item not found in `StreamingXml`
+  |                                   ^^^^^^^^ associated function or constant not found in `StreamingXml`

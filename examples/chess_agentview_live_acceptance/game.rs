@@ -1690,8 +1690,12 @@ mod tests {
             static NEXT_FAKE_UCI: AtomicU64 = AtomicU64::new(1);
             let instance = NEXT_FAKE_UCI.fetch_add(1, Ordering::Relaxed);
             let base = format!("agentview-task-5-uci-{}-{instance}", std::process::id());
-            let program = std::env::temp_dir().join(&base);
-            let quit_marker = std::env::temp_dir().join(format!("{base}.quit"));
+            let target_dir = std::env::current_exe()?
+                .parent()
+                .expect("Cargo example test executable has a parent")
+                .to_owned();
+            let program = target_dir.join(&base);
+            let quit_marker = target_dir.join(format!("{base}.quit"));
             let script = format!(
                 "#!/bin/sh\nwhile IFS= read -r command; do\n  case \"$command\" in\n    uci) printf '%s\\n' uciok ;;\n    isready) printf '%s\\n' readyok ;;\n    go*) printf '%s\\n' 'bestmove e7e5' ;;\n    quit) printf '%s\\n' quit > '{}'; exit 0 ;;\n  esac\ndone\n",
                 quit_marker.display()
