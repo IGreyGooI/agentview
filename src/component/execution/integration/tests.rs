@@ -4,6 +4,7 @@ use std::{
 };
 
 use agentview_derive::{component, view};
+use async_trait::async_trait;
 use futures::FutureExt;
 
 use super::{PluginControl, PluginPort, SkillControl, SkillPort};
@@ -12,8 +13,11 @@ use crate::{
         execution::{
             application::Application,
             debug::DebugProviderPort,
-            external::{ExternalAct, ExternalObservation},
-            reaction::FrameBasis,
+            external::{
+                ExternalAct, ExternalControlFault, ExternalIngressGeneration, ExternalObservation,
+                ExternalObservationKind,
+            },
+            reaction::{FrameBasis, ReactionPort},
             RenderedProjection,
         },
         prelude::*,
@@ -71,6 +75,90 @@ async fn drive_plugin(
 
 fn completed_text(text: &str) -> ExternalAct {
     ExternalAct::text(text)
+}
+
+#[async_trait]
+trait QueuedRoleControl {
+    async fn next_observation(&self) -> Result<ExternalObservation, ExternalControlFault>;
+
+    async fn complete(
+        &self,
+        generation: ExternalIngressGeneration,
+    ) -> Result<(), ExternalControlFault>;
+}
+
+#[async_trait]
+impl QueuedRoleControl for SkillControl {
+    async fn next_observation(&self) -> Result<ExternalObservation, ExternalControlFault> {
+        SkillControl::next_observation(self).await
+    }
+
+    async fn complete(
+        &self,
+        generation: ExternalIngressGeneration,
+    ) -> Result<(), ExternalControlFault> {
+        SkillControl::complete(self, generation).await
+    }
+}
+
+#[async_trait]
+impl QueuedRoleControl for PluginControl {
+    async fn next_observation(&self) -> Result<ExternalObservation, ExternalControlFault> {
+        PluginControl::next_observation(self).await
+    }
+
+    async fn complete(
+        &self,
+        generation: ExternalIngressGeneration,
+    ) -> Result<(), ExternalControlFault> {
+        PluginControl::complete(self, generation).await
+    }
+}
+
+async fn assert_unfinished_stream_drop_recovers_with_full<P, C>(
+    mut application: Application<P>,
+    control: C,
+) where
+    P: ReactionPort,
+    C: QueuedRoleControl,
+{
+    let mut cancelled = Box::pin(application.react());
+    let first = tokio::select! {
+        observation = control.next_observation() => observation.unwrap(),
+        result = &mut cancelled => panic!("reaction ended before first handoff: {result:?}"),
+    };
+    drop(cancelled);
+
+    assert!(matches!(
+        control.complete(first.ingress_generation()).await,
+        Err(ExternalControlFault::StaleIngress)
+    ));
+
+    let mut recovery = Box::pin(application.react());
+    let recovered = tokio::select! {
+        observation = control.next_observation() => observation.unwrap(),
+        result = &mut recovery => panic!("reaction ended before recovery handoff: {result:?}"),
+    };
+    assert_eq!(recovered.kind(), ExternalObservationKind::Full);
+    assert!(recovered.frame().epoch() > first.frame().epoch());
+
+    control
+        .complete(recovered.ingress_generation())
+        .await
+        .unwrap();
+    recovery.await.unwrap();
+    application.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn skill_and_plugin_preserve_unfinished_stream_drop_recovery() {
+    let (skill_port, skill_control) = SkillPort::new().unwrap();
+    let skill = Application::mount(shared_driver_root, skill_port).unwrap();
+    assert_unfinished_stream_drop_recovers_with_full(skill, skill_control).await;
+
+    let (plugin_port, plugin_control) = PluginPort::new().unwrap();
+    let plugin = Application::mount(shared_driver_root, plugin_port).unwrap();
+    assert_unfinished_stream_drop_recovers_with_full(plugin, plugin_control).await;
 }
 
 #[tokio::test]

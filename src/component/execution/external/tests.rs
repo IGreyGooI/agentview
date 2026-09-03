@@ -26,8 +26,9 @@ use crate::component::execution::{
     application::{Application, ApplicationFault},
     reaction::{
         Frame, FrameBasis, FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact,
-        ReactionPort, ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason,
-        SubmitFault, TargetDeclaration, ToolCatalog,
+        ProviderFactStream, ReactionPort, ReactionPortFault, ReactionPortFaultCode,
+        ReactionPortFaultKind, ReactionPortFaultReason, SubmitFault, TargetContinuity,
+        TargetDeclaration, TargetEpoch, ToolCatalog,
     },
     ProviderEvent, ProviderFault,
 };
@@ -417,6 +418,77 @@ fn test_frame(declaration: &TargetDeclaration, sequence: u64, payload: &str) -> 
     .unwrap()
 }
 
+struct FullResetOnDropPort {
+    declaration: TargetDeclaration,
+}
+
+struct FullResetOnDropStream<'a> {
+    declaration: &'a mut TargetDeclaration,
+}
+
+impl futures::Stream for FullResetOnDropStream<'_> {
+    type Item = Result<ProviderFact, ReactionPortFault>;
+
+    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
+    }
+}
+
+impl Drop for FullResetOnDropStream<'_> {
+    fn drop(&mut self) {
+        let next_epoch = self
+            .declaration
+            .continuity()
+            .epoch()
+            .get()
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .expect("test epoch space");
+        *self.declaration = TargetDeclaration::full(
+            self.declaration.identity(),
+            TargetEpoch::new(next_epoch),
+            self.declaration.profile().clone(),
+        );
+    }
+}
+
+#[async_trait::async_trait]
+impl ReactionPort for FullResetOnDropPort {
+    fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+        Ok(self.declaration.clone())
+    }
+
+    async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
+        frame.check_handoff_precondition(&self.declaration)?;
+        self.declaration =
+            TargetDeclaration::resume(frame.revision(), frame.prepared_profile().clone());
+        Ok(Box::pin(FullResetOnDropStream {
+            declaration: &mut self.declaration,
+        }))
+    }
+}
+
+#[test]
+fn third_party_unfinished_stream_drop_makes_the_next_declaration_truthful() {
+    let (mut seed, _control) = ExternalProviderPort::new().unwrap();
+    let initial = seed.declare().unwrap();
+    let initial_epoch = initial.continuity().epoch();
+    let mut port = FullResetOnDropPort {
+        declaration: initial.clone(),
+    };
+    let stream = futures::executor::block_on(port.submit(test_frame(&initial, 1, "first")))
+        .expect("first Frame handoff");
+
+    drop(stream);
+
+    let next = port.declare().unwrap();
+    assert!(matches!(
+        next.continuity(),
+        TargetContinuity::FullRequired { epoch } if *epoch > initial_epoch
+    ));
+}
+
 #[test]
 fn crossing_poll_synchronously_enqueues_the_exact_frame() {
     let (mut port, control) = ExternalProviderPort::new().unwrap();
@@ -453,10 +525,11 @@ fn pending_reserve_cancellation_is_zero_handoff_and_zero_acceptance() {
     drop(first_stream);
 
     let pending_declaration = port.declare().unwrap();
-    assert!(pending_declaration
-        .continuity()
-        .accepted_revision()
-        .is_none());
+    assert!(matches!(
+        pending_declaration.continuity(),
+        TargetContinuity::FullRequired { epoch }
+            if *epoch > first_declaration.continuity().epoch()
+    ));
     let pending = test_frame(&pending_declaration, 2, "must-not-send");
     let mut submission = Box::pin(port.submit(pending));
     let waker = noop_waker();
@@ -852,10 +925,12 @@ async fn abnormal_protocol_resets_continuity_for_the_next_explicit_reaction() {
 }
 
 #[tokio::test]
-async fn cancelling_post_handoff_act_leaves_the_application_terminal() {
+async fn cancelling_post_handoff_act_allows_the_next_observe_to_recover() {
     let props = ExternalProps::new();
     let mut external = wrapper(&props);
-    external.observe().await.unwrap();
+    let cancelled = external.observe().await.unwrap();
+    let cancelled_generation = cancelled.ingress_generation();
+    let control = external.control();
 
     let mut act = Box::pin(external.act(completed_text("blocked")));
     tokio::select! {
@@ -872,8 +947,13 @@ async fn cancelling_post_handoff_act_leaves_the_application_terminal() {
     .await
     .unwrap();
 
-    let fault = external.observe().await.unwrap_err();
-    assert!(matches!(fault, ExternalApplicationFault::Application));
+    let recovered = external.observe().await.unwrap();
+    assert_eq!(recovered.kind(), ExternalObservationKind::Full);
+    assert!(recovered.content().contains("blocked"));
+    assert!(matches!(
+        control.complete(cancelled_generation).await,
+        Err(ExternalControlFault::StaleIngress)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
