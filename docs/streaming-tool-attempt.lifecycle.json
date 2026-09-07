@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Streaming Tool Attempt",
+    "subtitle": "Typed XML, compensatable live effects, publication, and recovery",
+    "output": "docs/streaming-tool-attempt.lifecycle.html",
+    "viewBox": [980, 660]
+  },
+  "lanes": [
+    { "id": "main", "label": "Normal attempt" },
+    { "id": "decision", "label": "Decision" },
+    { "id": "cleanup", "label": "Cleanup and resolution" },
+    { "id": "terminal", "label": "Terminal outcomes" }
+  ],
+  "states": [
+    { "id": "created", "type": "start", "label": "Created", "sublabel": "fresh state", "lane": "main", "col": 0, "step": "01", "tag": "attempt" },
+    { "id": "streaming", "type": "active", "label": "Streaming", "sublabel": "parse + live", "lane": "main", "col": 1, "step": "02", "tag": "ordered" },
+    { "id": "finalizing", "type": "decision", "label": "Finalizing", "sublabel": "EOF validation", "lane": "main", "col": 2, "step": "03", "tag": "accept?" },
+    { "id": "publishing", "type": "active", "label": "Publishing", "sublabel": "ordered batch", "lane": "main", "col": 3, "step": "04", "tag": "atomic" },
+    { "id": "confirming", "type": "active", "label": "Confirming", "sublabel": "settle live receipts", "lane": "main", "col": 4, "step": "05", "tag": "barrier crossed" },
+    { "id": "rejected", "type": "decision", "label": "Rejected", "sublabel": "model feedback", "lane": "decision", "col": 0, "yOffset": -18, "tag": "no publish" },
+    { "id": "aborting", "type": "waiting", "label": "Rolling Back", "sublabel": "reverse receipts", "lane": "cleanup", "col": 1, "yOffset": 52, "tag": "awaited" },
+    { "id": "recovery", "type": "waiting", "label": "Recovery Required", "sublabel": "evidence retained", "lane": "cleanup", "col": 2, "yOffset": -18, "tag": "resolve API" },
+    { "id": "retry_ready", "type": "neutral", "label": "Retry Ready", "sublabel": "outer driver", "lane": "terminal", "col": 0, "tag": "explicit" },
+    { "id": "aborted", "type": "failure", "label": "Aborted", "sublabel": "fault or cancel", "lane": "terminal", "col": 1, "tag": "cleaned" },
+    { "id": "settled", "type": "success", "label": "Settled", "sublabel": "barrier + confirmed", "lane": "terminal", "col": 2, "tag": "success" }
+  ],
+  "transitions": [
+    { "from": "created", "to": "streaming", "variant": "emphasis", "route": "straight", "fromSide": "right", "toSide": "left" },
+    { "from": "streaming", "to": "finalizing", "variant": "emphasis", "route": "straight", "fromSide": "right", "toSide": "left" },
+    { "from": "finalizing", "to": "publishing", "variant": "emphasis", "route": "straight", "fromSide": "right", "toSide": "left" },
+    { "from": "publishing", "to": "confirming", "variant": "emphasis", "route": "straight", "fromSide": "right", "toSide": "left" },
+    { "from": "finalizing", "to": "confirming", "variant": "dashed", "route": "bottom-channel", "fromSide": "bottom", "toSide": "bottom", "channelY": 218 },
+    { "from": "finalizing", "to": "rejected", "label": "reject", "variant": "security", "route": "drop", "fromSide": "bottom", "toSide": "top", "labelDx": -18 },
+    { "from": "rejected", "to": "aborting", "variant": "security", "fromSide": "right", "toSide": "left", "via": [[479, 289], [479, 359]] },
+    { "from": "streaming", "to": "aborting", "label": "fault / cancel", "variant": "security", "route": "drop", "fromSide": "bottom", "toSide": "top", "channelY": 250, "labelDx": 30 },
+    { "from": "streaming", "to": "recovery", "label": "apply / undo unknown", "variant": "dashed", "route": "drop", "fromSide": "bottom", "toSide": "top", "channelY": 224, "labelAt": [465, 212] },
+    { "from": "finalizing", "to": "recovery", "label": "finish unknown", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "via": [[402, 238], [710, 238]], "labelAt": [650, 230] },
+    { "from": "finalizing", "to": "aborting", "variant": "security", "route": "left-channel", "fromSide": "left", "toSide": "left", "channelX": 310 },
+    { "from": "publishing", "to": "aborting", "label": "not published", "variant": "security", "route": "drop", "fromSide": "bottom", "toSide": "top", "labelAt": [570, 258] },
+    { "from": "publishing", "to": "recovery", "label": "indeterminate", "variant": "dashed", "route": "drop", "fromSide": "bottom", "toSide": "top", "labelAt": [770, 244] },
+    { "from": "confirming", "to": "recovery", "label": "not settled", "variant": "dashed", "route": "straight", "fromSide": "bottom", "toSide": "top", "labelAt": [752, 202] },
+    { "from": "aborting", "to": "retry_ready", "label": "model reject", "variant": "default", "route": "drop", "fromSide": "bottom", "toSide": "top", "labelDx": -24 },
+    { "from": "aborting", "to": "aborted", "label": "fault / cancel", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top", "labelAt": [590, 414] },
+    { "from": "aborting", "to": "recovery", "variant": "dashed", "fromSide": "right", "toSide": "left", "via": [[633, 359], [633, 289]] },
+    { "from": "recovery", "to": "aborting", "variant": "dashed", "route": "bottom-channel", "fromSide": "bottom", "toSide": "bottom", "channelY": 412 },
+    { "from": "recovery", "to": "confirming", "variant": "dashed", "route": "left-channel", "fromSide": "left", "toSide": "left", "channelX": 630 },
+    { "from": "recovery", "to": "recovery", "label": "still unknown", "variant": "dashed", "fromSide": "right", "toSide": "top", "via": [[825, 289], [825, 230], [710, 230]], "labelAt": [875, 270] },
+    { "from": "confirming", "to": "settled", "label": "all settled", "variant": "emphasis", "route": "right-channel", "fromSide": "right", "toSide": "right", "channelX": 842, "labelAt": [846, 376] }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Normal path",
+      "items": [
+        "Fresh reducer state is scoped to one provider reaction",
+        "Output and Commit remain globally ordered until publication",
+        "Published or no-op barriers confirm every Live receipt before Settled"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Rejected model output",
+      "items": [
+        "Normal EOF and final validation choose Accept or Reject",
+        "Reject rolls back Live before exposing retry feedback",
+        "The rejection action queues a later reaction only after reconciliation"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Fault and recovery",
+      "items": [
+        "A supervisor owns side effects after the react waiter is dropped",
+        "Uncertain apply, settlement, or publish retains prepared operations",
+        "Cleanup state and the saved business disposition remain independent"
+      ]
+    }
+  ]
+}
