@@ -2,7 +2,7 @@
 
 ## Status
 
-后续提案：[用 use_preparation 驱动模型回合](preparation-driven-react-proposal.md)，讨论固定 react 循环、并发准备和应用退出；尚未实现。
+演进提案：[用 use_preparation 驱动模型回合](preparation-driven-react-proposal.md)。固定 react 循环和应用退出已落地；同批并发尚未实现。
 
 Implemented and verified on 2026-09-06. The implementation replaces keyed
 `use_dependency` with operation-scoped `use_preparation` while preserving
@@ -159,6 +159,15 @@ to `ApplicationFault`. The existing supervised mount-task panic behavior is
 unchanged.
 
 ## Failure, Cancellation, and Retry
+
+`Application::prepare()` and `react()` return `ControlFlow<ExitReason>` on
+success. A Component can request normal exit through `use_application_exit()`;
+the owning integration can use `Application::exit_handle()` while an operation
+borrows the Application. Exit wakes pending preparation, cancels its waiter,
+and returns `Break` without submitting a new Frame. A Provider submission that
+already acquired permission finishes its current reaction before returning
+`Break`; unresolved streaming publication still requires recovery. Exit does
+not replace application resource cleanup or consuming `shutdown()`.
 
 An ordinary preparation error is a retryable
 `ApplicationFault` with `ApplicationFaultStage::Preparation` and

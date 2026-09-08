@@ -363,6 +363,7 @@ pub(crate) enum HookKind {
     ProviderEventHandler,
     ReactionCompletion,
     ReactionRequest,
+    ApplicationExit,
     Future,
     Coroutine,
 }
@@ -402,6 +403,7 @@ impl fmt::Display for HookKind {
             Self::ProviderEventHandler => "provider-event-handler",
             Self::ReactionCompletion => "reaction-completion",
             Self::ReactionRequest => "reaction-request",
+            Self::ApplicationExit => "application-exit",
             Self::Future => "future",
             Self::Coroutine => "coroutine",
         };

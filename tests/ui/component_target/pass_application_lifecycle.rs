@@ -1,4 +1,7 @@
-use std::num::{NonZeroU128, NonZeroU64};
+use std::{
+    num::{NonZeroU128, NonZeroU64},
+    ops::ControlFlow,
+};
 
 use agentview::component::{
     execution::{
@@ -60,8 +63,9 @@ fn main() {
         let _ = application.take_reaction_request().unwrap();
         let wait = application.wait_for_reaction_request();
         drop(wait);
-        if let Err(fault) = application.react().await {
-            inspect_fault(fault);
+        match application.react().await {
+            Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(_)) => {}
+            Err(fault) => inspect_fault(fault),
         }
         application.shutdown().await.unwrap();
     });

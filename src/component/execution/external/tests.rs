@@ -1,11 +1,11 @@
 use std::{
     future::Future,
-    num::{NonZeroU64, NonZeroU128},
+    num::{NonZeroU128, NonZeroU64},
     panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
-        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
     },
     task::{Context, Poll},
 };
@@ -14,7 +14,7 @@ use crate::component::{
     authoring::{InternalEventInput as EventInput, InternalEventListener as EventListener},
     prelude::*,
 };
-use futures::{FutureExt, StreamExt, task::noop_waker};
+use futures::{task::noop_waker, FutureExt, StreamExt};
 use tokio::sync::Notify;
 
 use super::{
@@ -23,7 +23,6 @@ use super::{
     MAX_EXTERNAL_PROTOCOL_FRAMES, MAX_EXTERNAL_PROTOCOL_WIRE_BYTES, MAX_EXTERNAL_TEXT_BYTES,
 };
 use crate::component::execution::{
-    ProviderEvent, ProviderFault,
     application::{Application, ApplicationFault},
     reaction::{
         Frame, FrameBasis, FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact,
@@ -31,6 +30,7 @@ use crate::component::execution::{
         ReactionPortFaultKind, ReactionPortFaultReason, SubmitFault, TargetContinuity,
         TargetDeclaration, TargetEpoch, ToolCatalog,
     },
+    ProviderEvent, ProviderFault,
 };
 
 #[derive(Clone)]
@@ -160,6 +160,17 @@ fn shutdown_root(props: ShutdownProps, _events: EventInput<ProviderEvent>) -> Co
 }
 
 #[component]
+fn completed_external_root() -> Component {
+    let exit = use_application_exit();
+    use_preparation(move || async move {
+        exit.request(ExitReason::Completed)
+            .expect("mounted application exit handle");
+        Ok::<(), std::convert::Infallible>(())
+    });
+    view! { completed_external_root {} }
+}
+
+#[component]
 fn external_root(props: ExternalProps, events: EventInput<ProviderEvent>) -> Component {
     let rendered_values = format!("{:?}", *props.values.lock().unwrap());
     let values = Arc::clone(&props.values);
@@ -205,6 +216,31 @@ fn wrapper(props: &ExternalProps) -> ExternalApplication {
     let props = props.clone();
     ExternalApplication::new_with_event_input(move |events| external_root(props.clone(), events))
         .unwrap()
+}
+
+#[tokio::test]
+async fn normal_component_exit_stops_external_scheduler_persistently_and_allows_shutdown() {
+    let mut external = ExternalApplication::new_root(completed_external_root).unwrap();
+
+    assert!(matches!(
+        external.observe().await,
+        Err(ExternalApplicationFault::ApplicationStopped(
+            ExitReason::Completed
+        ))
+    ));
+    assert!(matches!(
+        external.observe().await,
+        Err(ExternalApplicationFault::ApplicationStopped(
+            ExitReason::Completed
+        ))
+    ));
+    assert!(matches!(
+        external.observe_full().await,
+        Err(ExternalApplicationFault::ApplicationStopped(
+            ExitReason::Completed
+        ))
+    ));
+    external.shutdown().await.unwrap();
 }
 
 type ShutdownWaiter =
@@ -1073,7 +1109,7 @@ async fn blocked_act_injection_is_interrupted_by_the_reaction_panic() {
 
 #[tokio::test]
 async fn ready_reaction_panic_wins_ready_cancellation() {
-    async fn panic_reaction() -> Result<(), ApplicationFault> {
+    async fn panic_reaction() -> Result<std::ops::ControlFlow<ExitReason>, ApplicationFault> {
         panic!("ready reaction panic")
     }
 

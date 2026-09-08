@@ -471,7 +471,10 @@ impl AcceptanceHarness {
 
         let requests_before = mock.request_count();
         let handlers_before = self.completed_handlers.load(Ordering::SeqCst);
-        application.react().await?;
+        anyhow::ensure!(
+            application.react().await?.is_continue(),
+            "Responses application exited"
+        );
         let request_delta = mock.request_count() - requests_before;
         self.requests_per_reaction.push(request_delta);
         self.handlers_completed_before_return &=

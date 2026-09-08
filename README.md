@@ -12,8 +12,8 @@ native tools, the tree fold contract, and focused verification.
 One `Application<P>` owns one logical target session:
 
 ```text
-external driver
-  | mount / inspect / react / shutdown
+external owner
+  | mount / inspect / run / shutdown
   v
 Application<P>
   |-- mounted Component tree and retained Signal state
@@ -25,9 +25,11 @@ Application<P>
           ordered ProviderFact stream -> canonical admission -> handlers
 ```
 
-The external driver decides when a reaction happens. Mounting, reading state,
-writing a `Signal`, completing a Component task, or requesting driver attention
-does not render another projection or submit a Frame by itself.
+`Application::run()` is the default fixed driver. An integration that needs
+manual scheduling can call `react()` for one reaction at a time. Mounting,
+reading state, writing a `Signal`, completing a Component task, or requesting
+driver attention does not render another projection or submit a Frame by
+itself.
 
 The public lifecycle is:
 
@@ -36,11 +38,16 @@ The public lifecycle is:
 2. `current_projection()` returns a read-only view of the latest committed,
    complete Component projection, its revision, and whether newer Component
    state is waiting to be reconciled.
-3. `react().await` reconciles dirty state and completes exactly one explicit
-   reaction. It hands off at most one compiler-produced Full or Delta Frame.
-4. `wait_for_reaction_request().await` and `take_reaction_request()` optionally
+3. `run().await` is the default fixed driver. It repeatedly runs Component
+   preparation and reactions until normal exit returns an `ExitReason`, or the
+   first `ApplicationFault` occurs. It does not clean up business resources or
+   call `shutdown()`.
+4. `react().await` is the manual single-reaction interface. It returns
+   `ControlFlow::Continue(())` after one reaction, or `Break(reason)` on normal
+   application exit and prevents subsequent Frame submissions.
+5. `wait_for_reaction_request().await` and `take_reaction_request()` optionally
    let a driver consume coalesced Component demand. They do not call `react()`.
-5. `shutdown().await` consumes the `Application`, fences the mount, and drains
+6. `shutdown().await` consumes the `Application`, fences the mount, and drains
    Component-owned tasks.
 
 ## Component Authoring
@@ -96,14 +103,27 @@ async fn run() -> Result<(), ApplicationFault> {
     )?;
 
     assert!(!application.current_projection().is_dirty());
-    application.react().await?;
+    assert_eq!(application.react().await?, std::ops::ControlFlow::Continue(()));
     assert_eq!(capture.frame_snapshots().len(), 1);
     application.shutdown().await
 }
 ```
 
-The Debug port makes this lifecycle credential-free. For text admission and
-state publication, see [`signal_reaction`](examples/signal_reaction.rs).
+The Debug port makes this lifecycle credential-free. This example deliberately
+uses the manual single-step interface to inspect one Frame. A fixed application
+instead retains the result from `run()`, cleans up its business resources, then
+consumes the Application:
+
+```rust,ignore
+let drive_result = application.run().await;
+// Stop and acknowledge application-owned business resources here.
+let shutdown_result = application.shutdown().await;
+let _reason = drive_result?;
+shutdown_result?;
+```
+
+For text admission and state publication, see
+[`signal_reaction`](examples/signal_reaction.rs).
 
 ### Business History
 
@@ -226,8 +246,9 @@ owns legal moves, retries, terminal decisions, and turn policy; a retained
 `use_coroutine` owns Stockfish, and `use_preparation` waits for its work before
 the next model turn. One strict multi-element streaming
 contract requires a nonempty `thought` before one `choose_move` or `resign`;
-the thin `ChessApplication` driver awaits the preparation barrier, checks
-completion, and consumes Component reaction requests. Offline verification uses reducer, scripted
+the thin `ChessApplication` driver awaits `reactor.run()`.
+The Component owns preparation and requests normal exit after terminal engine
+cleanup. Offline verification uses reducer, scripted
 port, and fake-UCI fixtures without an API key or installed Stockfish.
 
 ## Paid Chess Runs
@@ -268,9 +289,10 @@ code should use `Application<P>`, `ReactionPort`, ordinary Component roots, and
 `Application<P>` is an in-process owner, not a durable workflow or checkpoint.
 The runtime does not impose one universal business loop: a Component may own
 policy and retained state, as in Chess, while Skill or Plugin integrations may
-keep invocation policy in an external adapter. The external driver still owns
-when `react()` is called, and the runtime does not expose mutable port, session,
-history, or Component props access from an Application.
+keep invocation policy in an external adapter. `run()` is the default driver;
+an external adapter controls scheduling only when it intentionally calls
+`react()` itself. The runtime does not expose mutable port, session, history,
+or Component props access from an Application.
 
 The detailed runtime contract is in [`docs/engine.md`](docs/engine.md).
 

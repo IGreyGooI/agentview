@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::authoring::Signal;
 use super::{
     authoring::{
-        Component, ComponentAttemptFault, ComponentRenderStage, InternalEventInput as EventInput,
-        MountTaskStart, PreparationSet, RenderBindings,
+        application_exit::ApplicationExitControl, Component, ComponentAttemptFault,
+        ComponentRenderStage, InternalEventInput as EventInput, MountTaskStart, PreparationSet,
+        RenderBindings,
     },
     execution::{DriverDemandHandle, ProjectionExecutionScope, ProviderEvent, RenderedProjection},
     signal::{MountIdentity, SignalMountTransition, SignalRenderError, SignalRuntime},
@@ -54,6 +55,7 @@ pub struct ComponentHost<Props> {
     signals: SignalRuntime,
     driver_demand: Option<DriverDemandHandle>,
     tasks: Option<MountTaskHandle>,
+    application_exit: Option<ApplicationExitControl>,
     next_render_generation: u64,
     next_projection_revision: Option<ProjectionRevision>,
     current_projection_revision: Option<ProjectionRevision>,
@@ -68,7 +70,7 @@ enum ComponentRoot<Props> {
 
 impl<Props> ComponentHost<Props> {
     pub fn new_root(root: fn(Props) -> Component, props: Props) -> Self {
-        Self::new_with_optional_capabilities(ComponentRoot::Native(root), props, None, None)
+        Self::new_with_optional_capabilities(ComponentRoot::Native(root), props, None, None, None)
     }
 
     #[cfg(feature = "legacy-provider-port")]
@@ -85,7 +87,13 @@ impl<Props> ComponentHost<Props> {
         root: fn(Props, EventInput<ProviderEvent>) -> Component,
         props: Props,
     ) -> Self {
-        Self::new_with_optional_capabilities(ComponentRoot::WithEvents(root), props, None, None)
+        Self::new_with_optional_capabilities(
+            ComponentRoot::WithEvents(root),
+            props,
+            None,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn new_with_application_capabilities(
@@ -93,12 +101,14 @@ impl<Props> ComponentHost<Props> {
         props: Props,
         driver_demand: DriverDemandHandle,
         tasks: MountTaskHandle,
+        application_exit: Option<ApplicationExitControl>,
     ) -> Self {
         Self::new_with_optional_capabilities(
             ComponentRoot::WithEvents(root),
             props,
             Some(driver_demand),
             Some(tasks),
+            application_exit,
         )
     }
 
@@ -107,6 +117,7 @@ impl<Props> ComponentHost<Props> {
         props: Props,
         driver_demand: Option<DriverDemandHandle>,
         tasks: Option<MountTaskHandle>,
+        application_exit: Option<ApplicationExitControl>,
     ) -> Self {
         let instance = NEXT_COMPONENT_HOST_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -121,6 +132,7 @@ impl<Props> ComponentHost<Props> {
             signals: SignalRuntime::new(),
             driver_demand,
             tasks,
+            application_exit,
             next_render_generation: 1,
             next_projection_revision: Some(ProjectionRevision::FIRST),
             current_projection_revision: None,
@@ -250,6 +262,7 @@ where
                 &self.signals,
                 self.driver_demand.as_ref(),
                 self.tasks.as_ref(),
+                self.application_exit.as_ref(),
             )?;
         if candidate.has_task_starts() {
             self.tasks

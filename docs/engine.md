@@ -16,12 +16,14 @@ AgentView 把 LLM 应用组织成 retained Component tree：
   `Frame`；
 - `ReactionPort` 把 Frame handoff 给 Provider、Skill 或 Plugin，并返回有序 `ProviderFactStream`；
 - Runtime 先把 fact 接纳进 canonical history，再向 Component dispatch provider-neutral Event；
-- 只有 external driver 显式调用 `Application::react()`，Engine 才开始一次新的 reaction。
+- `Application::run()` 是默认 fixed driver；需要手动调度的 external owner 可以显式调用
+  `Application::react()` 开始一次 reaction。
 
 ```text
-external driver
+application owner
       |
-      | Application<P>::react()
+      | Application<P>::run() (default)
+      | or one explicit react()
       v
 Component Runtime -> complete RenderedProjection
       |                         |
@@ -85,10 +87,13 @@ impl<P: ReactionPort> Application<P> {
     ) -> Result<Self, ApplicationFault>;
 
     pub fn current_projection(&self) -> ProjectionSnapshot<'_>;
-    pub async fn prepare(&mut self) -> Result<(), ApplicationFault>;
+    pub fn exit_handle(&self) -> ApplicationExitHandle;
+    pub async fn prepare(&mut self) -> Result<ControlFlow<ExitReason>, ApplicationFault>;
     pub async fn wait_for_reaction_request(&mut self) -> Result<(), ApplicationFault>;
     pub fn take_reaction_request(&self) -> Result<bool, ApplicationFault>;
-    pub async fn react(&mut self) -> Result<(), ApplicationFault>;
+    pub async fn run(&mut self) -> Result<ExitReason, ApplicationFault>;
+    pub async fn react(&mut self) -> Result<ControlFlow<ExitReason>, ApplicationFault>;
+    pub async fn shutdown(self) -> Result<(), ApplicationFault>;
 }
 ```
 
@@ -98,6 +103,18 @@ impl<P: ReactionPort> Application<P> {
 每次显式`prepare()`和`react()`各自创建一个新的preparation operation，因此成功的`prepare()`之后的
 `react()`仍须再次运行全部active preparation。普通preparation失败或调用方drop pending operation后，
 同一个Application仍可由下一次显式`prepare()`或`react()`重试；该新operation也从全部active hooks重新开始。
+
+`run()`顺序循环调用`react()`，在第一个`Break(reason)`返回该`ExitReason`，或直接返回第一个
+`ApplicationFault`。它不spawn background driver、不替owner停止业务资源，也不调用`shutdown()`。
+`react()`是手动单步入口，返回`Continue(())`表示本轮已结算；`prepare()`的`Continue(())`只表示准备完成。
+`use_application_exit()`提供mount-fenced退出句柄，宿主可以通过`exit_handle()`取得独立句柄。
+`request(ExitReason::Completed | ExitReason::Requested)`记录第一个退出原因并唤醒pending preparation；
+退出后两个operation返回相同的`Break(reason)`，不再运行新准备或提交Frame。
+
+退出与提交许可经过同一个同步状态检查：退出先记录则不调用`port.submit`；当前提交先取得许可时，
+允许当前reaction完成，再返回Break。该许可不改变Provider handoff或history commit边界；continuity retry
+也必须再次检查许可。Exit不越过streaming recovery fence，不吞掉fault或panic。Break不证明业务资源已清理；
+owner仍需完成业务stop/ack并调用consuming shutdown，shutdown及Application drop会使退出句柄失效。
 
 `ReactionRequest::request()`只记录至少一次后续reaction的sticky request；重复request在driver消费前合并。
 `wait_for_reaction_request()`阻塞直到消费一个请求，`take_reaction_request()`不阻塞地消费当前请求并在没有请求时
@@ -642,7 +659,7 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
      -> close staged ToolOutputs
      -> validate admission closure and exact budgets
      -> private PreparedFrame
-6. port.submit(public Frame)
+6. acquire submission permission against application exit; port.submit(public Frame)
 7. Ready(Ok(stream)) -> synchronous infallible FrameSession commit
 8. run one fact/lane pump
      -> validate fact
@@ -656,7 +673,7 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
 10. finalize streaming parsers, decide each contract, and settle managed effects
     -> unresolved effects retain workers and return RecoveryRequired before step 11
 11. post-reconcile Component state
-12. release gate and return
+12. release gate; return Continue, or Break if exit was requested
 ```
 
 一次`react()`最多render/submit一个Frame，不自动开始下一次reaction。pre-handoff failure不推进任何
@@ -787,20 +804,30 @@ Provider stream与active lanes必须在同一个pump中并发推进，不能先�
 
 ## 8. 应用编排与 frontend
 
-### External driver owns scheduling
+### Default run and manual scheduling
 
 AgentView不提供framework-owned AgentLoop、public Reactor trait、ReactionHandle或Frame scheduling stream。
-external driver根据自己的timer、channel、CLI request、parent invocation或policy决定何时调用：
+`Application::run()`是默认固定循环；组件在`use_preparation`中等待timer、channel、CLI request或parent
+invocation：
 
 ```rust
-application.react().await?;
+let run_result = reactor.run().await;
+// Stop and acknowledge business-owned resources here.
+let shutdown_result = reactor.shutdown().await;
+let reason = run_result?;
+shutdown_result?;
 ```
 
-`react()`完成一整个structured reaction并返回。Signal dirty、Provider EOF、读取latest和command名称都
-不会自动调用它。Agent、Skill和Plugin共用Application/FrameSession/ReactionPort kernel，但不共享一个
-万能wait loop。
+`reactor`是持有`Application<P>`的变量，不是另一个runtime类型。`run()`内部的每次`react()`先等待组件
+准备，再完成一整个structured reaction。Signal dirty、Provider EOF、读取latest和command名称都不会自动
+触发reaction。外界发送业务输入即可，不需要额外发送reaction demand。准备hook目前仍按声明顺序await，
+尚未并发。
 
-| Integration | driver waits for | ReactionPort handoff |
+手动单步和现有demand集成仍可显式控制`react()`调用时机；固定`run()`不等待或消费demand。入口任务必须
+保留输入，让取消或失败后的preparation重试复用同一业务输入；多个hook的准备条件是AND，任选一个事件到达
+则由一个业务入口汇总。`run()`返回后，owner先收尾业务资源，再consuming `shutdown()`。
+
+| Integration | preparation or explicit driver waits for | ReactionPort handoff |
 |---|---|---|
 | Autonomous Agent | timer、policy、external request或Component demand | model transport accepts request |
 | Skill reaction | explicit invocation | owned observation queue accepts Frame |
@@ -824,8 +851,8 @@ fn chess_agent() -> Component {
 embedding API。root不返回framework completion/program类型，也不需要`ChessApplication`、
 `ComponentAgent`或`ApplicationReducer` trait。业务reducer是普通函数，由handler调用并写Signal。
 
-Autonomous Agent需要一条mount-fenced Component-to-driver demand channel，但它表达的只是“至少需要一个
-更晚turn”，不是Continue/Sleep/Stop policy：
+使用旧式demand调度的集成可以保留mount-fenced Component-to-driver channel，但它只表达“至少需要一个
+更晚turn”。固定react循环使用preparation和独立exit能力，不需要这个channel：
 
 ```rust
 let reaction = use_reaction_request();
@@ -1067,7 +1094,8 @@ Fact不得先被Observer或Component看见、之后才commit canonical history�
 18. 下一Frame必须闭合全部pending ToolCall，不能以Fresh、Full或context reset绕过。
 19. 一次`react()`最多handoff一个Frame，不自动rerender、retry或开始下一reaction。
 20. Signal dirty、读取latest、Provider EOF和task completion都不自动调用`react()`。
-21. external driver拥有when-to-react policy；Component demand只表达sticky demand，不表达host disposition。
+21. `Application::run()`是默认固定循环；direct `react()`是手动单步接口。Component preparation决定何时
+    允许提交，exit决定正常结束；兼容的Component demand只表达sticky demand，固定循环不依赖它。
 22. Skill latest/subcommand不隐式render或react；late act/plugin message不能越过ingress generation。
 23. cancellation不回滚已commit Component state、canonical fact、sealed private artifact或外部副作用。
 24. mounted handler/task/demand capability受mount generation fence，旧mount不能影响新mount；unmount先fence，

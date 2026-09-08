@@ -1,4 +1,5 @@
 use std::{
+    ops::ControlFlow,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -18,6 +19,10 @@ use agentview::{
 };
 
 struct TaskDropProbe(Arc<AtomicBool>);
+
+fn assert_continue(flow: ControlFlow<ExitReason>) {
+    assert_eq!(flow, ControlFlow::Continue(()));
+}
 
 impl Drop for TaskDropProbe {
     fn drop(&mut self) {
@@ -117,7 +122,7 @@ async fn public_text_and_empty_completion_are_ordered_stale_fenced_and_consuming
                 .await,
             Err(ExternalControlFault::StaleIngress)
         );
-        first_reaction.await.unwrap();
+        assert_continue(first_reaction.await.unwrap());
         first_ingress
     };
 
@@ -144,7 +149,7 @@ async fn public_text_and_empty_completion_are_ordered_stale_fenced_and_consuming
             control.complete(second_ingress).await,
             Err(ExternalControlFault::StaleIngress)
         );
-        second_reaction.await.unwrap();
+        assert_continue(second_reaction.await.unwrap());
         second_ingress
     };
 
@@ -162,7 +167,7 @@ async fn public_text_and_empty_completion_are_ordered_stale_fenced_and_consuming
             Err(ExternalControlFault::StaleIngress)
         );
         control.complete(third.ingress_generation()).await.unwrap();
-        third_reaction.await.unwrap();
+        assert_continue(third_reaction.await.unwrap());
     }
 
     assert_eq!(

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{ops::ControlFlow, time::Duration};
 
 use agentview::component::execution::{
     Application, ApplicationFault, ApplicationFaultCode, ApplicationFaultKind,
@@ -234,7 +234,7 @@ where
             return abort_before_dispatch(attempts, stage, reason_code);
         }
         let output = match timeout(reaction_timeout, white.react()).await {
-            Ok(Ok(())) => match control.read_state() {
+            Ok(Ok(ControlFlow::Continue(()))) => match control.read_state() {
                 Ok(state) => state,
                 Err(_) => {
                     return complete_dispatch_abort(
@@ -248,6 +248,17 @@ where
                     )
                 }
             },
+            Ok(Ok(ControlFlow::Break(_))) => {
+                return complete_dispatch_abort(
+                    attempts,
+                    &context,
+                    &attempt_snapshot,
+                    start,
+                    InfrastructureStage::ModelReaction,
+                    InfrastructureAbortReason::StateUnfinished,
+                    &mut on_dispatch,
+                )
+            }
             Ok(Err(fault)) => {
                 return complete_dispatch_abort(
                     attempts,
@@ -745,10 +756,13 @@ mod tests {
         assert!(!written.finished());
         assert!(application.current_projection().is_dirty());
 
-        tokio::time::timeout(Duration::from_secs(1), application.react())
-            .await
-            .expect("offline Chess reaction stays bounded")
-            .expect("scripted Chess reaction completes");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), application.react())
+                .await
+                .expect("offline Chess reaction stays bounded")
+                .expect("scripted Chess reaction completes")
+                .is_continue()
+        );
 
         assert_eq!(
             *capture
@@ -813,10 +827,11 @@ mod tests {
         control
             .begin_attempt(snapshot, context)
             .expect("retry state writes atomically");
-        application
+        assert!(application
             .react()
             .await
-            .expect("retry projection reaches the provider");
+            .expect("retry projection reaches the provider")
+            .is_continue());
 
         let submitted = capture
             .projections
@@ -929,10 +944,11 @@ mod tests {
         assert_eq!(failed_attempt.basis, FrameBasis::Full);
 
         capture.reject_before_handoff.store(false, Ordering::SeqCst);
-        application
+        assert!(application
             .react()
             .await
-            .expect("same Application retries the original response plan");
+            .expect("same Application retries the original response plan")
+            .is_continue());
 
         let attempts = capture
             .frame_attempts

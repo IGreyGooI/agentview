@@ -1,5 +1,6 @@
 use std::{
     num::{NonZeroU128, NonZeroU64},
+    ops::ControlFlow,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -88,7 +89,10 @@ async fn public_application_mounts_reacts_and_shuts_down_through_the_curated_own
     assert_eq!(observed.submit_count(), 0);
     let initial_revision = application.current_projection().revision();
 
-    application.react().await.unwrap();
+    assert_eq!(
+        application.react().await.unwrap(),
+        ControlFlow::Continue(())
+    );
 
     assert_eq!(observed.submit_count(), 1);
     assert_eq!(observed.accepted_frames(), 1);

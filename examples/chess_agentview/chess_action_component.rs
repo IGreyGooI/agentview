@@ -1,8 +1,4 @@
-use std::{
-    convert::Infallible,
-    str::FromStr,
-    sync::{Arc, Mutex},
-};
+use std::{convert::Infallible, str::FromStr, sync::Mutex};
 
 use agentview::component::prelude::*;
 use async_trait::async_trait;
@@ -10,7 +6,7 @@ use chess::ChessMove;
 use quick_xml::{events::Event, reader::Reader, XmlVersion};
 
 use super::{
-    application_state::{ChessEvent, ChessState, ModelAttemptKey},
+    application_state::{ChessEvent, ChessReduction, ChessState, ModelAttemptKey},
     chess_action::{ChessAction, ChessActionKind, InvalidActionReason},
     chess_application::reduce_signal,
     uci::{parse_strict_uci_move, StrictUciMoveError},
@@ -41,12 +37,11 @@ impl StreamingToolChannels for ChessActionChannels {
 
 #[derive(Default)]
 struct ChessActionAttempt {
-    thought: Option<String>,
-    actions: Vec<ChessAction>,
+    thought_completed: bool,
+    action: Option<ChessAction>,
 }
 
-#[derive(Clone)]
-struct ChessPublicationReceipt(Arc<Mutex<ChessPublicationState>>);
+struct ChessPublicationReceipt(Mutex<ChessPublicationState>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChessPublicationState {
@@ -57,7 +52,7 @@ enum ChessPublicationState {
 
 impl ChessPublicationReceipt {
     fn pending() -> Self {
-        Self(Arc::new(Mutex::new(ChessPublicationState::Pending)))
+        Self(Mutex::new(ChessPublicationState::Pending))
     }
 
     fn record_published(&self) {
@@ -121,15 +116,17 @@ impl ChessActionPublisher {
             ChessPublicationState::Pending => {}
         }
 
-        let effects = apply_model_action(&self.state, self.attempt, Ok(operation.action));
-        if effects.is_empty() {
-            operation.receipt.record_not_published();
-            StreamingPublishOutcome::NotPublished(ChessActionPublicationError::StaleAttempt)
-        } else {
-            // The reducer synchronously consumed the action and scheduled its next state. There
-            // is no actor or engine acknowledgement between this boundary and confirmation.
-            operation.receipt.record_published();
-            StreamingPublishOutcome::Published(())
+        match apply_model_action(&self.state, self.attempt, Ok(operation.action)) {
+            ChessReduction::Ignored => {
+                operation.receipt.record_not_published();
+                StreamingPublishOutcome::NotPublished(ChessActionPublicationError::StaleAttempt)
+            }
+            ChessReduction::Applied => {
+                // The reducer synchronously consumed the action and advanced application state.
+                // There is no actor or engine acknowledgement between this boundary and confirmation.
+                operation.receipt.record_published();
+                StreamingPublishOutcome::Published(())
+            }
         }
     }
 }
@@ -185,7 +182,7 @@ fn apply_model_action(
     state: &Signal<ChessState>,
     attempt: ModelAttemptKey,
     result: Result<ChessAction, InvalidActionReason>,
-) -> Vec<super::application_state::ChessEffect> {
+) -> ChessReduction {
     reduce_signal(state, ChessEvent::ModelAction { attempt, result })
 }
 
@@ -201,7 +198,7 @@ fn configure_action<Head: Send + Sync + 'static>(
 {
     handlers.on_complete_validated(
         |state, _| {
-            if state.thought.is_some() {
+            if state.thought_completed {
                 XmlOccurrenceValidity::Valid
             } else {
                 XmlOccurrenceValidity::Invalid(XmlOccurrenceRejection::diagnostic(
@@ -210,7 +207,7 @@ fn configure_action<Head: Send + Sync + 'static>(
             }
         },
         |state, event| {
-            state.actions.push(event.value);
+            state.action = Some(event.value);
             StreamingToolUpdate::none()
         },
     )
@@ -241,11 +238,9 @@ fn decide_action(
     }
     let result = match registered_action_count(&summary) {
         0 => Err(InvalidActionReason::MissingAction),
-        1 if state.actions.len() == 1 && summary.diagnostics.is_empty() => Ok(state
-            .actions
-            .into_iter()
-            .next()
-            .expect("one decoded Chess action")),
+        1 if state.action.is_some() && summary.diagnostics.is_empty() => {
+            Ok(state.action.expect("one decoded Chess action"))
+        }
         1 => Err(invalid_uci_reason(&summary).unwrap_or(InvalidActionReason::InvalidXml)),
         _ => Err(InvalidActionReason::MultipleActions),
     };
@@ -280,7 +275,7 @@ fn thought_problem(
         1 => {}
         _ => return Some(InvalidActionReason::MultipleThoughts),
     }
-    if thought.completed != 1 || state.thought.is_none() {
+    if thought.completed != 1 || !state.thought_completed {
         return Some(InvalidActionReason::InvalidThought);
     }
     summary
@@ -377,8 +372,8 @@ pub(crate) fn chess_action_component(
                         XmlOccurrenceValidity::Valid
                     }
                 },
-                |state, event| {
-                    state.thought = Some(event.value);
+                |state, _| {
+                    state.thought_completed = true;
                     StreamingToolUpdate::none()
                 },
             )
@@ -406,6 +401,9 @@ pub(crate) fn chess_action_component(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use super::super::application_state::ChessFeedback;
     use super::*;
     use agentview::component::ComponentHost;
 
@@ -453,7 +451,10 @@ mod tests {
     #[test]
     fn publishing_the_same_operation_twice_reuses_its_journaled_result() {
         let (_host, state) = mounted_publisher_state();
-        assert!(!reduce_signal(&state, ChessEvent::Start).is_empty());
+        assert_eq!(
+            reduce_signal(&state, ChessEvent::Start),
+            ChessReduction::Applied
+        );
         let attempt = state
             .with(|state| state.current_attempt())
             .unwrap()
@@ -478,9 +479,54 @@ mod tests {
     }
 
     #[test]
+    fn publishing_an_illegal_current_action_records_one_rejection() {
+        let (_host, state) = mounted_publisher_state();
+        assert_eq!(
+            reduce_signal(&state, ChessEvent::Start),
+            ChessReduction::Applied
+        );
+        let attempt = state
+            .with(|state| state.current_attempt())
+            .unwrap()
+            .expect("model attempt is active");
+        let action = ChessAction::ChooseMove(
+            parse_strict_uci_move("e2e5").expect("move has syntactically valid UCI"),
+        );
+        let mut publisher = ChessActionPublisher {
+            state: state.clone(),
+            attempt,
+        };
+        let operation = ChessActionPublication::new(action);
+
+        assert!(matches!(
+            publisher.publish_operation(&operation),
+            StreamingPublishOutcome::Published(())
+        ));
+        assert_eq!(operation.receipt.state(), ChessPublicationState::Published);
+        assert_eq!(
+            state.with(|state| state.feedback()).unwrap(),
+            ChessFeedback::Rejected(InvalidActionReason::IllegalMove(action))
+        );
+        assert_eq!(state.with(|state| state.retry_attempts()).unwrap(), 1);
+        assert!(state
+            .with(|state| state.committed_moves().is_empty())
+            .unwrap());
+        let after_first_publish = state.with(Clone::clone).unwrap();
+
+        assert!(matches!(
+            publisher.publish_operation(&operation),
+            StreamingPublishOutcome::Published(())
+        ));
+        assert_eq!(state.with(Clone::clone).unwrap(), after_first_publish);
+    }
+
+    #[test]
     fn stale_attempt_is_not_published() {
         let (_host, state) = mounted_publisher_state();
-        assert!(!reduce_signal(&state, ChessEvent::Start).is_empty());
+        assert_eq!(
+            reduce_signal(&state, ChessEvent::Start),
+            ChessReduction::Applied
+        );
         let current = state
             .with(|state| state.current_attempt())
             .unwrap()

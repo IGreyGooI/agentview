@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    ops::ControlFlow,
+    sync::{Arc, Mutex},
+};
 
 use agentview::{
     component::{
@@ -102,10 +105,10 @@ async fn retained_application_emits_developer_sequence_delta_and_suppresses_no_c
     )
     .unwrap();
 
-    app.react().await.unwrap();
+    assert_eq!(app.react().await.unwrap(), ControlFlow::Continue(()));
     entries.lock().unwrap().push(String::from("second"));
-    app.react().await.unwrap();
-    app.react().await.unwrap();
+    assert_eq!(app.react().await.unwrap(), ControlFlow::Continue(()));
+    assert_eq!(app.react().await.unwrap(), ControlFlow::Continue(()));
 
     let frames = capture.frame_snapshots();
     assert_eq!(frames.len(), 3);

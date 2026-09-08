@@ -3,6 +3,7 @@
 //! This module does not convert to the legacy generic component compiler. Its
 //! private declaration tree is the permanent lowering target for `view!`.
 
+pub(crate) mod application_exit;
 mod async_task;
 mod attempt;
 mod capture;
@@ -20,6 +21,9 @@ mod signal;
 pub mod streaming_attempt;
 mod streaming_xml;
 
+pub use application_exit::{
+    use_application_exit, ApplicationExitError, ApplicationExitHandle, ExitReason,
+};
 pub(crate) use async_task::MountTaskStart;
 pub use async_task::{
     spawn, use_coroutine, use_future, Coroutine, CoroutineInbox, CoroutineSendError, SpawnError,

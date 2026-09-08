@@ -104,7 +104,7 @@ async fn exchange(
             control.complete(observation.ingress_generation()).await?;
         }
     }
-    reaction.await?;
+    ensure!(reaction.await?.is_continue(), "Plugin application exited");
     Ok(observation)
 }
 

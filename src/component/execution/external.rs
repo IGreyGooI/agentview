@@ -1,10 +1,11 @@
 use std::{
     future::Future,
-    num::{NonZeroU64, NonZeroU128},
+    num::{NonZeroU128, NonZeroU64},
+    ops::ControlFlow,
     pin::Pin,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
     },
     task::Poll,
     vec::IntoIter,
@@ -20,12 +21,11 @@ use tokio::{
 };
 
 use crate::{
-    component::authoring::{Component, InternalEventInput as EventInput},
+    component::authoring::{Component, ExitReason, InternalEventInput as EventInput},
     llm_call::TextTurnEvent,
 };
 
 use super::{
-    ProviderEvent, ProviderFault,
     application::{Application, ApplicationFault},
     reaction::{
         Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
@@ -33,6 +33,7 @@ use super::{
         ReactionPortFaultCode, ReactionPortFaultReason, SubmitFault, TargetDeclaration,
         TargetEpoch, TargetIdentity,
     },
+    ProviderEvent, ProviderFault,
 };
 
 static NEXT_EXTERNAL_TARGET_ID: AtomicU64 = AtomicU64::new(1);
@@ -865,7 +866,7 @@ struct ExternalReactionCompletion {
 }
 
 enum ExternalReactionOutcome {
-    Finished(Result<(), ApplicationFault>),
+    Finished(Result<ControlFlow<ExitReason>, ApplicationFault>),
     Cancelled,
 }
 
@@ -915,6 +916,7 @@ pub struct ExternalApplication {
     control: ExternalControl,
     owner: Option<ExternalOwner>,
     reaction: Option<ExternalReaction>,
+    stopped: Option<ExitReason>,
 }
 
 impl ExternalApplication {
@@ -929,6 +931,7 @@ impl ExternalApplication {
             control,
             owner: Some(ExternalOwner { application }),
             reaction: None,
+            stopped: None,
         })
     }
 
@@ -955,6 +958,7 @@ impl ExternalApplication {
             control,
             owner: Some(ExternalOwner { application }),
             reaction: None,
+            stopped: None,
         })
     }
 
@@ -988,6 +992,7 @@ impl ExternalApplication {
 
     /// Finish any pending reaction without output, then return the next Frame.
     pub async fn observe(&mut self) -> Result<ExternalObservation, ExternalApplicationFault> {
+        self.ensure_running()?;
         self.finish_or_recover_current().await?;
         self.start_next().await
     }
@@ -997,6 +1002,7 @@ impl ExternalApplication {
         &mut self,
         act: ExternalAct,
     ) -> Result<ExternalObservation, ExternalApplicationFault> {
+        self.ensure_running()?;
         if self.current_reaction_phase() != Some(ExternalReactionPhase::AwaitingInput) {
             return Err(ExternalApplicationFault::NoActiveReaction);
         }
@@ -1014,6 +1020,7 @@ impl ExternalApplication {
     /// Unlike the removed same-revision re-render path, this always creates a
     /// new Full Frame in a later epoch and a new ingress generation.
     pub async fn observe_full(&mut self) -> Result<ExternalObservation, ExternalApplicationFault> {
+        self.ensure_running()?;
         self.finish_or_recover_current().await?;
         self.control.reset_continuity()?;
         self.start_next().await
@@ -1051,7 +1058,7 @@ impl ExternalApplication {
             }
             let completion = self.await_current_completion().await;
             let outcome = self.restore_joined_reaction(completion)?;
-            Self::finish_reaction_outcome(outcome)
+            self.finish_reaction_outcome_for_shutdown(outcome)
         } else {
             Ok(())
         };
@@ -1115,7 +1122,7 @@ impl ExternalApplication {
             ExternalReactionFinishProgress::Completion(completion) => {
                 cancellation.disarm();
                 let outcome = self.restore_joined_reaction(*completion)?;
-                return Self::finish_reaction_outcome(outcome);
+                return self.finish_reaction_outcome(outcome);
             }
             ExternalReactionFinishProgress::Injection(injection) => injection,
         };
@@ -1123,7 +1130,7 @@ impl ExternalApplication {
         let completion = self.await_current_completion().await;
         cancellation.disarm();
         let outcome = self.restore_joined_reaction(completion)?;
-        Self::finish_reaction_outcome(outcome)?;
+        self.finish_reaction_outcome(outcome)?;
         match injection {
             Ok(()) => {}
             Err(ExternalControlFault::StaleIngress) if stale_ingress_means_already_completed => {}
@@ -1133,6 +1140,7 @@ impl ExternalApplication {
     }
 
     async fn start_next(&mut self) -> Result<ExternalObservation, ExternalApplicationFault> {
+        self.ensure_running()?;
         let owner = self
             .owner
             .take()
@@ -1222,8 +1230,12 @@ impl ExternalApplication {
             Err(fault) => return Err(self.consume_failed_reaction(fault)),
         };
         match self.restore_completed_reaction(completion)? {
-            ExternalReactionOutcome::Finished(Ok(())) | ExternalReactionOutcome::Cancelled => {
+            ExternalReactionOutcome::Finished(Ok(ControlFlow::Continue(())))
+            | ExternalReactionOutcome::Cancelled => {
                 Err(ExternalApplicationFault::ReactionEndedBeforeObservation)
+            }
+            ExternalReactionOutcome::Finished(Ok(ControlFlow::Break(reason))) => {
+                Err(self.record_stopped(reason))
             }
             ExternalReactionOutcome::Finished(Err(fault)) => {
                 Err(ExternalApplicationFault::application(fault))
@@ -1236,12 +1248,8 @@ impl ExternalApplication {
             Ok(completion) => completion,
             Err(fault) => return Err(self.consume_failed_reaction(fault)),
         };
-        match self.restore_completed_reaction(completion)? {
-            ExternalReactionOutcome::Cancelled => Ok(()),
-            ExternalReactionOutcome::Finished(result) => {
-                result.map_err(ExternalApplicationFault::application)
-            }
-        }
+        let outcome = self.restore_completed_reaction(completion)?;
+        self.finish_reaction_outcome(outcome)
     }
 
     async fn await_current_completion(
@@ -1278,14 +1286,47 @@ impl ExternalApplication {
     }
 
     fn finish_reaction_outcome(
+        &mut self,
         outcome: ExternalReactionOutcome,
     ) -> Result<(), ExternalApplicationFault> {
         match outcome {
-            ExternalReactionOutcome::Finished(result) => {
-                result.map_err(ExternalApplicationFault::application)
+            ExternalReactionOutcome::Finished(Ok(ControlFlow::Continue(()))) => Ok(()),
+            ExternalReactionOutcome::Finished(Ok(ControlFlow::Break(reason))) => {
+                Err(self.record_stopped(reason))
+            }
+            ExternalReactionOutcome::Finished(Err(fault)) => {
+                Err(ExternalApplicationFault::application(fault))
             }
             ExternalReactionOutcome::Cancelled => Ok(()),
         }
+    }
+
+    fn finish_reaction_outcome_for_shutdown(
+        &mut self,
+        outcome: ExternalReactionOutcome,
+    ) -> Result<(), ExternalApplicationFault> {
+        match outcome {
+            ExternalReactionOutcome::Finished(Ok(ControlFlow::Break(reason))) => {
+                self.stopped.get_or_insert(reason);
+                Ok(())
+            }
+            outcome => self.finish_reaction_outcome(outcome),
+        }
+    }
+
+    fn ensure_running(&self) -> Result<(), ExternalApplicationFault> {
+        match self.stopped {
+            Some(reason) => Err(ExternalApplicationFault::ApplicationStopped(reason)),
+            None => Ok(()),
+        }
+    }
+
+    fn record_stopped(&mut self, reason: ExitReason) -> ExternalApplicationFault {
+        self.stopped.get_or_insert(reason);
+        ExternalApplicationFault::ApplicationStopped(
+            self.stopped
+                .expect("recorded external application exit reason"),
+        )
     }
 
     fn current_reaction_phase(&self) -> Option<ExternalReactionPhase> {
@@ -1325,7 +1366,7 @@ async fn run_reaction(
 }
 
 async fn await_reaction_or_cancellation(
-    reaction: impl std::future::Future<Output = Result<(), ApplicationFault>>,
+    reaction: impl std::future::Future<Output = Result<ControlFlow<ExitReason>, ApplicationFault>>,
     cancellation: oneshot::Receiver<()>,
 ) -> ExternalReactionOutcome {
     tokio::pin!(reaction);
@@ -1358,6 +1399,8 @@ pub enum ExternalControlFault {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ExternalApplicationFault {
+    #[error("external application stopped normally: {0:?}")]
+    ApplicationStopped(ExitReason),
     #[error("external command requires a current reaction; call observe first")]
     NoActiveReaction,
     #[error("external reaction synchronization closed unexpectedly")]

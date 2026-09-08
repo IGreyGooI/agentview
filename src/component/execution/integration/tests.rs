@@ -44,7 +44,7 @@ async fn drive_skill(
         .complete(observation.ingress_generation())
         .await
         .unwrap();
-    reaction.await.unwrap();
+    assert!(reaction.await.unwrap().is_continue());
     observation
 }
 
@@ -69,7 +69,7 @@ async fn drive_plugin(
             .await
             .unwrap(),
     }
-    reaction.await.unwrap();
+    assert!(reaction.await.unwrap().is_continue());
     observation
 }
 
@@ -146,7 +146,7 @@ async fn assert_unfinished_stream_drop_recovers_with_full<P, C>(
         .complete(recovered.ingress_generation())
         .await
         .unwrap();
-    recovery.await.unwrap();
+    assert!(recovery.await.unwrap().is_continue());
     application.shutdown().await.unwrap();
 }
 
@@ -165,7 +165,7 @@ async fn skill_and_plugin_preserve_unfinished_stream_drop_recovery() {
 async fn agent_skill_and_plugin_share_the_exact_canonical_frame_compiler() {
     let (debug, capture) = DebugProviderPort::new();
     let mut agent = Application::mount(shared_driver_root, debug).unwrap();
-    agent.react().await.unwrap();
+    assert!(agent.react().await.unwrap().is_continue());
     let agent_frame = capture.latest_frame().unwrap();
 
     let (skill_port, skill_control) = SkillPort::new().unwrap();

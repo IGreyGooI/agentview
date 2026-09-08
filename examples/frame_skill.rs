@@ -80,7 +80,7 @@ async fn explicit_exchange(
         }
     };
     control.complete(observation.ingress_generation()).await?;
-    reaction.await?;
+    ensure!(reaction.await?.is_continue(), "Skill application exited");
     Ok(observation)
 }
 

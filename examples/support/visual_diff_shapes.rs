@@ -75,7 +75,7 @@ async fn capture_atomic(mock: &mut ResponsesAcceptanceServer) -> anyhow::Result<
     let mut application =
         Application::mount(move || atomic_diff_application(props.clone()), provider)?;
     let operation_result = AssertUnwindSafe(async {
-        application.react().await?;
+        anyhow::ensure!(application.react().await?.is_continue());
         let baseline = request_view(&mock.next_request().await?)?;
         let signal = exported
             .lock()
@@ -83,7 +83,7 @@ async fn capture_atomic(mock: &mut ResponsesAcceptanceServer) -> anyhow::Result<
             .clone()
             .ok_or_else(|| anyhow::anyhow!("atomic Signal was not exported"))?;
         signal.set(String::from("A+"))?;
-        application.react().await?;
+        anyhow::ensure!(application.react().await?.is_continue());
         let current_component_prompt =
             projection_prompt(application.current_projection().projection())?;
         let current = request_view(&mock.next_request().await?)?;
@@ -117,7 +117,7 @@ async fn capture_replace(mock: &mut ResponsesAcceptanceServer) -> anyhow::Result
     let mut application =
         Application::mount(move || replace_diff_application(props.clone()), provider)?;
     let operation_result = AssertUnwindSafe(async {
-        application.react().await?;
+        anyhow::ensure!(application.react().await?.is_continue());
         let baseline = request_view(&mock.next_request().await?)?;
         let signal = exported
             .lock()
@@ -125,7 +125,7 @@ async fn capture_replace(mock: &mut ResponsesAcceptanceServer) -> anyhow::Result
             .clone()
             .ok_or_else(|| anyhow::anyhow!("replace Signal was not exported"))?;
         signal.set(String::from("B"))?;
-        application.react().await?;
+        anyhow::ensure!(application.react().await?.is_continue());
         let current_component_prompt =
             projection_prompt(application.current_projection().projection())?;
         let current = request_view(&mock.next_request().await?)?;

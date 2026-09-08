@@ -57,6 +57,7 @@ fn target_component_pom_subset_compiles_from_the_public_preludes() {
     tests.pass("tests/ui/component_target/pass_preparation_authoring.rs");
     tests.pass("tests/ui/component_target/pass_reaction_completion.rs");
     tests.pass("tests/ui/component_target/pass_reaction_request.rs");
+    tests.pass("tests/ui/component_target/pass_application_exit.rs");
     tests.pass("tests/ui/component_target/pass_async_task_authoring.rs");
     tests.pass("tests/ui/component_target/pass_xml_streaming_tool_call.rs");
     tests.pass("tests/ui/component_target/pass_streaming_xml.rs");

@@ -2,7 +2,8 @@
 
 日期：2026-09-08
 
-状态：待评审。本文件描述拟议改动，代码示例中的退出 API 尚未实现。
+状态：部分落地。固定 react 循环、应用退出 API 和 Chess 迁移已实现；同批 preparation 并发尚未实现。
+下文保留完整提案，同批并发及其验收项仍为后续工作。
 当前实现仍以 [engine.md](engine.md) 和 [component-preparation-design.md](component-preparation-design.md) 为准。
 
 ## 1. 建议

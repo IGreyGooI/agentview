@@ -4,6 +4,7 @@
 
 use std::{
     future::Future,
+    ops::ControlFlow,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     pin::Pin,
     sync::{
@@ -32,9 +33,11 @@ use super::{
 };
 use crate::component::{
     authoring::{
+        application_exit::ApplicationExitControl,
         streaming_attempt::{StreamingToolAbortCause, StreamingToolDriverFault},
-        Component, ComponentAttemptFault, InternalEventInput as EventInput, MountTaskStart,
-        PreparationFault, PreparationRun, RenderBindings, SpawnError,
+        ApplicationExitHandle, Component, ComponentAttemptFault, ExitReason,
+        InternalEventInput as EventInput, MountTaskStart, PreparationFault, PreparationRun,
+        RenderBindings, SpawnError,
     },
     host::CommittedRenderTransition,
     host::ComponentHost,
@@ -168,6 +171,7 @@ struct CompletedToolLane {
 enum SubmissionAttempt {
     Completed,
     ContinuityChanged,
+    Exited(ExitReason),
 }
 
 #[derive(Clone)]
@@ -235,12 +239,19 @@ pub struct Application<P: ReactionPort> {
     components: ComponentHost<RootFactory>,
     pending_render: Option<PendingApplicationRender>,
     driver_demand: DriverDemand,
+    application_exit: ApplicationExitControl,
     tasks: MountTaskSupervisor,
     session: FrameSession,
     declaration: TargetDeclaration,
     port: P,
     state: Arc<AtomicU8>,
     streaming: StreamingSupervisor,
+}
+
+impl<P: ReactionPort> Drop for Application<P> {
+    fn drop(&mut self) {
+        self.application_exit.close();
+    }
 }
 
 struct PendingApplicationRender {
@@ -328,6 +339,7 @@ impl<P: ReactionPort> Application<P> {
             .map_err(ApplicationFault::invalid_profile)?;
 
         let (driver_demand, demand_handle) = DriverDemand::new();
+        let application_exit = ApplicationExitControl::new();
         let tasks = MountTaskSupervisor::new();
         let task_handle = tasks.handle();
         let root: RootFactory = Arc::new(root);
@@ -337,9 +349,11 @@ impl<P: ReactionPort> Application<P> {
                 root,
                 demand_handle,
                 task_handle,
+                Some(application_exit.clone()),
             ),
             pending_render: None,
             driver_demand,
+            application_exit,
             tasks,
             session: FrameSession::new(&declaration).map_err(|source| {
                 ApplicationFault::from_session(ApplicationFaultStage::Declaration, source)
@@ -361,6 +375,12 @@ impl<P: ReactionPort> Application<P> {
         application.start_task_batch(ApplicationFaultStage::Bootstrap, task_starts)?;
         application.check_task_panic(ApplicationFaultStage::Bootstrap)?;
         Ok(application)
+    }
+
+    /// Obtain an application-scoped handle that can wake a blocked preparation
+    /// and prevent subsequent provider submissions.
+    pub fn exit_handle(&self) -> ApplicationExitHandle {
+        self.application_exit.handle()
     }
 
     /// Wait for and consume one coalesced Component request for a later reaction.
@@ -422,21 +442,9 @@ impl<P: ReactionPort> Application<P> {
         result
     }
 
-    /// Internal compatibility bridge for pre-public demand tests.
-    pub(crate) async fn wait_for_driver_demand(&mut self) -> Result<(), DriverDemandFault> {
-        self.wait_for_reaction_request()
-            .await
-            .map_err(|_| DriverDemandFault::StaleMount)
-    }
-
-    /// Internal compatibility bridge for pre-public demand tests.
-    pub(crate) fn take_driver_demand(&self) -> Result<bool, DriverDemandFault> {
-        self.take_reaction_request()
-            .map_err(|_| DriverDemandFault::StaleMount)
-    }
-
     /// Fence the mounted tree, then abort and await every Component-owned task.
     pub async fn shutdown(mut self) -> Result<(), ApplicationFault> {
+        self.application_exit.close();
         if self.streaming.pending() {
             self.streaming
                 .abort(StreamingToolAbortCause::Cancelled)
@@ -576,15 +584,16 @@ impl<P: ReactionPort> Application<P> {
         Ok(())
     }
 
-    /// Run preparation without submitting a provider reaction.
-    pub async fn prepare(&mut self) -> Result<(), ApplicationFault> {
+    /// Run preparation without submitting a provider reaction. A normal
+    /// application exit interrupts pending preparation and returns `Break`.
+    pub async fn prepare(&mut self) -> Result<ControlFlow<ExitReason>, ApplicationFault> {
         let stage = ApplicationFaultStage::Preparation;
         let application_state = Arc::clone(&self.state);
         let monitor = self.tasks.panic_monitor();
         begin_outer_driver_boundary(&application_state, &monitor)
             .map_err(|fault| application_fault_from_outer_driver_boundary(stage, fault))?;
         self.complete_streaming_cleanup().await?;
-        let mut preparation = Box::pin(self.prepare_components());
+        let mut preparation = Box::pin(self.prepare_with_exit());
         let result = tokio::select! {
             biased;
             task = monitor.wait() => {
@@ -601,7 +610,7 @@ impl<P: ReactionPort> Application<P> {
         };
         drop_driver_future_before_panic_arbitration(preparation, &monitor);
         match monitor.status() {
-            TaskSupervisorStatus::Healthy => result.map(|_| ()),
+            TaskSupervisorStatus::Healthy => result.map(|flow| flow.map_continue(|_| ())),
             TaskSupervisorStatus::Panicked => {
                 consume_supervised_task_panic(&application_state, &monitor);
                 Err(task_panic_terminal_fault(stage))
@@ -613,12 +622,32 @@ impl<P: ReactionPort> Application<P> {
         }
     }
 
-    /// Reconcile and complete exactly one externally requested reaction.
+    /// Run reactions until a Component or host requests normal application exit.
+    ///
+    /// Each reaction awaits its Component preparations. The first reaction fault
+    /// is returned without retrying; the owner retains the Application for
+    /// recovery, business resource cleanup, and consuming [`Self::shutdown`].
+    /// Dropping this future cancels the current `react()` operation.
+    pub async fn run(&mut self) -> Result<ExitReason, ApplicationFault> {
+        loop {
+            match self.react().await? {
+                // Immediately-ready ports must also let Component tasks progress.
+                ControlFlow::Continue(()) => tokio::task::yield_now().await,
+                ControlFlow::Break(reason) => return Ok(reason),
+            }
+        }
+    }
+
+    /// Prepare Components and complete one explicitly requested reaction.
     ///
     /// Dirty Component state never calls this method implicitly. A successful
     /// handoff commits before the returned fact stream is observed; later
     /// stream, binding, or lane faults retain that committed Frame.
-    pub async fn react(&mut self) -> Result<(), ApplicationFault> {
+    ///
+    /// Returns `Continue` after a completed reaction, or `Break` on normal
+    /// application exit. Exit interrupts preparation; after submission has
+    /// begun, the current reaction settles before exit is returned.
+    pub async fn react(&mut self) -> Result<ControlFlow<ExitReason>, ApplicationFault> {
         let application_state = Arc::clone(&self.state);
         let monitor = self.tasks.panic_monitor();
         begin_outer_driver_boundary(&application_state, &monitor).map_err(|fault| {
@@ -662,14 +691,20 @@ impl<P: ReactionPort> Application<P> {
     async fn react_inner(
         &mut self,
         cancellation: &ReactionCancellationControl,
-    ) -> Result<(), ApplicationFault> {
+    ) -> Result<ControlFlow<ExitReason>, ApplicationFault> {
+        if let Some(reason) = self.application_exit.reason() {
+            return Ok(ControlFlow::Break(reason));
+        }
         let declaration = self.refresh_declaration()?;
         self.check_task_panic(ApplicationFaultStage::Declaration)?;
-        let (projection, mut bindings) = self.prepare_components().await?;
+        let (projection, mut bindings) = match self.prepare_with_exit().await? {
+            ControlFlow::Continue(prepared) => prepared,
+            ControlFlow::Break(reason) => return Ok(ControlFlow::Break(reason)),
+        };
         let mut streaming_lease = self.streaming.start(bindings.take_streaming_contracts())?;
         self.driver_demand
             .set_streaming_fence(self.streaming.pending());
-        let result: Result<(), ApplicationFault> = async {
+        let result: Result<ControlFlow<ExitReason>, ApplicationFault> = async {
             let prepared = self
                 .session
                 .prepare(&declaration, &projection)
@@ -685,11 +720,16 @@ impl<P: ReactionPort> Application<P> {
                 prepared,
                 cancellation,
                 &mut self.streaming,
+                &self.application_exit,
             )
             .await?
             {
                 SubmissionAttempt::Completed => {}
+                SubmissionAttempt::Exited(reason) => return Ok(ControlFlow::Break(reason)),
                 SubmissionAttempt::ContinuityChanged => {
+                    if let Some(reason) = self.application_exit.reason() {
+                        return Ok(ControlFlow::Break(reason));
+                    }
                     let retry_declaration = self.refresh_declaration()?;
                     let retry = self
                         .session
@@ -707,10 +747,12 @@ impl<P: ReactionPort> Application<P> {
                         retry,
                         cancellation,
                         &mut self.streaming,
+                        &self.application_exit,
                     )
                     .await?
                     {
                         SubmissionAttempt::Completed => {}
+                        SubmissionAttempt::Exited(reason) => return Ok(ControlFlow::Break(reason)),
                         SubmissionAttempt::ContinuityChanged => {
                             return Err(ApplicationFault::terminal(
                                 ApplicationFaultStage::Submit,
@@ -721,9 +763,14 @@ impl<P: ReactionPort> Application<P> {
                     }
                 }
             }
-            Ok(())
+            Ok(ControlFlow::Continue(()))
         }
         .await;
+        if matches!(result, Ok(ControlFlow::Break(_))) && self.streaming.pending() {
+            self.streaming
+                .abort(StreamingToolAbortCause::Cancelled)
+                .await;
+        }
         if let Err(fault) = result {
             if fault.kind() != ApplicationFaultKind::RecoveryRequired {
                 self.streaming.saved_fault = Some(fault);
@@ -749,14 +796,41 @@ impl<P: ReactionPort> Application<P> {
         let cleanup = self.complete_streaming_cleanup().await;
         streaming_lease.complete();
         cleanup?;
-        result
+        result.map(|flow| match self.application_exit.reason() {
+            Some(reason) => ControlFlow::Break(reason),
+            None => flow,
+        })
+    }
+
+    async fn prepare_with_exit(
+        &mut self,
+    ) -> Result<
+        ControlFlow<ExitReason, (RenderedProjection, RenderBindings<ProviderEvent>)>,
+        ApplicationFault,
+    > {
+        let exit = self.application_exit.clone();
+        if let Some(reason) = exit.reason() {
+            return Ok(ControlFlow::Break(reason));
+        }
+        let mut preparation = Box::pin(self.prepare_components());
+        tokio::select! {
+            biased;
+            result = &mut preparation => result,
+            reason = exit.wait() => Ok(ControlFlow::Break(reason)),
+        }
     }
 
     async fn prepare_components(
         &mut self,
-    ) -> Result<(RenderedProjection, RenderBindings<ProviderEvent>), ApplicationFault> {
+    ) -> Result<
+        ControlFlow<ExitReason, (RenderedProjection, RenderBindings<ProviderEvent>)>,
+        ApplicationFault,
+    > {
         let mut run = PreparationRun::default();
         for wave in 0..=MAX_PREPARATION_WAVES {
+            if let Some(reason) = self.application_exit.reason() {
+                return Ok(ControlFlow::Break(reason));
+            }
             let rendered = self
                 .reconcile_components(ApplicationFaultStage::Reconcile)
                 .await?;
@@ -772,9 +846,12 @@ impl<P: ReactionPort> Application<P> {
                     .await
                     .map_err(ApplicationFault::from_preparation)?;
             }
+            if let Some(reason) = self.application_exit.reason() {
+                return Ok(ControlFlow::Break(reason));
+            }
             if !self.components.is_dirty() {
                 self.components.mark_current_projection_prepared();
-                return Ok((projection, bindings));
+                return Ok(ControlFlow::Continue((projection, bindings)));
             }
         }
         Err(ApplicationFault::preparation_graph_unstable())
@@ -970,7 +1047,13 @@ async fn run_submission_attempt<P: ReactionPort>(
     prepared: PreparedFrame,
     cancellation: &ReactionCancellationControl,
     streaming: &mut StreamingSupervisor,
+    application_exit: &ApplicationExitControl,
 ) -> Result<SubmissionAttempt, ApplicationFault> {
+    // The permit orders exit against starting this submission, independently
+    // of the provider's later Frame handoff and history commit.
+    if let Err(reason) = application_exit.try_begin_submission() {
+        return Ok(SubmissionAttempt::Exited(reason));
+    }
     let submission = submit_prepared_frame(port, session, prepared).await;
     match submission {
         Ok(facts) => {
@@ -2615,7 +2698,7 @@ mod tests {
         assert_eq!(probe.declarations.load(Ordering::Relaxed), 1);
         assert_eq!(probe.submissions.load(Ordering::Relaxed), 0);
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         let reconciled = application.current_projection();
         assert_eq!(reconciled.revision(), 2);
@@ -3118,8 +3201,8 @@ mod tests {
         let (port, probe) = scripted_port(vec![completed_reaction(), completed_reaction()], 0);
         let mut application = Application::mount(|| __private::fragment(Vec::new()), port).unwrap();
 
-        application.react().await.unwrap();
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
+        assert!(application.react().await.unwrap().is_continue());
 
         let bases = probe.bases.lock().unwrap();
         assert_eq!(bases.len(), 2);
@@ -3135,7 +3218,7 @@ mod tests {
         let (port, probe) = scripted_port(vec![completed_reaction()], 1);
         let mut application = Application::mount(|| __private::fragment(Vec::new()), port).unwrap();
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.declarations.load(Ordering::Relaxed), 3);
         assert_eq!(probe.submissions.load(Ordering::Relaxed), 2);
@@ -3289,7 +3372,7 @@ mod tests {
             1
         );
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.handoffs.load(Ordering::Relaxed), 2);
         assert_eq!(*probe.staged_input_counts.lock().unwrap(), [0, 1]);
@@ -3430,7 +3513,7 @@ mod tests {
             );
         }
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.declarations.load(Ordering::Relaxed), 3);
         assert_eq!(probe.submissions.load(Ordering::Relaxed), 2);
@@ -3492,7 +3575,7 @@ mod tests {
         }
         drop(cancelled);
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert!(matches!(
             probe.bases.lock().unwrap().as_slice(),
@@ -3525,7 +3608,7 @@ mod tests {
         assert!(poll_once(reaction.as_mut()).is_pending());
         drop(reaction);
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.handoffs.load(Ordering::Relaxed), 2);
         assert_eq!(
@@ -3573,7 +3656,7 @@ mod tests {
             ))
         );
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(*events.lock().unwrap(), ["delta"]);
         assert_eq!(
@@ -3622,7 +3705,7 @@ mod tests {
         let mounted = props.clone();
         let mut application =
             Application::mount(move || runtime_boundary_component(mounted.clone()), port).unwrap();
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         tokio::time::timeout(Duration::from_secs(1), async {
             while props.starts.load(Ordering::Acquire) == 0 {
                 tokio::task::yield_now().await;
@@ -3643,8 +3726,8 @@ mod tests {
         assert_eq!(application.current_projection().revision(), revision);
         assert!(application.take_reaction_request().unwrap());
         assert_eq!(props.starts.load(Ordering::Acquire), 1);
-        application.react().await.unwrap();
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
+        assert!(application.react().await.unwrap().is_continue());
         assert!(matches!(
             probe.bases.lock().unwrap().as_slice(),
             [FrameBasis::Full, FrameBasis::Full, FrameBasis::DeltaFrom(_)]
@@ -3680,7 +3763,7 @@ mod tests {
             .items()
             .is_empty());
         application.reset_model_context().unwrap();
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         {
             let frames = probe.canonical_frames.lock().unwrap();
             let frame: serde_json::Value = serde_json::from_slice(&frames[1]).unwrap();
@@ -3727,7 +3810,7 @@ mod tests {
             NonAdvancingResetPort(port),
         )
         .unwrap();
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         assert_eq!(
             application.reset_model_context().unwrap_err().kind(),
             ApplicationFaultKind::Terminal
@@ -3806,7 +3889,7 @@ mod tests {
             1
         );
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         assert_eq!(probe.handoffs.load(Ordering::Relaxed), 2);
         assert_eq!(*probe.staged_input_counts.lock().unwrap(), [0, 1]);
         assert_eq!(
@@ -3878,7 +3961,7 @@ mod tests {
                 1
             );
 
-            application.react().await.unwrap();
+            assert!(application.react().await.unwrap().is_continue());
             assert_eq!(
                 application
                     .session
@@ -4131,7 +4214,7 @@ mod tests {
         drop(reaction);
 
         let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _ = application.take_driver_demand();
+            let _ = application.take_reaction_request();
         }))
         .expect_err("the next Application boundary must resume the task panic");
         assert_eq!(
@@ -4195,7 +4278,7 @@ mod tests {
         assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
         assert_eq!(probe.post_await.load(Ordering::Acquire), 0);
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.invocations.load(Ordering::Acquire), 3);
         assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
@@ -4266,7 +4349,7 @@ mod tests {
         assert_eq!(probe.post_await.load(Ordering::Acquire), 0);
         assert_eq!(completions.load(Ordering::Acquire), 0);
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.invocations.load(Ordering::Acquire), 2);
         assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
@@ -4316,7 +4399,7 @@ mod tests {
         assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
         assert_eq!(probe.post_await.load(Ordering::Acquire), 0);
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.invocations.load(Ordering::Acquire), 2);
         assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
@@ -4346,7 +4429,7 @@ mod tests {
         assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
         assert_eq!(probe.post_await.load(Ordering::Acquire), 0);
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.invocations.load(Ordering::Acquire), 2);
         assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
@@ -4371,7 +4454,7 @@ mod tests {
                 .contains("<state>before</state>")
         );
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.handoffs.load(Ordering::Relaxed), 1);
         assert!(!application.components.is_dirty());
@@ -4389,7 +4472,7 @@ mod tests {
             1
         );
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.handoffs.load(Ordering::Relaxed), 2);
         assert_eq!(*probe.staged_input_counts.lock().unwrap(), [0, 1]);
@@ -4437,7 +4520,7 @@ mod tests {
                 .contains("<state>before</state>")
         );
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(*events.lock().unwrap(), ["delta", "complete"]);
         assert_eq!(probe.handoffs.load(Ordering::Relaxed), 1);
@@ -4464,7 +4547,7 @@ mod tests {
         )
         .unwrap();
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(completions.load(Ordering::Acquire), 1);
         assert_eq!(probe.handoffs.load(Ordering::Relaxed), 1);
@@ -4490,14 +4573,14 @@ mod tests {
         let demand = exported_demand.lock().unwrap().clone().unwrap();
         let signal = exported_signal.lock().unwrap().clone().unwrap();
 
-        assert!(!application.take_driver_demand().unwrap());
+        assert!(!application.take_reaction_request().unwrap());
         let initial_revision = application.current_projection().revision();
         demand.request().unwrap();
         let unchanged = application.current_projection();
         assert!(!unchanged.is_dirty());
         assert_eq!(unchanged.revision(), initial_revision);
         assert_eq!(probe.submissions.load(Ordering::Relaxed), 0);
-        assert!(application.take_driver_demand().unwrap());
+        assert!(application.take_reaction_request().unwrap());
 
         signal.set(String::from("after")).unwrap();
         demand.request().unwrap();
@@ -4505,11 +4588,11 @@ mod tests {
         let stale = application.current_projection();
         assert!(stale.is_dirty());
         assert!(rendered_text(stale.projection()).contains("before"));
-        application.wait_for_driver_demand().await.unwrap();
+        application.wait_for_reaction_request().await.unwrap();
         assert_eq!(probe.submissions.load(Ordering::Relaxed), 0);
-        assert!(!application.take_driver_demand().unwrap());
+        assert!(!application.take_reaction_request().unwrap());
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         let frames = probe.canonical_frames.lock().unwrap();
         let frame = std::str::from_utf8(&frames[0]).unwrap();
@@ -4548,13 +4631,13 @@ mod tests {
         .await
         .unwrap();
 
-        application.react().await.unwrap();
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
+        assert!(application.react().await.unwrap().is_continue());
         assert_eq!(starts.load(Ordering::Acquire), 1);
         release.notify_waiters();
         tokio::task::yield_now().await;
         assert!(!application.current_projection().is_dirty());
-        assert!(!application.take_driver_demand().unwrap());
+        assert!(!application.take_reaction_request().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4575,7 +4658,7 @@ mod tests {
 
         let first = exported_rx.recv().unwrap();
         first.send(1).await.unwrap();
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         let rerendered = exported_rx.recv().unwrap();
         rerendered.send(2).await.unwrap();
 
@@ -4586,7 +4669,7 @@ mod tests {
             Some([1, 2])
         );
         assert!(!application.current_projection().is_dirty());
-        assert!(!application.take_driver_demand().unwrap());
+        assert!(!application.take_reaction_request().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4621,7 +4704,7 @@ mod tests {
         )
         .unwrap();
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         let mut observed = Vec::new();
         tokio::time::timeout(Duration::from_secs(1), async {
             while observed.len() != 4 {
@@ -4633,7 +4716,7 @@ mod tests {
         observed.sort_unstable();
         assert_eq!(observed, ["future", "future", "invocation", "invocation"]);
         assert!(!application.current_projection().is_dirty());
-        assert!(!application.take_driver_demand().unwrap());
+        assert!(!application.take_reaction_request().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4660,7 +4743,7 @@ mod tests {
         .unwrap();
         let visible = exported.lock().unwrap().clone().unwrap();
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         tokio::time::timeout(Duration::from_secs(1), async {
             while !started.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
@@ -4671,7 +4754,7 @@ mod tests {
 
         application.port.observed_task_drop = Some(Arc::clone(&dropped));
         visible.set(false).unwrap();
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
 
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(*probe.task_drop_observed_at_submit.lock().unwrap(), [true]);
@@ -4707,7 +4790,7 @@ mod tests {
         .unwrap();
         let visible = exported.lock().unwrap().clone().unwrap();
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         tokio::time::timeout(Duration::from_secs(1), async {
             while !started.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
@@ -4737,7 +4820,7 @@ mod tests {
         assert!(rendered_text(pending.projection()).contains("retiring_child"));
         assert_eq!(probe.submissions.load(Ordering::Acquire), 1);
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(
             application.current_projection().revision(),
@@ -4775,7 +4858,7 @@ mod tests {
         .unwrap();
         let visible = exported.lock().unwrap().clone().unwrap();
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         tokio::time::timeout(Duration::from_secs(1), async {
             while !started.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
@@ -4837,7 +4920,7 @@ mod tests {
         .unwrap();
         let visible = exported.lock().unwrap().clone().unwrap();
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         tokio::time::timeout(Duration::from_secs(1), async {
             while !started.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
@@ -4933,21 +5016,27 @@ mod tests {
             assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
             assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(1), application.wait_for_driver_demand(),)
-                    .await
-                    .expect("blocking demand must fail instead of hanging"),
-                Err(DriverDemandFault::StaleMount)
-            );
+            let fault = tokio::time::timeout(
+                Duration::from_secs(1),
+                application.wait_for_reaction_request(),
+            )
+            .await
+            .expect("blocking reaction request wait must fail instead of hanging")
+            .unwrap_err();
+            assert_eq!(fault.stage(), ApplicationFaultStage::Reaction);
+            assert_eq!(fault.kind(), ApplicationFaultKind::Terminal);
+            assert_eq!(fault.code(), ApplicationFaultCode::Internal);
+            assert_eq!(fault.reason(), ApplicationFaultReason::ComponentRuntime);
             assert_eq!(probe.declarations.load(Ordering::Acquire), 1);
             assert_eq!(renders.load(Ordering::Acquire), 1);
             assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
             assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
-            assert_eq!(
-                application.take_driver_demand(),
-                Err(DriverDemandFault::StaleMount)
-            );
+            let fault = application.take_reaction_request().unwrap_err();
+            assert_eq!(fault.stage(), ApplicationFaultStage::Reaction);
+            assert_eq!(fault.kind(), ApplicationFaultKind::Terminal);
+            assert_eq!(fault.code(), ApplicationFaultCode::Internal);
+            assert_eq!(fault.reason(), ApplicationFaultReason::ComponentRuntime);
             assert_eq!(probe.declarations.load(Ordering::Acquire), 1);
             assert_eq!(renders.load(Ordering::Acquire), 1);
             assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
@@ -4979,7 +5068,7 @@ mod tests {
         )
         .unwrap();
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         tokio::time::timeout(Duration::from_secs(1), async {
             while starts.load(Ordering::Acquire) != 2 {
                 tokio::task::yield_now().await;
@@ -5005,7 +5094,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn task_panic_interrupts_demand_wait() {
+    async fn task_panic_interrupts_reaction_request_wait() {
         use futures::FutureExt as _;
 
         let starts = Arc::new(AtomicUsize::new(0));
@@ -5036,7 +5125,7 @@ mod tests {
             }
             trigger_release.notify_one();
         });
-        let panic = AssertUnwindSafe(application.wait_for_driver_demand())
+        let panic = AssertUnwindSafe(application.wait_for_reaction_request())
             .catch_unwind()
             .await
             .expect_err("a Component task panic must escape the driver wait");
@@ -5092,7 +5181,7 @@ mod tests {
 
         let unwind = tokio::time::timeout(
             Duration::from_secs(1),
-            AssertUnwindSafe(application.wait_for_driver_demand()).catch_unwind(),
+            AssertUnwindSafe(application.wait_for_reaction_request()).catch_unwind(),
         )
         .await;
         let panic = match unwind {
@@ -5233,7 +5322,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    let _ = application.take_driver_demand();
+                    let _ = application.take_reaction_request();
                 }))
                 .expect_err("the first driver boundary must resume bootstrap panic");
                 assert_eq!(
@@ -5312,37 +5401,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fresh_task_panic_overrides_post_handoff_cancellation_at_demand_wait_boundary() {
+    async fn fresh_task_panic_overrides_post_handoff_cancellation_at_reaction_request_wait_boundary(
+    ) {
         use futures::FutureExt as _;
 
         let (mut application, _) = cancelled_application_with_latched_task_panic().await;
-        let panic = AssertUnwindSafe(application.wait_for_driver_demand())
+        let panic = AssertUnwindSafe(application.wait_for_reaction_request())
             .catch_unwind()
             .await
-            .expect_err("fresh task panic must override the stale demand terminal fault");
+            .expect_err("fresh task panic must override the terminal reaction request fault");
         assert_eq!(
             panic.downcast_ref::<&str>(),
             Some(&"deferred bootstrap task panic")
         );
-        assert_eq!(
-            application.wait_for_driver_demand().await,
-            Err(DriverDemandFault::StaleMount)
-        );
+        let fault = application.wait_for_reaction_request().await.unwrap_err();
+        assert_eq!(fault.stage(), ApplicationFaultStage::Reaction);
+        assert_eq!(fault.kind(), ApplicationFaultKind::Terminal);
+        assert_eq!(fault.code(), ApplicationFaultCode::Unavailable);
+        assert_eq!(fault.reason(), ApplicationFaultReason::ComponentRuntime);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fresh_task_panic_overrides_post_handoff_cancellation_at_demand_take_boundary() {
+    async fn fresh_task_panic_overrides_post_handoff_cancellation_at_reaction_request_take_boundary(
+    ) {
         let (application, _) = cancelled_application_with_latched_task_panic().await;
-        let panic = std::panic::catch_unwind(AssertUnwindSafe(|| application.take_driver_demand()))
-            .expect_err("fresh task panic must override the stale demand terminal fault");
+        let panic =
+            std::panic::catch_unwind(AssertUnwindSafe(|| application.take_reaction_request()))
+                .expect_err("fresh task panic must override the terminal reaction request fault");
         assert_eq!(
             panic.downcast_ref::<&str>(),
             Some(&"deferred bootstrap task panic")
         );
-        assert_eq!(
-            application.take_driver_demand(),
-            Err(DriverDemandFault::StaleMount)
-        );
+        let fault = application.take_reaction_request().unwrap_err();
+        assert_eq!(fault.stage(), ApplicationFaultStage::Reaction);
+        assert_eq!(fault.kind(), ApplicationFaultKind::Terminal);
+        assert_eq!(fault.code(), ApplicationFaultCode::Unavailable);
+        assert_eq!(fault.reason(), ApplicationFaultReason::ComponentRuntime);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5375,7 +5469,7 @@ mod tests {
         release.notify_one();
         monitor.wait().await.unwrap();
 
-        let panic = AssertUnwindSafe(application.wait_for_driver_demand())
+        let panic = AssertUnwindSafe(application.wait_for_reaction_request())
             .catch_unwind()
             .await
             .expect_err("a latched panic must interrupt the driver wait");

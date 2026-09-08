@@ -7,11 +7,13 @@ use crate::component::{
 };
 
 use super::{
+    application_exit::ApplicationExitControl,
     async_task::{ComponentTaskContext, MountTaskStart},
     event_input::{EventInputOrigin, EventSelector},
     event_listener::EventListenerDeclaration,
     preparation::{PreparationDeclaration, PreparationSet},
-    Coroutine, CoroutineInbox, ReactionCompletionDeclaration, ReactionRequest, Signal,
+    ApplicationExitHandle, Coroutine, CoroutineInbox, ReactionCompletionDeclaration,
+    ReactionRequest, Signal,
 };
 
 /// Runtime hook authority passed only to repeatable Component renderers.
@@ -25,6 +27,7 @@ pub struct HookRenderContext<'render> {
     task_starts: &'render mut Vec<MountTaskStart>,
     driver_demand: Option<&'render DriverDemandHandle>,
     tasks: Option<&'render MountTaskHandle>,
+    application_exit: Option<&'render ApplicationExitControl>,
     attempt_local_allowed: bool,
 }
 
@@ -42,6 +45,7 @@ impl<'render> HookRenderContext<'render> {
         task_starts: &'render mut Vec<MountTaskStart>,
         driver_demand: Option<&'render DriverDemandHandle>,
         tasks: Option<&'render MountTaskHandle>,
+        application_exit: Option<&'render ApplicationExitControl>,
     ) -> Self {
         Self {
             signals,
@@ -52,6 +56,7 @@ impl<'render> HookRenderContext<'render> {
             task_starts,
             driver_demand,
             tasks,
+            application_exit,
             attempt_local_allowed: true,
         }
     }
@@ -69,6 +74,7 @@ impl<'render> HookRenderContext<'render> {
         task_starts: &'render mut Vec<MountTaskStart>,
         driver_demand: Option<&'render DriverDemandHandle>,
         tasks: Option<&'render MountTaskHandle>,
+        application_exit: Option<&'render ApplicationExitControl>,
     ) -> Self {
         Self {
             signals,
@@ -79,6 +85,7 @@ impl<'render> HookRenderContext<'render> {
             task_starts,
             driver_demand,
             tasks,
+            application_exit,
             attempt_local_allowed: false,
         }
     }
@@ -189,6 +196,21 @@ impl<'render> HookRenderContext<'render> {
             .use_marker_at(site, HookKind::ReactionRequest)
             .unwrap_or_else(|fault| panic!("{fault}"));
         ReactionRequest::new(mount, demand)
+    }
+
+    #[doc(hidden)]
+    pub fn use_application_exit_at(&mut self, site: u32) -> ApplicationExitHandle {
+        if !self.attempt_local_allowed {
+            panic!("System component declared generation-local application exit");
+        }
+        let exit = self.application_exit.cloned().unwrap_or_else(|| {
+            panic!("Component requires unavailable application exit capability")
+        });
+        let mount = self
+            .signals
+            .use_marker_at(site, HookKind::ApplicationExit)
+            .unwrap_or_else(|fault| panic!("{fault}"));
+        ApplicationExitHandle::for_mount(mount, exit)
     }
 
     #[doc(hidden)]

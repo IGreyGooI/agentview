@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(capture.accepted_revision(), None);
         assert!(completions.lock().unwrap().is_empty());
 
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
         assert_eq!(capture.submission_count(), 1);
         assert_eq!(capture.frames()[0].basis, FrameBasis::Full);
         assert!(capture.accepted_revision().is_some());

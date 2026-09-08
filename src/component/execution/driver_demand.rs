@@ -23,14 +23,12 @@ struct DriverDemandCore {
 
 /// Cloneable, mount-fenced capability that can request a later driver turn.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Phase 7 seam; the public Component hook is introduced in Phase 8.
 pub(crate) struct DriverDemandHandle {
     core: Arc<DriverDemandCore>,
 }
 
 impl DriverDemandHandle {
     /// Record at least one outstanding demand without rendering or reentry.
-    #[allow(dead_code)] // Invoked through the Phase 7 internal mount bridge and its tests.
     pub(crate) fn request(&self) -> Result<(), DriverDemandFault> {
         let mut state = self
             .core

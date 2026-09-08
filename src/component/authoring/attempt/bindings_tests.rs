@@ -794,6 +794,92 @@ fn reaction_request_is_rejected_inside_system_once() {
     assert!(panic.is_err());
 }
 
+#[component]
+fn application_exit_without_application() -> Component {
+    let _exit = use_application_exit();
+    view! {}
+}
+
+#[test]
+fn application_exit_without_orchestration_capability_panics() {
+    let signals = SignalRuntime::new();
+    let input = EventInput::<ProviderEvent>::new(1);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ComponentRenderStage::<ProviderEvent>::prepare_complete_root_with_signals(
+            application_exit_without_application(),
+            input.origin(),
+            &signals,
+        )
+    }));
+
+    assert!(panic.is_err());
+}
+
+#[component]
+fn system_application_exit() -> Component {
+    let _exit = use_application_exit();
+    view! {}
+}
+
+#[component]
+fn application_exit_in_system_scope() -> Component {
+    view! {
+        #[system_once]
+        { system_application_exit() }
+    }
+}
+
+#[test]
+fn application_exit_is_rejected_inside_system_once() {
+    let signals = SignalRuntime::new();
+    let input = EventInput::<ProviderEvent>::new(1);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ComponentRenderStage::<ProviderEvent>::prepare_complete_root_with_signals(
+            application_exit_in_system_scope(),
+            input.origin(),
+            &signals,
+        )
+    }));
+
+    assert!(panic.is_err());
+}
+
+#[component]
+fn application_exit_with_capability(
+    exported: Arc<Mutex<Option<ApplicationExitHandle>>>,
+) -> Component {
+    *exported.lock().unwrap() = Some(use_application_exit());
+    view! {}
+}
+
+#[test]
+fn application_exit_uses_the_injected_application_capability() {
+    let signals = SignalRuntime::new();
+    let exit = crate::component::authoring::application_exit::ApplicationExitControl::new();
+    let exported = Arc::new(Mutex::new(None));
+    let input = EventInput::<ProviderEvent>::new(1);
+
+    ComponentRenderStage::<ProviderEvent>::prepare_complete_root_candidate_with_capabilities(
+        application_exit_with_capability(Arc::clone(&exported)),
+        input.origin(),
+        &signals,
+        None,
+        None,
+        Some(&exit),
+    )
+    .unwrap()
+    .commit();
+
+    exported
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .request(ExitReason::Completed)
+        .unwrap();
+    assert_eq!(exit.reason(), Some(ExitReason::Completed));
+}
+
 #[tokio::test]
 async fn provider_handler_binding_is_stale_after_its_component_unmounts() {
     let log = Arc::new(Mutex::new(Vec::new()));

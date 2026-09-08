@@ -299,8 +299,8 @@ mod tests {
         let mut application =
             Application::mount(|| view! { debug { "exact frame" } }, port).unwrap();
 
-        application.react().await.unwrap();
-        application.react().await.unwrap();
+        assert!(application.react().await.unwrap().is_continue());
+        assert!(application.react().await.unwrap().is_continue());
 
         let snapshots = capture.frame_snapshots();
         assert_eq!(snapshots.len(), 2);

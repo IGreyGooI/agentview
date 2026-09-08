@@ -1,11 +1,14 @@
 use std::{
+    collections::VecDeque,
     convert::Infallible,
     num::{NonZeroU128, NonZeroU64},
+    ops::ControlFlow,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
+    task::Poll,
     thread,
     time::Duration,
 };
@@ -14,9 +17,10 @@ use agentview::{
     component::{
         execution::{
             Application, ApplicationFault, ApplicationFaultKind, ApplicationFaultReason,
-            ApplicationFaultStage, Frame, FrameCapabilities, FrameConstraints, FrameProfile,
-            ProviderFact, ProviderFactStream, ReactionPort, ReactionPortFault, RenderedProjection,
-            SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity,
+            ApplicationFaultStage, ExitReason, Frame, FrameCapabilities, FrameConstraints,
+            FrameProfile, ProviderFact, ProviderFactStream, ReactionPort, ReactionPortFault,
+            ReactionPortFaultCode, ReactionPortFaultReason, RenderedProjection, SubmitFault,
+            TargetDeclaration, TargetEpoch, TargetIdentity,
         },
         prelude::*,
     },
@@ -24,7 +28,7 @@ use agentview::{
     transcript::CanonicalInputItem,
 };
 use async_trait::async_trait;
-use futures::FutureExt;
+use futures::{poll, FutureExt};
 use tokio::sync::Notify;
 
 struct PreparationGate {
@@ -82,6 +86,8 @@ struct RecordingPort {
     probe: Arc<RecordingProbe>,
     continuity_rejections: usize,
     on_continuity_rejection: Option<Arc<dyn Fn() + Send + Sync>>,
+    completion_gate: Option<Arc<Notify>>,
+    submit_faults: VecDeque<SubmitFault>,
 }
 
 #[async_trait]
@@ -93,6 +99,9 @@ impl ReactionPort for RecordingPort {
 
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
         self.probe.submissions.fetch_add(1, Ordering::Release);
+        if let Some(fault) = self.submit_faults.pop_front() {
+            return Err(fault);
+        }
         if self.continuity_rejections > 0 {
             self.continuity_rejections -= 1;
             if let Some(on_rejection) = &self.on_continuity_rejection {
@@ -120,7 +129,11 @@ impl ReactionPort for RecordingPort {
         self.declaration =
             TargetDeclaration::resume(frame.revision(), frame.prepared_profile().clone());
         self.probe.handoffs.fetch_add(1, Ordering::Release);
-        Ok(Box::pin(futures::stream::once(async {
+        let completion_gate = self.completion_gate.clone();
+        Ok(Box::pin(futures::stream::once(async move {
+            if let Some(gate) = completion_gate {
+                gate.notified().await;
+            }
             Ok(ProviderFact::ReactionCompleted { primary_text: None })
         })))
     }
@@ -153,9 +166,27 @@ fn recording_port_with_continuity_rejection(
             probe: Arc::clone(&probe),
             continuity_rejections: usize::from(on_rejection.is_some()),
             on_continuity_rejection: on_rejection,
+            completion_gate: None,
+            submit_faults: VecDeque::new(),
         },
         probe,
     )
+}
+
+fn recording_port_with_completion_gate(
+    completion_gate: Arc<Notify>,
+) -> (RecordingPort, Arc<RecordingProbe>) {
+    let (mut port, probe) = recording_port();
+    port.completion_gate = Some(completion_gate);
+    (port, probe)
+}
+
+fn recording_port_with_submit_faults(
+    submit_faults: impl IntoIterator<Item = SubmitFault>,
+) -> (RecordingPort, Arc<RecordingProbe>) {
+    let (mut port, probe) = recording_port();
+    port.submit_faults = submit_faults.into_iter().collect();
+    (port, probe)
 }
 
 #[derive(Clone, Copy)]
@@ -166,11 +197,17 @@ enum PreparationOperation {
 
 impl PreparationOperation {
     async fn run(self, app: &mut Application<RecordingPort>) -> Result<(), ApplicationFault> {
-        match self {
+        let flow = match self {
             Self::Prepare => app.prepare().await,
             Self::React => app.react().await,
-        }
+        }?;
+        assert_continue(flow);
+        Ok(())
     }
+}
+
+fn assert_continue(flow: ControlFlow<ExitReason>) {
+    assert_eq!(flow, ControlFlow::Continue(()));
 }
 
 fn recording_port_for_nested_waves() -> (RecordingPort, Arc<RecordingProbe>) {
@@ -475,6 +512,52 @@ fn panicking_preparation_factory() -> Component {
     view! { panicking_preparation {} }
 }
 
+#[component]
+fn completed_exit_root() -> Component {
+    let exit = use_application_exit();
+    use_preparation(move || async move {
+        exit.request(ExitReason::Completed)
+            .expect("mounted application exit handle");
+        Ok::<(), Infallible>(())
+    });
+    view! { completed_exit {} }
+}
+
+#[component]
+fn exit_after_two_successful_reactions(runs: Arc<AtomicUsize>) -> Component {
+    let exit = use_application_exit();
+    use_preparation(move || async move {
+        if runs.fetch_add(1, Ordering::AcqRel) == 2 {
+            exit.request(ExitReason::Completed)
+                .expect("mounted application exit handle");
+        }
+        Ok::<(), Infallible>(())
+    });
+    view! { exit_after_two_successful_reactions {} }
+}
+
+#[component]
+fn exit_then_failing_preparation() -> Component {
+    let exit = use_application_exit();
+    use_preparation(move || {
+        exit.request(ExitReason::Requested)
+            .expect("mounted application exit handle");
+        std::future::ready(Err::<(), _>("preparation failure wins exit"))
+    });
+    view! { exit_then_failing_preparation {} }
+}
+
+#[component]
+fn exit_then_panicking_preparation() -> Component {
+    let exit = use_application_exit();
+    use_preparation(move || -> std::future::Ready<Result<(), Infallible>> {
+        exit.request(ExitReason::Requested)
+            .expect("mounted application exit handle");
+        panic!("preparation panic wins exit")
+    });
+    view! { exit_then_panicking_preparation {} }
+}
+
 #[tokio::test]
 async fn react_waits_for_preparation_and_submits_its_signal_write() {
     let gate = Arc::new(PreparationGate::new());
@@ -496,12 +579,286 @@ async fn react_waits_for_preparation_and_submits_its_signal_write() {
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
     gate.release.notify_one();
-    reaction.await.unwrap();
+    assert_continue(reaction.await.unwrap());
 
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
     assert!(probe.last_frame_text().contains("ready"));
     assert!(!probe.last_frame_text().contains("loading"));
     assert!(app.current_projection().is_prepared());
+}
+
+#[tokio::test]
+async fn host_exit_interrupts_blocked_preparation_without_provider_submission() {
+    let gate = Arc::new(PreparationGate::new());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (port, probe) = recording_port();
+    let mut app = Application::mount(
+        {
+            let gate = Arc::clone(&gate);
+            let attempts = Arc::clone(&attempts);
+            let drops = Arc::clone(&drops);
+            move || {
+                cancellable_preparation(
+                    Arc::clone(&gate),
+                    Arc::clone(&attempts),
+                    Arc::clone(&drops),
+                )
+            }
+        },
+        port,
+    )
+    .unwrap();
+    let exit = app.exit_handle();
+
+    let mut reaction = Box::pin(app.react());
+    tokio::select! {
+        _ = gate.started.notified() => {}
+        result = &mut reaction => panic!("preparation did not block reaction: {result:?}"),
+    }
+
+    exit.request(ExitReason::Requested).unwrap();
+    assert_eq!(
+        reaction.await.unwrap(),
+        ControlFlow::Break(ExitReason::Requested)
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while drops.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exit must cancel the blocked preparation");
+    assert_eq!(attempts.load(Ordering::Acquire), 1);
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
+    assert_eq!(
+        app.react().await.unwrap(),
+        ControlFlow::Break(ExitReason::Requested)
+    );
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn component_completed_exit_is_sticky_and_never_submits() {
+    let (port, probe) = recording_port();
+    let mut app = Application::mount(completed_exit_root, port).unwrap();
+
+    assert_eq!(
+        app.react().await.unwrap(),
+        ControlFlow::Break(ExitReason::Completed)
+    );
+    assert_eq!(
+        app.react().await.unwrap(),
+        ControlFlow::Break(ExitReason::Completed)
+    );
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exit_after_provider_handoff_waits_for_eof_then_stops_without_a_second_submit() {
+    let completion_gate = Arc::new(Notify::new());
+    let (port, probe) = recording_port_with_completion_gate(Arc::clone(&completion_gate));
+    let mut app = Application::mount(preparation_free_view, port).unwrap();
+    let exit = app.exit_handle();
+    let mut reaction = Box::pin(app.react());
+    assert!(matches!(poll!(reaction.as_mut()), Poll::Pending));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while probe.handoffs.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provider handoff must begin");
+    exit.request(ExitReason::Requested).unwrap();
+    assert!(matches!(poll!(reaction.as_mut()), Poll::Pending));
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 1);
+
+    completion_gate.notify_one();
+    assert_eq!(
+        reaction.await.unwrap(),
+        ControlFlow::Break(ExitReason::Requested)
+    );
+    assert_eq!(
+        app.react().await.unwrap(),
+        ControlFlow::Break(ExitReason::Requested)
+    );
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 1);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn preparation_error_and_panic_are_not_converted_to_normal_exit() {
+    let (port, probe) = recording_port();
+    let mut app = Application::mount(exit_then_failing_preparation, port).unwrap();
+
+    let fault = app.react().await.unwrap_err();
+    assert_eq!(fault.stage(), ApplicationFaultStage::Preparation);
+    assert_eq!(fault.kind(), ApplicationFaultKind::Retryable);
+    assert_eq!(fault.reason(), ApplicationFaultReason::Preparation);
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+
+    let (port, probe) = recording_port();
+    let mut app = Application::mount(exit_then_panicking_preparation, port).unwrap();
+    let panic = AssertUnwindSafe(app.react())
+        .catch_unwind()
+        .await
+        .expect_err("preparation panic must not become a normal exit");
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("preparation panic wins exit")
+    );
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn host_exit_handles_close_after_shutdown_and_application_drop() {
+    let (port, _) = recording_port();
+    let app = Application::mount(preparation_free_view, port).unwrap();
+    let shutdown_handle = app.exit_handle();
+    app.shutdown().await.unwrap();
+    assert_eq!(
+        shutdown_handle.request(ExitReason::Completed),
+        Err(ApplicationExitError::Closed)
+    );
+
+    let dropped_handle = {
+        let (port, _) = recording_port();
+        let app = Application::mount(preparation_free_view, port).unwrap();
+        app.exit_handle()
+    };
+    assert_eq!(
+        dropped_handle.request(ExitReason::Completed),
+        Err(ApplicationExitError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn run_reacts_twice_before_component_preparation_exits_without_a_third_submit() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (port, probe) = recording_port();
+    let mut app = Application::mount(
+        {
+            let runs = Arc::clone(&runs);
+            move || exit_after_two_successful_reactions(Arc::clone(&runs))
+        },
+        port,
+    )
+    .unwrap();
+
+    let mut run = Box::pin(app.run());
+    assert!(matches!(poll!(run.as_mut()), Poll::Pending));
+    assert_eq!(run.await.unwrap(), ExitReason::Completed);
+    assert_eq!(runs.load(Ordering::Acquire), 3);
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 2);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 2);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn run_returns_preparation_fault_without_retry_and_keeps_the_owner_usable() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (port, probe) = recording_port();
+    let mut app = Application::mount(
+        {
+            let attempts = Arc::clone(&attempts);
+            move || failing_once_preparation(Arc::clone(&attempts))
+        },
+        port,
+    )
+    .unwrap();
+
+    let fault = tokio::time::timeout(Duration::from_secs(1), app.run())
+        .await
+        .expect("run must return the first preparation fault")
+        .unwrap_err();
+    assert_eq!(fault.stage(), ApplicationFaultStage::Preparation);
+    assert_eq!(fault.kind(), ApplicationFaultKind::Retryable);
+    assert_eq!(fault.reason(), ApplicationFaultReason::Preparation);
+    assert_eq!(attempts.load(Ordering::Acquire), 1);
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+
+    assert_continue(app.react().await.unwrap());
+    assert_eq!(attempts.load(Ordering::Acquire), 2);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn run_returns_reaction_fault_without_retry_and_keeps_the_owner_usable() {
+    let (port, probe) =
+        recording_port_with_submit_faults([SubmitFault::Rejected(ReactionPortFault::retryable(
+            ReactionPortFaultCode::Unavailable,
+            ReactionPortFaultReason::Transport,
+        ))]);
+    let mut app = Application::mount(preparation_free_view, port).unwrap();
+
+    let fault = tokio::time::timeout(Duration::from_secs(1), app.run())
+        .await
+        .expect("run must return the first reaction fault")
+        .unwrap_err();
+    assert_eq!(fault.stage(), ApplicationFaultStage::Submit);
+    assert_eq!(fault.kind(), ApplicationFaultKind::Retryable);
+    assert_eq!(
+        fault.reason(),
+        ApplicationFaultReason::Port(ReactionPortFaultReason::Transport)
+    );
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 1);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
+
+    assert_continue(app.react().await.unwrap());
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 2);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn run_host_exit_interrupts_pending_preparation_and_leaves_the_owner_for_shutdown() {
+    let gate = Arc::new(PreparationGate::new());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (port, probe) = recording_port();
+    let mut app = Application::mount(
+        {
+            let gate = Arc::clone(&gate);
+            let attempts = Arc::clone(&attempts);
+            let drops = Arc::clone(&drops);
+            move || {
+                cancellable_preparation(
+                    Arc::clone(&gate),
+                    Arc::clone(&attempts),
+                    Arc::clone(&drops),
+                )
+            }
+        },
+        port,
+    )
+    .unwrap();
+    let exit = app.exit_handle();
+    let mut run = Box::pin(app.run());
+
+    tokio::select! {
+        _ = gate.started.notified() => {}
+        result = &mut run => panic!("run ended before preparation was interrupted: {result:?}"),
+    }
+    exit.request(ExitReason::Requested).unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("host exit must interrupt run")
+            .unwrap(),
+        ExitReason::Requested
+    );
+    assert_eq!(attempts.load(Ordering::Acquire), 1);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+    app.shutdown().await.unwrap();
 }
 
 #[test]
@@ -535,7 +892,7 @@ async fn ordinary_preparation_error_keeps_the_same_application_retryable() {
     assert_eq!(fault.reason(), ApplicationFaultReason::Preparation);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     assert_eq!(attempts.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
 }
@@ -553,8 +910,8 @@ async fn every_explicit_react_reruns_successful_preparation() {
     )
     .unwrap();
 
-    app.react().await.unwrap();
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().await.unwrap());
 
     assert_eq!(runs.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 2);
@@ -573,11 +930,11 @@ async fn prepare_then_react_reruns_successful_preparation() {
     )
     .unwrap();
 
-    app.prepare().await.unwrap();
+    assert_continue(app.prepare().await.unwrap());
     assert_eq!(runs.load(Ordering::Acquire), 1);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     assert_eq!(runs.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
 }
@@ -651,7 +1008,7 @@ async fn dropping_pending_react_cancels_preparation_without_handoff_and_retries(
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
     gate.release.notify_one();
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     assert_eq!(attempts.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
 }
@@ -715,7 +1072,7 @@ async fn preparation_stabilizes_nested_mounts_before_the_first_handoff() {
     )
     .unwrap();
 
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
 
     assert_eq!(*loader_order.lock().unwrap(), ["parent", "child"]);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
@@ -741,21 +1098,21 @@ async fn newly_remounted_nested_preparation_runs_in_its_new_mount_generation() {
     )
     .unwrap();
 
-    app.prepare().await.unwrap();
+    assert_continue(app.prepare().await.unwrap());
     assert_eq!(parent_runs.load(Ordering::Acquire), 1);
     assert_eq!(child_runs.load(Ordering::Acquire), 1);
     assert!(
         !projection_text(app.current_projection().projection()).contains("remounting_child_absent")
     );
 
-    app.prepare().await.unwrap();
+    assert_continue(app.prepare().await.unwrap());
     assert_eq!(parent_runs.load(Ordering::Acquire), 2);
     assert_eq!(child_runs.load(Ordering::Acquire), 2);
     assert!(
         projection_text(app.current_projection().projection()).contains("remounting_child_absent")
     );
 
-    app.prepare().await.unwrap();
+    assert_continue(app.prepare().await.unwrap());
     assert_eq!(parent_runs.load(Ordering::Acquire), 3);
     assert_eq!(child_runs.load(Ordering::Acquire), 3);
     assert!(
@@ -777,7 +1134,7 @@ async fn remount_within_one_operation_reruns_the_child_but_not_the_parent() {
     )
     .unwrap();
 
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
 
     assert_eq!(
         *loader_order.lock().unwrap(),
@@ -802,7 +1159,7 @@ async fn sixteen_preparation_waves_can_write_final_data_and_stabilize() {
     )
     .unwrap();
 
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
 
     assert_eq!(runs.load(Ordering::Acquire), 16);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
@@ -864,7 +1221,7 @@ async fn continuity_retry_in_the_same_react_does_not_rerun_preparation() {
     )
     .unwrap();
 
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
 
     assert_eq!(runs.load(Ordering::Acquire), 1);
     assert_eq!(probe.submissions.load(Ordering::Acquire), 2);
@@ -897,7 +1254,7 @@ async fn prepare_resolves_bootstrap_preparations_without_provider_handoff() {
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
     gate.release.notify_one();
-    preparation.await.unwrap();
+    assert_continue(preparation.await.unwrap());
 
     assert_eq!(probe.declarations.load(Ordering::Acquire), 1);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
@@ -929,7 +1286,7 @@ async fn failed_prepare_keeps_the_unprepared_application_retryable() {
     assert_eq!(probe.declarations.load(Ordering::Acquire), 1);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
-    app.prepare().await.unwrap();
+    assert_continue(app.prepare().await.unwrap());
     assert_eq!(attempts.load(Ordering::Acquire), 2);
     assert!(app.current_projection().is_prepared());
     assert_eq!(probe.declarations.load(Ordering::Acquire), 1);
@@ -973,7 +1330,7 @@ async fn dropping_pending_prepare_keeps_the_unprepared_application_retryable() {
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
     gate.release.notify_one();
-    app.prepare().await.unwrap();
+    assert_continue(app.prepare().await.unwrap());
     assert_eq!(attempts.load(Ordering::Acquire), 2);
     assert!(app.current_projection().is_prepared());
     assert_eq!(probe.declarations.load(Ordering::Acquire), 1);
@@ -995,7 +1352,7 @@ async fn signal_write_keeps_the_previous_prepared_checkpoint_visible_while_dirty
     )
     .unwrap();
 
-    app.prepare().await.unwrap();
+    assert_continue(app.prepare().await.unwrap());
     let first = app.current_projection();
     assert!(first.is_prepared());
     assert!(!first.is_dirty());
@@ -1014,7 +1371,7 @@ async fn signal_write_keeps_the_previous_prepared_checkpoint_visible_while_dirty
     assert!(dirty.is_dirty());
     assert!(projection_text(dirty.projection()).contains("initial"));
 
-    app.prepare().await.unwrap();
+    assert_continue(app.prepare().await.unwrap());
     let second = app.current_projection();
     assert!(second.is_prepared());
     assert!(!second.is_dirty());
@@ -1045,7 +1402,7 @@ fn synchronous_preparation_factory_can_read_and_write_a_signal_without_deadlock(
                         port,
                     )
                     .expect("mount factory access Component");
-                    app.prepare().await.is_ok()
+                    matches!(app.prepare().await, Ok(ControlFlow::Continue(())))
                         && app.current_projection().is_prepared()
                         && projection_text(app.current_projection().projection()).contains("2")
                 })

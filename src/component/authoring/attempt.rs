@@ -17,6 +17,7 @@ use crate::{
 };
 
 use super::{
+    application_exit::ApplicationExitControl,
     async_task::MountTaskStart,
     capture::{
         build_projection_items, ComponentCaptureError, ProjectionFragmentCapture,
@@ -142,6 +143,7 @@ where
             signals,
             driver_demand,
             None,
+            None,
         )?
         .commit())
     }
@@ -152,12 +154,19 @@ where
         signals: &'runtime SignalRuntime,
         driver_demand: Option<&DriverDemandHandle>,
         tasks: Option<&MountTaskHandle>,
+        application_exit: Option<&ApplicationExitControl>,
     ) -> Result<ComponentRenderCandidate<'runtime, Root>, ComponentAttemptFault> {
         let mut signal_render = signals
             .begin_render()
             .map_err(ComponentAttemptFault::signal)?;
-        let (stage, system_candidate) =
-            Self::mount(root, event_origin, &mut signal_render, driver_demand, tasks)?;
+        let (stage, system_candidate) = Self::mount(
+            root,
+            event_origin,
+            &mut signal_render,
+            driver_demand,
+            tasks,
+            application_exit,
+        )?;
         Ok(ComponentRenderCandidate {
             stage,
             system_candidate,
@@ -171,6 +180,7 @@ where
         signal_render: &mut SignalRenderTransaction<'_>,
         driver_demand: Option<&DriverDemandHandle>,
         tasks: Option<&MountTaskHandle>,
+        application_exit: Option<&ApplicationExitControl>,
     ) -> Result<(Self, Option<ResolvedDocument>), ComponentAttemptFault> {
         let mut listeners = Vec::new();
         let mut reaction_completions = Vec::new();
@@ -192,6 +202,7 @@ where
             event_origin,
             driver_demand,
             tasks,
+            application_exit,
             signal_render,
             &mut listeners,
             &mut reaction_completions,
@@ -436,6 +447,7 @@ fn visit_render(
     event_origin: EventInputOrigin,
     driver_demand: Option<&DriverDemandHandle>,
     tasks: Option<&MountTaskHandle>,
+    application_exit: Option<&ApplicationExitControl>,
     signal_render: &mut SignalRenderTransaction<'_>,
     listeners: &mut Vec<MountedListener>,
     reaction_completions: &mut Vec<ReactionCompletionDeclaration>,
@@ -460,6 +472,7 @@ fn visit_render(
                     event_origin,
                     driver_demand,
                     tasks,
+                    application_exit,
                     signal_render,
                     listeners,
                     reaction_completions,
@@ -508,6 +521,7 @@ fn visit_render(
                         event_origin,
                         driver_demand,
                         tasks,
+                        application_exit,
                         listeners,
                         reaction_completions,
                         preparations,
@@ -528,6 +542,7 @@ fn visit_render(
                 event_origin,
                 driver_demand,
                 tasks,
+                application_exit,
                 signal_render,
                 listeners,
                 reaction_completions,
@@ -559,6 +574,7 @@ fn visit_render(
                 event_origin,
                 driver_demand,
                 tasks,
+                application_exit,
                 signal_render,
                 listeners,
                 reaction_completions,
@@ -597,6 +613,7 @@ fn visit_render(
                     event_origin,
                     driver_demand,
                     tasks,
+                    application_exit,
                     signal_render,
                     listeners,
                     reaction_completions,
@@ -676,6 +693,7 @@ struct HookInvocationContext<'render> {
     event_origin: EventInputOrigin,
     driver_demand: Option<&'render DriverDemandHandle>,
     tasks: Option<&'render MountTaskHandle>,
+    application_exit: Option<&'render ApplicationExitControl>,
     listeners: &'render mut Vec<MountedListener>,
     reaction_completions: &'render mut Vec<ReactionCompletionDeclaration>,
     preparations: &'render mut PreparationSet,
@@ -693,6 +711,7 @@ fn invoke_repeatable(
         event_origin,
         driver_demand,
         tasks,
+        application_exit,
         listeners,
         reaction_completions,
         preparations,
@@ -712,6 +731,7 @@ fn invoke_repeatable(
                     task_starts,
                     driver_demand,
                     tasks,
+                    application_exit,
                 )
             } else {
                 HookRenderContext::for_system(
@@ -723,6 +743,7 @@ fn invoke_repeatable(
                     task_starts,
                     driver_demand,
                     tasks,
+                    application_exit,
                 )
             };
             Ok(renderer(&mut hooks))

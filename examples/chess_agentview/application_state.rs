@@ -1,7 +1,7 @@
 use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
 
 use super::{
-    chess_action::{ActionUnavailableReason, ChessAction, ChessActionKind, InvalidActionReason},
+    chess_action::{ActionUnavailableReason, ChessAction, InvalidActionReason},
     chess_draw_state::DrawState,
 };
 
@@ -13,29 +13,6 @@ pub(crate) enum ChessPhase {
     AwaitingModel,
     AwaitingStockfish,
     Finished,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RetryState {
-    attempts: u8,
-    last_rejection: Option<InvalidActionReason>,
-}
-
-impl RetryState {
-    fn fresh() -> Self {
-        Self {
-            attempts: 0,
-            last_rejection: None,
-        }
-    }
-
-    pub(crate) fn attempts(self) -> u8 {
-        self.attempts
-    }
-
-    pub(crate) fn last_rejection(self) -> Option<InvalidActionReason> {
-        self.last_rejection
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +69,7 @@ pub(crate) struct ChessState {
     agent_side: Color,
     board: Board,
     committed_moves: Vec<ChessMove>,
-    retry: RetryState,
+    retry_attempts: u8,
     feedback: ChessFeedback,
     phase: ChessPhase,
     outcome: Option<ChessOutcome>,
@@ -109,7 +86,7 @@ impl ChessState {
             agent_side,
             board: Board::default(),
             committed_moves: Vec::new(),
-            retry: RetryState::fresh(),
+            retry_attempts: 0,
             feedback: ChessFeedback::Initial,
             phase: ChessPhase::Ready,
             outcome: None,
@@ -129,8 +106,8 @@ impl ChessState {
         &self.committed_moves
     }
 
-    pub(crate) fn retry(&self) -> RetryState {
-        self.retry.clone()
+    pub(crate) fn retry_attempts(&self) -> u8 {
+        self.retry_attempts
     }
 
     pub(crate) fn feedback(&self) -> ChessFeedback {
@@ -140,7 +117,7 @@ impl ChessState {
     pub(crate) fn current_attempt(&self) -> Option<ModelAttemptKey> {
         (self.phase == ChessPhase::AwaitingModel).then_some(ModelAttemptKey {
             ply: self.committed_moves.len(),
-            attempt_index: self.retry.attempts,
+            attempt_index: self.retry_attempts,
         })
     }
 
@@ -164,22 +141,15 @@ pub(crate) enum ChessEvent {
     EngineFailed(StockfishFailure),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ChessEffect {
-    RequestReaction,
-    RequestStockfish(StockfishRequest),
-    Complete(ChessOutcome),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChessReduction {
+    Applied,
+    Ignored,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StockfishRequest {
-    pub(crate) position_revision: usize,
-    pub(crate) committed_moves: Vec<ChessMove>,
-}
-
-pub(crate) fn reduce(state: &mut ChessState, event: ChessEvent) -> Vec<ChessEffect> {
+pub(crate) fn reduce(state: &mut ChessState, event: ChessEvent) -> ChessReduction {
     if state.phase == ChessPhase::Finished {
-        return Vec::new();
+        return ChessReduction::Ignored;
     }
 
     match event {
@@ -195,28 +165,26 @@ pub(crate) fn reduce(state: &mut ChessState, event: ChessEvent) -> Vec<ChessEffe
         }
         ChessEvent::EngineFailed(failure) => finish(state, ChessOutcome::StockfishFailed(failure)),
         ChessEvent::Start | ChessEvent::ModelAction { .. } | ChessEvent::StockfishCompleted(_) => {
-            Vec::new()
+            return ChessReduction::Ignored;
         }
     }
+    ChessReduction::Applied
 }
 
-fn start(state: &mut ChessState) -> Vec<ChessEffect> {
+fn start(state: &mut ChessState) {
     if let Some(outcome) = position_outcome(state) {
         return finish(state, outcome);
     }
-    request_next_actor(state)
+    advance_turn(state)
 }
 
-fn complete_model(
-    state: &mut ChessState,
-    result: Result<ChessAction, InvalidActionReason>,
-) -> Vec<ChessEffect> {
+fn complete_model(state: &mut ChessState, result: Result<ChessAction, InvalidActionReason>) {
     let action = match result.and_then(|action| validate_model_action(state, action)) {
         Ok(action) => action,
         Err(reason) => return reject_model_action(state, reason),
     };
 
-    state.retry = RetryState::fresh();
+    state.retry_attempts = 0;
     state.feedback = ChessFeedback::Accepted(action);
     match action {
         ChessAction::ChooseMove(candidate) => commit_move(state, candidate),
@@ -233,10 +201,7 @@ fn complete_model(
     }
 }
 
-fn complete_stockfish(
-    state: &mut ChessState,
-    result: Result<ChessMove, StockfishFailure>,
-) -> Vec<ChessEffect> {
+fn complete_stockfish(state: &mut ChessState, result: Result<ChessMove, StockfishFailure>) {
     let candidate = match result {
         Ok(candidate) if is_legal(&state.board, candidate) => candidate,
         Ok(candidate) => {
@@ -251,7 +216,7 @@ fn complete_stockfish(
     commit_move(state, candidate)
 }
 
-fn commit_move(state: &mut ChessState, candidate: ChessMove) -> Vec<ChessEffect> {
+fn commit_move(state: &mut ChessState, candidate: ChessMove) {
     state.board = state.board.make_move_new(candidate);
     state.committed_moves.push(candidate);
 
@@ -261,32 +226,22 @@ fn commit_move(state: &mut ChessState, candidate: ChessMove) -> Vec<ChessEffect>
     if state.committed_moves.len() >= state.ply_limit {
         return finish(state, ChessOutcome::PlyLimitReached);
     }
-    request_next_actor(state)
+    advance_turn(state)
 }
 
-fn request_next_actor(state: &mut ChessState) -> Vec<ChessEffect> {
+fn advance_turn(state: &mut ChessState) {
     if state.board.side_to_move() == state.agent_side {
-        state.retry = RetryState::fresh();
+        state.retry_attempts = 0;
         state.phase = ChessPhase::AwaitingModel;
-        vec![ChessEffect::RequestReaction]
     } else {
         state.phase = ChessPhase::AwaitingStockfish;
-        vec![ChessEffect::RequestStockfish(StockfishRequest {
-            position_revision: state.committed_moves.len(),
-            committed_moves: state.committed_moves.clone(),
-        })]
     }
 }
 
-fn reject_model_action(state: &mut ChessState, reason: InvalidActionReason) -> Vec<ChessEffect> {
-    state.retry = RetryState {
-        attempts: state.retry.attempts.saturating_add(1),
-        last_rejection: Some(reason.clone()),
-    };
+fn reject_model_action(state: &mut ChessState, reason: InvalidActionReason) {
+    state.retry_attempts = state.retry_attempts.saturating_add(1);
     state.feedback = ChessFeedback::Rejected(reason.clone());
-    if state.retry.attempts < MAX_MODEL_ATTEMPTS {
-        vec![ChessEffect::RequestReaction]
-    } else {
+    if state.retry_attempts >= MAX_MODEL_ATTEMPTS {
         finish(
             state,
             ChessOutcome::ModelForfeit {
@@ -302,7 +257,7 @@ fn validate_model_action(
     action: ChessAction,
 ) -> Result<ChessAction, InvalidActionReason> {
     let unavailable = |reason| InvalidActionReason::ActionUnavailable {
-        action: action_kind(action),
+        action: action.kind(),
         reason,
     };
     if state.phase == ChessPhase::Finished {
@@ -328,21 +283,13 @@ fn validate_model_action(
     }
 }
 
-fn action_kind(action: ChessAction) -> ChessActionKind {
-    match action {
-        ChessAction::ChooseMove(_) => ChessActionKind::ChooseMove,
-        ChessAction::Resign => ChessActionKind::Resign,
-    }
-}
-
 fn is_legal(board: &Board, candidate: ChessMove) -> bool {
     MoveGen::new_legal(board).any(|legal| legal == candidate)
 }
 
-fn finish(state: &mut ChessState, outcome: ChessOutcome) -> Vec<ChessEffect> {
+fn finish(state: &mut ChessState, outcome: ChessOutcome) {
     state.phase = ChessPhase::Finished;
-    state.outcome = Some(outcome.clone());
-    vec![ChessEffect::Complete(outcome)]
+    state.outcome = Some(outcome);
 }
 
 fn position_outcome(state: &ChessState) -> Option<ChessOutcome> {
@@ -419,7 +366,7 @@ mod tests {
         let mut state = ChessState::new(100);
         assert_eq!(
             reduce(&mut state, ChessEvent::Start),
-            vec![ChessEffect::RequestReaction]
+            ChessReduction::Applied
         );
         state
     }
@@ -434,7 +381,7 @@ mod tests {
         }
     }
 
-    fn play(state: &mut ChessState, candidate: ChessMove) -> Vec<ChessEffect> {
+    fn play(state: &mut ChessState, candidate: ChessMove) -> ChessReduction {
         if state.board().side_to_move() == state.agent_side() {
             let event = model_event(state, Ok(ChessAction::ChooseMove(candidate)));
             reduce(state, event)
@@ -485,14 +432,11 @@ mod tests {
 
         for expected_attempts in 1..MAX_MODEL_ATTEMPTS {
             let event = model_event(&state, Err(InvalidActionReason::InvalidXml));
+            assert_eq!(reduce(&mut state, event), ChessReduction::Applied);
+            assert_eq!(state.retry_attempts(), expected_attempts);
             assert_eq!(
-                reduce(&mut state, event),
-                vec![ChessEffect::RequestReaction]
-            );
-            assert_eq!(state.retry().attempts(), expected_attempts);
-            assert_eq!(
-                state.retry().last_rejection(),
-                Some(InvalidActionReason::InvalidXml)
+                state.feedback(),
+                ChessFeedback::Rejected(InvalidActionReason::InvalidXml)
             );
             assert_eq!(state.phase(), ChessPhase::AwaitingModel);
         }
@@ -502,27 +446,18 @@ mod tests {
             attempts: MAX_MODEL_ATTEMPTS,
         };
         let event = model_event(&state, Err(InvalidActionReason::InvalidXml));
-        assert_eq!(
-            reduce(&mut state, event),
-            vec![ChessEffect::Complete(outcome.clone())]
-        );
+        assert_eq!(reduce(&mut state, event), ChessReduction::Applied);
         assert_eq!(state.phase(), ChessPhase::Finished);
         assert_eq!(state.outcome(), Some(&outcome));
     }
 
     #[test]
-    fn accepted_white_move_commits_authoritative_state_then_requests_stockfish() {
+    fn accepted_white_move_commits_authoritative_state_then_awaits_stockfish() {
         let mut state = started();
         let white = move_("e2e4");
         let event = model_event(&state, Ok(ChessAction::ChooseMove(white)));
 
-        assert_eq!(
-            reduce(&mut state, event),
-            vec![ChessEffect::RequestStockfish(StockfishRequest {
-                position_revision: 1,
-                committed_moves: vec![white],
-            })]
-        );
+        assert_eq!(reduce(&mut state, event), ChessReduction::Applied);
         assert_eq!(state.committed_moves(), &[white]);
         assert_eq!(state.board(), Board::default().make_move_new(white));
         assert_eq!(state.board().side_to_move(), Color::Black);
@@ -530,26 +465,20 @@ mod tests {
     }
 
     #[test]
-    fn accepted_black_result_commits_authoritative_state_then_requests_reaction() {
+    fn accepted_black_result_commits_authoritative_state_then_awaits_model() {
         let mut state = started();
         let white = move_("e2e4");
         let black = move_("e7e5");
         let event = model_event(&state, Ok(ChessAction::ChooseMove(white)));
-        assert_eq!(
-            reduce(&mut state, event),
-            vec![ChessEffect::RequestStockfish(StockfishRequest {
-                position_revision: 1,
-                committed_moves: vec![white],
-            })]
-        );
+        assert_eq!(reduce(&mut state, event), ChessReduction::Applied);
 
         assert_eq!(
             reduce(&mut state, ChessEvent::StockfishCompleted(Ok(black))),
-            vec![ChessEffect::RequestReaction]
+            ChessReduction::Applied
         );
         assert_eq!(state.committed_moves(), &[white, black]);
         assert_eq!(state.phase(), ChessPhase::AwaitingModel);
-        assert_eq!(state.retry().attempts(), 0);
+        assert_eq!(state.retry_attempts(), 0);
     }
 
     #[test]
@@ -570,7 +499,7 @@ mod tests {
 
             assert_eq!(
                 reduce(&mut state, ChessEvent::Start),
-                vec![ChessEffect::Complete(outcome.clone())]
+                ChessReduction::Applied
             );
             assert_eq!(state.phase(), ChessPhase::Finished);
             assert_eq!(state.outcome(), Some(&outcome));
@@ -584,12 +513,11 @@ mod tests {
         let mut state = ChessState::new(200);
         assert_eq!(
             reduce(&mut state, ChessEvent::Start),
-            vec![ChessEffect::RequestReaction]
+            ChessReduction::Applied
         );
 
         for candidate in history.iter().copied().take(15) {
-            let effects = play(&mut state, candidate);
-            assert_eq!(effects.len(), 1);
+            assert_eq!(play(&mut state, candidate), ChessReduction::Applied);
             assert_ne!(state.phase(), ChessPhase::Finished);
         }
 
@@ -598,7 +526,7 @@ mod tests {
         };
         assert_eq!(
             play(&mut state, *history.last().unwrap()),
-            vec![ChessEffect::Complete(outcome.clone())]
+            ChessReduction::Applied
         );
         assert_eq!(state.outcome(), Some(&outcome));
     }
@@ -609,12 +537,11 @@ mod tests {
         let mut state = ChessState::new(200);
         assert_eq!(
             reduce(&mut state, ChessEvent::Start),
-            vec![ChessEffect::RequestReaction]
+            ChessReduction::Applied
         );
 
         for candidate in history.iter().copied().take(149) {
-            let effects = play(&mut state, candidate);
-            assert_eq!(effects.len(), 1);
+            assert_eq!(play(&mut state, candidate), ChessReduction::Applied);
             assert_ne!(state.phase(), ChessPhase::Finished);
         }
 
@@ -623,13 +550,13 @@ mod tests {
         };
         assert_eq!(
             play(&mut state, *history.last().unwrap()),
-            vec![ChessEffect::Complete(outcome.clone())]
+            ChessReduction::Applied
         );
         assert_eq!(state.outcome(), Some(&outcome));
     }
 
     #[test]
-    fn terminal_completion_is_emitted_once_and_later_events_have_no_effect() {
+    fn terminal_completion_is_applied_once_and_later_events_are_ignored() {
         let mut state = started();
         let outcome = ChessOutcome::Resignation {
             resigned: Color::White,
@@ -637,29 +564,33 @@ mod tests {
         };
         let event = model_event(&state, Ok(ChessAction::Resign));
 
-        assert_eq!(
-            reduce(&mut state, event),
-            vec![ChessEffect::Complete(outcome.clone())]
-        );
+        assert_eq!(reduce(&mut state, event), ChessReduction::Applied);
         let terminal_state = state.clone();
 
-        assert!(reduce(&mut state, ChessEvent::Start).is_empty());
-        assert!(reduce(
-            &mut state,
-            ChessEvent::ModelAction {
-                attempt: ModelAttemptKey {
-                    ply: 0,
-                    attempt_index: 0,
+        assert_eq!(
+            reduce(&mut state, ChessEvent::Start),
+            ChessReduction::Ignored
+        );
+        assert_eq!(
+            reduce(
+                &mut state,
+                ChessEvent::ModelAction {
+                    attempt: ModelAttemptKey {
+                        ply: 0,
+                        attempt_index: 0,
+                    },
+                    result: Err(InvalidActionReason::InvalidXml),
                 },
-                result: Err(InvalidActionReason::InvalidXml),
-            },
-        )
-        .is_empty());
-        assert!(reduce(
-            &mut state,
-            ChessEvent::StockfishCompleted(Err(StockfishFailure::TimedOut)),
-        )
-        .is_empty());
+            ),
+            ChessReduction::Ignored
+        );
+        assert_eq!(
+            reduce(
+                &mut state,
+                ChessEvent::StockfishCompleted(Err(StockfishFailure::TimedOut)),
+            ),
+            ChessReduction::Ignored
+        );
         assert_eq!(state, terminal_state);
         assert_eq!(state.outcome(), Some(&outcome));
     }
@@ -672,14 +603,11 @@ mod tests {
             attempt: first_attempt,
             result: Err(InvalidActionReason::InvalidXml),
         };
-        assert_eq!(
-            reduce(&mut state, first.clone()),
-            vec![ChessEffect::RequestReaction]
-        );
-        assert_eq!(state.retry().attempts(), 1);
+        assert_eq!(reduce(&mut state, first.clone()), ChessReduction::Applied);
+        assert_eq!(state.retry_attempts(), 1);
 
         let after_first = state.clone();
-        assert!(reduce(&mut state, first).is_empty());
+        assert_eq!(reduce(&mut state, first), ChessReduction::Ignored);
         assert_eq!(state, after_first);
         assert_eq!(
             state.current_attempt(),

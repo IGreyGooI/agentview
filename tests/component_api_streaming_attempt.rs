@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     convert::Infallible,
     num::{NonZeroU128, NonZeroU64},
+    ops::ControlFlow,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -11,9 +12,9 @@ use std::{
 use agentview::{
     component::{
         execution::{
-            Application, Frame, FrameCapabilities, FrameConstraints, FrameProfile, ProviderFact,
-            ProviderFactStream, ProviderOutputKey, ReactionPort, ReactionPortFault, SubmitFault,
-            TargetDeclaration, TargetEpoch, TargetIdentity,
+            Application, ExitReason, Frame, FrameCapabilities, FrameConstraints, FrameProfile,
+            ProviderFact, ProviderFactStream, ProviderOutputKey, ReactionPort, ReactionPortFault,
+            SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity,
         },
         prelude::*,
     },
@@ -27,6 +28,7 @@ struct Probe {
     rejected: Arc<Mutex<Vec<String>>>,
     states: Arc<AtomicUsize>,
     submits: Arc<AtomicUsize>,
+    handoffs: Arc<AtomicUsize>,
 }
 
 struct Channels;
@@ -166,6 +168,8 @@ struct Port {
     declaration: TargetDeclaration,
     scripts: VecDeque<Vec<ProviderFact>>,
     probe: Probe,
+    continuity_rejections: usize,
+    on_continuity_rejection: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Port {
@@ -186,7 +190,20 @@ impl Port {
             ),
             scripts: scripts.into(),
             probe,
+            continuity_rejections: 0,
+            on_continuity_rejection: None,
         }
+    }
+
+    fn with_continuity_rejection(
+        probe: Probe,
+        scripts: Vec<Vec<ProviderFact>>,
+        on_continuity_rejection: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let mut port = Self::new(probe, scripts);
+        port.continuity_rejections = 1;
+        port.on_continuity_rejection = Some(on_continuity_rejection);
+        port
     }
 }
 
@@ -197,10 +214,31 @@ impl ReactionPort for Port {
     }
 
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
-        frame.check_handoff_precondition(&self.declaration)?;
         self.probe.submits.fetch_add(1, Ordering::SeqCst);
+        if self.continuity_rejections > 0 {
+            self.continuity_rejections -= 1;
+            if let Some(on_rejection) = &self.on_continuity_rejection {
+                on_rejection();
+            }
+            let next_epoch = self
+                .declaration
+                .continuity()
+                .epoch()
+                .get()
+                .get()
+                .checked_add(1)
+                .and_then(NonZeroU64::new)
+                .expect("test epoch space");
+            self.declaration = TargetDeclaration::full(
+                self.declaration.identity(),
+                TargetEpoch::new(next_epoch),
+                self.declaration.profile().clone(),
+            );
+        }
+        frame.check_handoff_precondition(&self.declaration)?;
         self.declaration =
             TargetDeclaration::resume(frame.revision(), frame.prepared_profile().clone());
+        self.probe.handoffs.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(futures::stream::iter(
             self.scripts
                 .pop_front()
@@ -209,6 +247,10 @@ impl ReactionPort for Port {
                 .map(Ok),
         )))
     }
+}
+
+fn assert_continue(flow: ControlFlow<ExitReason>) {
+    assert_eq!(flow, ControlFlow::Continue(()));
 }
 
 fn text_facts(chunks: &[&str]) -> Vec<ProviderFact> {
@@ -268,10 +310,10 @@ async fn separate_components_independently_parse_the_same_tag_each_reaction() {
     )
     .unwrap();
     assert_eq!(probe.states.load(Ordering::SeqCst), 0);
-    app.prepare().await.unwrap();
+    assert_continue(app.prepare().await.unwrap());
     assert_eq!(probe.states.load(Ordering::SeqCst), 0);
-    app.react().await.unwrap();
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().await.unwrap());
     let mut actual = probe.published.lock().unwrap().clone();
     actual.sort();
     assert_eq!(
@@ -297,7 +339,7 @@ async fn rejecting_one_contract_does_not_reject_or_rollback_another() {
         Port::new(probe.clone(), vec![text_facts(&["<say>accepted</say>"])]),
     )
     .unwrap();
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     assert_eq!(
         *probe.published.lock().unwrap(),
         vec![("second".into(), "accepted".into())]
@@ -318,7 +360,7 @@ async fn foreign_element_policy_is_local_to_each_contract() {
         ),
     )
     .unwrap();
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     let mut actual = probe.published.lock().unwrap().clone();
     actual.sort();
     assert_eq!(
@@ -370,7 +412,7 @@ async fn commentary_is_not_parsed_and_sealed_only_text_is_still_consumed() {
         Port::new(probe.clone(), vec![facts]),
     )
     .unwrap();
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     assert_eq!(
         *probe.published.lock().unwrap(),
         vec![("answer".into(), "answer".into())]
@@ -390,11 +432,59 @@ async fn empty_reactions_finalize_each_contract_without_fake_text_completion() {
         ),
     )
     .unwrap();
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     let mut rejected = probe.rejected.lock().unwrap().clone();
     rejected.sort();
     assert_eq!(rejected, vec!["first", "second"]);
     assert!(probe.published.lock().unwrap().is_empty());
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exit_from_a_continuity_rejection_prevents_retry_submission() {
+    let probe = Probe::default();
+    let exit = Arc::new(Mutex::new(None::<ApplicationExitHandle>));
+    let exit_on_rejection = Arc::clone(&exit);
+    let port = Port::with_continuity_rejection(
+        probe.clone(),
+        vec![text_facts(&["<say>must-not-run</say>"])],
+        Arc::new(move || {
+            exit_on_rejection
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("host exit handle before provider submit")
+                .request(ExitReason::Requested)
+                .expect("live host exit handle");
+        }),
+    );
+    let mut app = Application::mount(
+        || {
+            text_contract(ContractProps {
+                identity: "continuity-exit",
+                tag: "say",
+                probe: Probe::default(),
+                reject: false,
+                ignore_unknown: false,
+            })
+        },
+        port,
+    )
+    .unwrap();
+    *exit.lock().unwrap() = Some(app.exit_handle());
+
+    assert_eq!(
+        app.react().await.unwrap(),
+        ControlFlow::Break(ExitReason::Requested)
+    );
+    assert_eq!(probe.submits.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.handoffs.load(Ordering::SeqCst), 0);
+    assert!(probe.published.lock().unwrap().is_empty());
+    assert_eq!(
+        app.react().await.unwrap(),
+        ControlFlow::Break(ExitReason::Requested)
+    );
+    assert_eq!(probe.submits.load(Ordering::SeqCst), 1);
     app.shutdown().await.unwrap();
 }
 
@@ -586,7 +676,7 @@ async fn accept_without_publication_still_confirms_live_receipts() {
         Port::new(Probe::default(), vec![text_facts(&["<say>hello</say>"])]),
     )
     .unwrap();
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     assert_eq!(live.confirmed.load(Ordering::SeqCst), 1);
     assert_eq!(live.rolled_back.load(Ordering::SeqCst), 0);
     app.shutdown().await.unwrap();
@@ -646,7 +736,7 @@ async fn dropping_react_keeps_inflight_apply_owned_then_rolls_back_and_allows_re
     );
     assert!(live.active.lock().unwrap().is_empty());
     assert_eq!(live.rolled_back.load(Ordering::SeqCst), 1);
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     assert_eq!(live.confirmed.load(Ordering::SeqCst), 1);
     app.shutdown().await.unwrap();
 }
@@ -775,12 +865,12 @@ async fn shared_state_enforces_think_before_say_and_coalesces_retry_after_cleanu
         ),
     )
     .unwrap();
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     assert!(probe.published.lock().unwrap().is_empty());
     assert_eq!(*probe.rejected.lock().unwrap(), vec!["ordered"]);
     assert!(app.take_reaction_request().unwrap());
     assert!(!app.take_reaction_request().unwrap());
-    app.react().await.unwrap();
+    assert_continue(app.react().await.unwrap());
     assert_eq!(
         *probe.published.lock().unwrap(),
         vec![("ordered".into(), "answer".into())]
@@ -963,7 +1053,87 @@ async fn dropped_recovery_waiter_preserves_publication_and_settled_sibling() {
     assert_eq!(recovery.resolved.load(Ordering::SeqCst), 1);
     assert_eq!(probe.submits.load(Ordering::SeqCst), 1);
     assert_eq!(probe.published.lock().unwrap().len(), 1);
-    app.prepare().await.unwrap();
+    assert_continue(app.prepare().await.unwrap());
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exit_waits_for_indeterminate_publication_recovery_before_breaking() {
+    use agentview::component::execution::{ApplicationFaultKind, StreamingToolRecoveryStatus};
+    use std::time::Duration;
+
+    let probe = Probe::default();
+    let recovery = Arc::new(RecoveryProbe::default());
+    let root_recovery = Arc::clone(&recovery);
+    let mut app = Application::mount(
+        move || {
+            let publisher_probe = Arc::clone(&root_recovery);
+            XmlStreamingToolCall::new::<Channels>("exit-recovery")
+                .state_with(|_| Ok::<_, Infallible>(()))
+                .element(
+                    XmlToolElement::text("say").decode(|_| Ok(()), |_, text| Ok(text.to_owned())),
+                    |handlers| {
+                        handlers.on_complete(|_, event| StreamingToolUpdate::output(event.value))
+                    },
+                )
+                .finish(|_, _| StreamingToolDecision::Accept(StreamingToolUpdate::none()))
+                .without_live()
+                .publish_with(move |_| {
+                    Ok::<_, Infallible>(UncertainPublisher(Arc::clone(&publisher_probe)))
+                })
+                .build()
+        },
+        Port::new(probe.clone(), vec![text_facts(&["<say>answer</say>"])]),
+    )
+    .unwrap();
+    let exit = app.exit_handle();
+
+    assert_eq!(
+        app.react().await.unwrap_err().kind(),
+        ApplicationFaultKind::RecoveryRequired
+    );
+    exit.request(ExitReason::Requested).unwrap();
+    assert_eq!(
+        app.react().await.unwrap_err().kind(),
+        ApplicationFaultKind::RecoveryRequired
+    );
+
+    let mut recovery_waiter = Box::pin(app.recover_streaming_attempt());
+    tokio::select! {
+        _ = recovery.started.notified() => {},
+        result = &mut recovery_waiter => panic!("recovery settled before publisher resolution: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("publisher recovery did not begin"),
+    }
+    drop(recovery_waiter);
+    assert!(matches!(
+        app.recover_streaming_attempt().await.unwrap(),
+        StreamingToolRecoveryStatus::InFlight { .. }
+    ));
+
+    recovery.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match app.recover_streaming_attempt().await.unwrap() {
+                StreamingToolRecoveryStatus::Recovered { .. } => break,
+                StreamingToolRecoveryStatus::InFlight { .. }
+                | StreamingToolRecoveryStatus::StillRequired { .. } => {
+                    tokio::task::yield_now().await
+                }
+                StreamingToolRecoveryStatus::NotRequired => {
+                    panic!("indeterminate publication recovery was lost")
+                }
+            }
+        }
+    })
+    .await
+    .expect("publisher recovery must settle");
+
+    assert_eq!(
+        app.react().await.unwrap(),
+        ControlFlow::Break(ExitReason::Requested)
+    );
+    assert_eq!(probe.submits.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.handoffs.load(Ordering::SeqCst), 1);
     app.shutdown().await.unwrap();
 }
 
@@ -1083,10 +1253,11 @@ async fn native_tool_lanes_keep_running_while_streaming_live_apply_waits() {
         Port::new(Probe::default(), vec![facts]),
     )
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), app.react())
+    let flow = tokio::time::timeout(Duration::from_secs(5), app.react())
         .await
         .expect("native lane must progress during Live apply")
         .unwrap();
+    assert_continue(flow);
     assert_eq!(live.confirmed.load(Ordering::SeqCst), 1);
     app.shutdown().await.unwrap();
 }

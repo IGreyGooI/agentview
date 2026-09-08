@@ -203,9 +203,9 @@ async fn run_reactions_with(first_reaction: ScriptedReaction) -> anyhow::Result<
     let operation_result = async {
         let submissions_at_mount = capture.submission_count();
         wait_for_task_start(&task_started).await?;
-        application.react().await?;
+        anyhow::ensure!(application.react().await?.is_continue());
         let first_handler_completed_before_return = completed_handlers.load(Ordering::SeqCst) == 1;
-        application.react().await?;
+        anyhow::ensure!(application.react().await?.is_continue());
         let current_projection_text =
             projection_text(application.current_projection().projection())?;
         let delta_statuses = delta_statuses

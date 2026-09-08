@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{ops::ControlFlow, sync::Arc};
 
 use agentview::component::{
-    execution::{Application, ApplicationFault, DebugPromptCapture, DebugProviderPort},
+    execution::{Application, ApplicationFault, DebugPromptCapture, DebugProviderPort, ExitReason},
     prelude::*,
 };
 use tokio::sync::Notify;
@@ -35,7 +35,7 @@ fn frame_agent_component(props: AgentProps) -> Component {
     view! { frame_agent { "{value}" } }
 }
 
-async fn run_agent() -> Result<DebugPromptCapture, ApplicationFault> {
+async fn run_agent() -> Result<ControlFlow<ExitReason, DebugPromptCapture>, ApplicationFault> {
     let release = Arc::new(Notify::new());
     let root_release = Arc::clone(&release);
     let (port, capture) = DebugProviderPort::new();
@@ -49,23 +49,32 @@ async fn run_agent() -> Result<DebugPromptCapture, ApplicationFault> {
     )?;
 
     let result = async {
-        application.react().await?;
+        match application.react().await? {
+            ControlFlow::Continue(()) => {}
+            ControlFlow::Break(reason) => return Ok(ControlFlow::Break(reason)),
+        }
         release.notify_one();
         application.wait_for_reaction_request().await?;
         application.react().await
     }
     .await;
     let shutdown = application.shutdown().await;
-    result?;
+    let flow = result?;
     shutdown?;
-    Ok(capture)
+    Ok(match flow {
+        ControlFlow::Continue(()) => ControlFlow::Continue(capture),
+        ControlFlow::Break(reason) => ControlFlow::Break(reason),
+    })
 }
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run_agent().await {
-        eprintln!("frame agent failed: {error}");
-        std::process::exit(1);
+    match run_agent().await {
+        Ok(ControlFlow::Continue(_)) | Ok(ControlFlow::Break(_)) => {}
+        Err(error) => {
+            eprintln!("frame agent failed: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -79,7 +88,10 @@ mod tests {
         let mut application =
             Application::mount(frame_workflow_golden::shared_frame_workflow_root, port).unwrap();
 
-        application.react().await.unwrap();
+        assert_eq!(
+            application.react().await.unwrap(),
+            ControlFlow::Continue(())
+        );
         let frame = capture.latest_frame().unwrap();
         let basis = frame.basis();
         let payload = frame.canonical_payload().to_vec();
@@ -91,7 +103,10 @@ mod tests {
 
     #[tokio::test]
     async fn component_future_requests_a_second_delta_reaction_after_publishing_state() {
-        let capture = run_agent().await.unwrap();
+        let capture = match run_agent().await.unwrap() {
+            ControlFlow::Continue(capture) => capture,
+            ControlFlow::Break(reason) => panic!("frame agent exited early: {reason:?}"),
+        };
         let frames = capture.frame_snapshots();
 
         assert_eq!(frames.len(), 2);
