@@ -62,11 +62,41 @@ fn take_admission_work() -> usize {
 pub(super) struct AdmittedProviderFact {
     event: Option<ProviderEvent>,
     tool_lane: Option<ToolLaneTicket>,
+    structured_text: Option<AdmittedTextFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AdmittedTextFact {
+    Delta {
+        output: ProviderOutputKey,
+        phase: Option<AssistantPhase>,
+        delta: String,
+    },
+    Sealed {
+        output: ProviderOutputKey,
+        phase: Option<AssistantPhase>,
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AdmittedReactionSummary {
+    pub(super) primary_text: Option<ProviderOutputKey>,
 }
 
 impl AdmittedProviderFact {
     pub(super) fn into_parts(self) -> (Option<ProviderEvent>, Option<ToolLaneTicket>) {
         (self.event, self.tool_lane)
+    }
+
+    pub(super) fn into_structured_parts(
+        self,
+    ) -> (
+        Option<ProviderEvent>,
+        Option<ToolLaneTicket>,
+        Option<AdmittedTextFact>,
+    ) {
+        (self.event, self.tool_lane, self.structured_text)
     }
 }
 
@@ -493,6 +523,7 @@ impl<'a> ReactionAdmissionGuard<'a> {
             });
         }
 
+        let mut structured_text = None;
         let (event, tool_lane) = match fact {
             ProviderFact::TextDelta {
                 output,
@@ -500,6 +531,11 @@ impl<'a> ReactionAdmissionGuard<'a> {
                 delta,
             } => {
                 self.admit_text_delta(output, phase, &delta)?;
+                structured_text = Some(AdmittedTextFact::Delta {
+                    output,
+                    phase,
+                    delta: delta.clone(),
+                });
                 (
                     Some(ProviderEvent::Text(TextTurnEvent::TextDelta(delta))),
                     None,
@@ -510,7 +546,12 @@ impl<'a> ReactionAdmissionGuard<'a> {
                 phase,
                 text,
             } => {
-                self.admit_text_sealed(output, phase, text)?;
+                self.admit_text_sealed(output, phase, text.clone())?;
+                structured_text = Some(AdmittedTextFact::Sealed {
+                    output,
+                    phase,
+                    text,
+                });
                 (None, None)
             }
             ProviderFact::ToolCall {
@@ -574,7 +615,11 @@ impl<'a> ReactionAdmissionGuard<'a> {
         // Every fallible check precedes the state changes above. Constructing
         // this wrapper is infallible, so a returned event proves its canonical
         // incremental tail is already authoritative.
-        Ok(AdmittedProviderFact { event, tool_lane })
+        Ok(AdmittedProviderFact {
+            event,
+            tool_lane,
+            structured_text,
+        })
     }
 
     pub(super) fn stage_tool_output(
@@ -612,18 +657,26 @@ impl<'a> ReactionAdmissionGuard<'a> {
     }
 
     /// Finish a grammatically complete reaction and restore canonical history.
-    pub(super) fn finish_normal(&mut self) -> Result<(), ReactionAdmissionFault> {
+    pub(super) fn finish_normal(
+        &mut self,
+    ) -> Result<AdmittedReactionSummary, ReactionAdmissionFault> {
         if self.state.terminal.is_none() {
             return Err(ReactionAdmissionFault::MissingCompletion);
         }
         self.staging.ensure_resolved(&self.tool_registrations)?;
+        let summary = AdmittedReactionSummary {
+            primary_text: self
+                .state
+                .terminal
+                .expect("normal completion was validated"),
+        };
         if self.finished {
-            return Ok(());
+            return Ok(summary);
         }
 
         self.restore_transcript();
         self.finished = true;
-        Ok(())
+        Ok(summary)
     }
 
     pub(super) fn finish_cancelled(&mut self) {
@@ -1296,7 +1349,7 @@ fn sanitize_staging_budget_fault(error: FrameBudgetFault) -> ToolOutputStagingFa
 mod tests {
     use std::{
         error::Error,
-        num::{NonZeroU128, NonZeroU64},
+        num::{NonZeroU64, NonZeroU128},
     };
 
     use crate::{
@@ -1308,8 +1361,8 @@ mod tests {
             },
         },
         transcript::{
-            reset_construction_work, take_construction_work, AssistantTextStatus,
-            CanonicalInputItem,
+            AssistantTextStatus, CanonicalInputItem, reset_construction_work,
+            take_construction_work,
         },
     };
 
@@ -2303,40 +2356,48 @@ mod tests {
             .stage_tool_output(ticket, call.output("too-large".repeat(512)))
             .unwrap_err();
         assert_eq!(fault.reason(), ToolOutputStagingReason::Budget);
-        assert!(guard
-            .staging
-            .slots
-            .get(&retry.registration)
-            .unwrap()
-            .output
-            .is_none());
-        assert!(guard
-            .staging
-            .slots
-            .get(&retry.registration)
-            .unwrap()
-            .cancellation_fallback
-            .is_some());
+        assert!(
+            guard
+                .staging
+                .slots
+                .get(&retry.registration)
+                .unwrap()
+                .output
+                .is_none()
+        );
+        assert!(
+            guard
+                .staging
+                .slots
+                .get(&retry.registration)
+                .unwrap()
+                .cancellation_fallback
+                .is_some()
+        );
 
         guard
             .stage_tool_output(retry, call.output("small"))
             .unwrap();
-        assert!(guard
-            .staging
-            .slots
-            .values()
-            .next()
-            .unwrap()
-            .output
-            .is_some());
-        assert!(guard
-            .staging
-            .slots
-            .values()
-            .next()
-            .unwrap()
-            .cancellation_fallback
-            .is_none());
+        assert!(
+            guard
+                .staging
+                .slots
+                .values()
+                .next()
+                .unwrap()
+                .output
+                .is_some()
+        );
+        assert!(
+            guard
+                .staging
+                .slots
+                .values()
+                .next()
+                .unwrap()
+                .cancellation_fallback
+                .is_none()
+        );
     }
 
     #[test]

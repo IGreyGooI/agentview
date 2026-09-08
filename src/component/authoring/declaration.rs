@@ -42,6 +42,7 @@ pub(crate) enum ComponentNode {
     EventListener(EventListenerDeclaration),
     StreamingXmlTag(Box<StreamingXmlTagDeclaration>),
     XmlStreamingToolCall(Box<XmlStreamingToolCallDeclaration>),
+    StreamingAttempt(Box<super::streaming_attempt::ContractDeclaration>),
     NativeToolCall(Box<super::native_tool::NativeToolCallDeclaration>),
 }
 

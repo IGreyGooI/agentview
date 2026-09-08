@@ -26,8 +26,10 @@ use super::{
     event_input::EventInputOrigin,
     event_listener::EventListenerDispatchFault,
     native_tool::{await_output, NativeToolCallDeclaration, NativeToolDispatchFault},
+    preparation::PreparationSet,
     reaction_completion::{ReactionCompletionDeclaration, ReactionCompletionDispatchFault},
     render_context::HookRenderContext,
+    streaming_attempt::ContractDeclaration,
     streaming_xml::{
         MountedStreamingRoute, ParsedContractEvent, StreamingXmlDispatchFault,
         StreamingXmlMountFault,
@@ -54,6 +56,7 @@ type NativeToolFuture = Pin<
 /// The stage is consumed after the Provider-facing transcript is copied out.
 pub(crate) struct ComponentRenderStage<Root> {
     projection: RenderedProjection,
+    preparations: PreparationSet,
     bindings: RenderBindings<Root>,
     task_starts: Vec<MountTaskStart>,
 }
@@ -171,6 +174,7 @@ where
     ) -> Result<(Self, Option<ResolvedDocument>), ComponentAttemptFault> {
         let mut listeners = Vec::new();
         let mut reaction_completions = Vec::new();
+        let mut preparations = PreparationSet::default();
         let mut native_tools = Vec::new();
         let mut task_starts = Vec::new();
         let root_id = ComponentId::root();
@@ -191,6 +195,7 @@ where
             signal_render,
             &mut listeners,
             &mut reaction_completions,
+            &mut preparations,
             &mut native_tools,
             &mut task_starts,
             &mut capture,
@@ -198,6 +203,7 @@ where
         rendered?;
 
         let streaming_routes = build_streaming_routes(&listeners)?;
+        let streaming_contracts = std::mem::take(&mut capture.streaming_contracts);
         let system_candidate = capture.resolve_system_candidate()?;
         let projection = capture.into_projection(system_candidate.as_ref())?;
         let projection = RenderedProjection::with_native_tool_names(
@@ -213,11 +219,13 @@ where
         Ok((
             Self {
                 projection,
+                preparations,
                 bindings: RenderBindings {
                     listeners,
                     reaction_completions,
                     native_tools,
                     streaming_routes,
+                    streaming_contracts,
                     finished: false,
                     faulted: false,
                     marker: std::marker::PhantomData,
@@ -236,8 +244,10 @@ where
         self.projection = projection;
     }
 
-    pub(crate) fn into_execution_parts(self) -> (RenderBindings<Root>, Vec<MountTaskStart>) {
-        (self.bindings, self.task_starts)
+    pub(crate) fn into_execution_parts(
+        self,
+    ) -> (PreparationSet, RenderBindings<Root>, Vec<MountTaskStart>) {
+        (self.preparations, self.bindings, self.task_starts)
     }
 
     #[cfg(test)]
@@ -257,6 +267,7 @@ pub(crate) struct RenderBindings<Root> {
     reaction_completions: Vec<ReactionCompletionDeclaration>,
     native_tools: Vec<NativeToolCallDeclaration>,
     streaming_routes: Vec<MountedStreamingRoute>,
+    streaming_contracts: Vec<ContractDeclaration>,
     finished: bool,
     faulted: bool,
     marker: std::marker::PhantomData<fn(Root)>,
@@ -266,6 +277,10 @@ impl<Root> RenderBindings<Root>
 where
     Root: Send + Sync + 'static,
 {
+    pub(crate) fn take_streaming_contracts(&mut self) -> Vec<ContractDeclaration> {
+        std::mem::take(&mut self.streaming_contracts)
+    }
+
     /// Dispatch one immutable root event without rendering.
     pub(crate) async fn dispatch(&mut self, event: Root) -> Result<(), ComponentAttemptFault> {
         self.ensure_open()?;
@@ -424,6 +439,7 @@ fn visit_render(
     signal_render: &mut SignalRenderTransaction<'_>,
     listeners: &mut Vec<MountedListener>,
     reaction_completions: &mut Vec<ReactionCompletionDeclaration>,
+    preparations: &mut PreparationSet,
     native_tools: &mut Vec<NativeToolCallDeclaration>,
     task_starts: &mut Vec<MountTaskStart>,
     capture: &mut RenderCapture,
@@ -447,6 +463,7 @@ fn visit_render(
                     signal_render,
                     listeners,
                     reaction_completions,
+                    preparations,
                     native_tools,
                     task_starts,
                     capture,
@@ -493,6 +510,7 @@ fn visit_render(
                         tasks,
                         listeners,
                         reaction_completions,
+                        preparations,
                         task_starts,
                     },
                 )?,
@@ -513,6 +531,7 @@ fn visit_render(
                 signal_render,
                 listeners,
                 reaction_completions,
+                preparations,
                 native_tools,
                 task_starts,
                 capture,
@@ -543,6 +562,7 @@ fn visit_render(
                 signal_render,
                 listeners,
                 reaction_completions,
+                preparations,
                 native_tools,
                 task_starts,
                 capture,
@@ -561,7 +581,7 @@ fn visit_render(
                     .map_err(ComponentCaptureError::from)?;
                 capture.push(
                     owner,
-                    Placement::User,
+                    forced.unwrap_or(Placement::User),
                     document.into_children(),
                     Some((address.structural_path, address.slot)),
                 )?;
@@ -580,6 +600,7 @@ fn visit_render(
                     signal_render,
                     listeners,
                     reaction_completions,
+                    preparations,
                     native_tools,
                     task_starts,
                     capture,
@@ -622,6 +643,18 @@ fn visit_render(
             capture.push(owner, placement, document.into_children(), None)?;
             listeners.push(MountedListener::new_streaming(*declaration, event_origin)?);
         }
+        ComponentNode::StreamingAttempt(declaration) => {
+            let placement = forced.unwrap_or(Placement::User);
+            if placement == Placement::SystemOnce {
+                return Err(ComponentAttemptFault::SystemAttemptLocal {
+                    component: owner.to_string(),
+                    capability: "XmlStreamingToolCall/attempt",
+                });
+            }
+            let document = declaration.validate_and_prompt()?;
+            capture.push(owner, placement, document.into_children(), None)?;
+            capture.streaming_contracts.push(*declaration);
+        }
         ComponentNode::NativeToolCall(declaration) => {
             if forced == Some(Placement::SystemOnce) {
                 return Err(ComponentAttemptFault::SystemAttemptLocal {
@@ -645,6 +678,7 @@ struct HookInvocationContext<'render> {
     tasks: Option<&'render MountTaskHandle>,
     listeners: &'render mut Vec<MountedListener>,
     reaction_completions: &'render mut Vec<ReactionCompletionDeclaration>,
+    preparations: &'render mut PreparationSet,
     task_starts: &'render mut Vec<MountTaskStart>,
 }
 
@@ -661,6 +695,7 @@ fn invoke_repeatable(
         tasks,
         listeners,
         reaction_completions,
+        preparations,
         task_starts,
     } = context;
     let mut provider_handlers = Vec::new();
@@ -673,6 +708,7 @@ fn invoke_repeatable(
                     event_origin,
                     &mut provider_handlers,
                     &mut local_reaction_completions,
+                    preparations,
                     task_starts,
                     driver_demand,
                     tasks,
@@ -683,6 +719,7 @@ fn invoke_repeatable(
                     event_origin,
                     &mut provider_handlers,
                     &mut local_reaction_completions,
+                    preparations,
                     task_starts,
                     driver_demand,
                     tasks,
@@ -710,6 +747,7 @@ fn ensure_depth(depth: usize) -> Result<(), ComponentAttemptFault> {
 }
 
 struct RenderCapture {
+    streaming_contracts: Vec<ContractDeclaration>,
     system: BlockChildren,
     nodes: Vec<ProjectionNodeCapture>,
     last_run: Option<ProjectionRunAddress>,
@@ -722,6 +760,7 @@ impl RenderCapture {
         let mut node_indexes = HashMap::new();
         node_indexes.insert(root.clone(), 0);
         Self {
+            streaming_contracts: Vec::new(),
             system: BlockChildren::new(),
             nodes: vec![ProjectionNodeCapture {
                 identity: root,
@@ -859,7 +898,7 @@ impl RenderCapture {
         forced: Option<Placement>,
     ) -> Result<Option<DiffAddress>, ComponentAttemptFault> {
         validate_diff_slot(slot)?;
-        if forced.is_some_and(|placement| placement != Placement::User) {
+        if forced == Some(Placement::SystemOnce) {
             return Ok(None);
         }
         let address = DiffAddress {
@@ -913,6 +952,30 @@ fn validate_diff_slot(slot: &'static str) -> Result<(), ComponentAttemptFault> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ComponentAttemptFault {
+    #[error("invalid streaming element declaration in contract `{contract}`")]
+    InvalidStreamingToolElementName {
+        contract: &'static str,
+        element: &'static str,
+        detail: String,
+    },
+    #[error("invalid streaming attribute declaration in contract `{contract}`")]
+    InvalidStreamingToolAttributeName {
+        contract: &'static str,
+        element: &'static str,
+        attribute: &'static str,
+        detail: String,
+    },
+    #[error("duplicate streaming element `{element}` in contract `{contract}`")]
+    DuplicateStreamingToolElement {
+        contract: &'static str,
+        element: &'static str,
+    },
+    #[error("duplicate streaming attribute `{attribute}` in contract `{contract}`")]
+    DuplicateStreamingToolAttribute {
+        contract: &'static str,
+        element: &'static str,
+        attribute: &'static str,
+    },
     #[error("provider stream lifecycle has already finished")]
     AfterStreamFinish,
     #[error("render bindings are no longer active")]

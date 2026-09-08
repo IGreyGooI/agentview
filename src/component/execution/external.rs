@@ -1,10 +1,10 @@
 use std::{
     future::Future,
-    num::{NonZeroU128, NonZeroU64},
+    num::{NonZeroU64, NonZeroU128},
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     task::Poll,
     vec::IntoIter,
@@ -25,6 +25,7 @@ use crate::{
 };
 
 use super::{
+    ProviderEvent, ProviderFault,
     application::{Application, ApplicationFault},
     reaction::{
         Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
@@ -32,7 +33,6 @@ use super::{
         ReactionPortFaultCode, ReactionPortFaultReason, SubmitFault, TargetDeclaration,
         TargetEpoch, TargetIdentity,
     },
-    ProviderEvent, ProviderFault,
 };
 
 static NEXT_EXTERNAL_TARGET_ID: AtomicU64 = AtomicU64::new(1);

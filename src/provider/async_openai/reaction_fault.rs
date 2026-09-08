@@ -19,6 +19,7 @@ pub(super) enum OpenAiFailureClass {
     Authorization,
     RateLimited,
     UpstreamRetryable,
+    ResponseIncomplete,
     UpstreamRejected,
     ResponseProtocolRetryable,
     ResponseProtocolViolation,
@@ -135,6 +136,11 @@ pub(super) fn map_openai_fault(failure: &OpenAiReactionFailure) -> ReactionPortF
         Class::UpstreamRetryable => (
             ReactionPortFaultKind::Retryable,
             Code::Unavailable,
+            Reason::UpstreamRejected,
+        ),
+        Class::ResponseIncomplete => (
+            ReactionPortFaultKind::Retryable,
+            Code::Rejected,
             Reason::UpstreamRejected,
         ),
         Class::UpstreamRejected => (
@@ -263,6 +269,12 @@ mod tests {
                 Class::UpstreamRetryable,
                 Kind::Retryable,
                 Code::Unavailable,
+                Reason::UpstreamRejected,
+            ),
+            (
+                Class::ResponseIncomplete,
+                Kind::Retryable,
+                Code::Rejected,
                 Reason::UpstreamRejected,
             ),
             (

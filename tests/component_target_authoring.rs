@@ -170,7 +170,7 @@ fn application_host_owns_provider_binding_and_observer_state() {
 }
 
 #[test]
-fn prepared_render_transfers_scoped_projection_and_local_bindings() {
+fn prepared_render_transfers_scoped_projection_preparations_and_local_bindings() {
     assert!(COMPONENT_HOST.contains("let committed = self.begin_managed_render()?;"));
     assert!(COMPONENT_HOST.contains("self.publish_managed_render(committed)"));
     assert!(COMPONENT_HOST
@@ -178,18 +178,21 @@ fn prepared_render_transfers_scoped_projection_and_local_bindings() {
     assert!(COMPONENT_HOST.contains(".with_execution_scope(ProjectionExecutionScope {"));
     assert!(COMPONENT_HOST.contains("candidate.stage_mut().set_projection(projection.clone());"));
     assert!(COMPONENT_HOST.contains("let (stage, _, mounts) = candidate.commit_deferred();"));
-    assert!(COMPONENT_HOST.contains("let (bindings, task_starts) = stage.into_execution_parts();"));
+    assert!(COMPONENT_HOST
+        .contains("let (preparations, bindings, task_starts) = stage.into_execution_parts();"));
     assert!(COMPONENT_HOST.contains("pub(crate) struct CommittedRenderTransition"));
     assert!(COMPONENT_HOST.contains("pub(crate) fn retired_mounts(&self)"));
     assert!(COMPONENT_HOST.contains("mounts.activate();"));
+    assert!(COMPONENT_HOST.contains("preparations: PreparationSet"));
     assert!(COMPONENT_HOST.contains("bindings: RenderBindings<ProviderEvent>"));
     assert!(COMPONENT_HOST.contains("pub(crate) fn into_execution_parts("));
-    assert!(COMPONENT_HOST.contains("(RenderedProjection, RenderBindings<ProviderEvent>)"));
-    assert!(COMPONENT_HOST.contains("(self.projection, self.bindings)"));
+    assert!(COMPONENT_HOST.contains("RenderedProjection,\n        PreparationSet,"));
+    assert!(COMPONENT_HOST.contains("(self.projection, self.preparations, self.bindings)"));
     assert!(APPLICATION_HOST.contains("fn prepare_component_reaction<Props>("));
-    assert!(
-        APPLICATION_HOST.contains("let (projection, bindings) = prepared.into_execution_parts();")
-    );
+    assert!(APPLICATION_HOST
+        .contains("let (projection, preparations, bindings) = prepared.into_execution_parts();"));
+    assert!(APPLICATION_HOST.contains("if !preparations.is_empty()"));
+    assert!(APPLICATION_HOST.contains("ComponentPreparationsUnsupported"));
     assert!(APPLICATION_HOST.contains("async fn dispatch_prepared_reaction<P>("));
     assert!(!COMPONENT_HOST.contains("ComponentHost<Props, Events>"));
 

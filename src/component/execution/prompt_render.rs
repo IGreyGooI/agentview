@@ -3,8 +3,8 @@ use std::fmt::Write as _;
 use crate::{
     pom_renderer::render_pom_document,
     transcript::{
-        AssistantPhase, AssistantTextStatus, CanonicalInputItem, ConversationRole,
-        InstructionAuthority, ASSISTANT_OUTPUT_INTERRUPTED_MARKER,
+        ASSISTANT_OUTPUT_INTERRUPTED_MARKER, AssistantPhase, AssistantTextStatus,
+        CanonicalInputItem, ConversationRole, InstructionAuthority,
     },
 };
 
@@ -98,7 +98,7 @@ fn render_pom(pom: &crate::pom::ResolvedDocument) -> Result<String, ProviderFaul
 
 #[cfg(test)]
 mod tests {
-    use super::{render_prompt_item, ASSISTANT_OUTPUT_INTERRUPTED_MARKER};
+    use super::{ASSISTANT_OUTPUT_INTERRUPTED_MARKER, render_prompt_item};
     use crate::transcript::CanonicalInputItem;
 
     #[test]

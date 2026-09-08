@@ -435,6 +435,40 @@ impl FrameSession {
             .max(self.target_delivery.highest_epoch);
     }
 
+    pub(super) fn can_reset_model_context(&self) -> bool {
+        self.target_delivery
+            .tool_outputs
+            .reserve_outputs()
+            .next()
+            .is_none()
+            && ensure_pending_tool_calls_closed(self.canonical_history.transcript.items(), &[])
+                .is_ok()
+    }
+
+    /// Rebase the next submission on the complete authored projection, while
+    /// preserving this mount's target identity and monotonic revision sequence.
+    pub(super) fn reset_model_context(
+        &mut self,
+        declaration: &TargetDeclaration,
+    ) -> Result<(), FrameSessionFault> {
+        self.validate_declaration(declaration)?;
+        if !matches!(
+            declaration.continuity(),
+            TargetContinuity::FullRequired { .. }
+        ) || declaration.continuity().epoch() <= self.highest_observed_epoch
+        {
+            return Err(FrameSessionFault::InvalidModelContextReset);
+        }
+        debug_assert!(self.can_reset_model_context());
+        self.canonical_history = CanonicalHistoryState::default();
+        self.target_delivery.checkpoint = None;
+        self.target_delivery.committed_revision = None;
+        self.target_delivery.tool_outputs = ToolOutputStaging::default();
+        self.target_delivery.highest_epoch = declaration.continuity().epoch();
+        self.highest_observed_epoch = declaration.continuity().epoch();
+        Ok(())
+    }
+
     /// Returns the mount-stable proof capability used by canonical admission.
     ///
     /// The capability owns only immutable budget constraints. It cannot inspect
@@ -864,6 +898,8 @@ pub(super) enum FrameSessionFault {
     ContinuityResetWithoutEpochAdvance { epoch: TargetEpoch },
     #[error("canonical replay replacement is unsupported by the v1 FrameSession")]
     ReplayReplacementUnsupported,
+    #[error("model context reset did not establish a higher epoch requiring Full")]
+    InvalidModelContextReset,
     #[error(transparent)]
     ProjectionReconciliation(#[from] ProjectionReconciliationFault),
     #[error("Frame revision identity space is exhausted")]
@@ -1134,6 +1170,76 @@ mod tests {
         let revision = frame.revision();
         session.commit(commit);
         revision
+    }
+
+    #[test]
+    fn model_context_reset_rebases_history_and_preserves_revision_sequence() {
+        let profile = profile(true);
+        let declaration = full(profile.clone(), 1);
+        let mut session = FrameSession::new(&declaration).unwrap();
+        commit_first(&mut session, &declaration, &projection(Some("old-input")));
+        session.canonical_history.transcript = session
+            .canonical_history
+            .transcript
+            .appended(CanonicalInputItem::interrupted_assistant_text(
+                "old-output",
+                None,
+            ))
+            .unwrap();
+        let next_sequence = session.target_delivery.next_sequence;
+        let namespace = session.target_delivery.namespace;
+        assert!(session.can_reset_model_context());
+
+        let replacement = full(profile.clone(), 2);
+        session.reset_model_context(&replacement).unwrap();
+        assert!(session.canonical_history.transcript.items().is_empty());
+        assert_eq!(session.target_delivery.next_sequence, next_sequence);
+        assert_eq!(session.target_delivery.namespace, namespace);
+        let complete = projection(Some("authoritative-history-and-new-input"));
+        let prepared = session.prepare(&replacement, &complete).unwrap();
+        assert_eq!(prepared.frame.basis(), FrameBasis::Full);
+        assert!(prepared.frame.submission().replay().is_empty());
+        let (frame, candidate) = prepared.into_parts();
+        let revision = frame.revision();
+        session.commit(candidate);
+
+        let next = session
+            .prepare(&TargetDeclaration::resume(revision, profile), &complete)
+            .unwrap();
+        assert_eq!(next.frame.basis(), FrameBasis::DeltaFrom(revision));
+        assert!(next.frame.submission().projection().items().is_empty());
+    }
+
+    #[test]
+    fn model_context_reset_rejects_nonadvancing_declaration_without_mutation() {
+        let profile = profile(true);
+        let declaration = full(profile.clone(), 1);
+        let mut session = FrameSession::new(&declaration).unwrap();
+        let revision = commit_first(&mut session, &declaration, &projection(Some("retained")));
+        let before = session.canonical_history.transcript.clone();
+        assert!(session.reset_model_context(&declaration).is_err());
+        assert!(session
+            .reset_model_context(&TargetDeclaration::resume(revision, profile))
+            .is_err());
+        assert_eq!(session.canonical_history.transcript, before);
+        assert_eq!(session.target_delivery.committed_revision, Some(revision));
+    }
+
+    #[test]
+    fn model_context_reset_does_not_discard_open_tool_calls() {
+        let mut session = FrameSession::new(&full(profile(true), 1)).unwrap();
+        session.canonical_history.transcript = session
+            .canonical_history
+            .transcript
+            .appended(CanonicalInputItem::tool_call("pending-call", "lookup", "{}").unwrap())
+            .unwrap();
+        assert!(!session.can_reset_model_context());
+        session.canonical_history.transcript = session
+            .canonical_history
+            .transcript
+            .appended(CanonicalInputItem::tool_result("pending-call", "done").unwrap())
+            .unwrap();
+        assert!(session.can_reset_model_context());
     }
 
     #[test]
@@ -1960,6 +2066,7 @@ mod tests {
             guard.finish_normal().unwrap();
         }
         let resume = TargetDeclaration::resume(head, profile);
+        assert!(!session.can_reset_model_context());
         let prepared = session.prepare(&resume, &complete).unwrap();
         assert_eq!(prepared.frame.submission().staged_inputs().len(), 1);
         assert_eq!(
@@ -1996,6 +2103,7 @@ mod tests {
             Some(CanonicalInputItem::ToolResult { call_id, content })
                 if call_id == "call-7" && content == "result"
         ));
+        assert!(session.can_reset_model_context());
     }
 
     #[test]

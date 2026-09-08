@@ -1,0 +1,8 @@
+error[E0308]: mismatched types
+ --> tests/ui/streaming_attempt/fail_missing_completion.rs:6:40
+  |
+6 |         .element(element(), |handlers| handlers.on_open(|_, _| StreamingToolUpdate::none()));
+  |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `XmlElementHandlers<(), ..., (), ..., ...>`, found `XmlElementHandlers<(), ..., (), ...>`
+  |
+  = note: expected struct `XmlElementHandlers<(), Channels, (), std::string::String, ReadyCompletion>`
+             found struct `XmlElementHandlers<(), Channels, (), std::string::String, agentview::component::authoring::MissingCompletion>`

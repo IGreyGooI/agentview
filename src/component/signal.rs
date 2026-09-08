@@ -359,6 +359,7 @@ impl fmt::Display for HookSite {
 #[allow(dead_code)] // Phase 8 hook kinds are wired into authoring incrementally.
 pub(crate) enum HookKind {
     Signal,
+    Preparation,
     ProviderEventHandler,
     ReactionCompletion,
     ReactionRequest,
@@ -397,6 +398,7 @@ impl fmt::Display for HookKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::Signal => "signal",
+            Self::Preparation => "preparation",
             Self::ProviderEventHandler => "provider-event-handler",
             Self::ReactionCompletion => "reaction-completion",
             Self::ReactionRequest => "reaction-request",

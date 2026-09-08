@@ -25,14 +25,16 @@ use super::{
     projection_diff::ProjectionReconciliationFault,
     reaction::{
         ProviderFactStream, ReactionPort, ReactionPortFault, ReactionPortFaultCode,
-        ReactionPortFaultKind, ReactionPortFaultReason, SubmitFault, TargetDeclaration,
-        TargetDeclarationInvariantFault,
+        ReactionPortFaultKind, ReactionPortFaultReason, ResettableReactionPort, SubmitFault,
+        TargetDeclaration, TargetDeclarationInvariantFault,
     },
+    streaming::{StreamingSupervisor, StreamingToolRecoveryStatus},
 };
 use crate::component::{
     authoring::{
+        streaming_attempt::{StreamingToolAbortCause, StreamingToolDriverFault},
         Component, ComponentAttemptFault, InternalEventInput as EventInput, MountTaskStart,
-        RenderBindings, SpawnError,
+        PreparationFault, PreparationRun, RenderBindings, SpawnError,
     },
     host::CommittedRenderTransition,
     host::ComponentHost,
@@ -51,6 +53,8 @@ fn render_root(root: RootFactory, events: EventInput<ProviderEvent>) -> Componen
 
 const APPLICATION_READY: u8 = 0;
 const APPLICATION_TERMINATED_AFTER_TASK_PANIC: u8 = 2;
+const APPLICATION_TERMINATED_AFTER_CONTEXT_RESET: u8 = 3;
+const MAX_PREPARATION_WAVES: usize = 16;
 
 fn consume_supervised_task_panic(application_state: &Arc<AtomicU8>, monitor: &TaskPanicMonitor) {
     if application_state.swap(APPLICATION_TERMINATED_AFTER_TASK_PANIC, Ordering::AcqRel)
@@ -78,6 +82,11 @@ fn application_terminal_state_fault(
     match state {
         APPLICATION_READY => None,
         APPLICATION_TERMINATED_AFTER_TASK_PANIC => Some(task_panic_terminal_fault(stage)),
+        APPLICATION_TERMINATED_AFTER_CONTEXT_RESET => Some(ApplicationFault::terminal(
+            stage,
+            ApplicationFaultCode::Protocol,
+            ApplicationFaultReason::InvalidModelContextReset,
+        )),
         _ => Some(ApplicationFault::terminal(
             stage,
             ApplicationFaultCode::Internal,
@@ -139,8 +148,8 @@ fn application_fault_from_outer_driver_boundary(
     }
 }
 
-fn drop_reaction_before_panic_arbitration<T>(reaction: T, monitor: &TaskPanicMonitor) {
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(reaction))) {
+fn drop_driver_future_before_panic_arbitration<T>(future: T, monitor: &TaskPanicMonitor) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(future))) {
         if monitor.status() != TaskSupervisorStatus::Panicked {
             resume_unwind(payload);
         }
@@ -231,6 +240,7 @@ pub struct Application<P: ReactionPort> {
     declaration: TargetDeclaration,
     port: P,
     state: Arc<AtomicU8>,
+    streaming: StreamingSupervisor,
 }
 
 struct PendingApplicationRender {
@@ -246,6 +256,7 @@ pub struct ProjectionSnapshot<'a> {
     projection: &'a RenderedProjection,
     revision: u64,
     dirty: bool,
+    prepared: bool,
 }
 
 impl ProjectionSnapshot<'_> {
@@ -259,6 +270,10 @@ impl ProjectionSnapshot<'_> {
 
     pub const fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub const fn is_prepared(&self) -> bool {
+        self.prepared
     }
 }
 
@@ -332,6 +347,7 @@ impl<P: ReactionPort> Application<P> {
             declaration,
             port,
             state: Arc::new(AtomicU8::new(APPLICATION_READY)),
+            streaming: StreamingSupervisor::default(),
         };
         let committed = application
             .components
@@ -421,6 +437,20 @@ impl<P: ReactionPort> Application<P> {
 
     /// Fence the mounted tree, then abort and await every Component-owned task.
     pub async fn shutdown(mut self) -> Result<(), ApplicationFault> {
+        if self.streaming.pending() {
+            self.streaming
+                .abort(StreamingToolAbortCause::Cancelled)
+                .await;
+            while !self.streaming.clear() {
+                self.streaming.recover().await;
+                if !self.streaming.clear() {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }
+            if let Some(payload) = self.streaming.take_panic_if_clear() {
+                resume_unwind(payload);
+            }
+        }
         let application_state = Arc::clone(&self.state);
         let monitor = self.tasks.panic_monitor();
         let panic_already_consumed =
@@ -482,6 +512,104 @@ impl<P: ReactionPort> Application<P> {
             projection,
             revision,
             dirty: self.components.is_dirty() || self.pending_render.is_some(),
+            prepared: self.components.current_projection_is_prepared(),
+        }
+    }
+
+    /// Resolve retained contract operations without starting a provider reaction.
+    /// Dropping this waiter leaves already started worker operations running.
+    pub async fn recover_streaming_attempt(
+        &mut self,
+    ) -> Result<StreamingToolRecoveryStatus, ApplicationFault> {
+        let monitor = self.tasks.panic_monitor();
+        begin_outer_driver_boundary(&self.state, &monitor).map_err(|fault| {
+            application_fault_from_outer_driver_boundary(
+                ApplicationFaultStage::StreamingRecovery,
+                fault,
+            )
+        })?;
+        if !self.streaming.pending() {
+            return Ok(StreamingToolRecoveryStatus::NotRequired);
+        }
+        if self.streaming.busy() {
+            return Ok(StreamingToolRecoveryStatus::InFlight {
+                attempts: self.streaming.reports(),
+            });
+        }
+        self.streaming.recover().await;
+        if !self.streaming.clear() {
+            return Ok(StreamingToolRecoveryStatus::StillRequired {
+                attempts: self.streaming.reports(),
+            });
+        }
+        let attempts = self.streaming.reports();
+        let reaction_requested = self.streaming.reaction_requested();
+        self.complete_streaming_cleanup().await?;
+        Ok(StreamingToolRecoveryStatus::Recovered {
+            attempts,
+            reaction_requested,
+        })
+    }
+
+    async fn complete_streaming_cleanup(&mut self) -> Result<(), ApplicationFault> {
+        if !self.streaming.pending() {
+            return Ok(());
+        }
+        if !self.streaming.clear() {
+            return Err(ApplicationFault::streaming_recovery());
+        }
+        if let Some(payload) = self.streaming.take_panic_if_clear() {
+            resume_unwind(payload);
+        }
+        if self.components.is_dirty() {
+            if let Err(fault) = self
+                .reconcile_components(ApplicationFaultStage::PostReconcile)
+                .await
+            {
+                self.streaming.saved_fault.get_or_insert(fault);
+                return Err(fault);
+            }
+        }
+        let request = self.streaming.reaction_requested();
+        self.streaming.release();
+        self.driver_demand.release_streaming(request);
+        Ok(())
+    }
+
+    /// Run preparation without submitting a provider reaction.
+    pub async fn prepare(&mut self) -> Result<(), ApplicationFault> {
+        let stage = ApplicationFaultStage::Preparation;
+        let application_state = Arc::clone(&self.state);
+        let monitor = self.tasks.panic_monitor();
+        begin_outer_driver_boundary(&application_state, &monitor)
+            .map_err(|fault| application_fault_from_outer_driver_boundary(stage, fault))?;
+        self.complete_streaming_cleanup().await?;
+        let mut preparation = Box::pin(self.prepare_components());
+        let result = tokio::select! {
+            biased;
+            task = monitor.wait() => {
+                drop_driver_future_before_panic_arbitration(preparation, &monitor);
+                return match task {
+                    Ok(()) => {
+                        consume_supervised_task_panic(&application_state, &monitor);
+                        Err(task_panic_terminal_fault(stage))
+                    }
+                    Err(source) => Err(ApplicationFault::from_task_supervisor(stage, source)),
+                };
+            }
+            result = &mut preparation => result,
+        };
+        drop_driver_future_before_panic_arbitration(preparation, &monitor);
+        match monitor.status() {
+            TaskSupervisorStatus::Healthy => result.map(|_| ()),
+            TaskSupervisorStatus::Panicked => {
+                consume_supervised_task_panic(&application_state, &monitor);
+                Err(task_panic_terminal_fault(stage))
+            }
+            TaskSupervisorStatus::Closed => Err(ApplicationFault::from_task_supervisor(
+                stage,
+                MountTaskSupervisorError::Closed,
+            )),
         }
     }
 
@@ -496,13 +624,14 @@ impl<P: ReactionPort> Application<P> {
         begin_outer_driver_boundary(&application_state, &monitor).map_err(|fault| {
             application_fault_from_outer_driver_boundary(ApplicationFaultStage::Reaction, fault)
         })?;
+        self.complete_streaming_cleanup().await?;
         let cancellation = ReactionCancellationControl::new(monitor.clone());
         let mut reaction = Box::pin(self.react_inner(&cancellation));
         let result = tokio::select! {
             biased;
             task = monitor.wait() => {
                 cancellation.suppress();
-                drop_reaction_before_panic_arbitration(reaction, &monitor);
+                drop_driver_future_before_panic_arbitration(reaction, &monitor);
                 return match task {
                     Ok(()) => {
                         consume_supervised_task_panic(&application_state, &monitor);
@@ -516,7 +645,7 @@ impl<P: ReactionPort> Application<P> {
             }
             result = &mut reaction => result,
         };
-        drop_reaction_before_panic_arbitration(reaction, &monitor);
+        drop_driver_future_before_panic_arbitration(reaction, &monitor);
         match monitor.status() {
             TaskSupervisorStatus::Healthy => result,
             TaskSupervisorStatus::Panicked => {
@@ -536,61 +665,119 @@ impl<P: ReactionPort> Application<P> {
     ) -> Result<(), ApplicationFault> {
         let declaration = self.refresh_declaration()?;
         self.check_task_panic(ApplicationFaultStage::Declaration)?;
-        let rendered = self
-            .reconcile_components(ApplicationFaultStage::Reconcile)
-            .await?;
-        let (projection, mut bindings) = rendered.into_execution_parts();
-        let prepared = self
-            .session
-            .prepare(&declaration, &projection)
-            .map_err(|source| {
-                ApplicationFault::from_session(ApplicationFaultStage::FramePrepare, source)
-            })?;
-        self.check_task_panic(ApplicationFaultStage::FramePrepare)?;
+        let (projection, mut bindings) = self.prepare_components().await?;
+        let mut streaming_lease = self.streaming.start(bindings.take_streaming_contracts())?;
+        self.driver_demand
+            .set_streaming_fence(self.streaming.pending());
+        let result: Result<(), ApplicationFault> = async {
+            let prepared = self
+                .session
+                .prepare(&declaration, &projection)
+                .map_err(|source| {
+                    ApplicationFault::from_session(ApplicationFaultStage::FramePrepare, source)
+                })?;
+            self.check_task_panic(ApplicationFaultStage::FramePrepare)?;
 
-        match run_submission_attempt(
-            &mut self.port,
-            &mut self.session,
-            &mut bindings,
-            prepared,
-            cancellation,
-        )
-        .await?
-        {
-            SubmissionAttempt::Completed => {}
-            SubmissionAttempt::ContinuityChanged => {
-                let retry_declaration = self.refresh_declaration()?;
-                let retry = self
-                    .session
-                    .prepare(&retry_declaration, &projection)
-                    .map_err(|source| {
-                        ApplicationFault::from_session(ApplicationFaultStage::FramePrepare, source)
-                    })?;
-                match run_submission_attempt(
-                    &mut self.port,
-                    &mut self.session,
-                    &mut bindings,
-                    retry,
-                    cancellation,
-                )
-                .await?
-                {
-                    SubmissionAttempt::Completed => {}
-                    SubmissionAttempt::ContinuityChanged => {
-                        return Err(ApplicationFault::terminal(
-                            ApplicationFaultStage::Submit,
-                            ApplicationFaultCode::Protocol,
-                            ApplicationFaultReason::UnstableContinuity,
-                        ))
+            match run_submission_attempt(
+                &mut self.port,
+                &mut self.session,
+                &mut bindings,
+                prepared,
+                cancellation,
+                &mut self.streaming,
+            )
+            .await?
+            {
+                SubmissionAttempt::Completed => {}
+                SubmissionAttempt::ContinuityChanged => {
+                    let retry_declaration = self.refresh_declaration()?;
+                    let retry = self
+                        .session
+                        .prepare(&retry_declaration, &projection)
+                        .map_err(|source| {
+                            ApplicationFault::from_session(
+                                ApplicationFaultStage::FramePrepare,
+                                source,
+                            )
+                        })?;
+                    match run_submission_attempt(
+                        &mut self.port,
+                        &mut self.session,
+                        &mut bindings,
+                        retry,
+                        cancellation,
+                        &mut self.streaming,
+                    )
+                    .await?
+                    {
+                        SubmissionAttempt::Completed => {}
+                        SubmissionAttempt::ContinuityChanged => {
+                            return Err(ApplicationFault::terminal(
+                                ApplicationFaultStage::Submit,
+                                ApplicationFaultCode::Protocol,
+                                ApplicationFaultReason::UnstableContinuity,
+                            ));
+                        }
                     }
                 }
             }
+            Ok(())
         }
-        if self.components.is_dirty() {
+        .await;
+        if let Err(fault) = result {
+            if fault.kind() != ApplicationFaultKind::RecoveryRequired {
+                self.streaming.saved_fault = Some(fault);
+                if self.streaming.pending() {
+                    self.streaming
+                        .abort(StreamingToolAbortCause::ProviderFailed)
+                        .await;
+                }
+            } else if !self.streaming.normal_eof {
+                self.streaming
+                    .abort(StreamingToolAbortCause::RuntimeFault)
+                    .await;
+            }
+        }
+        if self.streaming.pending() && !self.streaming.clear() {
+            streaming_lease.complete();
+            return Err(ApplicationFault::streaming_recovery());
+        }
+        if !self.streaming.pending() && self.components.is_dirty() {
             self.reconcile_components(ApplicationFaultStage::PostReconcile)
                 .await?;
         }
-        Ok(())
+        let cleanup = self.complete_streaming_cleanup().await;
+        streaming_lease.complete();
+        cleanup?;
+        result
+    }
+
+    async fn prepare_components(
+        &mut self,
+    ) -> Result<(RenderedProjection, RenderBindings<ProviderEvent>), ApplicationFault> {
+        let mut run = PreparationRun::default();
+        for wave in 0..=MAX_PREPARATION_WAVES {
+            let rendered = self
+                .reconcile_components(ApplicationFaultStage::Reconcile)
+                .await?;
+            let (projection, preparations, bindings) = rendered.into_execution_parts();
+            if wave == MAX_PREPARATION_WAVES {
+                if preparations.has_pending(&run) {
+                    return Err(ApplicationFault::preparation_graph_unstable());
+                }
+                drop(preparations);
+            } else {
+                preparations
+                    .prepare(&mut run)
+                    .await
+                    .map_err(ApplicationFault::from_preparation)?;
+            }
+            if !self.components.is_dirty() {
+                self.components.mark_current_projection_prepared();
+                return Ok((projection, bindings));
+            }
+        }
+        Err(ApplicationFault::preparation_graph_unstable())
     }
 
     async fn reconcile_components(
@@ -685,6 +872,81 @@ impl<P: ReactionPort> Application<P> {
     }
 }
 
+impl<P: ResettableReactionPort> Application<P> {
+    /// Forget model interaction history and rebuild from the next complete
+    /// Component projection. The mounted tree, tasks, Signals, and pending
+    /// reaction request remain alive; this does not call `react()`.
+    ///
+    /// Call only after the previous reaction future has exited or been dropped.
+    /// The caller must project every business fact needed by the next reaction,
+    /// including the outcomes of actions that may already have executed. This
+    /// operation does not undo those actions or their persistence.
+    ///
+    /// Pending native tool results and streaming recovery prevent a reset.
+    /// On success the provider advances its epoch, all canonical replay and
+    /// projection diff baselines are cleared, and the next handoff is Full.
+    /// Later completed reactions can resume normal semantic deltas.
+    pub fn reset_model_context(&mut self) -> Result<(), ApplicationFault> {
+        let stage = ApplicationFaultStage::ModelContextReset;
+        let monitor = self.tasks.panic_monitor();
+        begin_outer_driver_boundary(&self.state, &monitor)
+            .map_err(|fault| application_fault_from_outer_driver_boundary(stage, fault))?;
+        if self.streaming.pending() {
+            return Err(ApplicationFault::streaming_recovery());
+        }
+        if !self.session.can_reset_model_context() {
+            return Err(ApplicationFault {
+                stage,
+                kind: ApplicationFaultKind::Retryable,
+                code: ApplicationFaultCode::Rejected,
+                reason: ApplicationFaultReason::ModelContextBusy,
+            });
+        }
+        self.refresh_declaration()?;
+        self.check_task_panic(stage)?;
+        let reset = catch_unwind(AssertUnwindSafe(|| self.port.reset_model_context()));
+        let declaration = match reset {
+            Ok(Ok(declaration)) => declaration,
+            Ok(Err(fault)) => {
+                if fault.kind() == ReactionPortFaultKind::Terminal {
+                    self.state.store(
+                        APPLICATION_TERMINATED_AFTER_CONTEXT_RESET,
+                        Ordering::Release,
+                    );
+                }
+                return Err(ApplicationFault::from_port(stage, fault));
+            }
+            Err(payload) => {
+                self.state.store(
+                    APPLICATION_TERMINATED_AFTER_CONTEXT_RESET,
+                    Ordering::Release,
+                );
+                resume_unwind(payload);
+            }
+        };
+
+        // Provider reset and local history reset are one synchronous boundary.
+        // A broken port contract cannot leave a reusable mismatched Application.
+        let committed = declaration
+            .validate()
+            .map_err(ApplicationFault::invalid_declaration)
+            .and_then(|()| {
+                self.session
+                    .reset_model_context(&declaration)
+                    .map_err(|fault| ApplicationFault::from_session(stage, fault))
+            });
+        if let Err(fault) = committed {
+            self.state.store(
+                APPLICATION_TERMINATED_AFTER_CONTEXT_RESET,
+                Ordering::Release,
+            );
+            return Err(fault);
+        }
+        self.declaration = declaration;
+        self.check_task_panic(stage)
+    }
+}
+
 /// Submit one prepared Frame and linearize its private commit at handoff.
 ///
 /// Only the port borrow is carried by the returned stream. The session borrow
@@ -707,11 +969,12 @@ async fn run_submission_attempt<P: ReactionPort>(
     bindings: &mut RenderBindings<ProviderEvent>,
     prepared: PreparedFrame,
     cancellation: &ReactionCancellationControl,
+    streaming: &mut StreamingSupervisor,
 ) -> Result<SubmissionAttempt, ApplicationFault> {
     let submission = submit_prepared_frame(port, session, prepared).await;
     match submission {
         Ok(facts) => {
-            pump_provider_facts(session, bindings, facts, cancellation.clone()).await?;
+            pump_provider_facts(session, bindings, facts, cancellation.clone(), streaming).await?;
             Ok(SubmissionAttempt::Completed)
         }
         Err(SubmitFault::ContinuityChanged) => Ok(SubmissionAttempt::ContinuityChanged),
@@ -724,6 +987,7 @@ async fn pump_provider_facts(
     bindings: &mut RenderBindings<ProviderEvent>,
     facts: ProviderFactStream<'_>,
     cancellation: ReactionCancellationControl,
+    streaming: &mut StreamingSupervisor,
 ) -> Result<(), ApplicationFault> {
     let budget = session.full_reserve_budget();
     let admission = ReactionAdmissionGuard::with_budget(
@@ -767,10 +1031,13 @@ async fn pump_provider_facts(
                     break Some(ApplicationFault::from_port(
                         ApplicationFaultStage::FactStream,
                         source,
-                    ))
+                    ));
                 }
                 Next::Fact(Some(Ok(fact))) => {
-                    let (event, ticket) = recovery.admission_mut().admit(fact)?.into_parts();
+                    let (event, ticket, structured_text) = recovery
+                        .admission_mut()
+                        .admit(fact)?
+                        .into_structured_parts();
                     match (event, ticket) {
                         (Some(ProviderEvent::ToolCall(call)), Some(ticket)) => {
                             let future = bindings.start_native_tool(call).map_err(|source| {
@@ -786,8 +1053,15 @@ async fn pump_provider_facts(
                             }));
                         }
                         (Some(event), None) => {
-                            await_binding_with_lanes(
-                                bindings.dispatch(event),
+                            await_with_lanes(
+                                async {
+                                    bindings.dispatch(event).await.map_err(|source| {
+                                        ApplicationFault::from_attempt(
+                                            ApplicationFaultStage::Binding,
+                                            source,
+                                        )
+                                    })
+                                },
                                 &mut lanes,
                                 recovery.admission_mut(),
                             )
@@ -799,8 +1073,16 @@ async fn pump_provider_facts(
                                 ApplicationFaultStage::Admission,
                                 ApplicationFaultCode::Internal,
                                 ApplicationFaultReason::FactProjectionInvariant,
-                            ))
+                            ));
                         }
+                    }
+                    if let Some(text) = structured_text {
+                        await_with_lanes(
+                            streaming.dispatch(text),
+                            &mut lanes,
+                            recovery.admission_mut(),
+                        )
+                        .await?;
                     }
                 }
             }
@@ -813,7 +1095,8 @@ async fn pump_provider_facts(
         if let Some(fault) = fact_stream_fault {
             return Err(fault);
         }
-        recovery.admission_mut().finish_normal()?;
+        let summary = recovery.admission_mut().finish_normal()?;
+        streaming.finish(summary).await?;
         bindings.finish_normal().await.map_err(|source| {
             ApplicationFault::from_attempt(ApplicationFaultStage::Binding, source)
         })?;
@@ -843,25 +1126,21 @@ fn finish_tool_lane(
     }
 }
 
-async fn await_binding_with_lanes<T, F>(
+async fn await_with_lanes<T, F>(
     future: F,
     lanes: &mut FuturesUnordered<ToolLane>,
     admission: &mut ReactionAdmissionGuard<'_>,
 ) -> Result<T, ApplicationFault>
 where
-    F: Future<Output = Result<T, ComponentAttemptFault>>,
+    F: Future<Output = Result<T, ApplicationFault>>,
 {
     let mut future = Box::pin(future);
     loop {
         if lanes.is_empty() {
-            return future.await.map_err(|source| {
-                ApplicationFault::from_attempt(ApplicationFaultStage::Binding, source)
-            });
+            return future.await;
         }
         tokio::select! {
-            result = &mut future => return result.map_err(|source| {
-                ApplicationFault::from_attempt(ApplicationFaultStage::Binding, source)
-            }),
+            result = &mut future => return result,
             lane = lanes.next() => finish_tool_lane(lane, admission)?,
         }
     }
@@ -873,6 +1152,7 @@ where
 pub enum ApplicationFaultKind {
     Retryable,
     Terminal,
+    RecoveryRequired,
 }
 
 /// Payload-free structural category for an Application failure.
@@ -897,6 +1177,7 @@ pub enum ApplicationFaultStage {
     Declaration,
     Bootstrap,
     Reconcile,
+    Preparation,
     FramePrepare,
     Submit,
     FactStream,
@@ -904,6 +1185,8 @@ pub enum ApplicationFaultStage {
     Binding,
     ToolOutput,
     PostReconcile,
+    StreamingRecovery,
+    ModelContextReset,
 }
 
 /// Closed, payload-free cause for an Application failure.
@@ -920,6 +1203,8 @@ pub enum ApplicationFaultReason {
     AcceptedRevisionInNewEpoch,
     ContinuityResetWithoutEpochAdvance,
     ReplayReplacementUnsupported,
+    InvalidModelContextReset,
+    ModelContextBusy,
     AmbiguousProjectionProvenance,
     RevisionExhausted,
     PendingToolCall,
@@ -929,6 +1214,8 @@ pub enum ApplicationFaultReason {
     UnstableContinuity,
     ProfileChangedBeforeHandoff,
     ComponentRuntime,
+    Preparation,
+    PreparationGraphUnstable,
     ComponentContract,
     ComponentInvariant,
     BindingLifecycle,
@@ -938,6 +1225,8 @@ pub enum ApplicationFaultReason {
     Admission(ReactionAdmissionReason),
     ToolOutput(ToolOutputStagingReason),
     FactProjectionInvariant,
+    StreamingContract,
+    StreamingRecovery,
 }
 
 /// Sanitized failure from the fixed-port Application pipeline.
@@ -955,6 +1244,49 @@ pub struct ApplicationFault {
 }
 
 impl ApplicationFault {
+    pub(super) const fn streaming_recovery() -> Self {
+        Self {
+            stage: ApplicationFaultStage::StreamingRecovery,
+            kind: ApplicationFaultKind::RecoveryRequired,
+            code: ApplicationFaultCode::Unavailable,
+            reason: ApplicationFaultReason::StreamingRecovery,
+        }
+    }
+
+    pub(super) const fn streaming_runtime() -> Self {
+        Self::terminal(
+            ApplicationFaultStage::Binding,
+            ApplicationFaultCode::Internal,
+            ApplicationFaultReason::StreamingContract,
+        )
+    }
+
+    pub(super) const fn streaming_protocol() -> Self {
+        Self::terminal(
+            ApplicationFaultStage::Binding,
+            ApplicationFaultCode::Protocol,
+            ApplicationFaultReason::StreamingContract,
+        )
+    }
+
+    pub(super) fn from_streaming(fault: StreamingToolDriverFault) -> Self {
+        match fault {
+            StreamingToolDriverFault::RecoveryRequired { .. } => Self::streaming_recovery(),
+            StreamingToolDriverFault::Input { .. } => Self::streaming_protocol(),
+            StreamingToolDriverFault::Limit { .. } => Self::terminal(
+                ApplicationFaultStage::Binding,
+                ApplicationFaultCode::Limit,
+                ApplicationFaultReason::StreamingContract,
+            ),
+            StreamingToolDriverFault::Declaration(_) => Self::terminal(
+                ApplicationFaultStage::Binding,
+                ApplicationFaultCode::Component,
+                ApplicationFaultReason::ComponentContract,
+            ),
+            _ => Self::streaming_runtime(),
+        }
+    }
+
     const fn terminal(
         stage: ApplicationFaultStage,
         code: ApplicationFaultCode,
@@ -1034,6 +1366,10 @@ impl ApplicationFault {
                 ApplicationFaultCode::Protocol,
                 ApplicationFaultReason::ReplayReplacementUnsupported,
             ),
+            FrameSessionFault::InvalidModelContextReset => (
+                ApplicationFaultCode::Protocol,
+                ApplicationFaultReason::InvalidModelContextReset,
+            ),
             FrameSessionFault::ProjectionReconciliation(
                 ProjectionReconciliationFault::AmbiguousProjectionProvenance,
             ) => (
@@ -1106,6 +1442,23 @@ impl ApplicationFault {
         }
     }
 
+    fn from_preparation(_fault: PreparationFault) -> Self {
+        Self {
+            stage: ApplicationFaultStage::Preparation,
+            kind: ApplicationFaultKind::Retryable,
+            code: ApplicationFaultCode::Component,
+            reason: ApplicationFaultReason::Preparation,
+        }
+    }
+
+    fn preparation_graph_unstable() -> Self {
+        Self::terminal(
+            ApplicationFaultStage::Preparation,
+            ApplicationFaultCode::Limit,
+            ApplicationFaultReason::PreparationGraphUnstable,
+        )
+    }
+
     fn from_task_supervisor(
         stage: ApplicationFaultStage,
         _fault: MountTaskSupervisorError,
@@ -1125,7 +1478,10 @@ impl ApplicationFault {
         )
     }
 
-    fn from_driver_demand(stage: ApplicationFaultStage, _fault: DriverDemandFault) -> Self {
+    fn from_driver_demand(stage: ApplicationFaultStage, fault: DriverDemandFault) -> Self {
+        if fault == DriverDemandFault::StreamingRecovery {
+            return Self::streaming_recovery();
+        }
         Self::terminal(
             stage,
             ApplicationFaultCode::Unavailable,
@@ -1143,6 +1499,10 @@ impl ApplicationFault {
             | ComponentAttemptFault::EventSelectorCollision { .. }
             | ComponentAttemptFault::SystemAttemptLocal { .. }
             | ComponentAttemptFault::HookCapabilityUnavailable { .. }
+            | ComponentAttemptFault::InvalidStreamingToolElementName { .. }
+            | ComponentAttemptFault::InvalidStreamingToolAttributeName { .. }
+            | ComponentAttemptFault::DuplicateStreamingToolElement { .. }
+            | ComponentAttemptFault::DuplicateStreamingToolAttribute { .. }
             | ComponentAttemptFault::StreamingMount { .. } => {
                 ApplicationFaultReason::ComponentContract
             }
@@ -1550,6 +1910,40 @@ mod tests {
             },
             probe,
         )
+    }
+
+    impl ResettableReactionPort for ScriptedPort {
+        fn reset_model_context(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+            let epoch = self.declaration.continuity().epoch().get().get() + 1;
+            self.declaration = TargetDeclaration::full(
+                self.declaration.identity(),
+                TargetEpoch::new(NonZeroU64::new(epoch).unwrap()),
+                self.declaration.profile().clone(),
+            );
+            Ok(self.declaration.clone())
+        }
+    }
+
+    struct NonAdvancingResetPort(ScriptedPort);
+
+    #[async_trait]
+    impl ReactionPort for NonAdvancingResetPort {
+        fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+            self.0.declare()
+        }
+
+        async fn submit<'a>(
+            &'a mut self,
+            frame: Frame,
+        ) -> Result<ProviderFactStream<'a>, SubmitFault> {
+            self.0.submit(frame).await
+        }
+    }
+
+    impl ResettableReactionPort for NonAdvancingResetPort {
+        fn reset_model_context(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+            Ok(self.0.declaration.clone())
+        }
     }
 
     fn completed_reaction() -> FactScript {
@@ -3211,6 +3605,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_context_reset_keeps_mount_tasks_and_pending_demand() {
+        let (port, probe) = scripted_port(
+            vec![
+                completed_reaction(),
+                completed_reaction(),
+                completed_reaction(),
+            ],
+            0,
+        );
+        let props = RuntimeBoundaryProps {
+            starts: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(Notify::new()),
+            exported_demand: Arc::new(Mutex::new(None)),
+        };
+        let mounted = props.clone();
+        let mut application =
+            Application::mount(move || runtime_boundary_component(mounted.clone()), port).unwrap();
+        application.react().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while props.starts.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        props
+            .exported_demand
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .request()
+            .unwrap();
+        let revision = application.current_projection().revision();
+        application.reset_model_context().unwrap();
+        assert_eq!(application.current_projection().revision(), revision);
+        assert!(application.take_reaction_request().unwrap());
+        assert_eq!(props.starts.load(Ordering::Acquire), 1);
+        application.react().await.unwrap();
+        application.react().await.unwrap();
+        assert!(matches!(
+            probe.bases.lock().unwrap().as_slice(),
+            [FrameBasis::Full, FrameBasis::Full, FrameBasis::DeltaFrom(_)]
+        ));
+        assert_eq!(props.starts.load(Ordering::Acquire), 1);
+        application.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_context_reset_removes_interrupted_output_from_next_full() {
+        let (port, probe) = scripted_port(
+            vec![
+                FactScript::PendingAfterFullReset(vec![Ok(ProviderFact::TextDelta {
+                    output: ProviderOutputKey::new(17),
+                    phase: None,
+                    delta: "discarded-output".to_owned(),
+                })]),
+                completed_reaction(),
+            ],
+            0,
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut application =
+            Application::mount(move || stateful_provider_handler(Arc::clone(&events)), port)
+                .unwrap();
+        let mut reaction = Box::pin(application.react());
+        assert!(poll_once(reaction.as_mut()).is_pending());
+        drop(reaction);
+        assert!(!application
+            .session
+            .canonical_history
+            .transcript
+            .items()
+            .is_empty());
+        application.reset_model_context().unwrap();
+        application.react().await.unwrap();
+        {
+            let frames = probe.canonical_frames.lock().unwrap();
+            let frame: serde_json::Value = serde_json::from_slice(&frames[1]).unwrap();
+            assert_eq!(frame["replay"], serde_json::json!([]));
+            assert!(!std::str::from_utf8(&frames[1])
+                .unwrap()
+                .contains("discarded-output"));
+        }
+        application.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_context_reset_rejects_pending_tool_before_touching_port() {
+        let (port, _) = scripted_port(vec![], 0);
+        let mut application = Application::mount(|| __private::fragment(Vec::new()), port).unwrap();
+        application.session.canonical_history.transcript = application
+            .session
+            .canonical_history
+            .transcript
+            .appended(CanonicalInputItem::tool_call("pending", "lookup", "{}").unwrap())
+            .unwrap();
+        let epoch = application.port.declaration.continuity().epoch();
+        let fault = application.reset_model_context().unwrap_err();
+        assert_eq!(fault.kind(), ApplicationFaultKind::Retryable);
+        assert_eq!(fault.reason(), ApplicationFaultReason::ModelContextBusy);
+        assert_eq!(application.port.declaration.continuity().epoch(), epoch);
+        assert_eq!(
+            application
+                .session
+                .canonical_history
+                .transcript
+                .items()
+                .len(),
+            1
+        );
+        application.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_context_reset_invalid_port_reply_prevents_further_handoff() {
+        let (port, probe) = scripted_port(vec![completed_reaction(), completed_reaction()], 0);
+        let mut application = Application::mount(
+            || __private::fragment(Vec::new()),
+            NonAdvancingResetPort(port),
+        )
+        .unwrap();
+        application.react().await.unwrap();
+        assert_eq!(
+            application.reset_model_context().unwrap_err().kind(),
+            ApplicationFaultKind::Terminal
+        );
+        let fault = application.react().await.unwrap_err();
+        assert_eq!(
+            fault.reason(),
+            ApplicationFaultReason::InvalidModelContextReset
+        );
+        assert_eq!(probe.handoffs.load(Ordering::Relaxed), 1);
+        application.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelled_tool_fallback_survives_a_later_pre_handoff_submit_cancellation() {
         let lane_started = Arc::new(Notify::new());
         let observed_start = Arc::clone(&lane_started);
@@ -4425,7 +4956,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn shutdown_resumes_a_polled_task_panic_with_its_original_payload() {
+    async fn shutdown_resumes_a_latched_task_panic_with_its_original_payload() {
         use futures::FutureExt as _;
 
         let starts = Arc::new(AtomicUsize::new(0));
@@ -4456,7 +4987,12 @@ mod tests {
         })
         .await
         .unwrap();
+        let monitor = application.tasks.panic_monitor();
         release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), monitor.wait())
+            .await
+            .expect("Component task panic must be latched before shutdown")
+            .expect("task supervisor must remain observable");
 
         let panic = AssertUnwindSafe(application.shutdown())
             .catch_unwind()

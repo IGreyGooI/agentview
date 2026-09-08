@@ -1,10 +1,10 @@
 use std::{collections::HashSet, convert::Infallible, future::Future, pin::Pin};
 
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{StreamExt, stream::FuturesUnordered};
 
 use crate::component::{
-    authoring::{ComponentAttemptFault, RenderBindings},
     ComponentHost, ComponentHostFault, ComponentHostId,
+    authoring::{ComponentAttemptFault, RenderBindings},
 };
 
 #[allow(
@@ -115,6 +115,12 @@ impl Drop for ReactionLifecycle<'_> {
 }
 
 /// Coordinates one retained Component application with one model backend.
+///
+/// This compatibility runtime does not execute `use_preparation` declarations.
+/// It returns [`ApplicationHostFault::ComponentPreparationsUnsupported`]
+/// before invoking [`ProviderPort::execute`] when a Component declares one.
+/// Use [`Application`](super::Application) with a [`ReactionPort`](super::ReactionPort)
+/// for preparation preparation.
 #[deprecated(note = "use `Application<P>` as the mounted runtime owner")]
 pub struct ApplicationHost<P> {
     provider: P,
@@ -248,7 +254,10 @@ where
     Props: Clone + Send + 'static,
 {
     let prepared = components.render()?;
-    let (projection, bindings) = prepared.into_execution_parts();
+    let (projection, preparations, bindings) = prepared.into_execution_parts();
+    if !preparations.is_empty() {
+        return Err(ApplicationHostFault::ComponentPreparationsUnsupported);
+    }
     Ok(PreparedComponentReaction {
         projection,
         bindings,
@@ -438,6 +447,10 @@ pub enum ApplicationHostFault {
         expected: ComponentHostId,
         observed: ComponentHostId,
     },
+    #[error(
+        "Component preparations require Application<P> with ReactionPort and are unsupported by ApplicationHost"
+    )]
+    ComponentPreparationsUnsupported,
     #[error(transparent)]
     Component(#[from] ComponentHostFault),
     #[error("ProviderPort execute setup failed: {0}")]
@@ -463,8 +476,8 @@ mod tests {
         convert::Infallible,
         future::pending,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -475,19 +488,19 @@ mod tests {
 
     use crate::{
         component::{
+            ComponentHost,
             execution::{
                 ProviderEvent, ProviderEventStream, ProviderFault, ProviderPort, ToolCall,
                 ToolOutput, ToolOutputSink,
             },
             prelude::*,
-            ComponentHost,
         },
         llm_call::TextTurnEvent,
     };
 
     use super::{
-        await_bindings_with_lanes, finish_lane, ApplicationHost, ApplicationHostFault,
-        CompletedLane, EngineObservation, EngineObserver, ReactionLane, ReactionLifecycle,
+        ApplicationHost, ApplicationHostFault, CompletedLane, EngineObservation, EngineObserver,
+        ReactionLane, ReactionLifecycle, await_bindings_with_lanes, finish_lane,
     };
 
     #[derive(Debug, Default)]

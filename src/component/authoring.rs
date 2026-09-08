@@ -11,11 +11,13 @@ mod event_input;
 mod event_listener;
 mod handler;
 mod native_tool;
+mod preparation;
 mod provider_event_handler;
 mod reaction_completion;
 mod reaction_request;
 mod render_context;
 mod signal;
+pub mod streaming_attempt;
 mod streaming_xml;
 
 pub(crate) use async_task::MountTaskStart;
@@ -27,6 +29,8 @@ pub(crate) use attempt::{ComponentRenderStage, RenderBindings};
 pub use capture::ComponentCaptureError;
 pub use declaration::Component;
 pub(crate) use event_input::EventInput as InternalEventInput;
+pub use preparation::use_preparation;
+pub(crate) use preparation::{PreparationFault, PreparationRun, PreparationSet};
 #[cfg(feature = "legacy-provider-port")]
 #[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
 pub type EventInput<E> = InternalEventInput<E>;
@@ -41,6 +45,7 @@ pub use reaction_completion::use_reaction_completion;
 pub(crate) use reaction_completion::ReactionCompletionDeclaration;
 pub use reaction_request::{use_reaction_request, ReactionRequest, ReactionRequestError};
 pub use signal::{use_signal, Signal};
+pub use streaming_attempt::*;
 pub use streaming_xml::{
     StreamingXml, StreamingXmlTag, XmlContractDiagnostic, XmlStreamingToolCall,
 };

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Chess 准备屏障与模型请求",
+    "output": "docs/chess-loop.sequence.html",
+    "viewBox": [820, 520],
+    "quality_profile": "showcase",
+    "legend": { "mode": "hidden" }
+  },
+  "participants": [
+    { "id": "driver", "type": "external", "label": "外部驱动", "sublabel": "drive_application" },
+    { "id": "application", "type": "backend", "label": "Application", "sublabel": "准备屏障与需求" },
+    { "id": "component", "type": "backend", "label": "Chess 组件", "sublabel": "use_preparation" },
+    { "id": "actor", "type": "messagebus", "label": "引擎 actor", "sublabel": "串行处理准备请求" },
+    { "id": "stockfish", "type": "external", "label": "Stockfish", "sublabel": "UCI 引擎进程" },
+    { "id": "state", "type": "database", "label": "ChessState", "sublabel": "Signal 中的状态机" }
+  ],
+  "messages": [
+    { "from": "driver", "to": "application", "y": 180, "label": "prepare()", "variant": "emphasis" },
+    { "from": "application", "to": "component", "y": 212, "label": "运行准备 hook", "variant": "emphasis" },
+    { "from": "component", "to": "actor", "y": 244, "label": "发送准备请求", "variant": "default" },
+    { "from": "actor", "to": "stockfish", "y": 276, "label": "best_move()", "variant": "default" },
+    { "from": "stockfish", "to": "actor", "y": 308, "label": "bestmove e7e5", "variant": "return" },
+    { "from": "actor", "to": "state", "y": 340, "label": "同步归约黑方落子", "variant": "emphasis" },
+    { "from": "actor", "to": "component", "y": 372, "label": "回执 ready", "variant": "return" },
+    { "from": "component", "to": "application", "y": 404, "label": "新 key：request()", "variant": "emphasis" },
+    { "from": "application", "to": "driver", "y": 436, "label": "全部准备完成", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "application", "from": 172, "to": 442 },
+    { "participant": "component", "from": 204, "to": 410 },
+    { "participant": "actor", "from": 236, "to": 378 },
+    { "participant": "stockfish", "from": 268, "to": 314 },
+    { "participant": "state", "from": 332, "to": 350 }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "前提：白方 e2e4 已提交",
+      "items": [
+        "上一轮 react 已结算，当前为 AwaitingStockfish。",
+        "本次 prepare 等待 UCI 搜索和黑方状态更新。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "ready 与 request 是两次交接",
+      "items": [
+        "actor 回执组件；组件读取新 key {2, 0} 后请求。",
+        "所有已声明 preparation 完成，屏障才放行。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "驱动下一步",
+      "items": [
+        "检查终局、消费 demand、再检查，然后 react。",
+        "react 再准备；相同 key 不重复 request 或搜索。"
+      ]
+    }
+  ]
+}

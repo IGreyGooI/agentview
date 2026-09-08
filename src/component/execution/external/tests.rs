@@ -1,11 +1,11 @@
 use std::{
     future::Future,
-    num::{NonZeroU128, NonZeroU64},
+    num::{NonZeroU64, NonZeroU128},
     panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
 };
@@ -14,7 +14,7 @@ use crate::component::{
     authoring::{InternalEventInput as EventInput, InternalEventListener as EventListener},
     prelude::*,
 };
-use futures::{task::noop_waker, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, task::noop_waker};
 use tokio::sync::Notify;
 
 use super::{
@@ -23,6 +23,7 @@ use super::{
     MAX_EXTERNAL_PROTOCOL_FRAMES, MAX_EXTERNAL_PROTOCOL_WIRE_BYTES, MAX_EXTERNAL_TEXT_BYTES,
 };
 use crate::component::execution::{
+    ProviderEvent, ProviderFault,
     application::{Application, ApplicationFault},
     reaction::{
         Frame, FrameBasis, FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact,
@@ -30,7 +31,6 @@ use crate::component::execution::{
         ReactionPortFaultKind, ReactionPortFaultReason, SubmitFault, TargetContinuity,
         TargetDeclaration, TargetEpoch, ToolCatalog,
     },
-    ProviderEvent, ProviderFault,
 };
 
 #[derive(Clone)]

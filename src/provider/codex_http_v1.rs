@@ -9,11 +9,11 @@ use std::{
 };
 
 use crate::{
-    pom_renderer::{render_pom_document, PomRenderError},
+    pom_renderer::{PomRenderError, render_pom_document},
     transcript::{
-        AssistantPhase, AssistantTextStatus, CanonicalInputItem, CanonicalTranscript,
-        ConversationRole, InstructionAuthority, ProviderExtension,
-        ASSISTANT_OUTPUT_INTERRUPTED_MARKER,
+        ASSISTANT_OUTPUT_INTERRUPTED_MARKER, AssistantPhase, AssistantTextStatus,
+        CanonicalInputItem, CanonicalTranscript, ConversationRole, InstructionAuthority,
+        ProviderExtension,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -104,6 +104,9 @@ pub struct CodexHttpV1Options {
     tools: Option<Vec<CodexFunctionTool>>,
     reasoning: Option<CodexReasoning>,
     prompt_cache_key: Option<String>,
+    max_output_tokens: Option<u32>,
+    context_management: bool,
+    explicit_assistant_status: bool,
 }
 
 impl CodexHttpV1Options {
@@ -132,7 +135,42 @@ impl CodexHttpV1Options {
             tools,
             reasoning,
             prompt_cache_key,
+            max_output_tokens: None,
+            context_management: true,
+            explicit_assistant_status: false,
         })
+    }
+
+    /// Limits model-generated output tokens for this request profile.
+    pub fn with_max_output_tokens(
+        mut self,
+        max_output_tokens: u32,
+    ) -> Result<Self, CodexHttpV1Error> {
+        if max_output_tokens == 0 {
+            return Err(CodexHttpV1Error::ZeroMaxOutputTokens);
+        }
+        self.max_output_tokens = Some(max_output_tokens);
+        Ok(self)
+    }
+
+    /// Omits the optional Responses `context_management` field.
+    ///
+    /// The default retains the Codex server-side compaction configuration.
+    /// Call this only for Responses-compatible endpoints that reject that
+    /// Codex-specific request extension.
+    pub fn without_context_management(mut self) -> Self {
+        self.context_management = false;
+        self
+    }
+
+    /// Includes a terminal status on canonical assistant messages.
+    ///
+    /// The default preserves the standard minimal Responses input shape. Use
+    /// this for compatible endpoints which require replayed assistant items to
+    /// explicitly distinguish completed and interrupted output.
+    pub fn with_explicit_assistant_status(mut self) -> Self {
+        self.explicit_assistant_status = true;
+        self
     }
 }
 
@@ -140,6 +178,8 @@ impl CodexHttpV1Options {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CodexHttpV1Request {
     model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "String::is_empty")]
     instructions: String,
     input: Vec<CodexInputItem>,
@@ -148,7 +188,8 @@ pub struct CodexHttpV1Request {
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
     reasoning: Option<CodexReasoning>,
-    context_management: Vec<ContextManagement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_management: Option<Vec<ContextManagement>>,
     store: bool,
     stream: bool,
     include: Vec<IncludedField>,
@@ -159,6 +200,8 @@ pub struct CodexHttpV1Request {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct CodexHttpV1WireRequest<'a> {
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "str::is_empty")]
     instructions: &'a str,
     input: &'a [Value],
@@ -167,7 +210,8 @@ struct CodexHttpV1WireRequest<'a> {
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
     reasoning: Option<&'a CodexReasoning>,
-    context_management: &'a [ContextManagement],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_management: Option<&'a [ContextManagement]>,
     store: bool,
     stream: bool,
     include: &'a [IncludedField],
@@ -183,13 +227,14 @@ impl<'a> CodexHttpV1WireRequest<'a> {
     ) -> Self {
         Self {
             model: &request.model,
+            max_output_tokens: request.max_output_tokens,
             instructions,
             input,
             tools: request.tools.as_deref(),
             tool_choice: request.tool_choice,
             parallel_tool_calls: request.parallel_tool_calls,
             reasoning: request.reasoning.as_ref(),
-            context_management: &request.context_management,
+            context_management: request.context_management.as_deref(),
             store: request.store,
             stream: request.stream,
             include: &request.include,
@@ -272,7 +317,11 @@ impl HistoryPolicy for CodexHttpV1HistoryPolicy {
         &self,
         transcript: &CanonicalTranscript,
     ) -> Result<Self::History, Self::Error> {
-        project_codex_items(transcript.items(), InterruptedTextEncoding::Reject)
+        project_codex_items(
+            transcript.items(),
+            InterruptedTextEncoding::Reject,
+            AssistantStatusEncoding::Omit,
+        )
     }
 }
 
@@ -282,15 +331,28 @@ enum InterruptedTextEncoding {
     AssistantAndBoundary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssistantStatusEncoding {
+    Omit,
+    Explicit,
+}
+
+impl AssistantStatusEncoding {
+    const fn enabled(self) -> bool {
+        matches!(self, Self::Explicit)
+    }
+}
+
 fn project_codex_items(
     items: &[CanonicalInputItem],
     interrupted_text: InterruptedTextEncoding,
+    assistant_status: AssistantStatusEncoding,
 ) -> Result<CodexHttpV1History, CodexHttpV1Error> {
     let mut instructions = None;
     let mut input = Vec::with_capacity(items.len());
 
     for item in items {
-        let lowered = lower_codex_item(item, interrupted_text)?;
+        let lowered = lower_codex_item(item, interrupted_text, assistant_status)?;
         if let Some(current) = lowered.instructions {
             if instructions.replace(current).is_some() {
                 return Err(CodexHttpV1Error::MultipleSystemInstructions);
@@ -313,6 +375,7 @@ struct LoweredCodexItem {
 fn lower_codex_item(
     item: &CanonicalInputItem,
     interrupted_text: InterruptedTextEncoding,
+    assistant_status: AssistantStatusEncoding,
 ) -> Result<LoweredCodexItem, CodexHttpV1Error> {
     let mut instructions = None;
     let mut input = Vec::with_capacity(2);
@@ -330,38 +393,45 @@ fn lower_codex_item(
                 text: render_pom_document(pom)?,
             },
         )),
-        CanonicalInputItem::Message { role, pom } => {
-            let (role, content) = match role {
-                ConversationRole::User => (
-                    MessageRole::User,
-                    TextContent::InputText {
-                        text: render_pom_document(pom)?,
-                    },
-                ),
-                ConversationRole::Assistant => (
-                    MessageRole::Assistant,
-                    TextContent::OutputText {
-                        text: render_pom_document(pom)?,
-                    },
-                ),
-            };
-            input.push(CodexInputItem::message(role, content));
-        }
+        CanonicalInputItem::Message { role, pom } => match role {
+            ConversationRole::User => input.push(CodexInputItem::message(
+                MessageRole::User,
+                TextContent::InputText {
+                    text: render_pom_document(pom)?,
+                },
+            )),
+            ConversationRole::Assistant => input.push(CodexInputItem::assistant_text(
+                render_pom_document(pom)?,
+                None,
+                AssistantInputStatus::Completed,
+                assistant_status,
+            )),
+        },
         CanonicalInputItem::AssistantText {
             text,
             phase,
             status: AssistantTextStatus::Sealed,
-        } => input.push(CodexInputItem::assistant_text(text.clone(), *phase)),
+        } => input.push(CodexInputItem::assistant_text(
+            text.clone(),
+            *phase,
+            AssistantInputStatus::Completed,
+            assistant_status,
+        )),
         CanonicalInputItem::AssistantText {
             text,
             phase,
             status: AssistantTextStatus::Interrupted,
         } => match interrupted_text {
             InterruptedTextEncoding::Reject => {
-                return Err(CodexHttpV1Error::InterruptedAssistantTextUnsupported)
+                return Err(CodexHttpV1Error::InterruptedAssistantTextUnsupported);
             }
             InterruptedTextEncoding::AssistantAndBoundary => {
-                input.push(CodexInputItem::assistant_text(text.clone(), *phase));
+                input.push(CodexInputItem::assistant_text(
+                    text.clone(),
+                    *phase,
+                    AssistantInputStatus::Incomplete,
+                    assistant_status,
+                ));
                 input.push(CodexInputItem::message(
                     MessageRole::User,
                     TextContent::InputText {
@@ -420,15 +490,11 @@ impl CodexHttpV1LoweredItem {
 #[derive(Debug, Clone)]
 pub struct CodexHttpV1Encoder {
     options: CodexHttpV1Options,
-    history_policy: CodexHttpV1HistoryPolicy,
 }
 
 impl CodexHttpV1Encoder {
     pub const fn new(options: CodexHttpV1Options) -> Self {
-        Self {
-            options,
-            history_policy: CodexHttpV1HistoryPolicy,
-        }
+        Self { options }
     }
 
     pub fn request(
@@ -443,7 +509,15 @@ impl CodexHttpV1Encoder {
         transcript: &CanonicalTranscript,
         native_tool_names: &[String],
     ) -> Result<CodexHttpV1Request, CodexHttpV1Error> {
-        let history = self.history_policy.project_history(transcript)?;
+        let history = project_codex_items(
+            transcript.items(),
+            InterruptedTextEncoding::Reject,
+            if self.options.explicit_assistant_status {
+                AssistantStatusEncoding::Explicit
+            } else {
+                AssistantStatusEncoding::Omit
+            },
+        )?;
         let tools = if native_tool_names.is_empty() {
             self.options.tools.clone()
         } else {
@@ -463,7 +537,15 @@ impl CodexHttpV1Encoder {
         &self,
         item: &CanonicalInputItem,
     ) -> Result<CodexHttpV1LoweredItem, CodexHttpV1Error> {
-        let lowered = lower_codex_item(item, InterruptedTextEncoding::AssistantAndBoundary)?;
+        let lowered = lower_codex_item(
+            item,
+            InterruptedTextEncoding::AssistantAndBoundary,
+            if self.options.explicit_assistant_status {
+                AssistantStatusEncoding::Explicit
+            } else {
+                AssistantStatusEncoding::Omit
+            },
+        )?;
         let input = lowered
             .input
             .into_iter()
@@ -503,13 +585,17 @@ impl CodexHttpV1Encoder {
     ) -> CodexHttpV1Request {
         CodexHttpV1Request {
             model: self.options.model.clone(),
+            max_output_tokens: self.options.max_output_tokens,
             instructions: history.instructions,
             input: history.input,
             tools,
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: false,
             reasoning: self.options.reasoning,
-            context_management: vec![ContextManagement::server_side_compaction()],
+            context_management: self
+                .options
+                .context_management
+                .then(|| vec![ContextManagement::server_side_compaction()]),
             store: false,
             stream: true,
             include: vec![IncludedField::ReasoningEncryptedContent],
@@ -650,6 +736,8 @@ enum CodexInputItem {
         content: Vec<TextContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         phase: Option<AssistantPhase>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<AssistantInputStatus>,
     },
     Reasoning {
         summary: Vec<ReasoningSummaryText>,
@@ -673,16 +761,30 @@ impl CodexInputItem {
             role,
             content: vec![content],
             phase: None,
+            status: None,
         }
     }
 
-    fn assistant_text(text: String, phase: Option<AssistantPhase>) -> Self {
+    fn assistant_text(
+        text: String,
+        phase: Option<AssistantPhase>,
+        status: AssistantInputStatus,
+        status_encoding: AssistantStatusEncoding,
+    ) -> Self {
         Self::Message {
             role: MessageRole::Assistant,
             content: vec![TextContent::OutputText { text }],
             phase,
+            status: status_encoding.enabled().then_some(status),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AssistantInputStatus {
+    Completed,
+    Incomplete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -801,6 +903,8 @@ pub enum CodexHttpV1Error {
     DuplicateToolName { name: String },
     #[error("Codex prompt cache key must be non-empty when present")]
     EmptyPromptCacheKey,
+    #[error("Codex max output tokens must be positive when configured")]
+    ZeroMaxOutputTokens,
     #[error("codex-http-v1 accepts at most one System instruction")]
     MultipleSystemInstructions,
     #[error("legacy codex-http-v1 history cannot encode interrupted assistant text")]
@@ -886,17 +990,138 @@ mod tests {
     }
 
     #[test]
+    fn max_output_tokens_is_optional_in_public_and_native_requests() {
+        let default_encoder = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+        );
+        let default_public = default_encoder
+            .request(&CanonicalTranscript::new())
+            .unwrap();
+        let default_public: Value = serde_json::to_value(default_public).unwrap();
+        assert!(default_public.get("max_output_tokens").is_none());
+        let default_native = default_encoder
+            .encode_frame_request_bounded(&[], "", &[], usize::MAX)
+            .unwrap();
+        let default_native: Value = serde_json::from_slice(&default_native).unwrap();
+        assert!(default_native.get("max_output_tokens").is_none());
+
+        let configured_encoder = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)
+                .unwrap()
+                .with_max_output_tokens(1_024)
+                .unwrap(),
+        );
+        let configured_public = configured_encoder
+            .request(&CanonicalTranscript::new())
+            .unwrap();
+        let configured_public: Value = serde_json::to_value(configured_public).unwrap();
+        assert_eq!(configured_public["max_output_tokens"], json!(1_024));
+        let configured_native = configured_encoder
+            .encode_frame_request_bounded(&[], "", &[], usize::MAX)
+            .unwrap();
+        let configured_native: Value = serde_json::from_slice(&configured_native).unwrap();
+        assert_eq!(configured_native["max_output_tokens"], json!(1_024));
+    }
+
+    #[test]
+    fn max_output_tokens_rejects_zero() {
+        assert!(matches!(
+            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)
+                .unwrap()
+                .with_max_output_tokens(0),
+            Err(CodexHttpV1Error::ZeroMaxOutputTokens)
+        ));
+    }
+
+    #[test]
+    fn context_management_defaults_to_compaction_and_can_be_omitted() {
+        let default_encoder = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+        );
+        let default_public: Value = serde_json::to_value(
+            default_encoder
+                .request(&CanonicalTranscript::new())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            default_public["context_management"],
+            json!([{"type": "compaction", "compact_threshold": 200_000}])
+        );
+        let default_native = default_encoder
+            .encode_frame_request_bounded(&[], "", &[], usize::MAX)
+            .unwrap();
+        let default_native: Value = serde_json::from_slice(&default_native).unwrap();
+        assert_eq!(
+            default_native["context_management"],
+            json!([{"type": "compaction", "compact_threshold": 200_000}])
+        );
+
+        let disabled_encoder = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)
+                .unwrap()
+                .without_context_management(),
+        );
+        let disabled_public: Value = serde_json::to_value(
+            disabled_encoder
+                .request(&CanonicalTranscript::new())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(disabled_public.get("context_management").is_none());
+        let disabled_native = disabled_encoder
+            .encode_frame_request_bounded(&[], "", &[], usize::MAX)
+            .unwrap();
+        let disabled_native: Value = serde_json::from_slice(&disabled_native).unwrap();
+        assert!(disabled_native.get("context_management").is_none());
+    }
+
+    #[test]
+    fn explicit_assistant_status_is_opt_in_and_preserves_interruption_semantics() {
+        let assistant_history = CanonicalTranscript::new()
+            .appended(CanonicalInputItem::message(
+                ConversationRole::Assistant,
+                xml_document("say", "completed history"),
+            ))
+            .unwrap();
+        let default = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+        );
+        let default_body: Value =
+            serde_json::to_value(default.request(&assistant_history).unwrap()).unwrap();
+        assert!(default_body["input"][0].get("status").is_none());
+
+        let explicit = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)
+                .unwrap()
+                .with_explicit_assistant_status(),
+        );
+        let explicit_body: Value =
+            serde_json::to_value(explicit.request(&assistant_history).unwrap()).unwrap();
+        assert_eq!(explicit_body["input"][0]["status"], json!("completed"));
+
+        let interrupted = CanonicalInputItem::interrupted_assistant_text("partial", None);
+        let (_, input) = explicit
+            .lower_canonical_item(&interrupted)
+            .unwrap()
+            .into_parts();
+        assert_eq!(input[0]["status"], json!("incomplete"));
+        assert_eq!(input[0]["content"][0]["text"], json!("partial"));
+        assert_eq!(input[1]["role"], json!("user"));
+        assert_eq!(
+            input[1]["content"][0]["text"],
+            json!(ASSISTANT_OUTPUT_INTERRUPTED_MARKER)
+        );
+    }
+
+    #[test]
     fn native_frame_items_expand_interrupted_text_and_accept_delta_tool_result() {
         let encoder = CodexHttpV1Encoder::new(
             CodexHttpV1Options::new(
                 "gpt-5.6-codex",
-                Some(vec![CodexFunctionTool::new(
-                    "configured_tool",
-                    "old",
-                    json!({}),
-                    false,
-                )
-                .unwrap()]),
+                Some(vec![
+                    CodexFunctionTool::new("configured_tool", "old", json!({}), false).unwrap(),
+                ]),
                 None,
                 None::<String>,
             )

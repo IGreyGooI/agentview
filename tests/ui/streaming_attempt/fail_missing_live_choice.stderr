@@ -1,0 +1,14 @@
+error[E0599]: no method named `build` found for struct `XmlStreamingAttemptBuilder<Channels, (), agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Missing, agentview::component::authoring::Ready>` in the current scope
+ --> tests/ui/streaming_attempt/fail_missing_live_choice.rs:9:10
+  |
+4 | /     XmlStreamingToolCall::new::<Channels>("test")
+5 | |         .state_with(|_| Ok::<_, std::convert::Infallible>(()))
+6 | |         .element(element(), |handlers| handlers.on_complete(|_, _| StreamingToolUpdate::none()))
+7 | |         .finish(|_, _| StreamingToolDecision::Accept(StreamingToolUpdate::none()))
+8 | |         .without_publication()
+9 | |         .build();
+  | |         -^^^^^ method not found in `XmlStreamingAttemptBuilder<Channels, (), agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Missing, agentview::component::authoring::Ready>`
+  | |_________|
+  |
+  |
+  = note: the method was found for `XmlStreamingAttemptBuilder<C, State, agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Ready, R, P>`

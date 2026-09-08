@@ -684,6 +684,31 @@ pub trait ReactionPort: Send {
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault>;
 }
 
+/// Optional port capability for starting a new model-context lineage without
+/// rebuilding the owning [`Application`](super::Application).
+///
+/// This operation is local to the port. Callers must invoke it only after an
+/// earlier fact stream has been dropped and after they have resolved or
+/// rejected any work whose continuation depends on that stream. On success,
+/// the port must discard every provider-owned replay artifact, including raw
+/// output and pending-call state, and return a declaration with the same
+/// target identity and profile at a strictly higher [`TargetEpoch`]. The
+/// declaration must require a [`FrameBasis::Full`] submission.
+///
+/// The returned Full-required declaration starts a new model-context baseline.
+/// Its next Full Frame must be encoded solely from that Frame, never by
+/// retaining a prefix from the discarded context.
+///
+/// A retryable reset error must leave the exact pre-call declaration and every
+/// provider-owned context artifact unchanged, including canonical coverage,
+/// raw output, and pending-call state. A terminal reset error must leave
+/// [`ReactionPort::declare`] terminal, with no usable continuation. This lets
+/// an [`Application`](super::Application) distinguish a retryable local
+/// failure from a provider whose continuity can no longer be trusted.
+pub trait ResettableReactionPort: ReactionPort {
+    fn reset_model_context(&mut self) -> Result<TargetDeclaration, ReactionPortFault>;
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU128, NonZeroU64};

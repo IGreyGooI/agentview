@@ -4,6 +4,9 @@
 provider-neutral Frames and admitting ordered model facts back into
 application-owned state.
 
+Coding agents: start with [HELP.md](HELP.md) for business POM and diff authoring,
+native tools, the tree fold contract, and focused verification.
+
 ## Runtime Boundary
 
 One `Application<P>` owns one logical target session:
@@ -102,6 +105,20 @@ async fn run() -> Result<(), ApplicationFault> {
 The Debug port makes this lifecycle credential-free. For text admission and
 state publication, see [`signal_reaction`](examples/signal_reaction.rs).
 
+### Business History
+
+Render complete business state as typed POM. Use `#[diff(slot = "state")]` to
+declare a stable diff boundary, `#[view(diff)]` for changing fields, and
+`#[view(diff(append))]` for growing business records. The Frame compiler selects
+complete values, supported deltas, or omission from its retained baseline.
+
+Declare native tools with `NativeToolCall::named(...).on_call(...)` and return
+the current call's output. The runtime retains canonical conversation and tool
+history; the port owns provider encoding and private session state.
+
+See [HELP.md: Business History](HELP.md#business-history) for code, delta
+requirements, native tool usage, and the established tree fold rules.
+
 ### Streaming XML
 
 Use `StreamingXml::tag` when a Component only needs lifecycle events for one
@@ -116,11 +133,12 @@ StreamingXml::tag("speak")
     .on_invalid(handle_invalid)
 ```
 
-Use `XmlStreamingToolCall::contract` for a typed XML action declaration. It
-projects model-visible example syntax, decodes matching empty elements, and
-reports contract diagnostics. Both APIs register with the same parser hub for
-the mounted provider-text route, so matching events retain XML source order and
-each async handler is awaited before the next event is dispatched.
+Use `XmlStreamingToolCall::new::<Channels>(...)` for a strict typed streaming
+attempt. One contract declares every top-level action element that shares state,
+cardinality, and one final decision; it owns an independent parser for each
+provider reaction. Separate contracts may independently parse the same selected
+provider text. The legacy `XmlStreamingToolCall::contract` and `StreamingXml`
+surfaces remain parser-hub compatibility APIs.
 
 ## Frame And Reaction Semantics
 
@@ -205,9 +223,11 @@ cargo run --no-default-features --example chess_agentview -- --help
 [`chess_agentview`](docs/chess-runtime-target.md) uses one native
 `Application<P>` with a Component-owned `Signal<ChessState>`. A pure reducer
 owns legal moves, retries, terminal decisions, and turn policy; a retained
-`use_coroutine` actor owns Stockfish. The thin `ChessApplication` driver only
-mounts, waits for Component demand, completes requested reactions, observes the
-terminal result, and shuts down. Offline verification uses reducer, scripted
+`use_coroutine` owns Stockfish, and `use_preparation` waits for its work before
+the next model turn. One strict multi-element streaming
+contract requires a nonempty `thought` before one `choose_move` or `resign`;
+the thin `ChessApplication` driver awaits the preparation barrier, checks
+completion, and consumes Component reaction requests. Offline verification uses reducer, scripted
 port, and fake-UCI fixtures without an API key or installed Stockfish.
 
 ## Paid Chess Runs

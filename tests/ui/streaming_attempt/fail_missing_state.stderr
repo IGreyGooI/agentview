@@ -1,0 +1,12 @@
+error[E0599]: no method named `build` found for struct `XmlStreamingAttemptBuilder<Channels, NoState, agentview::component::authoring::Missing, agentview::component::authoring::Missing, agentview::component::authoring::Missing, agentview::component::authoring::Ready, agentview::component::authoring::Ready>` in the current scope
+ --> tests/ui/streaming_attempt/fail_missing_state.rs:7:10
+  |
+4 | /     XmlStreamingToolCall::new::<Channels>("test")
+5 | |         .without_live()
+6 | |         .without_publication()
+7 | |         .build();
+  | |         -^^^^^ method not found in `XmlStreamingAttemptBuilder<Channels, NoState, agentview::component::authoring::Missing, agentview::component::authoring::Missing, agentview::component::authoring::Missing, agentview::component::authoring::Ready, agentview::component::authoring::Ready>`
+  | |_________|
+  |
+  |
+  = note: the method was found for `XmlStreamingAttemptBuilder<C, State, agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Ready, R, P>`

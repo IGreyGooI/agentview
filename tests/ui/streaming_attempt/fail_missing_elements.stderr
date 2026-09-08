@@ -1,0 +1,11 @@
+error[E0599]: no method named `finish` found for struct `XmlStreamingAttemptBuilder<Channels, (), agentview::component::authoring::Ready>` in the current scope
+ --> tests/ui/streaming_attempt/fail_missing_elements.rs:6:10
+  |
+4 | /     XmlStreamingToolCall::new::<Channels>("test")
+5 | |         .state_with(|_| Ok::<_, std::convert::Infallible>(()))
+6 | |         .finish(|_, _| StreamingToolDecision::Accept(StreamingToolUpdate::none()));
+  | |         -^^^^^^ method not found in `XmlStreamingAttemptBuilder<Channels, (), agentview::component::authoring::Ready>`
+  | |_________|
+  |
+  |
+  = note: the method was found for `XmlStreamingAttemptBuilder<C, State, agentview::component::authoring::Ready, agentview::component::authoring::Ready, agentview::component::authoring::Missing, Live, Publish, R, P>`

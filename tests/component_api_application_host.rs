@@ -39,6 +39,24 @@ struct HostProps {
     exposed: Arc<Mutex<Option<Signal<String>>>>,
 }
 
+#[derive(Clone)]
+struct LegacyPreparationProps {
+    loader_calls: Arc<AtomicUsize>,
+}
+
+#[component]
+fn legacy_preparation_application(
+    props: LegacyPreparationProps,
+    _events: EventInput<ProviderEvent>,
+) -> Component {
+    let loader_calls = Arc::clone(&props.loader_calls);
+    use_preparation(move || async move {
+        loader_calls.fetch_add(1, Ordering::SeqCst);
+        Ok::<(), Infallible>(())
+    });
+    view! { preparation_state { "loading" } }
+}
+
 #[component]
 fn host_application(props: HostProps, _events: EventInput<ProviderEvent>) -> Component {
     let state = use_signal(|| String::from("A"));
@@ -473,6 +491,37 @@ fn scripted_no_event_port(
         },
         projections,
     )
+}
+
+#[tokio::test]
+async fn legacy_application_host_rejects_preparations_before_provider_execute() {
+    let execute_calls = Arc::new(AtomicUsize::new(0));
+    let loader_calls = Arc::new(AtomicUsize::new(0));
+    let port = ScriptedEventPort {
+        scripts: VecDeque::from([EventScript::Eof(Vec::new())]),
+        execute_calls: Arc::clone(&execute_calls),
+        projections: Arc::new(Mutex::new(Vec::new())),
+        polls: None,
+    };
+    let mut components = ComponentHost::new(
+        legacy_preparation_application,
+        LegacyPreparationProps {
+            loader_calls: Arc::clone(&loader_calls),
+        },
+    );
+    let mut host = ApplicationHost::new(port);
+
+    let fault = host
+        .dispatch_llm_reaction(&mut components)
+        .await
+        .expect_err("legacy ApplicationHost must reject Component preparations");
+
+    assert!(matches!(
+        fault,
+        ApplicationHostFault::ComponentPreparationsUnsupported
+    ));
+    assert_eq!(loader_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

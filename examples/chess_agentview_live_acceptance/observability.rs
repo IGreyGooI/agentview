@@ -53,6 +53,10 @@ impl From<chess::Color> for ObservedSide {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ObservedInvalidActionReason {
     InvalidXml,
+    MissingThought,
+    InvalidThought,
+    MultipleThoughts,
+    ThoughtAfterAction,
     MissingAction,
     MultipleActions,
     InvalidUci,
@@ -65,6 +69,10 @@ impl ObservedInvalidActionReason {
     pub(crate) fn code(self) -> &'static str {
         match self {
             Self::InvalidXml => "invalid_xml",
+            Self::MissingThought => "missing_thought",
+            Self::InvalidThought => "invalid_thought",
+            Self::MultipleThoughts => "multiple_thoughts",
+            Self::ThoughtAfterAction => "thought_after_action",
             Self::MissingAction => "missing_action",
             Self::MultipleActions => "multiple_actions",
             Self::InvalidUci => "invalid_uci",
@@ -79,6 +87,10 @@ impl From<InvalidActionReason> for ObservedInvalidActionReason {
     fn from(value: InvalidActionReason) -> Self {
         match value {
             InvalidActionReason::InvalidXml => Self::InvalidXml,
+            InvalidActionReason::MissingThought => Self::MissingThought,
+            InvalidActionReason::InvalidThought => Self::InvalidThought,
+            InvalidActionReason::MultipleThoughts => Self::MultipleThoughts,
+            InvalidActionReason::ThoughtAfterAction => Self::ThoughtAfterAction,
             InvalidActionReason::MissingAction => Self::MissingAction,
             InvalidActionReason::MultipleActions => Self::MultipleActions,
             InvalidActionReason::InvalidUci { .. } => Self::InvalidUci,

@@ -17,11 +17,13 @@ pub use signal::SignalAccessError;
 
 /// Curated imports for Component authors.
 pub mod prelude {
+    pub use super::authoring::streaming_attempt::*;
     pub use super::authoring::{
-        spawn, use_coroutine, use_future, use_provider_event_handler, use_reaction_completion,
-        use_reaction_request, use_signal, Component, Coroutine, CoroutineInbox, CoroutineSendError,
-        NativeToolCall, ProviderEventSelector, ReactionRequest, ReactionRequestError, Signal,
-        SpawnError, StreamingXml, StreamingXmlTag, XmlContractDiagnostic, XmlStreamingToolCall,
+        spawn, use_coroutine, use_future, use_preparation, use_provider_event_handler,
+        use_reaction_completion, use_reaction_request, use_signal, Component, Coroutine,
+        CoroutineInbox, CoroutineSendError, NativeToolCall, ProviderEventSelector, ReactionRequest,
+        ReactionRequestError, Signal, SpawnError, StreamingXml, StreamingXmlTag,
+        XmlContractDiagnostic, XmlStreamingToolCall,
     };
     #[cfg(feature = "legacy-provider-port")]
     #[allow(

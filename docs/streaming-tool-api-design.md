@@ -2,7 +2,8 @@
 
 Date: 2026-09-07
 
-Status: **proposed v1 contract; implementation and compile-spike not started**
+Status: **AgentView v1 core implemented and tested; the in-repository Chess example is migrated.
+Forgotten City consumer migrations and application-specific durable adapters remain external work.**
 
 This document designs the Component API for model-authored streaming XML tools. It covers the
 requirements exercised by `forgotten-city` while preserving the ownership rules in
@@ -14,14 +15,14 @@ source is [`streaming-tool-attempt.lifecycle.json`](streaming-tool-attempt.lifec
 
 ## 1. Decision
 
-Add one high-level, strict, multi-element attempt API under the existing
+Add one high-level, strict, multi-element contract API under the existing
 `XmlStreamingToolCall` entry point:
 
 ```rust,ignore
-XmlStreamingToolCall::contract("forgotten-city.player-selector", "v2")
-    .attempt::<SelectorChannels>()
+XmlStreamingToolCall::new::<SelectorChannels>("forgotten-city.player-selector")
+    .version("v2") // optional; the default is "v1"
     .state_with(...)
-    .envelope(XmlEnvelope::strict_fragment())
+    // XmlEnvelope::strict_fragment() is the default.
     .element(...)
     .finish(...)
     .live_with(...)
@@ -30,29 +31,35 @@ XmlStreamingToolCall::contract("forgotten-city.player-selector", "v2")
     .build()
 ```
 
-Current HEAD is substantially narrower: `StreamingXml::tag` exposes async open/cumulative-stream/
-complete callbacks, while `XmlStreamingToolCall` recognizes one self-closing tag with zero or one
-typed attribute. Declarations on a route share the current parser, but there is no per-reaction
-shared reducer state, heterogeneous strict grammar, cardinality/final decision, compensatable Live
-lane, atomic publication, or recovery fence. The provider projection also removes output key/phase
-and turns `ReactionCompleted` into public `TextComplete`, which is why section 7 is a prerequisite
-rather than parser cleanup.
+`XmlStreamingToolCall::new::<C>(identity)` creates one strict contract declaration. The branch now
+contains an incremental parser, typed element declarations, reducers, managed lanes, and a
+reaction-owned supervisor. Each selected structured text stream is broadcast to every mounted
+contract, which starts an isolated parser, state value, cardinality ledger, and effect ledger. This
+document records the implemented framework boundary and the wider consumer migration criteria in
+section 13. External application migrations are not implied by the AgentView implementation.
 
-The high-level attempt owns five things for exactly one provider reaction:
+The high-level declaration owns five things for one contract in one provider reaction:
 
-1. one prompt-producing XML fragment grammar containing all accepted top-level elements;
-2. one shared streaming parser for the selected provider text output;
+1. one prompt-producing XML fragment grammar containing its accepted top-level elements;
+2. one isolated streaming parser for the selected provider text output;
 3. fresh reducer state and occurrence/cardinality accounting;
 4. staged `Output`, immediately interpreted but compensatable `Live`, and staged `Commit` values;
 5. one terminal `Accept` or `Reject` decision after normal reaction EOF.
+
+The reaction supervisor owns the cross-contract behavior: it broadcasts the selected input, waits
+for every contract to reach a definitive result or recovery fence, runs Application
+post-reconciliation once, and releases at most one coalesced successor demand. A tag name may be
+declared by more than one contract because each parser is independent. Repeating a tag name inside
+one contract remains a declaration fault.
 
 Keep the two existing APIs, but narrow their roles:
 
 - `StreamingXml::tag(...)` remains a prompt-free, permissive, raw lifecycle subscriber. It has no
   transaction, cardinality, retry, or publication guarantees.
-- The existing `XmlStreamingToolCall::contract(...).empty_element(...)` chain remains as a
-  compatibility adapter. It lowers to one self-closing permissive element without widening its
-  accepted wire syntax, and is not the canonical API for new applications.
+- The existing `XmlStreamingToolCall::contract(...).empty_element(...)` chain remains a legacy
+  shared-route, single-element compatibility API. It retains its existing permissive parser and
+  wire syntax; it does not yet lower through the new contract worker, and is not the canonical API
+  for new applications.
 
 Do not restore the deleted `StreamingXml<E, D>` / `DurableComponent` surface. The useful semantics
 from that implementation are retained as smaller layers without restoring its mounted runtime.
@@ -73,9 +80,9 @@ The framework owns protocol mechanics. The application retains business authorit
 AgentView owns:
 
 - provider-neutral text selection and reaction EOF;
-- XML scanning, resource limits, decoded text deltas, source spans, and source order;
-- structural schema validation and typed wire decoding;
-- fresh attempt state, occurrence identity, cardinality accounting, and finalization;
+- per-contract XML scanning, resource limits, decoded text deltas, source spans, and source order;
+- per-contract structural schema validation and typed wire decoding;
+- fresh contract-attempt state, occurrence identity, cardinality accounting, and finalization;
 - deterministic lane staging;
 - live-effect receipt tracking, normal confirmation, reverse compensation, and recovery fencing;
 - the publication boundary through an injected publisher interface;
@@ -94,19 +101,21 @@ which continue through `NativeToolCall` and the native tool lane.
 
 ## 3. Non-negotiable invariants
 
-1. A provider text route has exactly one strict grammar owner. Multiple permissive subscribers may
-   observe it, but a second strict owner fails at Component mount.
-   Element names inside that owner's grammar are unique; duplicate declarations are an invalid
-   Component declaration rather than an ordered fan-out.
-2. One reaction creates fresh grammar state. No count, diagnostic, decoded value, live receipt, or
-   staged value crosses into another reaction.
+1. A provider reaction may mount multiple strict contracts. The Application broadcasts its selected
+   structured text to every contract, and every contract parses it independently. Element names are
+   scoped to a contract: the same tag in two contracts is valid, while duplicate declarations in one
+   contract are an invalid Component declaration.
+2. One reaction creates fresh state for every contract attempt. No count, diagnostic, decoded
+   value, live receipt, or staged value crosses into another reaction or another contract.
 3. Commentary/reasoning text is never parsed as an XML action stream. The default route selects the
    sole non-commentary text output and verifies it against the reaction's primary output.
 4. Reaction EOF is a distinct runtime signal. `TextComplete` or `TextSealed` is not EOF.
-5. All tags in a grammar share one parser and one monotonically increasing attempt-order sequence.
-   Parser events, diagnostics, and reducer emissions draw from that same counter, preserving source
-   and dispatch order across different tags.
-6. A handler and every live effect it emits finish before the next XML event is dispatched.
+5. All tags declared by one contract share one parser and one monotonically increasing
+   contract-attempt order sequence. Parser events, diagnostics, and reducer emissions preserve
+   source and dispatch order inside that contract. Different contracts do not share parser state,
+   counters, business decisions, or effect ledgers.
+6. Within a contract, a handler and every live effect it emits finish before the next XML event is
+   dispatched.
 7. Self-closing syntax produces `Open` followed immediately by `Complete` for the same occurrence.
 8. `on_open` runs only after structural attribute validation and open-value decoding succeed.
    `on_open` and `on_delta` receive shared State read-only; only `on_complete`, after structural and
@@ -138,7 +147,7 @@ which continue through `NativeToolCall` and the native tool lane.
 
 ### 4.1 Channel contract
 
-The channel marker keeps a grammar's lane types nominal and prevents an erased runtime from
+The channel marker keeps a contract's lane types nominal and prevents an erased runtime from
 confusing `Live` with `Commit`.
 
 ```rust,ignore
@@ -182,8 +191,8 @@ Each single-value constructor creates the first entry. Every consuming `with_*` 
 entry to the tail, so chain call order is emission order. Values need not implement `Clone`, and the
 first version does not expose the backing vector or a generic untyped insertion method. Emission
 order is retained even though only `Live` is interpreted immediately. The runtime stamps every
-parser event, diagnostic record, and update entry from one attempt-wide order counter. An emitted
-entry also records the parser event that caused it:
+parser event, diagnostic record, and update entry from one contract-attempt-wide order counter. An
+emitted entry also records the parser event that caused it:
 
 ```rust,ignore
 pub enum StreamingEmissionOrigin {
@@ -249,7 +258,7 @@ invalidate an occurrence; the final reducer alone accepts or rejects the whole a
 
 ### 4.2 Grammar and element contracts
 
-One grammar contains every element that is valid on its strict XML fragment route:
+One contract owns every element that is valid in its strict XML fragment grammar:
 
 ```rust,ignore
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -377,8 +386,15 @@ and rejects nested markup.
 An explicit paired-empty syntax can be added later as a separate constructor without silently
 widening `self_closing`. Strict fragments allow only declared top-level sibling elements and
 whitespace outside them. Unknown elements, namespaces, duplicate attributes, undeclared
-attributes, non-text children, and trailing text are contract violations. Registering two element
-contracts with the same name fails at mount before any provider request.
+attributes, non-text children, and trailing text are contract violations. Registering the same
+element name twice in one contract fails at mount before any provider request. The same name in two
+different contracts is valid because each contract has its own parser and declaration namespace.
+
+Strict fragment parsing is the builder default, so `.envelope(XmlEnvelope::strict_fragment())` is
+usually unnecessary. `.ignore_unknown_elements()` is an opt-in, per-contract policy: it ignores an
+unknown top-level element and its subtree for that contract only. This makes separately authored
+contracts composable on the same reaction input without suppressing diagnostics from a contract
+that intentionally remains strict.
 
 `allow_unclosed_text_at_eof` is an explicit migration policy for the current NPC behavior. It only
 permits an already-open `text` element to end at EOF. It does not make malformed opening markup,
@@ -528,8 +544,10 @@ visible to application policy. It increments `completed` only when that validato
 
 ### 4.4 Shared attempt state and reducers
 
-The attempt builder accepts heterogeneous element contracts. Each element has its own typed
-`Head` and `Value`, while every handler observes the same `State` and emits the same root channels.
+One contract builder accepts heterogeneous element declarations. Each element has its own typed
+`Head` and `Value`, while every handler in that contract observes the same `State` and emits the
+same root channels. State, reducer order, terminal decision, and managed effects never span two
+contracts merely because they receive the same reaction input.
 
 ```rust,ignore
 pub struct MissingCompletion;
@@ -964,20 +982,19 @@ their intended phase. Implementations must make apply/confirm/rollback/recovery 
 ID so a lost acknowledgement can be resolved safely. These framework IDs are process-local
 correlation values, not durable database identities.
 
-All side-effecting calls are owned by an Application-level `StreamingToolAttemptSupervisor`. Once a
-call starts, cancelling or dropping the `react()` waiter does not drop that call. The supervisor
-records the outcome, aborts the attempt when required, and owns every receipt and prepared
-operation until it is definitively settled.
+All side-effecting calls are owned by Application's `StreamingSupervisor` and its per-contract
+workers. Once a call starts, cancelling or dropping the `react()` waiter does not drop that call.
+The worker records the outcome, aborts its contract when required, and owns every receipt and
+prepared operation until it is definitively settled or retained for recovery.
 
 Consuming `Application::shutdown(self) -> Result<(), ApplicationFault>` first waits for a call
 already in flight, then repeatedly drives the same recovery machinery with bounded backoff. It
-returns only when `CleanupState::Clear`: `Ok(())` for a settled/ready disposition, or the saved fault
-for Terminal. Preparation-needed, NotSettled, Indeterminate, resolve error, or a recovery-time
-factory error while retained evidence still needs an adapter all keep shutdown pending. A
-permanently unresolved adapter therefore cannot discard evidence or
-acknowledge clean shutdown. Cancelling the shutdown future, merely dropping `Application`, or
-terminating the process remains outside this in-process guarantee. Adapters that need crash recovery
-must persist their own stable operation IDs.
+returns only after every retained worker is clear, or returns the retained terminal fault.
+Preparation-needed, NotSettled, Indeterminate, resolve error, or a recovery-time factory error
+while retained evidence still needs an adapter all keep shutdown pending. A permanently unresolved
+adapter therefore cannot discard evidence or acknowledge clean shutdown. Cancelling the shutdown
+future, merely dropping `Application`, or terminating the process remains outside this in-process
+guarantee. Adapters that need crash recovery must persist their own stable operation IDs.
 
 ### 5.2 Accepted publication
 
@@ -1064,17 +1081,16 @@ The final reducer can reject an otherwise normally completed provider reaction. 
    or Commit emission;
 2. discards already staged Output and Commit values;
 3. rolls back all live receipts;
-4. after rollback is definitive, invokes the configured `on_rejected` handler exactly once with the
-   owned raw output and diagnostics, unless post-handoff cancellation selected Terminal before the
-   handler was claimed;
-5. runs Component post-reconciliation exactly once;
-6. interprets the returned `StreamingToolRejectionAction`, optionally queueing one successor
-   reaction demand, then returns without starting that provider call inline.
+4. after its rollback is definitive, invokes the configured `on_rejected` handler exactly once with
+   the owned raw output and diagnostics, unless cancellation arrived before the handler was claimed;
+5. records a local `StreamingToolRejectionAction` without starting another provider call inline;
+6. after every contract worker is definitive, lets Application run one post-cleanup reconciliation
+   pass and coalesce the workers' requested successor reaction into at most one demand.
 
 The rejection handler normally writes typed feedback into Component state and returns
 `RequestReaction`. It must not call `ReactionRequest` directly: external mutation remains fenced
-until rejection continuation and post-reconciliation finish. The supervisor has the sole privileged
-path that converts the action into a latent demand, released only after the Application is Ready.
+until every worker has cleaned up and Application has completed its post-cleanup reconciliation.
+Application has the sole privileged path that converts the coalesced action into a latent demand.
 `Complete` queues nothing. Retry budget and partial-acceptance policy stay in the application.
 
 Canonical provider facts have already been admitted before Component dispatch. Rejection therefore
@@ -1085,41 +1101,31 @@ concern.
 
 ### 5.4 Recovery fence
 
-Recovery is an explicit Application operation rather than an implicit model retry:
+Recovery is an explicit Application operation rather than an implicit model retry. The public status
+is reaction-scoped and reports every independently mounted contract:
 
 ```rust,ignore
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamingToolRecoveryPhase {
-    ResolveLiveApply,
-    ResolvePublication,
-    ConfirmLive,
-    RollbackLive,
-    HandleRejection,
-    PostReconcile,
+#[derive(Debug, Clone)]
+pub struct StreamingToolRecoveryReport {
+    pub attempt: StreamingToolAttemptId,
+    pub contract: &'static str,
+    pub accepted: bool,
+    pub settled: bool,
+    pub fault: Option<ApplicationFault>,
 }
 
-#[non_exhaustive]
-pub enum StreamingToolRecoveredDisposition {
-    Settled,
-    RetryReady { reaction_requested: bool },
-    Terminal { fault: ApplicationFault },
-}
-
+#[derive(Debug, Clone)]
 pub enum StreamingToolRecoveryStatus {
     NotRequired,
-    Recovered {
-        attempt: StreamingToolAttemptId,
-        disposition: StreamingToolRecoveredDisposition,
-    },
     InFlight {
-        attempt: StreamingToolAttemptId,
-        phase: StreamingToolRecoveryPhase,
+        attempts: Box<[StreamingToolRecoveryReport]>,
     },
     StillRequired {
-        attempt: StreamingToolAttemptId,
-        // Duplicates are meaningful: several receipts may need the same phase.
-        pending: Box<[StreamingToolRecoveryPhase]>,
+        attempts: Box<[StreamingToolRecoveryReport]>,
+    },
+    Recovered {
+        attempts: Box<[StreamingToolRecoveryReport]>,
+        reaction_requested: bool,
     },
 }
 
@@ -1130,122 +1136,47 @@ impl<P: ReactionPort> Application<P> {
 }
 ```
 
-Calling `recover_streaming_attempt` when no streaming attempt is fenced returns `NotRequired` and
-does not touch an adapter. A `StillRequired.pending` slice is always non-empty.
-Once an active streaming fence is found, attempt-related adapter, handler, and reconciliation
-outcomes are journaled and returned as `Ok(InFlight | StillRequired | Recovered)`, including
-`RecoveredDisposition::Terminal { fault }`. The outer `Err(ApplicationFault)` is reserved for an
-unrelated Application lifecycle fault detected before joining/starting a drive; it guarantees that
-this call invoked no adapter/callback and did not alter the existing fence. Thus an `Err` never asks
-the caller to guess whether recovery evidence survived.
+`NotRequired` means no worker set is retained. Every other status contains one report for each
+strict contract that was mounted for the reaction. `accepted` records that contract's accepted
+terminal path, while `settled` means its worker has no queued operation or retained recovery
+evidence. `fault` preserves a terminal contract fault, including a non-rejection abort cause, or a
+retained Application cleanup fault. A recovered NotPublished or interrupted apply must therefore
+not appear as a clean accepted/settled contract merely because its effect ledger was released.
 
-The supervisor is defined by two orthogonal state axes, not one overloaded status:
+`InFlight` reports a worker command already being driven. `StillRequired` reports that a recovery
+pass left at least one worker with evidence to resolve. `Recovered` is returned only after every
+worker is clear and Application's post-cleanup reconciliation succeeds; `reaction_requested` is the
+single coalesced demand bit computed across the reports. `Recovered` does not imply that every
+contract accepted or had no terminal fault; callers inspect the reports for those facts.
 
-```text
-CleanupState:
-  Clear | InFlight { generation, phase } | RecoveryRequired { generation }
+Each worker owns its own prepared Live apply operation, publication operation, settlement intent,
+and receipt records. Confirmation scans a worker's receipts in apply order and rollback scans them
+in reverse apply order. A failed or indeterminate item does not erase later evidence. A recovery
+call never restarts the provider or replays a completed contract; it only drives the retained worker
+operations toward a definitive result.
 
-PostCleanupDisposition:
-  Ready | Accept | Reject(report) | Terminal(fault)
-```
+Application owns the only reaction-level continuation. Once every worker is clear, it performs one
+post-cleanup reconciliation pass when Component state is dirty, releases the worker set, and then
+releases at most one coalesced successor demand. A post-reconcile failure remains fenced and is
+preserved in the reports until a later recovery call succeeds; it does not rerun a completed worker.
 
-`Terminal(fault)` never erases cleanup evidence, and `RecoveryRequired` never erases the terminal
-fault. While cleanup is not Clear, callers observe the recovery fence even if cancellation or a
-task panic has already selected Terminal. Once cleanup becomes Clear, the saved business
-disposition becomes visible.
+Dropping the original `react()` waiter after provider handoff cancels every active worker, prevents
+successor demand release, and retains any uncertain cleanup behind the fence. If a rejection handler
+has not begun, cancellation prevents it from starting. Dropping a
+`recover_streaming_attempt()` waiter merely detaches that observer: an enqueued worker command keeps
+running, and a later recovery call reports `InFlight` or its resulting contract state.
 
-The supervisor's cleanup ledger is authoritative. It retains the prepared Live apply operation,
-the prepared publication operation, the intended settlement, and one record per receipt in apply
-order. Receipt records independently represent applied, preparation-needed, retryable-not-settled,
-indeterminate-with-operation, confirmed, or rolled-back state. Confirmation scans in apply order;
-rollback scans in reverse apply order. A failed or indeterminate item does not skip later items, so
-one pass may retain several operations. A cursor is only a scan optimization and never the source
-of truth.
+Prepared operations and receipts are retained before their external futures are polled. A caught
+adapter-future panic discards that runtime or publisher instance, recreates one from the retained
+factory, and resolves the same immutable operation. If factory recreation fails or an operation
+remains indeterminate, the worker stays in `StillRequired` with its evidence intact.
 
-Successful acceptance has an exactly-once continuation after all Live receipts are confirmed,
-including the `without_publication` path:
-
-```text
-AcceptPending -> PostReconcileClaimed -> Reconciled -> Ready(Settled)
-```
-
-The post-reconcile claim is saved before invocation. Waiter loss cannot repeat it; failure records
-Terminal, and Settled is not exposed until reconciliation succeeds.
-
-Reject continuation has its own in-memory journal:
-
-```text
-Pending(report)
-  -> HandlerClaimed
-  -> OutcomeSaved(Ok(action) | Err(handler_fault))
-  -> PostReconcileClaimed
-  -> ReconcileOutcomeSaved(Ok | Err(reconcile_fault))
-       | Ok(action) + Ok(reconcile) -> DemandStaged(no-op for Complete) -> Ready(RetryReady)
-       | Err(handler) + Ok(reconcile) -> Terminal(handler_fault)
-       | any Err(reconcile)           -> Terminal(reconcile_fault)
-```
-
-Each transition is recorded before the next callback/external wake-up. `HandlerClaimed` prevents a
-sync panic while constructing the future, an async panic/error, or waiter loss from invoking the
-handler again. `OutcomeSaved` has an explicit error branch: handler error/panic selects Terminal but
-still proceeds to post-reconciliation once, because the handler may already have changed Component
-Signals; no reaction demand is then staged. If post-reconciliation also fails, its terminal
-consistency fault takes public precedence while both causes remain available to internal telemetry.
-
-On successful reconciliation, the Application actor atomically sets its coalesced sticky demand bit
-(only for `RequestReaction`) and records `DemandStaged` while the execution fence is still held. It
-then records Ready, clears the fence, and wakes the ordinary driver, which consumes that bit. The bit
-is idempotent and cannot be consumed before Ready, closing both the record-before-wake loss window
-and the wake-before-record duplicate window.
-
-Dropping the original `react()` waiter after provider handoff is business cancellation and changes
-the saved disposition to `Terminal(CancelledAfterHandoff)` without erasing either journal. If the
-rejection handler was not yet claimed, the journal records
-`Pending -> Skipped(Cancelled) -> Terminal`; it can never be claimed later. If already claimed, it
-and post-reconciliation are driven to their safe point, followed by an explicit Terminal branch
-that bypasses `DemandStaged`/Ready. Any previously staged but still fenced demand is cleared. Actor
-serialization linearizes this against Ready. By contrast, dropping a
-`recover_streaming_attempt()` waiter merely detaches that observer: it does not change the business
-disposition and the current generation continues in the supervisor.
-
-Each supervisor drive has a generation and at most one adapter call is InFlight at a time. Before
-polling that future, the operation and generation are recorded. If a `react` or recovery waiter is
-dropped, the supervisor continues and atomically records the outcome before notifying remaining
-waiters. A later recovery call that finds an existing generation returns `InFlight` (an
-implementation may instead await the same generation), but never re-enters the adapter. Dropping
-all waiters does not drop the supervisor call.
-
-Prepared operation values are semantically immutable: adapter futures may use them as request keys
-but may not make recovery depend on in-place mutation. After a caught adapter-future panic the
-possibly corrupted runtime/publisher instance is discarded, the original factory is invoked with
-the same attempt start context, and only the new instance may resolve the retained operation. This
-managed-lane panic boundary is narrower than ordinary Component callback unwind behavior.
-Receipts have the same panic-stability and cross-instance requirement; recovery cannot depend on
-interior mutation made while a failed future was being polled.
-Factories are pre-I/O. If recreation returns an error or panics again, the ledger, operation, and
-receipts remain unchanged, the instance is discarded, and the drive returns `StillRequired`; a
-later recovery/shutdown drive may retry factory creation.
-
-Each explicit recovery call is bounded: for every operation pending at call entry it performs at
-most one retry or matching `resolve_*`; a definitive result may make one confirm/rollback pass newly
-reachable. `StillIndeterminate`, resolution error, or caught adapter panic retains the same
-operation and returns `StillRequired`. Publication uncertainty blocks all confirmation and rollback
-until it resolves. An explicitly recovered streaming/parser attempt is never resumed.
-
-Recovery continuation is complete and deterministic:
-
-- an interrupted Live apply resolves to NotApplied or to an Applied receipt that is rolled back,
-  then exposes the saved Terminal disposition;
-- an occurrence-local rollback that became uncertain aborts the whole attempt, discards all staged
-  publication values, rolls back every receipt, and exposes the saved Terminal disposition;
-- publication resolving NotPublished rolls back all receipts and exposes Terminal;
-- publication resolving Published confirms every receipt and runs accepted post-reconciliation; a
-  previously recorded independent runtime fault remains Terminal, otherwise the attempt becomes
-  Settled;
-- recovered rejection that remains the saved disposition finishes rollback, invokes `on_rejected`
-  exactly once, runs post-reconciliation once, queues its optional latent demand, and becomes
-  RetryReady;
-- confirm/rollback recovery preserves the disposition that originally selected that settlement.
+Each recovery pass drives retained Live and publication evidence without resuming XML parsing. A
+resolved interrupted apply either proves no effect or produces a receipt that follows the contract's
+stored settlement path. Publication uncertainty blocks rollback until it resolves; a NotPublished
+resolution rolls back the contract's receipts, while a Published resolution confirms them. A
+recovered rejection invokes its handler only if it was not already invoked, and any request is
+coalesced with its siblings only after Application's post-cleanup handoff.
 
 While the fence is active, `react()`, `ReactionRequest`, Component reconciliation/remount, and any
 successor streaming attempt fail before provider submission. Read-only snapshots remain available.
@@ -1257,13 +1188,14 @@ while its own unresolved journal is present, because framework recovery IDs are 
 
 ## 6. Complete builder shape
 
-The proposed public composition is:
+The public composition is:
 
 ```rust,ignore
-XmlStreamingToolCall::contract(identity, implementation_version)
-    .attempt::<Channels>()
+XmlStreamingToolCall::new::<Channels>(identity)
+    .version(implementation_version) // optional; defaults to "v1"
     .state_with(|start: StreamingToolAttemptStart| -> Result<State, InitError> { ... })
-    .envelope(XmlEnvelope::strict_fragment())
+    // Strict fragments are the default.
+    // .ignore_unknown_elements() is an opt-in per-contract compatibility policy.
     .element(
         element_contract,
         |handlers: XmlElementHandlers<State, Channels, Head, Value>| {
@@ -1313,8 +1245,10 @@ pub struct XmlStreamingAttemptBuilder<
     >,
 }
 
-impl XmlStreamingToolCallContract {
-    pub fn attempt<C: StreamingToolChannels>(self) -> XmlStreamingAttemptBuilder<C>;
+impl XmlStreamingToolCall {
+    pub fn new<C: StreamingToolChannels>(
+        identity: &'static str,
+    ) -> XmlStreamingAttemptBuilder<C>;
 }
 
 impl<C, Elements, Finish, Live, Publish>
@@ -1458,7 +1392,15 @@ where
     C: StreamingToolChannels,
     State: Send + 'static,
 {
+    pub fn version(self, version: &'static str) -> Self {
+        unimplemented!()
+    }
+
     pub fn envelope(self, envelope: XmlEnvelope) -> Self {
+        unimplemented!()
+    }
+
+    pub fn ignore_unknown_elements(self) -> Self {
         unimplemented!()
     }
 
@@ -1494,9 +1436,10 @@ where
 ```
 
 The elided factory storage is private and type-erased at `build`; the slot transitions and bounds
-above are normative. The implementation compile-spike must lock the exact return spellings before
-stabilization. Compile-fail UI tests cover missing state, zero elements, missing finish, missing live
-choice, missing publication choice, and registering an element draft before `.decode`. A disabled
+above describe the required slot transitions; implementation-specific runtime and publisher type
+parameters are elided. Compile-fail UI tests cover missing state, zero elements, missing
+finish, missing live choice, missing publication choice, and registering an element draft before
+`.decode`. A disabled
 lane therefore requires an explicit
 `.without_live()` or `.without_publication()` call; `.build()` never installs a panic placeholder.
 Live and publisher factories are retained for the attempt and may be invoked again after a caught
@@ -1532,12 +1475,13 @@ strict structured routes is a later extension.
 
 ## 7. Input routing prerequisite
 
-The current public `ProviderEvent::Text(TextTurnEvent)` drops `ProviderOutputKey` and
-`AssistantPhase` before streaming XML sees it. It also uses `TextComplete` as both full text and the
-parser's completion signal. A complete tool cannot build on that projection.
+The public `ProviderEvent::Text(TextTurnEvent)` drops `ProviderOutputKey` and `AssistantPhase`
+before streaming XML sees it. It also uses `TextComplete` as both full text and the parser's
+completion signal. Strict contracts therefore use an internal structured sidecar rather than that
+compatibility projection.
 
-The minimal compatible implementation adds a crate-private sidecar rather than changing the
-public event enum:
+The implementation adds a crate-private sidecar rather than changing the public event
+enum:
 
 ```rust,ignore
 pub(crate) enum AdmittedTextFact {
@@ -1564,7 +1508,7 @@ pub(crate) struct AdmittedReactionSummary {
 }
 ```
 
-The new structured route:
+The structured route:
 
 - ignores commentary phases;
 - binds the first non-commentary output key and relies on admission's existing uniqueness rule;
@@ -1579,9 +1523,18 @@ for `TextSealed` it carries only the sidecar; `ReactionCompleted` still produces
 `TextComplete`. This preserves every current public handler while preventing the strict parser from
 using that compatibility completion event as reaction EOF.
 
-`ReactionAdmissionGuard::finish_normal()` returns `AdmittedReactionSummary`. Only after the actual
-fact stream reaches EOF, `ReactionCompleted` has been validated, and native tool lanes are closed
-does `RenderBindings::finish_normal(summary)` finalize streaming tools.
+`StreamingSupervisor` owns one worker per strict contract. It broadcasts every admitted selected
+text delta or sealed value to all workers; it never shares a scanner between them. Each worker calls
+`Parser::push` for deltas and uses sealing only to validate or append the final suffix. Only after
+the actual fact stream reaches EOF, `ReactionCompleted` has been validated, and native tool lanes
+are closed does `StreamingSupervisor::finish(summary)` call each contract's normal EOF transition.
+
+After every worker has either settled definitively or retained recovery evidence, Application owns
+the reaction-level handoff. `complete_streaming_cleanup` runs post-reconciliation once, releases
+the worker set, and releases at most one coalesced reaction demand. Cancellation aborts every
+worker without invoking its final reducer; once all cleanup is definitive, the Application is
+reusable. Any uncertain apply, publication, confirmation, or rollback keeps its worker behind the
+recovery fence until `recover_streaming_attempt` reaches a definitive result.
 
 Existing `ProviderEvent::TEXT` handlers keep their current public event values and ordering. The
 compatibility `.listen_to(events.select(ProviderEvent::TEXT))` route keeps its legacy mixed-text
@@ -1594,30 +1547,33 @@ semantics and does not claim commentary isolation.
 For each admitted provider fact:
 
 1. canonical history commits the fact;
-2. the structured XML parser consumes the sidecar and queues derived events;
-3. existing raw `ProviderEvent` handlers run;
-4. derived XML events run in source order;
-5. each synchronous reducer update is interpreted in entry order;
-6. each Live apply is awaited before the next derived event.
+2. any public `ProviderEvent` is dispatched to existing raw handlers, preserving the legacy order;
+3. the supervisor broadcasts the selected structured-text sidecar to every contract worker;
+4. each worker's independent parser queues its own derived events;
+5. within each contract, derived XML events run in source order and each synchronous reducer update
+   is interpreted in entry order;
+6. within each contract, each Live apply is awaited before the next derived event.
+
+Native tool lanes continue to be polled while either a raw handler or a contract Live apply awaits,
+so a slow streaming effect does not stall an already admitted native tool completion.
 
 At normal reaction EOF:
 
 1. the selected text output is verified as sealed and primary;
-2. incomplete elements are diagnosed, or one permitted open text element is completed with
-   `ImplicitEof`;
-3. minimum cardinality diagnostics are generated;
-4. the grammar final reducer runs exactly once;
-5. `Reject` stores its report and rolls back Live before running its rejection continuation;
-6. `Accept` sends one ordered batch to the publisher, or crosses the explicit no-op barrier from
-   `without_publication`;
-7. known publication success and the no-op barrier enter `Confirming` and confirm every Live receipt;
-8. an unresolved apply/publish/rollback/confirm enters `RecoveryRequired` with its evidence;
-9. rejection handling and Component post-reconciliation run after cleanup, before a normally
-   settled `Application::react()` returns or an optional successor demand becomes runnable.
+2. every worker independently diagnoses incomplete elements, optionally completes one permitted
+   open text element with `ImplicitEof`, and emits minimum-cardinality diagnostics;
+3. every contract's synchronous final reducer runs exactly once; it is not a recovery operation;
+4. each `Reject` stores its report and rolls back its own Live receipts before its rejection
+   continuation, while each `Accept` publishes its own ordered batch or crosses its no-op barrier;
+5. known publication success and no-op barriers confirm that contract's Live receipts;
+6. an unresolved apply, publish, rollback, or confirmation retains that contract's evidence behind
+   the recovery fence;
+7. only after all workers are definitive does Application run post-reconciliation once and release
+   at most one successor demand before a normally settled `Application::react()` returns.
 
-The reaction-completion hook introduced by commit `836db3a` has the required normal ordering and
-should be reused or absorbed when that work lands. The streaming attempt still needs its own typed
-state and publication owner; it must not implement finalization as an unrelated second EOF loop.
+There is one reaction-level completion loop. It fan-outs normal EOF to the independent contract
+attempts, then joins only after their definitive cleanup; it does not share a parser or invent an
+EOF from `TextSealed`.
 
 ### 8.2 Contract diagnostics
 
@@ -1693,10 +1649,9 @@ never computes its own byte delta.
 
 ### 9.3 NPC response
 
-One strict grammar registers all six tags. `thought`, `speak`, `act`, and `log_behavior` are text
+One strict contract registers all six tags. `thought`, `speak`, `act`, and `log_behavior` are text
 elements. `share_knowledge` and `update_relationship` are self-closing elements with typed
-attributes.
-They share state, attempt-order sequence, and a final validator.
+attributes. They share one contract-attempt state value, order sequence, and final validator.
 
 Visible speech may use Live effects. Relationship and knowledge changes should normally be Commit
 values, not irreversible open-handler side effects. The final validator enforces at least one
@@ -1710,6 +1665,19 @@ behavior are deterministic.
 
 ### 9.4 Chess
 
+The in-repository example uses one `chess.action` contract with a nonempty `thought` text element
+followed by one `choose_move` or `resign` self-closing element. Shared State prevents an action from
+completing before the thought; missing, invalid, repeated, or late thoughts produce retry feedback.
+Its final reducer accepts exactly one decoded action; its publisher applies that action to the
+shared Chess Signal synchronously and retains a Published/NotPublished journal for replay.
+Rejection writes the existing typed feedback. After streaming cleanup, `use_preparation` waits for
+Stockfish and requests the next model attempt only when ready. Terminal preparation stops the
+driver before another provider submission.
+This example explicitly disables Live and Commit. See
+[`chess_action_component.rs`](../examples/chess_agentview/chess_action_component.rs).
+
+A richer application can also add a preview and a durable outbox:
+
 ```rust,ignore
 let move_element = XmlToolElement::self_closing("move")
     .required_attribute::<StrictUciMove>("uci", "e2e4")
@@ -1717,41 +1685,51 @@ let move_element = XmlToolElement::self_closing("move")
     .decode(decode_move, |head, _| Ok(*head));
 ```
 
-The complete validator checks the captured legal set; because self-closing Open and Complete are
-adjacent, its valid reducer emits the Live preview in the same dispatch batch and updates State.
-The final reducer accepts only one valid completed occurrence and emits Output + Commit. The
-publisher atomically records the move output and an outbox item containing the expected ply.
-Anything before published acceptance rolls back the preview.
+In that extension, a complete validator checks the captured legal set, its valid reducer emits a
+Live preview, and the final reducer emits Output + Commit. An application-owned publisher would
+atomically record the move and an outbox item containing the expected ply. This durable adapter is
+not part of the current example.
 
 ## 10. Compatibility and migration
 
-Implementation is divided into five reviewable changes:
+The implementation and migration boundaries are:
 
-1. **Structured text route**: retain output identity/phase internally, separate seal from reaction
-   EOF, and reuse the normal reaction-completion ordering.
-2. **Grammar core**: strict fragment envelope, heterogeneous element contracts, attributes, decoded
-   text delta, spans, cardinality, diagnostics, fresh reducer state, and typestate compile-fail
-   tests.
-3. **Supervisor and fence**: add the Application-owned attempt supervisor, cancellation handoff,
-   recovery fault kind, and the sole recovery driver before enabling side effects.
-4. **Managed lanes**: add occurrence-scoped staging, tri-state live apply/settlement, ordered
-   publication, reverse rollback, confirmation, and publisher resolution.
-5. **Adapters and migration**: lower the old one-attribute chain through the new self-closing parser,
-   preserve `XmlContractDiagnostic` through a lossy mapping from new violations, then migrate
-   phrase, NPC, selector, then chess, and finally remove Forgotten City's legacy
-   `StreamingToolRunner`, direct `HermesParser`, and deleted mounted API references.
+1. **Structured route and contract core (implemented)**: the internal selected-text sidecar,
+   independent strict parser, typed builder, declaration validation, cardinality, reducer state, and
+   normal EOF handling are present.
+2. **Application coordination and managed lanes (implemented)**: one worker starts per strict
+   contract, workers receive the same selected input, cleanup is joined before a single
+   post-reconcile/demand handoff, and uncertainty remains behind the recovery fence.
+3. **Legacy compatibility (current boundary)**: `StreamingXml::tag(...)` and
+   `XmlStreamingToolCall::contract(...).empty_element(...)` continue to use their existing
+   shared-route permissive parser. They are not contract workers and do not participate in a strict
+   contract's state, final decision, managed lanes, or recovery ledger.
+4. **Chess consumer (implemented)**: one multi-element contract, thought-before-action validation,
+   synchronous publication, rejection feedback, and preparation-driven successor scheduling;
+   40 example tests cover the barrier, scripted workflow, and publication journal.
+5. **Forgotten City consumers (external follow-up)**: migrate phrase, NPC, and selector to
+   `XmlStreamingToolCall::new::<C>(identity)`, then remove that application's `StreamingToolRunner`,
+   direct `HermesParser`, and deleted mounted API references. Those consumers are not implemented
+   or validated by changes to this repository.
 
-During migration, a strict grammar and old permissive subscribers may coexist on the same admitted
-reaction, but they do not share scanner state or input projection. The strict parser consumes the
-keyed, non-commentary primary-text sidecar; legacy subscribers keep consuming their existing public
-mixed-text projection through their own permissive parser. Old leaf declarations may observe their
-declared tags, but they do not participate in the strict grammar's final decision. Two strict grammar
-owners on the structured route are a typed mount error.
+During migration, strict contracts and legacy permissive subscribers may coexist on one admitted
+reaction, but they have separate parsers and input projections. Strict contracts consume the keyed,
+non-commentary primary-text sidecar; legacy subscribers keep consuming the public mixed-text route.
+Multiple strict contracts also coexist: every worker sees the same selected input and makes its own
+decision. Contracts that intentionally declare different top-level tags opt into
+`.ignore_unknown_elements()` independently; a strict contract that does not opt in still reports a
+foreign top-level element as its own diagnostic.
 
 The legacy `streaming_tool::StreamingTool` trait and `StreamingToolRunner` remain available only
 until all in-repository consumers migrate. They receive deprecation notices before removal.
 
 ## 11. Acceptance suite
+
+Current AgentView coverage includes 19 streaming unit tests, 17 Application integration tests,
+7 compile-fail fixtures, and 40 Chess example tests. The default and no-default-feature full
+library/integration suites pass; the final sequence and panic changes additionally pass focused
+checks. The matrix below also describes consumer-specific and broader fault-injection acceptance
+criteria, including external adapters that are not present in this repository.
 
 ### Parser and grammar
 
@@ -1761,7 +1739,11 @@ until all in-repository consumers migrate. They receive deprecation notices befo
   occurrence match. Reducer emissions/final results are equal only for reducers documented and
   tested as delta-segmentation-invariant.
 - Tag names, attributes, quotes, entities, closing prefixes, and multi-byte text may cross chunks.
-- Repeated and heterogeneous tags retain source order.
+- Repeated and heterogeneous tags retain source order within each contract parser.
+- Two contracts declaring the same tag receive independent parser events, state initialization,
+  decisions, and publications on every reaction.
+- Contracts declaring different tags compose when each appropriate contract independently opts into
+  unknown-element ignoring; a strict sibling still reports the same foreign markup.
 - Duplicate element names in one strict grammar fail at mount before provider submission.
 - Invalid element names, invalid attribute names, and duplicate attribute declarations within one
   element produce their exact structured `ComponentAttemptFault` before prompt construction or
@@ -1785,7 +1767,7 @@ until all in-repository consumers migrate. They receive deprecation notices befo
 
 ### Reducer and attempt
 
-- State is recreated for every reaction.
+- State is recreated for every contract on every reaction.
 - Compile and runtime tests cover all nine `StreamingToolUpdate` constructors. A mixed
   `output(...).with_live(...).with_diagnostic(...).with_commit(...)` update is interpreted in that
   exact order, and tests use non-`Clone` lane values.
@@ -1793,12 +1775,14 @@ until all in-repository consumers migrate. They receive deprecation notices befo
   entries and rolls back its Live receipts.
 - A phrase/NPC occurrence that emitted Live on open/delta and then fails its complete validator does
   not invoke the mutable reducer, withdraws only that occurrence, and leaves sibling State intact.
-- With two siblings, an indeterminate rollback while invalidating the first aborts rather than
-  dispatching the second, discards all staged lanes, and becomes Terminal only after global rollback.
+- With two occurrences in one contract, an indeterminate rollback while invalidating the first
+  aborts rather than dispatching the second, discards that contract's staged lanes, and becomes
+  Terminal only after its receipt cleanup is definitive.
 - A Domain diagnostic by itself remains a warning; explicit `XmlOccurrenceValidity::Invalid` is the
   only handler-level invalidation signal.
 - Maximum cardinality emits a violation before decode or an open handler.
-- Cross-tag ordering and repeated occurrences of the same declared element are deterministic.
+- Cross-tag ordering and repeated occurrences of the same declared element are deterministic within
+  one contract.
 - The final reducer runs once only on normal EOF and sees exact bounded raw output.
 - A valid selector occurrence plus an invalid sibling can be accepted by application policy.
 - Compile-fail tests prove every required attempt slot, exactly one completion handler per element,
@@ -1827,7 +1811,8 @@ until all in-repository consumers migrate. They receive deprecation notices befo
 ### Publication and recovery
 
 - Output/Commit are invisible before accepted publication.
-- Output and Commit reach the publisher in one globally ordered sequence with origin metadata.
+- Output and Commit reach each contract's publisher in one contract-local ordered sequence with
+  origin metadata. Separate contracts have no fabricated global publication order.
 - A complete publication operation is stored before `publish` is polled; dropping or panicking the
   publish/resolve waiter does not lose it or cause a second invocation for the same generation.
 - `NotPublished` rolls back Live and cannot leak staged values.
@@ -1848,6 +1833,11 @@ until all in-repository consumers migrate. They receive deprecation notices befo
 - Dropping the original react waiter before handler claim skips it and ends Terminal; dropping it
   after claim finishes the claimed callback/reconcile but suppresses demand. Dropping a recovery
   waiter only detaches and still permits RetryReady.
+- An indeterminate contract keeps the Application fenced while an already settled sibling stays
+  settled and is never replayed. A dropped recovery waiter does not stop the unresolved worker.
+- After all contracts are definitive, Application post-reconciliation runs once and releases at
+  most one coalesced demand. A failed post-reconcile retains the fence and does not replay a
+  rejection handler on recovery.
 - Terminal disposition and RecoveryRequired can coexist; the recovery fence is exposed until every
   receipt is settled, after which the original terminal fault becomes visible.
 - Resolution StillIndeterminate/error retains the identical operation and does not replay publish.
@@ -1875,8 +1865,15 @@ until all in-repository consumers migrate. They receive deprecation notices befo
 ### Add more methods to the current single-attribute chain
 
 This would add syntax but not shared state, strict envelope ownership, cardinality, finalization,
-live compensation, or publication. Multiple strict leaf declarations would also reject one
-another's valid tags as unknown.
+live compensation, or publication. Retaining its shared-route parser would also force separately
+authored strict contracts to compete for one grammar and one effect lifecycle.
+
+### Share one strict parser across all contracts
+
+A reaction-level scanner looks cheaper, but it makes grammar ownership, occurrence order, parser
+faults, and unknown-element policy cross-component concerns. Independent parsers preserve local
+state and effects, permit the same tag in multiple contracts, and let a contract choose its own
+compatibility policy.
 
 ### Restore the deleted mounted runtime
 
@@ -1907,11 +1904,16 @@ A binary apply error cannot prove whether an external effect occurred, and consu
 before confirm/rollback succeeds destroys the only recovery evidence. Three-way outcomes plus
 borrowed receipts make uncertainty explicit and keep it fenced.
 
-## 13. Definition of done
+## 13. Cross-repository completion
 
-The design is implemented only when:
+The framework implementation is available in AgentView. The wider migration across AgentView,
+Forgotten City, and Cube Stage reaches its target state only when:
 
 - all acceptance groups above run against the current `Application<ReactionPort>` path;
+- multiple strict contracts can share a reaction input with independent parsers, state, decisions,
+  publications, and recovery reports, while Application performs one definitive handoff;
+- the legacy `.contract(...).empty_element(...)` route is either deliberately retained with its
+  documented shared-parser behavior or explicitly lowered through the new worker with parity tests;
 - Forgotten City has one implementation per XML consumer and no references to deleted mounted
   types;
 - no Forgotten City consumer manually derives text deltas from cumulative byte lengths;

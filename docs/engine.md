@@ -48,6 +48,7 @@ Component Runtime 是业务权威，拥有：
 
 - mounted Component identity 和 mount generation；
 - `use_signal` state；
+- 每个lexical `use_preparation` hook的identity与本次render的声明；
 - Component tree 表达的完整业务 POM；
 - latest committed complete `RenderedProjection`；
 - retained provider-event handler slots；
@@ -58,6 +59,7 @@ Component 内先校验，再一次性写入自洽的新状态。
 
 `RenderedProjection` 始终是完整值，不是 patch。Runtime 可以跳过 clean subtree 的重复执行并复用
 retained fragment，但这只能是内部优化，不能让 projection 变成 partial。
+preparation completion仅属于当前显式operation；Runtime不保留key、readiness或其他跨operation cache。
 
 ### Application<P>
 
@@ -70,6 +72,8 @@ retained fragment，但这只能是内部优化，不能让 projection 变成 pa
 
 一个 Application 只代表一个 logical target session。它不公开 `port_mut()`、FrameSession mutation、
 history commit 或替换 port 的 API。`&mut Application` 使第一版同一 Application 最多运行一个 reaction。
+每次active `prepare()`或`react()` operation还临时拥有本轮各`(mount identity, lexical slot)`的完成记录；
+该记录随operation结束而丢弃，不是Application或Component上的跨operation缓存。
 
 公共编排入口保持很小；root没有运行时props，但可以由mount closure捕获只读启动配置：
 
@@ -81,11 +85,19 @@ impl<P: ReactionPort> Application<P> {
     ) -> Result<Self, ApplicationFault>;
 
     pub fn current_projection(&self) -> ProjectionSnapshot<'_>;
+    pub async fn prepare(&mut self) -> Result<(), ApplicationFault>;
     pub async fn wait_for_reaction_request(&mut self) -> Result<(), ApplicationFault>;
     pub fn take_reaction_request(&self) -> Result<bool, ApplicationFault>;
     pub async fn react(&mut self) -> Result<(), ApplicationFault>;
 }
 ```
+
+`mount()`保持同步。它发布一版完整bootstrap projection；若render含有preparation declaration，该projection
+可以是provisional，`ProjectionSnapshot::is_prepared()`明确区分它。`prepare()`只驱动Component preparation
+和reconcile，不读取`declare()`、不构造或修改`FrameSession` candidate，也不调用`submit()`。
+每次显式`prepare()`和`react()`各自创建一个新的preparation operation，因此成功的`prepare()`之后的
+`react()`仍须再次运行全部active preparation。普通preparation失败或调用方drop pending operation后，
+同一个Application仍可由下一次显式`prepare()`或`react()`重试；该新operation也从全部active hooks重新开始。
 
 `ReactionRequest::request()`只记录至少一次后续reaction的sticky request；重复request在driver消费前合并。
 `wait_for_reaction_request()`阻塞直到消费一个请求，`take_reaction_request()`不阻塞地消费当前请求并在没有请求时
@@ -184,6 +196,7 @@ pub enum ApplicationFaultStage {
     Declaration,
     Bootstrap,
     Reconcile,
+    Preparation,
     FramePrepare,
     Submit,
     FactStream,
@@ -213,6 +226,8 @@ pub enum ApplicationFaultReason {
     FrameInvariant,
     UnstableContinuity,
     ProfileChangedBeforeHandoff,
+    Preparation,
+    PreparationGraphUnstable,
     ComponentRuntime,
     ComponentContract,
     ComponentInvariant,
@@ -294,7 +309,10 @@ journal。Engine 的取消不能撤销已经发生的外部动作。
 Component mount lifecycle 可以建立 retained state。
 
 Signal dirty 表示 Component state 比 latest committed projection 更新。dirty 不会自动 reconcile或
-react；`current_projection()` 仍返回上一版完整 projection，并同时暴露 projection revision和dirty bit。
+react；`current_projection()` 仍返回上一版完整 projection，并同时暴露 projection revision、dirty bit和
+preparation checkpoint bit。一个已经prepared的snapshot发生后续Signal写入时仍保持prepared，同时标记dirty；
+发布含preparation declaration的新projection在当前operation完成前为provisional。这个bit只描述已发布
+projection的checkpoint，不是hook readiness，不能使未来显式`prepare()`或`react()`跳过preparation。
 正常 reaction返回前执行一次 post-reconcile，使 handler和ToolCall lane产生的状态出现在下一 Frame。
 
 完整projection中的全部`Instruction(System, pom)`不是普通append history。Frame compiler按node/item
@@ -308,6 +326,54 @@ private checkpoint保存最近一次成功handoff的snapshot。首次非空、�
 accepted baseline。prepare、Pending、pre-handoff Err都不推进snapshot；successful handoff与Frame revision
 及其他commit candidate同步原子提交，post-handoff stream fault不回滚。port只应用这个Full/Delta结果，
 不得从private history推断System replacement。
+
+### Component preparation
+
+`use_preparation(factory)`是Component-owned的pre-handoff hook，不是root登记的coroutine，也不是
+Component-scoped background task：
+
+```rust
+pub fn use_preparation<Factory, PreparationFuture, Error>(factory: Factory)
+where
+    Factory: FnOnce() -> PreparationFuture + Send + 'static,
+    PreparationFuture: Future<Output = Result<(), Error>> + Send + 'static,
+    Error: Display + Send + 'static;
+```
+
+render只同步声明factory，绝不执行I/O。每个显式`prepare()`或`react()`创建独立的preparation operation：
+每个active `(mount generation, lexical hook slot)`在其中运行一次；rerender跳过该operation内已经完成的slot，
+新mount的slot则在当前operation运行。下一次显式operation无论前一次成功、失败还是取消，都重新运行全部
+active slot；所以`prepare()`之后的`react()`也会运行它们。operation完成记录不会成为跨operation
+readiness cache或key。
+
+dispatch时使用该slot当前render declaration所捕获的factory snapshot，并按Component结构和hook词法顺序
+直接await future。另一个hook随后写Signal并改变已经完成slot的inputs，不会使该slot在同一operation重跑；
+需要顺序依赖的I/O必须放进同一个factory，或由其Signal写入挂载nested Component来表达。
+
+pre-handoff阶段最多运行16个execution waves：每一wave先render/reconcile并发现slot，dispatch本轮未完成
+slot并直接await futures，丢弃已完成slot的新declaration；若projection clean则立即success，否则进入下一wave
+reconcile其Signal写入。只有第16个execution wave留下dirty projection时，才进行一次不得开始第17个factory
+或future的final reconcile。final reconcile后必须没有unfinished hook，且丢弃unused declarations后projection
+仍然clean才能success；若仍有unfinished declaration或dirty状态，返回terminal
+`ApplicationFault { stage: ApplicationFaultStage::Preparation, reason:
+ApplicationFaultReason::PreparationGraphUnstable, .. }`；普通preparation error返回retryable同stage的
+`ApplicationFaultReason::Preparation`。两者均发生在`FrameSession::prepare()`和provider handoff之前。
+
+factory和future都在mount fence外执行。Runtime在dispatch前authorize当前mount generation，在future完成时
+verify该generation仍mounted。retired generation不能record completion或publish late Signal write；
+retirement前已publish的Signal写入始终是authoritative且nontransactional，失败、取消或graph fault均不rollback
+它们或外部effects。
+Runtime只等待返回的future，对factory自行detached的work不提供readiness、completion或cancellation guarantee。
+preparation不提供exactly-once保证；factory及其返回future必须tolerate repeated/partial execution和cancellation，
+外部effects需要业务方自己的idempotency和durable deduplication。
+
+factory或future panic仍是当前`prepare()`/`react()`调用栈上的direct user-code panic，原样unwind且不转为
+`ApplicationFault`；supervised mount-task panic保持既有sticky terminal仲裁。ordinary failure和
+pre-handoff cancellation均不隐式开始reaction；下一次显式operation重新运行全部active hooks。一个
+`ContinuityChanged`所要求的同一`react()`内retry复用当前operation的completed slots，不重跑preparation。
+
+legacy `ApplicationHost` / `ProviderPort`不运行Component preparation；render声明preparation时，必须在
+provider execution前fail closed为`ApplicationHostFault::ComponentPreparationsUnsupported`。
 
 ### Frame boundary
 
@@ -376,6 +442,26 @@ ambiguous multiset。普通item若在完成本scopeclaim后仍匹配该multiset�
 消费，后续Frame仍受同一fence约束。未来显式projection provenance可以替换这个保守fault。
 
 ### HistoryPolicy 与 canonical replay
+
+面向编写 Component 代码的 agent 的用法与 tree fold 说明见 [HELP.md](../HELP.md#business-history)。
+
+Component每次render完整的业务POM状态；变化字段使用`#[view(diff)]`，增长的业务记录使用
+`#[view(diff(append))]`，外层通过`#[diff(slot = "state")]`声明稳定边界。Frame compiler根据baseline
+选择完整值、支持的delta或omit。当前structured delta要求root有多个children且含diff slot；只有一个
+history字段时变化会full-fallback。业务层不重建旧assistant回复或ToolCall/ToolResult，也不通过新的
+`view!`语法声明canonical message边界。
+
+Native tool由Component声明并处理当前call，返回绑定该call的output。private FrameSession维护
+canonical conversation/tool history与待提交结果，port负责provider编码和private session state。
+下一次显式`react()`提交待处理结果；tool完成本身不会自动发起下一轮模型请求。
+
+固定同一execution scope和Component identity时，ordinary projection item的tree fold示例如下
+（省略System和provider outputs）：已提交`[A, O]`，当前node vector为`[[A, B], [O, P]]`，
+本轮新增`[B, P]`，累计history为`[A, O, B, P]`。之后projection变成`[[A, B, C], [O]]`，
+本轮只新增`[C]`，缺少的`P`不撤回，累计history为`[A, O, B, P, C]`。
+完整projection的node-order展开与跨reaction累计的canonical顺序是两个不同的值；
+每轮新增项保持当前node顺序和node内item顺序，已有history不重排。该例描述ordinary occurrence规则；
+`#[diff]`产生的append-forced操作沿用上一节的独立提交规则，不参与ordinary occurrence去重。
 
 `HistoryPolicy` 是 crate-private pure function：它从只读 `CanonicalTranscript` 和mount-stable
 `FrameProfile` 选择 replay view。它不拥有history、不提交Event、不推进revision，也不参与ToolOutput
@@ -542,7 +628,14 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
 1. &mut Application acquires single-flight ownership
 2. port.declare() -> identity + continuity + stable profile
 3. validate fixed target/profile and monotonic epoch
-4. reconcile Component -> complete projection + exact bindings
+4. start an operation-scoped Component preparation
+     -> synchronous render/discover active declarations in structural/hook order
+     -> dispatch each unfinished `(mount generation, lexical slot)` once
+     -> directly await factories' futures and reconcile their Signal writes
+     -> early success only when clean with no unfinished hooks
+     -> after a dirty sixteenth execution wave, one final reconcile without a 17th dispatch
+     -> complete projection + exact bindings
+     -> create fresh independent streaming contract attempts
 5. FrameSession.prepare(...)
      -> select and validate canonical replay view
      -> lower #[diff]
@@ -556,17 +649,39 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
      -> precompute the optional admitted root ProviderEvent
      -> commit canonical fact
      -> dispatch event
+     -> broadcast selected structured text to independent contract workers
      -> committed ToolCall starts its lane immediately
-     -> poll fact stream and active lanes concurrently
+     -> poll active lanes while awaiting raw handlers or streaming work
 9. valid terminal + normal EOF -> drain remaining lanes
-10. finalize streaming parsers and dispatch EOF diagnostics
+10. finalize streaming parsers, decide each contract, and settle managed effects
+    -> unresolved effects retain workers and return RecoveryRequired before step 11
 11. post-reconcile Component state
 12. release gate and return
 ```
 
 一次`react()`最多render/submit一个Frame，不自动开始下一次reaction。pre-handoff failure不推进任何
 candidate state；post-handoff HTTP、stream、handler或lane failure不回滚已经handoff的input、已经接纳的
-fact、Component写入或外部副作用。
+fact、Component写入或外部副作用。continuity retry只重复declaration、Frame prepare和submit，不重复第4步。
+
+### Managed streaming contracts
+
+`XmlStreamingToolCall::new::<Channels>(identity)`为每个contract在每次reaction中创建独立parser、State、
+诊断和effect ledger。同一contract内的所有element共享这些状态和有序sequence；不同contract可以声明
+相同标签。重复element只在同一contract内构成declaration fault。旧`StreamingXml`和
+`.contract(...).empty_element(...)`继续使用原有shared-route parser。
+
+canonical admission之后先运行既有raw handler，再把保留output key和phase的内部text sidecar广播给各
+contract；Commentary不进入新parser。`TextSealed`只校验完整文本，真实provider EOF才运行各contract的
+`finish`。各contract独立Accept/Reject，业务Reject不撤回另一个contract的发布。新managed Live通道是
+上面普通副作用规则的显式补充：只有注册receipt的效果由框架执行confirm/rollback；它不回滚canonical
+history、普通Signal写入或任意未登记的外部副作用。
+
+worker持有进行中的apply、publish和settlement，取消`react()`等待不会丢弃这些操作。流在EOF前中断时
+所有仍在解析的contract进入abort；EOF后的发布恢复保留各contract已确定的结果。所有worker清理完成后
+Application执行post-reconcile，再释放至多一个合并的后继reaction请求。取消清理完成后可重新使用
+Application；无法确定的效果返回`RecoveryRequired`并阻止新的prepare/react和reaction demand，调用
+`recover_streaming_attempt()`继续处理。后置reconcile失败保留fence和fault；恢复不会重跑已完成的拒绝
+回调。完整API和恢复报告见[streaming-tool-api-design.md](streaming-tool-api-design.md)。
 
 ## 6. ProviderFact 与 canonical admission
 
@@ -770,8 +885,8 @@ slot；unmount删除slot。旧binding不能dispatch到新mount。公共API不暴
 
 ### User panic boundary
 
-Runtime不在Component root/render、provider-event handler、legacy event listener、native tool handler、streaming
-decoder、engine observer或usage observer外层调用`catch_unwind`。这些user-code panic不转换成typed fault、不吞掉、
+Runtime不在Component root/render、provider-event handler、legacy event listener、native tool handler、legacy
+streaming decoder、engine observer或usage observer外层调用`catch_unwind`。这些user-code panic不转换成typed fault、不吞掉、
 也不通过ErrorBoundary恢复旧Application。正常返回的`Result::Err`仍按各自typed contract处理。
 
 render candidate、hook topology、listener declaration和task factory仍遵守commit-before-publish；panic unwind时未发布
@@ -782,10 +897,16 @@ candidate由RAII丢弃。这只证明candidate未publish，不构成对任意use
 panic unwind期间Runtime不得再次进入任何user callback或observer；RAII cleanup只销毁reaction-local资源。
 因此panic路径不保证发送terminal/cleanup observation，原panic payload优先。
 
-唯一的production panic interception是不能自然跨栈传播的runtime/ownership边界：Tokio把spawned task panic编码为
+普通callback的production panic interception仅用于不能自然跨栈传播的runtime/ownership边界：Tokio把spawned task panic编码为
 `JoinError`，supervisor取回原payload并在outer driver boundary调用`resume_unwind`；Drop catch只允许在正在销毁的
 future/reaction上仲裁primary payload。两者都不得转换成业务`Result`或恢复被处理对象。workspace不覆盖Rust默认
 `panic = "unwind"`profile；未来`extern "C"`边界若存在，必须阻止unwind跨ABI且不能冒充业务恢复。
+
+新的managed streaming worker同样跨越ownership边界：它暂存decoder/reducer的原始panic payload，在
+receipt清理确定后向原调用方或下一次恢复边界`resume_unwind`，不会把原始panic替换为普通业务诊断。
+原等待方消失时payload仍由worker保留。只有显式managed adapter和拒绝continuation采用其专用故障契约：
+adapter future panic保留预先记录的operation并按不确定结果恢复，`on_rejected`的error/panic成为terminal
+adapter fault。这不扩大普通Component callback的panic恢复范围。
 
 本节冻结的是frame-driven Component/Application Runtime及上面列出的callback。legacy `AgentTurnObserver`的
 post-commit fire-and-forget contract不在本次Phase 8中暗改；它若迁移到同一panic policy，必须先引入可在outer
@@ -955,7 +1076,8 @@ Fact不得先被Observer或Component看见、之后才commit canonical history�
     保留已commit/admit的state，把open text标记`Interrupted`，并以exactly one预留
     `Tool execution was cancelled; its outcome is unknown.` ToolOutput闭合每个未完成的已接纳ToolCall。下一次
     显式`react()`必须从port的truthful continuity declaration继续。
-26. Runtime不catch或吞掉Component/render/handler/tool/parser/observer panic。Tokio task panic是唯一无法自然跨栈
+26. Runtime不吞掉Component/render/handler/tool/parser/observer的原始panic；managed streaming的临时payload
+    保留和adapter例外遵循上面的User panic boundary。Tokio task panic是另一种无法自然跨栈
     的user-code例外：必须在当前/下一outer driver boundary用原payload直接stack unwind。sibling abort立即发起，
     但drain不能阻塞unwind。caller自行catch任何user panic后都不能恢复Application的业务执行，并必须丢弃可能已
     mutate的user资源；Runtime不提供poisoned-state recovery。task panic在resume前额外把Application标记terminal，
@@ -964,6 +1086,23 @@ Fact不得先被Observer或Component看见、之后才commit canonical history�
     observation或task operation时确定`Closed`，不能继续handoff或留下永久Pending retirement。
 28. production owner的shutdown acknowledgement必须发生在active reaction join、mount fence和全部task destructor
     完成之后；取消shutdown waiter不能取消已经取得唯一Application ownership的cleanup。
+29. FrameSession prepare和Provider handoff前，当前operation的全部active preparation必须完成，且其
+    Signal写入必须先reconcile。最多16个execution waves，clean且无unfinished hook时early success；只有
+    dirty的第16 wave之后才有一个不得dispatch新factory/future的final reconcile。success必须同时clean且无
+    unfinished hook；若仍需另一wave，零handoff并以`PreparationGraphUnstable` terminal fail closed。
+30. 每次显式`prepare()`或`react()`都创建新operation，并使每个active `(mount generation, lexical slot)`
+    运行一次；rerender跳过本operation已完成slot，新mount运行。ordinary failure或pre-handoff cancellation
+    不自动重试，并保留同一个Application供下一次显式operation使用；下一次从全部active hooks重新开始。
+    同一`react()`的continuity retry不得重新运行preparation。
+31. 同步mount可以公开provisional bootstrap projection；`ProjectionSnapshot::is_prepared()`是已发布projection
+    的checkpoint而不是readiness cache。dirty可以与prepared同时为true；新的含preparation declaration的
+    projection在当前operation完成前为provisional，prepared bit不能跳过未来operation。
+32. preparation factory和future在mount fence外执行，dispatch前authorize mount且完成时verify mount；
+    retired generation不能record completion或publish late Signal write，retirement前Signal写入仍
+    authoritative且nontransactional。Runtime只等待返回future，不保证detached work；它不提供exactly-once，
+    factory/future必须tolerate repeated/partial execution和cancellation。direct factory/future panic原样unwind。
+    普通preparation error为`Preparation` stage/reason，持续remount graph为terminal
+    `PreparationGraphUnstable`，legacy host遇到declaration为`ComponentPreparationsUnsupported`。
 
 ## 13. 非目标
 
@@ -975,5 +1114,6 @@ Fact不得先被Observer或Component看见、之后才commit canonical history�
 - public mutable history/session API；
 - framework-owned AgentLoop、public Reactor trait或Component-owned scheduling policy；
 - task retry/backoff、durable jobs、unbounded coroutine inbox或resource/action最终API；
+- global preparation cache、readiness store或resource subsystem；
 - Skill subcommand schema、Plugin multiplexing wire syntax或UI/JSONL展示格式；
 - 实现顺序、迁移进度和发布里程碑。

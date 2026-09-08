@@ -10,6 +10,7 @@ use super::{
     async_task::{ComponentTaskContext, MountTaskStart},
     event_input::{EventInputOrigin, EventSelector},
     event_listener::EventListenerDeclaration,
+    preparation::{PreparationDeclaration, PreparationSet},
     Coroutine, CoroutineInbox, ReactionCompletionDeclaration, ReactionRequest, Signal,
 };
 
@@ -20,6 +21,7 @@ pub struct HookRenderContext<'render> {
     event_origin: EventInputOrigin,
     provider_handlers: &'render mut Vec<EventListenerDeclaration>,
     reaction_completions: &'render mut Vec<ReactionCompletionDeclaration>,
+    preparations: &'render mut PreparationSet,
     task_starts: &'render mut Vec<MountTaskStart>,
     driver_demand: Option<&'render DriverDemandHandle>,
     tasks: Option<&'render MountTaskHandle>,
@@ -27,11 +29,16 @@ pub struct HookRenderContext<'render> {
 }
 
 impl<'render> HookRenderContext<'render> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the render context borrows each generation-local capability separately"
+    )]
     pub(crate) fn new(
         signals: &'render mut signal_kernel::SignalRenderScope,
         event_origin: EventInputOrigin,
         provider_handlers: &'render mut Vec<EventListenerDeclaration>,
         reaction_completions: &'render mut Vec<ReactionCompletionDeclaration>,
+        preparations: &'render mut PreparationSet,
         task_starts: &'render mut Vec<MountTaskStart>,
         driver_demand: Option<&'render DriverDemandHandle>,
         tasks: Option<&'render MountTaskHandle>,
@@ -41,6 +48,7 @@ impl<'render> HookRenderContext<'render> {
             event_origin,
             provider_handlers,
             reaction_completions,
+            preparations,
             task_starts,
             driver_demand,
             tasks,
@@ -48,11 +56,16 @@ impl<'render> HookRenderContext<'render> {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the render context borrows each generation-local capability separately"
+    )]
     pub(crate) fn for_system(
         signals: &'render mut signal_kernel::SignalRenderScope,
         event_origin: EventInputOrigin,
         provider_handlers: &'render mut Vec<EventListenerDeclaration>,
         reaction_completions: &'render mut Vec<ReactionCompletionDeclaration>,
+        preparations: &'render mut PreparationSet,
         task_starts: &'render mut Vec<MountTaskStart>,
         driver_demand: Option<&'render DriverDemandHandle>,
         tasks: Option<&'render MountTaskHandle>,
@@ -62,6 +75,7 @@ impl<'render> HookRenderContext<'render> {
             event_origin,
             provider_handlers,
             reaction_completions,
+            preparations,
             task_starts,
             driver_demand,
             tasks,
@@ -96,6 +110,24 @@ impl<'render> HookRenderContext<'render> {
                 mount,
                 task_context,
             ));
+    }
+
+    #[doc(hidden)]
+    pub fn use_preparation_at<Loader, LoaderFuture, Error>(&mut self, site: u32, loader: Loader)
+    where
+        Loader: FnOnce() -> LoaderFuture + Send + 'static,
+        LoaderFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        if !self.attempt_local_allowed {
+            panic!("System component declared generation-local preparation");
+        }
+        let mount = self
+            .signals
+            .use_marker_at(site, HookKind::Preparation)
+            .unwrap_or_else(|fault| panic!("{fault}"));
+        self.preparations
+            .push(PreparationDeclaration::new(loader, mount));
     }
 
     #[doc(hidden)]

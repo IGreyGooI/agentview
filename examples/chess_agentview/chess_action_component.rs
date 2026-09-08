@@ -1,22 +1,23 @@
 use std::{
     convert::Infallible,
-    future::ready,
     str::FromStr,
     sync::{Arc, Mutex},
 };
 
 use agentview::component::prelude::*;
-use anyhow::Context as _;
+use async_trait::async_trait;
 use chess::ChessMove;
-use tokio::sync::oneshot;
+use quick_xml::{events::Event, reader::Reader, XmlVersion};
 
 use super::{
-    application_state::ModelAttemptKey,
+    application_state::{ChessEvent, ChessState, ModelAttemptKey},
     chess_action::{ChessAction, ChessActionKind, InvalidActionReason},
+    chess_application::reduce_signal,
     uci::{parse_strict_uci_move, StrictUciMoveError},
 };
 
 const ACTION_CONTRACT_VERSION: &str = "v1";
+const ACTION_CONTRACT_ID: &str = "chess.action";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StrictUciMove(ChessMove);
@@ -29,111 +30,411 @@ impl FromStr for StrictUciMove {
     }
 }
 
-async fn send_model_action(
-    workflow: Coroutine<ChessAttemptInput>,
+struct ChessActionChannels;
+
+impl StreamingToolChannels for ChessActionChannels {
+    type Output = ChessAction;
+    type Live = NoStreamingValue;
+    type Commit = NoStreamingValue;
+    type Diagnostic = InvalidActionReason;
+}
+
+#[derive(Default)]
+struct ChessActionAttempt {
+    thought: Option<String>,
+    actions: Vec<ChessAction>,
+}
+
+#[derive(Clone)]
+struct ChessPublicationReceipt(Arc<Mutex<ChessPublicationState>>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChessPublicationState {
+    Pending,
+    Published,
+    NotPublished,
+}
+
+impl ChessPublicationReceipt {
+    fn pending() -> Self {
+        Self(Arc::new(Mutex::new(ChessPublicationState::Pending)))
+    }
+
+    fn record_published(&self) {
+        let mut state = self.0.lock().unwrap();
+        if *state == ChessPublicationState::Pending {
+            *state = ChessPublicationState::Published;
+        }
+    }
+
+    fn record_not_published(&self) {
+        let mut state = self.0.lock().unwrap();
+        if *state == ChessPublicationState::Pending {
+            *state = ChessPublicationState::NotPublished;
+        }
+    }
+
+    fn state(&self) -> ChessPublicationState {
+        *self.0.lock().unwrap()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ChessActionPublicationError {
+    #[error("the accepted Chess contract did not contain exactly one action")]
+    InvalidAcceptedAttempt,
+    #[error("the Chess state did not consume the model action for this attempt")]
+    StaleAttempt,
+}
+
+struct ChessActionPublisher {
+    state: Signal<ChessState>,
+    attempt: ModelAttemptKey,
+}
+
+struct ChessActionPublication {
+    action: ChessAction,
+    receipt: ChessPublicationReceipt,
+}
+
+impl ChessActionPublication {
+    fn new(action: ChessAction) -> Self {
+        Self {
+            action,
+            receipt: ChessPublicationReceipt::pending(),
+        }
+    }
+}
+
+impl ChessActionPublisher {
+    fn publish_operation(
+        &mut self,
+        operation: &ChessActionPublication,
+    ) -> StreamingPublishOutcome<(), ChessActionPublicationError> {
+        match operation.receipt.state() {
+            ChessPublicationState::Published => return StreamingPublishOutcome::Published(()),
+            ChessPublicationState::NotPublished => {
+                return StreamingPublishOutcome::NotPublished(
+                    ChessActionPublicationError::StaleAttempt,
+                );
+            }
+            ChessPublicationState::Pending => {}
+        }
+
+        let effects = apply_model_action(&self.state, self.attempt, Ok(operation.action));
+        if effects.is_empty() {
+            operation.receipt.record_not_published();
+            StreamingPublishOutcome::NotPublished(ChessActionPublicationError::StaleAttempt)
+        } else {
+            // The reducer synchronously consumed the action and scheduled its next state. There
+            // is no actor or engine acknowledgement between this boundary and confirmation.
+            operation.receipt.record_published();
+            StreamingPublishOutcome::Published(())
+        }
+    }
+}
+
+#[async_trait]
+impl StreamingToolAttemptPublisher<ChessActionChannels> for ChessActionPublisher {
+    type Published = ();
+    type PublicationOperation = ChessActionPublication;
+    type Error = ChessActionPublicationError;
+
+    fn prepare(
+        &mut self,
+        _: &StreamingPublishContext,
+        attempt: AcceptedStreamingToolAttempt<ChessActionChannels>,
+    ) -> Result<Self::PublicationOperation, Self::Error> {
+        let mut action = None;
+        for entry in attempt.entries {
+            match entry.value {
+                StagedStreamingToolValue::Output(candidate) => {
+                    if action.replace(candidate).is_some() {
+                        return Err(ChessActionPublicationError::InvalidAcceptedAttempt);
+                    }
+                }
+                StagedStreamingToolValue::Commit(never) => match never {},
+            }
+        }
+        let action = action.ok_or(ChessActionPublicationError::InvalidAcceptedAttempt)?;
+        Ok(ChessActionPublication::new(action))
+    }
+
+    async fn publish(
+        &mut self,
+        _: &StreamingPublishContext,
+        operation: &Self::PublicationOperation,
+    ) -> StreamingPublishOutcome<Self::Published, Self::Error> {
+        self.publish_operation(operation)
+    }
+
+    async fn resolve(
+        &mut self,
+        _: &StreamingPublishRecoveryContext,
+        operation: &Self::PublicationOperation,
+    ) -> Result<StreamingPublishResolution<Self::Published>, Self::Error> {
+        Ok(match operation.receipt.state() {
+            ChessPublicationState::Published => StreamingPublishResolution::Published(()),
+            ChessPublicationState::NotPublished => StreamingPublishResolution::NotPublished,
+            ChessPublicationState::Pending => StreamingPublishResolution::StillIndeterminate,
+        })
+    }
+}
+
+fn apply_model_action(
+    state: &Signal<ChessState>,
     attempt: ModelAttemptKey,
     result: Result<ChessAction, InvalidActionReason>,
-) -> anyhow::Result<()> {
-    let (handled, completion) = oneshot::channel();
-    workflow
-        .send(ChessAttemptInput {
-            attempt,
-            result,
-            handled,
-        })
-        .await?;
-    completion
-        .await
-        .context("Chess workflow stopped before handling the model action")?;
-    Ok(())
+) -> Vec<super::application_state::ChessEffect> {
+    reduce_signal(state, ChessEvent::ModelAction { attempt, result })
 }
 
-pub(crate) struct ChessAttemptInput {
-    pub(crate) attempt: ModelAttemptKey,
-    pub(crate) result: Result<ChessAction, InvalidActionReason>,
-    pub(crate) handled: oneshot::Sender<()>,
+fn thought_contract() -> XmlElementContract<(), String> {
+    XmlToolElement::text("thought")
+        .occurs(XmlCardinality::exactly(1))
+        .decode(|_| Ok(()), |_, text| Ok(text.to_owned()))
 }
 
-fn invalid_action(kind: ChessActionKind, diagnostic: XmlContractDiagnostic) -> InvalidActionReason {
-    match diagnostic {
-        XmlContractDiagnostic::InvalidAttributeValue { value, .. }
-            if matches!(kind, ChessActionKind::ChooseMove) =>
-        {
-            InvalidActionReason::invalid_uci(kind, &value)
-        }
-        _ => InvalidActionReason::InvalidXml,
+fn configure_action<Head: Send + Sync + 'static>(
+    handlers: XmlElementHandlers<ChessActionAttempt, ChessActionChannels, Head, ChessAction>,
+) -> XmlElementHandlers<ChessActionAttempt, ChessActionChannels, Head, ChessAction, ReadyCompletion>
+{
+    handlers.on_complete_validated(
+        |state, _| {
+            if state.thought.is_some() {
+                XmlOccurrenceValidity::Valid
+            } else {
+                XmlOccurrenceValidity::Invalid(XmlOccurrenceRejection::diagnostic(
+                    InvalidActionReason::ThoughtAfterAction,
+                ))
+            }
+        },
+        |state, event| {
+            state.actions.push(event.value);
+            StreamingToolUpdate::none()
+        },
+    )
+}
+
+fn choose_move_contract() -> XmlElementContract<StrictUciMove, ChessAction> {
+    XmlToolElement::self_closing("choose_move")
+        .required_attribute::<StrictUciMove>("uci", "...")
+        .decode(
+            |mut attributes| attributes.take_required::<StrictUciMove>("uci"),
+            |head, _| Ok(ChessAction::ChooseMove(head.0)),
+        )
+}
+
+fn resign_contract() -> XmlElementContract<(), ChessAction> {
+    XmlToolElement::self_closing("resign").decode(
+        |_| Ok::<(), XmlDecodeViolation>(()),
+        |_, _| Ok::<ChessAction, XmlDecodeViolation>(ChessAction::Resign),
+    )
+}
+
+fn decide_action(
+    state: ChessActionAttempt,
+    summary: XmlAttemptSummary<'_, InvalidActionReason>,
+) -> StreamingToolDecision<ChessActionChannels> {
+    if let Some(reason) = thought_problem(&state, &summary) {
+        return StreamingToolDecision::Reject(StreamingToolRejection::diagnostic(reason));
     }
+    let result = match registered_action_count(&summary) {
+        0 => Err(InvalidActionReason::MissingAction),
+        1 if state.actions.len() == 1 && summary.diagnostics.is_empty() => Ok(state
+            .actions
+            .into_iter()
+            .next()
+            .expect("one decoded Chess action")),
+        1 => Err(invalid_uci_reason(&summary).unwrap_or(InvalidActionReason::InvalidXml)),
+        _ => Err(InvalidActionReason::MultipleActions),
+    };
+    match result {
+        Ok(action) => StreamingToolDecision::Accept(StreamingToolUpdate::output(action)),
+        Err(reason) => StreamingToolDecision::Reject(StreamingToolRejection::diagnostic(reason)),
+    }
+}
+
+fn registered_action_count(summary: &XmlAttemptSummary<'_, InvalidActionReason>) -> usize {
+    summary
+        .elements
+        .iter()
+        .filter(|element| matches!(element.name, "choose_move" | "resign"))
+        .map(|element| element.seen)
+        .sum()
+}
+
+fn thought_problem(
+    state: &ChessActionAttempt,
+    summary: &XmlAttemptSummary<'_, InvalidActionReason>,
+) -> Option<InvalidActionReason> {
+    let Some(thought) = summary
+        .elements
+        .iter()
+        .find(|element| element.name == "thought")
+    else {
+        return Some(InvalidActionReason::MissingThought);
+    };
+    match thought.seen {
+        0 => return Some(InvalidActionReason::MissingThought),
+        1 => {}
+        _ => return Some(InvalidActionReason::MultipleThoughts),
+    }
+    if thought.completed != 1 || state.thought.is_none() {
+        return Some(InvalidActionReason::InvalidThought);
+    }
+    summary
+        .diagnostics
+        .iter()
+        .find_map(|record| match &record.diagnostic {
+            StreamingToolDiagnostic::Domain(InvalidActionReason::ThoughtAfterAction) => {
+                Some(InvalidActionReason::ThoughtAfterAction)
+            }
+            _ => None,
+        })
+}
+
+fn invalid_uci_reason(
+    summary: &XmlAttemptSummary<'_, InvalidActionReason>,
+) -> Option<InvalidActionReason> {
+    summary.diagnostics.iter().find_map(|record| {
+        if !matches!(
+            record.diagnostic,
+            StreamingToolDiagnostic::Decode(XmlDecodeViolation::Model {
+                code: "invalid_attribute",
+                ..
+            })
+        ) {
+            return None;
+        }
+        let StreamingToolDiagnosticOrigin::Parser {
+            span: Some(span), ..
+        } = &record.origin
+        else {
+            return None;
+        };
+        let opening = span.slice(summary.raw_output)?;
+        extract_uci_attribute(opening).map(|submitted| {
+            InvalidActionReason::invalid_uci(ChessActionKind::ChooseMove, &submitted)
+        })
+    })
+}
+
+fn extract_uci_attribute(opening: &str) -> Option<String> {
+    let mut reader = Reader::from_str(opening);
+    let event = reader.read_event().ok()?;
+    let element = match event {
+        Event::Empty(element) | Event::Start(element) => element,
+        _ => return None,
+    };
+    if element.name().as_ref() != b"choose_move" {
+        return None;
+    }
+    element
+        .attributes()
+        .with_checks(false)
+        .find_map(|attribute| {
+            let attribute = attribute.ok()?;
+            (attribute.key.as_ref() == b"uci").then_some(attribute)
+        })?
+        .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+        .ok()
+        .map(|value| value.into_owned())
+}
+
+fn rejection_reason(
+    report: &RejectedStreamingToolAttempt<InvalidActionReason>,
+) -> InvalidActionReason {
+    report
+        .diagnostics
+        .iter()
+        .rev()
+        .find_map(|record| match &record.diagnostic {
+            StreamingToolDiagnostic::Domain(reason) => Some(reason.clone()),
+            StreamingToolDiagnostic::Contract(_) | StreamingToolDiagnostic::Decode(_) => None,
+        })
+        .unwrap_or(InvalidActionReason::InvalidXml)
 }
 
 #[component]
 pub(crate) fn chess_action_component(
     attempt: ModelAttemptKey,
-    workflow: Coroutine<ChessAttemptInput>,
+    state: Signal<ChessState>,
 ) -> Component {
-    let collected: Arc<Mutex<Vec<Result<ChessAction, InvalidActionReason>>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let completion_collected = Arc::clone(&collected);
-    use_reaction_completion(move || async move {
-        let result = {
-            let mut collected = completion_collected.lock().unwrap();
-            match collected.len() {
-                0 => Err(InvalidActionReason::MissingAction),
-                1 => collected.pop().expect("one collected Chess action result"),
-                _ => Err(InvalidActionReason::MultipleActions),
+    let publisher_state = state.clone();
+    let rejection_state = state;
+    XmlStreamingToolCall::new::<ChessActionChannels>(ACTION_CONTRACT_ID)
+        .version(ACTION_CONTRACT_VERSION)
+        .state_with(|_| Ok::<_, Infallible>(ChessActionAttempt::default()))
+        .element(thought_contract(), |handlers| {
+            handlers.on_complete_validated(
+                |_, event| {
+                    if event.value.trim().is_empty() {
+                        XmlOccurrenceValidity::Invalid(XmlOccurrenceRejection::diagnostic(
+                            InvalidActionReason::InvalidThought,
+                        ))
+                    } else {
+                        XmlOccurrenceValidity::Valid
+                    }
+                },
+                |state, event| {
+                    state.thought = Some(event.value);
+                    StreamingToolUpdate::none()
+                },
+            )
+        })
+        .element(choose_move_contract(), configure_action)
+        .element(resign_contract(), configure_action)
+        .finish(decide_action)
+        .without_live()
+        .publish_with(move |_| {
+            Ok::<_, Infallible>(ChessActionPublisher {
+                state: publisher_state.clone(),
+                attempt,
+            })
+        })
+        .on_rejected(move |report| {
+            let state = rejection_state.clone();
+            let reason = rejection_reason(&report);
+            async move {
+                let _ = apply_model_action(&state, attempt, Err(reason));
+                Ok::<_, Infallible>(StreamingToolRejectionAction::Complete)
             }
-        };
-        send_model_action(workflow, attempt, result).await
-    });
-
-    let choose_move_decoded = Arc::clone(&collected);
-    let choose_move_invalid = Arc::clone(&collected);
-    let resign_decoded = Arc::clone(&collected);
-    let resign_invalid = collected;
-
-    view! {
-        {
-            XmlStreamingToolCall::contract("chess.choose_move", ACTION_CONTRACT_VERSION)
-                .empty_element("choose_move")
-                .required_attribute::<StrictUciMove>("uci")
-                .on_decoded(move |candidate| {
-                    choose_move_decoded
-                        .lock()
-                        .unwrap()
-                        .push(Ok(ChessAction::ChooseMove(candidate.0)));
-                    ready(Ok::<(), Infallible>(()))
-                })
-                .on_invalid(move |diagnostic| {
-                    choose_move_invalid.lock().unwrap().push(Err(invalid_action(
-                        ChessActionKind::ChooseMove,
-                        diagnostic,
-                    )));
-                    ready(Ok::<(), Infallible>(()))
-                })
-        }
-        {
-            XmlStreamingToolCall::contract("chess.resign", ACTION_CONTRACT_VERSION)
-                .empty_element("resign")
-                .on_decoded(move || {
-                    resign_decoded
-                        .lock()
-                        .unwrap()
-                        .push(Ok(ChessAction::Resign));
-                    ready(Ok::<(), Infallible>(()))
-                })
-                .on_invalid(move |diagnostic| {
-                    resign_invalid
-                        .lock()
-                        .unwrap()
-                        .push(Err(invalid_action(ChessActionKind::Resign, diagnostic)));
-                    ready(Ok::<(), Infallible>(()))
-                })
-        }
-    }
+        })
+        .build()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentview::component::ComponentHost;
+
+    #[derive(Clone)]
+    struct PublisherTestProps {
+        exposed: Arc<Mutex<Option<Signal<ChessState>>>>,
+    }
+
+    #[component]
+    fn publisher_test_root(props: PublisherTestProps) -> Component {
+        let state = use_signal(|| ChessState::new(1));
+        *props.exposed.lock().unwrap() = Some(state);
+        view! {}
+    }
+
+    fn mounted_publisher_state() -> (ComponentHost<PublisherTestProps>, Signal<ChessState>) {
+        let props = PublisherTestProps {
+            exposed: Arc::new(Mutex::new(None)),
+        };
+        let mut host = ComponentHost::new_root(publisher_test_root, props.clone());
+        host.render().expect("publisher test root renders");
+        let state = props
+            .exposed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("publisher test root exposes its Signal");
+        (host, state)
+    }
 
     #[test]
     fn strict_move_decoder_rejects_noncanonical_uci() {
@@ -142,31 +443,69 @@ mod tests {
     }
 
     #[test]
-    fn move_value_diagnostics_are_business_level_invalid_uci() {
-        let diagnostic = XmlContractDiagnostic::InvalidAttributeValue {
-            contract: "chess.choose_move",
-            attribute: "uci",
-            value: "E2E4".to_owned(),
-            expected: "StrictUciMove",
-            detail: "invalid UCI move".to_owned(),
-        };
-
+    fn rejected_uci_extraction_decodes_xml_attribute_escapes() {
         assert_eq!(
-            invalid_action(ChessActionKind::ChooseMove, diagnostic),
-            InvalidActionReason::invalid_uci(ChessActionKind::ChooseMove, "E2E4")
+            extract_uci_attribute(r#"<choose_move uci="e2e&amp;4" />"#),
+            Some("e2e&4".to_owned())
         );
     }
 
     #[test]
-    fn structural_diagnostics_are_business_level_invalid_xml() {
-        let diagnostic = XmlContractDiagnostic::MalformedElement {
-            contract: "chess.resign",
-            detail: "target element must use empty-element syntax".to_owned(),
+    fn publishing_the_same_operation_twice_reuses_its_journaled_result() {
+        let (_host, state) = mounted_publisher_state();
+        assert!(!reduce_signal(&state, ChessEvent::Start).is_empty());
+        let attempt = state
+            .with(|state| state.current_attempt())
+            .unwrap()
+            .expect("model attempt is active");
+        let mut publisher = ChessActionPublisher {
+            state: state.clone(),
+            attempt,
         };
+        let operation = ChessActionPublication::new(ChessAction::Resign);
 
+        assert!(matches!(
+            publisher.publish_operation(&operation),
+            StreamingPublishOutcome::Published(())
+        ));
+        let after_first_publish = state.with(Clone::clone).unwrap();
+
+        assert!(matches!(
+            publisher.publish_operation(&operation),
+            StreamingPublishOutcome::Published(())
+        ));
+        assert_eq!(state.with(Clone::clone).unwrap(), after_first_publish);
+    }
+
+    #[test]
+    fn stale_attempt_is_not_published() {
+        let (_host, state) = mounted_publisher_state();
+        assert!(!reduce_signal(&state, ChessEvent::Start).is_empty());
+        let current = state
+            .with(|state| state.current_attempt())
+            .unwrap()
+            .expect("model attempt is active");
+        let stale = ModelAttemptKey {
+            attempt_index: current.attempt_index + 1,
+            ..current
+        };
+        let mut publisher = ChessActionPublisher {
+            state: state.clone(),
+            attempt: stale,
+        };
+        let operation = ChessActionPublication::new(ChessAction::Resign);
+
+        assert!(matches!(
+            publisher.publish_operation(&operation),
+            StreamingPublishOutcome::NotPublished(ChessActionPublicationError::StaleAttempt)
+        ));
         assert_eq!(
-            invalid_action(ChessActionKind::Resign, diagnostic),
-            InvalidActionReason::InvalidXml
+            operation.receipt.state(),
+            ChessPublicationState::NotPublished
+        );
+        assert_eq!(
+            state.with(|state| state.current_attempt()).unwrap(),
+            Some(current)
         );
     }
 }

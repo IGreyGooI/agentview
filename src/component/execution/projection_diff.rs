@@ -901,10 +901,12 @@ mod tests {
         )
         .unwrap();
         assert!(text_projection_items(&second_claim.submission).is_empty());
-        assert!(second_claim
-            .reconciliation
-            .unclaimed_provider_outputs
-            .is_empty());
+        assert!(
+            second_claim
+                .reconciliation
+                .unclaimed_provider_outputs
+                .is_empty()
+        );
     }
 
     #[test]

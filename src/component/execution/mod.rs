@@ -20,6 +20,7 @@ mod port;
 mod projection_diff;
 #[cfg(feature = "legacy-provider-port")]
 mod prompt_render;
+mod streaming;
 
 pub(crate) use driver_demand::{DriverDemandFault, DriverDemandHandle};
 
@@ -105,6 +106,7 @@ pub use reaction::{
     Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
     FrameSubmission, ProjectionSubmission, ProviderFact, ProviderFactStream, ProviderOutputKey,
     ProviderToolCall, ProviderToolCallError, ReactionPort, ReactionPortFault,
-    ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason, SubmitFault,
-    TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
+    ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason, ResettableReactionPort,
+    SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
 };
+pub use streaming::{StreamingToolRecoveryReport, StreamingToolRecoveryStatus};

@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 struct DriverDemandState {
     active: bool,
     pending: bool,
+    streaming_fenced: bool,
 }
 
 #[derive(Debug)]
@@ -39,6 +40,9 @@ impl DriverDemandHandle {
         if !state.active {
             return Err(DriverDemandFault::StaleMount);
         }
+        if state.streaming_fenced {
+            return Err(DriverDemandFault::StreamingRecovery);
+        }
         state.pending = true;
         drop(state);
         self.core.changed.notify_waiters();
@@ -53,11 +57,31 @@ pub(crate) struct DriverDemand {
 }
 
 impl DriverDemand {
+    pub(crate) fn set_streaming_fence(&self, fenced: bool) {
+        self.core
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .streaming_fenced = fenced;
+        self.core.changed.notify_waiters();
+    }
+
+    pub(crate) fn release_streaming(&self, request: bool) {
+        let mut state = self.core.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.streaming_fenced = false;
+        if state.active {
+            state.pending |= request;
+        }
+        drop(state);
+        self.core.changed.notify_waiters();
+    }
+
     pub(crate) fn new() -> (Self, DriverDemandHandle) {
         let core = Arc::new(DriverDemandCore {
             state: Mutex::new(DriverDemandState {
                 active: true,
                 pending: false,
+                streaming_fenced: false,
             }),
             changed: Notify::new(),
         });
@@ -79,6 +103,9 @@ impl DriverDemand {
         if !state.active {
             return Err(DriverDemandFault::StaleMount);
         }
+        if state.streaming_fenced {
+            return Err(DriverDemandFault::StreamingRecovery);
+        }
         Ok(std::mem::take(&mut state.pending))
     }
 
@@ -97,6 +124,9 @@ impl DriverDemand {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if !state.active {
                     return Err(DriverDemandFault::StaleMount);
+                }
+                if state.streaming_fenced {
+                    return Err(DriverDemandFault::StreamingRecovery);
                 }
                 if std::mem::take(&mut state.pending) {
                     return Ok(());
@@ -126,6 +156,8 @@ impl Drop for DriverDemand {
 pub(crate) enum DriverDemandFault {
     #[error("reaction demand belongs to a stale Component mount")]
     StaleMount,
+    #[error("streaming effects must finish recovery before requesting another reaction")]
+    StreamingRecovery,
 }
 
 #[cfg(test)]

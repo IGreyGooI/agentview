@@ -508,7 +508,7 @@ impl OpenAiOutputLedger {
         &mut self,
         payload: &Map<String, Value>,
     ) -> Result<(), ResponseOutputItemLifecycleError> {
-        let parsed = parse_lifecycle_item(payload)?;
+        let parsed = parse_lifecycle_item(payload, true)?;
         validate_observed_item(&parsed)?;
         if !self
             .output_identities
@@ -536,7 +536,7 @@ impl OpenAiOutputLedger {
         &mut self,
         payload: &Map<String, Value>,
     ) -> Result<Option<SealedOpenAiPrivateOutput>, ProviderFault> {
-        let parsed = parse_lifecycle_item(payload)
+        let parsed = parse_lifecycle_item(payload, false)
             .map_err(ResponseOutputItemLifecycleError::into_provider_fault)?;
         validate_observed_item(&parsed)
             .map_err(ResponseOutputItemLifecycleError::into_provider_fault)?;
@@ -1717,19 +1717,24 @@ fn response_lifecycle_id(
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .ok_or_else(|| invalid_lifecycle("OpenAI response lifecycle has an invalid id"))?;
-    if response.get("status").and_then(Value::as_str) != Some(expected_status) {
-        return Err(invalid_lifecycle(
-            "OpenAI response lifecycle has an invalid status",
-        ));
+    match response.get("status") {
+        None => {}
+        Some(Value::String(status)) if status == expected_status => {}
+        Some(_) => {
+            return Err(invalid_lifecycle(
+                "OpenAI response lifecycle has an invalid status",
+            ))
+        }
     }
     Ok(id.to_owned())
 }
 
 fn output_text_part(payload: &Map<String, Value>) -> Result<OutputTextContent, ProviderFault> {
-    let part = payload
+    let mut part = payload
         .get("part")
         .cloned()
         .ok_or_else(|| invalid_lifecycle("OpenAI content part lifecycle is missing part"))?;
+    normalize_output_text_annotations(&mut part);
     match serde_json::from_value::<OutputContent>(part)
         .map_err(|_| invalid_lifecycle("OpenAI content part has an invalid shape"))?
     {
@@ -1742,16 +1747,54 @@ fn output_text_part(payload: &Map<String, Value>) -> Result<OutputTextContent, P
 
 fn parse_lifecycle_item(
     payload: &Map<String, Value>,
+    allow_omitted_in_progress_message_content: bool,
 ) -> Result<ParsedOutputItem, ResponseOutputItemLifecycleError> {
     let output_index = payload
         .get("output_index")
         .and_then(Value::as_u64)
         .ok_or(ResponseOutputItemLifecycleError::InvalidOutputIndex)?;
-    let raw = payload
+    let mut raw = payload
         .get("item")
         .cloned()
         .ok_or(ResponseOutputItemLifecycleError::MissingItem)?;
+    normalize_lifecycle_message(&mut raw, allow_omitted_in_progress_message_content);
     parse_output_item(output_index, raw)
+}
+
+/// Some Responses-compatible streams omit fields that are semantically empty
+/// while a message is being produced. Normalize only those absent fields before
+/// decoding through `async-openai`; malformed or contradictory values remain
+/// rejected by the normal lifecycle checks.
+fn normalize_lifecycle_message(raw: &mut Value, allow_omitted_in_progress_message_content: bool) {
+    let Some(message) = raw.as_object_mut() else {
+        return;
+    };
+    if message.get("type").and_then(Value::as_str) != Some("message") {
+        return;
+    }
+    if allow_omitted_in_progress_message_content
+        && message.get("status").and_then(Value::as_str) == Some("in_progress")
+        && !message.contains_key("content")
+    {
+        message.insert("content".to_owned(), Value::Array(Vec::new()));
+    }
+    let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for part in content {
+        normalize_output_text_annotations(part);
+    }
+}
+
+fn normalize_output_text_annotations(part: &mut Value) {
+    let Some(part) = part.as_object_mut() else {
+        return;
+    };
+    if part.get("type").and_then(Value::as_str) == Some("output_text")
+        && !part.contains_key("annotations")
+    {
+        part.insert("annotations".to_owned(), Value::Array(Vec::new()));
+    }
 }
 
 fn parse_output_item(

@@ -6,19 +6,22 @@ use agentview::component::{
 };
 use anyhow::Context as _;
 use chess::{Board, ChessMove, Color, MoveGen};
-use tokio::{sync::watch, time::Instant};
+use tokio::{
+    sync::{oneshot, watch},
+    time::Instant,
+};
 
 use super::{
     application_state::{
         reduce, ChessEffect, ChessEvent, ChessFeedback, ChessOutcome, ChessPhase, ChessState,
         ModelAttemptKey, StockfishFailure, StockfishRequest,
     },
-    chess_action_component::{chess_action_component, ChessAttemptInput},
+    chess_action_component::chess_action_component,
     chess_draw_state::DrawState,
     uci::{BestMoveError, UciEngine, UciProcessConfig},
 };
 
-const WORKFLOW_CAPACITY: usize = 4;
+const PREPARATION_CAPACITY: usize = 1;
 
 #[derive(Clone)]
 pub(crate) struct ChessApplicationConfig {
@@ -68,6 +71,10 @@ enum ChessActorFailure {
 enum ChessActorExit {
     Completed(Result<ChessResult, ChessActorFailure>),
     Stopped(Result<(), ChessActorFailure>),
+}
+
+struct ChessPreparationRequest {
+    ready: oneshot::Sender<()>,
 }
 
 pub(crate) struct ChessApplication<P: ReactionPort> {
@@ -163,25 +170,33 @@ async fn stop_actor(
 
 async fn drive_application<P: ReactionPort>(
     runtime: &mut Application<P>,
-    actor_exit: &mut watch::Receiver<Option<ChessActorExit>>,
+    completion: &mut watch::Receiver<Option<ChessActorExit>>,
 ) -> anyhow::Result<ChessResult> {
     loop {
-        if let Some(exit) = actor_exit.borrow().clone() {
+        runtime
+            .prepare()
+            .await
+            .context("Chess preparation failed")?;
+        if let Some(exit) = completion.borrow().clone() {
             return completed_result(exit);
         }
-
         tokio::select! {
             biased;
-            changed = actor_exit.changed() => {
-                changed.context("Chess workflow ended without a terminal result")?;
+            changed = completion.changed() => {
+                changed.context("Chess completion channel closed")?;
+                continue;
             }
             demand = runtime.wait_for_reaction_request() => {
                 demand.context("Chess Component reaction request failed")?;
-                // Complete an admitted reaction before observing completion. Cancelling
-                // react() after provider handoff would terminally cancel Application.
-                runtime.react().await.context("Chess model reaction failed")?;
             }
         }
+        if let Some(exit) = completion.borrow().clone() {
+            return completed_result(exit);
+        }
+        runtime
+            .react()
+            .await
+            .context("Chess model reaction failed")?;
     }
 }
 
@@ -202,30 +217,49 @@ fn chess_application(
     actor_exit: watch::Sender<Option<ChessActorExit>>,
 ) -> Component {
     let state = use_signal(|| ChessState::new(config.ply_limit));
+    let requested_attempt = use_signal(|| None::<ModelAttemptKey>);
     let reaction = use_reaction_request();
 
     let actor_state = state.clone();
-    let actor_reaction = reaction.clone();
     let actor_config = config.clone();
     let actor_stop = stop.clone();
-    let actor_exit = actor_exit.clone();
-    let workflow: Coroutine<ChessAttemptInput> =
-        use_coroutine(WORKFLOW_CAPACITY, move |inbox| async move {
-            run_chess_actor(
-                inbox,
-                actor_state,
-                actor_reaction,
-                actor_config,
-                actor_stop,
-                actor_exit,
-            )
-            .await;
+    let engine_exit = actor_exit.clone();
+    let engine: Coroutine<ChessPreparationRequest> =
+        use_coroutine(PREPARATION_CAPACITY, move |inbox| async move {
+            run_stockfish_actor(inbox, actor_state, actor_config, actor_stop, engine_exit).await;
         });
+
+    let preparation_state = state.clone();
+    use_preparation(move || {
+        let engine = engine.clone();
+        let state = preparation_state.clone();
+        let completion = actor_exit.clone();
+        let requested_attempt = requested_attempt.clone();
+        let reaction = reaction.clone();
+        async move {
+            let (ready, prepared) = oneshot::channel();
+            let sent = engine.send(ChessPreparationRequest { ready }).await;
+            if sent.is_err() || prepared.await.is_err() {
+                anyhow::ensure!(
+                    completion.borrow().is_some(),
+                    "Stockfish stopped before completing preparation"
+                );
+                return Ok::<_, anyhow::Error>(());
+            }
+            if let Some(attempt) = state.with(ChessState::current_attempt)? {
+                if requested_attempt.with(|requested| *requested != Some(attempt))? {
+                    reaction.request()?;
+                    requested_attempt.set(Some(attempt))?;
+                }
+            }
+            Ok(())
+        }
+    });
 
     let rendered = state.with(Clone::clone).expect("mounted Chess state");
     let attempt = rendered.current_attempt();
     let action = attempt
-        .map(|attempt| chess_action_component(attempt, workflow))
+        .map(|attempt| chess_action_component(attempt, state.clone()))
         .unwrap_or_else(|| view! {});
 
     view! {
@@ -235,10 +269,9 @@ fn chess_application(
     }
 }
 
-async fn run_chess_actor(
-    mut inbox: CoroutineInbox<ChessAttemptInput>,
+async fn run_stockfish_actor(
+    mut inbox: CoroutineInbox<ChessPreparationRequest>,
     state: Signal<ChessState>,
-    reaction: ReactionRequest,
     config: ChessApplicationConfig,
     mut stop: watch::Receiver<bool>,
     actor_exit: watch::Sender<Option<ChessActorExit>>,
@@ -276,32 +309,8 @@ async fn run_chess_actor(
             }
         };
 
-    let mut event = ChessEvent::Start;
-    let mut handled = None;
     loop {
-        let effects = reduce_signal(&state, event);
-        match effects.as_slice() {
-            [] => {}
-            [ChessEffect::RequestReaction] => reaction
-                .request()
-                .expect("mounted Chess reaction capability"),
-            [ChessEffect::RequestStockfish(request)] => {
-                event = stockfish_event(&mut engine, request, config.engine_nodes).await;
-                continue;
-            }
-            [ChessEffect::Complete(outcome)] => {
-                let shutdown = shutdown_engine(&mut engine, config.engine_timeout).await;
-                let exit = shutdown.map(|()| chess_result(&state, outcome.clone()));
-                publish_actor_exit(&actor_exit, ChessActorExit::Completed(exit));
-                acknowledge_action(&mut handled);
-                drain_finished_events(&mut inbox, &state, &mut stop).await;
-                return;
-            }
-            _ => panic!("Chess reducer emitted an unsupported effect batch"),
-        }
-        acknowledge_action(&mut handled);
-
-        tokio::select! {
+        let request = tokio::select! {
             biased;
             changed = stop.changed() => {
                 let _ = changed;
@@ -310,48 +319,41 @@ async fn run_chess_actor(
                 return;
             }
             next = inbox.recv() => {
-                let Some(ChessAttemptInput { attempt, result, handled: next_handled }) = next else {
+                let Some(request) = next else {
                     let exit = shutdown_engine(&mut engine, config.engine_timeout).await;
                     publish_actor_exit(&actor_exit, ChessActorExit::Stopped(exit));
                     return;
                 };
-                event = ChessEvent::ModelAction { attempt, result };
-                handled = Some(next_handled);
+                request
             }
         };
-    }
-}
 
-async fn drain_finished_events(
-    inbox: &mut CoroutineInbox<ChessAttemptInput>,
-    state: &Signal<ChessState>,
-    stop: &mut watch::Receiver<bool>,
-) {
-    while !*stop.borrow() {
-        tokio::select! {
-            biased;
-            changed = stop.changed() => {
-                let _ = changed;
-                return;
-            }
-            next = inbox.recv() => {
-                let Some(ChessAttemptInput { attempt, result, handled }) = next else {
-                    return;
-                };
-                debug_assert!(reduce_signal(
-                    state,
-                    ChessEvent::ModelAction { attempt, result },
-                )
-                .is_empty());
-                let _ = handled.send(());
-            }
+        if state.with(ChessState::phase).expect("mounted Chess state") == ChessPhase::Ready {
+            reduce_signal(&state, ChessEvent::Start);
         }
-    }
-}
-
-fn acknowledge_action(handled: &mut Option<tokio::sync::oneshot::Sender<()>>) {
-    if let Some(handled) = handled.take() {
-        let _ = handled.send(());
+        let stockfish = state
+            .with(|state| {
+                (state.phase() == ChessPhase::AwaitingStockfish).then(|| StockfishRequest {
+                    position_revision: state.committed_moves().len(),
+                    committed_moves: state.committed_moves().to_vec(),
+                })
+            })
+            .expect("mounted Chess state");
+        if let Some(stockfish) = stockfish {
+            let event = stockfish_event(&mut engine, &stockfish, config.engine_nodes).await;
+            reduce_signal(&state, event);
+        }
+        let outcome = state
+            .with(|state| state.outcome().cloned())
+            .expect("mounted Chess state");
+        if let Some(outcome) = outcome {
+            let shutdown = shutdown_engine(&mut engine, config.engine_timeout).await;
+            let exit = shutdown.map(|()| chess_result(&state, outcome));
+            publish_actor_exit(&actor_exit, ChessActorExit::Completed(exit));
+            let _ = request.ready.send(());
+            return;
+        }
+        let _ = request.ready.send(());
     }
 }
 
@@ -370,18 +372,10 @@ fn publish_without_engine(
     );
 }
 
-fn reduce_signal(state: &Signal<ChessState>, event: ChessEvent) -> Vec<ChessEffect> {
-    let (next, effects) = state
-        .with(|current| {
-            let mut next = current.clone();
-            let effects = reduce(&mut next, event);
-            (next, effects)
-        })
-        .expect("mounted Chess actor state");
-    if !effects.is_empty() {
-        state.set(next).expect("mounted Chess actor state");
-    }
-    effects
+pub(crate) fn reduce_signal(state: &Signal<ChessState>, event: ChessEvent) -> Vec<ChessEffect> {
+    state
+        .update(|current| reduce(current, event))
+        .expect("mounted Chess state")
 }
 
 fn chess_result(state: &Signal<ChessState>, outcome: ChessOutcome) -> ChessResult {
@@ -471,10 +465,7 @@ fn chess_projection(state: ChessState) -> Component {
         #[system_once]
         chess_player {
             identity { "You are the chess agent playing {agent_side}." }
-            objective { "Choose one legal action for the authoritative position." }
-            private_reasoning {
-                "Reason privately about checks, captures, threats, king safety, tactics, strategy, and automatic draw conditions."
-            }
+            objective { "Evaluate the authoritative position briefly, then choose one legal action." }
         }
         #[developer]
         chess_game_state {
@@ -502,7 +493,12 @@ fn chess_projection(state: ChessState) -> Component {
         chess_action_policy {
             chess_action_instructions {
                 response {
-                    "Your response must contain exactly one registered self-closing XML action element. Text outside that action element is allowed. The rule elements below are instructions, not valid output."
+                    "Respond with exactly two XML elements and no other text: first one nonempty <thought>...</thought> with a concise move evaluation, then exactly one registered self-closing XML action element. The rule elements below are instructions, not valid output."
+                }
+                thought_rule {
+                    output_element: "thought",
+                    purpose { "State one concise move evaluation before the action." }
+                    requirement { "Use nonempty plain text without nested XML." }
                 }
                 action_rule {
                     output_element: "choose_move",
@@ -667,6 +663,16 @@ mod tests {
 
     static NEXT_FAKE_UCI: AtomicU64 = AtomicU64::new(1);
 
+    const BRIEF_THOUGHT: &str = "<thought>brief move evaluation</thought>";
+
+    fn thought_then_choose_move(uci: &str) -> String {
+        format!("{BRIEF_THOUGHT}<choose_move uci=\"{uci}\" />")
+    }
+
+    fn thought_then_resign() -> String {
+        format!("{BRIEF_THOUGHT}<resign />")
+    }
+
     fn render_chess_prompt(state: ChessState) -> String {
         let mut components = ComponentHost::new_root(chess_projection, state);
         let rendered = components.render().expect("Chess projection renders");
@@ -711,10 +717,16 @@ mod tests {
     struct FakeUciProgram {
         program: PathBuf,
         transcript: PathBuf,
+        first_go_hold: Option<PathBuf>,
+        first_go_release: Option<PathBuf>,
     }
 
     impl FakeUciProgram {
         fn create() -> Self {
+            Self::create_with_first_go_hold(false)
+        }
+
+        fn create_with_first_go_hold(hold_first_go: bool) -> Self {
             let sequence = NEXT_FAKE_UCI.fetch_add(1, Ordering::Relaxed);
             let path = std::env::current_exe()
                 .expect("resolve Cargo example test executable")
@@ -727,6 +739,23 @@ mod tests {
             let mut transcript = path.as_os_str().to_os_string();
             transcript.push(".commands");
             let transcript = PathBuf::from(transcript);
+            let first_go_hold = hold_first_go.then(|| {
+                let mut hold = path.as_os_str().to_os_string();
+                hold.push(".hold-first-go");
+                PathBuf::from(hold)
+            });
+            let first_go_release = hold_first_go.then(|| {
+                let mut release = path.as_os_str().to_os_string();
+                release.push(".release-first-go");
+                PathBuf::from(release)
+            });
+            if let Some(hold) = &first_go_hold {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(hold)
+                    .expect("create first Stockfish search hold");
+            }
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -745,6 +774,11 @@ while IFS= read -r command; do
         isready) printf 'readyok\n' ;;
         "go nodes 10")
             go_count=$((go_count + 1))
+            if [ "$go_count" -eq 1 ] && [ -f "${0}.hold-first-go" ]; then
+                while [ ! -f "${0}.release-first-go" ]; do
+                    sleep 0.01
+                done
+            fi
             if [ "$go_count" -eq 1 ]; then
                 printf 'bestmove e7e5\n'
             else
@@ -761,6 +795,8 @@ done
             Self {
                 program: path,
                 transcript,
+                first_go_hold,
+                first_go_release,
             }
         }
 
@@ -775,21 +811,284 @@ done
                 .map(str::to_owned)
                 .collect()
         }
+
+        fn release_first_go(&self) {
+            let release = self
+                .first_go_release
+                .as_ref()
+                .expect("fake UCI does not hold its first Stockfish search");
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(release)
+                .expect("release first Stockfish search");
+        }
     }
 
     impl Drop for FakeUciProgram {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.program);
             let _ = fs::remove_file(&self.transcript);
+            if let Some(hold) = &self.first_go_hold {
+                let _ = fs::remove_file(hold);
+            }
+            if let Some(release) = &self.first_go_release {
+                let _ = fs::remove_file(release);
+            }
         }
     }
 
-    #[tokio::test]
-    async fn component_actor_owns_the_full_model_and_stockfish_turn() {
+    async fn assert_thought_rejection(invalid_response: impl Into<String>, expected_reason: &str) {
         let fake_uci = FakeUciProgram::create();
         let (provider, capture) = ScriptedProvider::new([
-            ScriptedReaction::text(["<choose_move uci=\"e2e4\" />"]),
-            ScriptedReaction::text(["<choose_move uci=\"d2d4\" />"]),
+            ScriptedReaction::text([invalid_response.into()]),
+            ScriptedReaction::text([thought_then_choose_move("e2e4")]),
+        ])
+        .unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 1).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            ChessApplication::mount(config, provider).unwrap().run(),
+        )
+        .await
+        .expect("a rejected thought must request another model reaction")
+        .unwrap();
+
+        assert_eq!(result.outcome, ChessOutcome::PlyLimitReached);
+        assert_eq!(result.committed_moves, vec!["e2e4".parse().unwrap()]);
+        let frames = capture.frames();
+        assert_eq!(frames.len(), 2);
+        let retry = &frames[1].text;
+        assert!(
+            retry.contains(&format!("previous_decision=\"rejected:{expected_reason}\"")),
+            "{retry}"
+        );
+        assert!(
+            retry.contains(&format!("corrective_reason=\"{expected_reason}\"")),
+            "{retry}"
+        );
+        assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
+    }
+
+    fn stockfish_go_count(program: &FakeUciProgram) -> usize {
+        program
+            .commands()
+            .iter()
+            .filter(|command| command.as_str() == "go nodes 10")
+            .count()
+    }
+
+    fn current_chess_projection<P: ReactionPort>(application: &ChessApplication<P>) -> String {
+        let snapshot = application.runtime.current_projection();
+        snapshot
+            .projection()
+            .nodes()
+            .iter()
+            .flat_map(|node| node.items())
+            .filter_map(|item| match item {
+                CanonicalInputItem::Instruction { pom, .. }
+                | CanonicalInputItem::Message { pom, .. } => {
+                    Some(render_pom_document(pom).expect("Chess POM renders"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn shutdown_raw_chess_application<P: ReactionPort>(mut application: ChessApplication<P>) {
+        stop_actor(&application.stop, &mut application.actor_exit)
+            .await
+            .expect("stop raw Chess actor");
+        application
+            .runtime
+            .shutdown()
+            .await
+            .expect("shutdown raw Chess runtime");
+    }
+
+    #[tokio::test]
+    async fn prepare_initializes_chess_without_submitting_a_provider_frame() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) = ScriptedProvider::new([]).unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 4).unwrap();
+        let mut application = ChessApplication::mount(config, provider).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), application.runtime.prepare())
+            .await
+            .expect("initial Chess preparation must complete")
+            .unwrap();
+
+        assert_eq!(capture.submission_count(), 0);
+        assert!(fake_uci.commands().iter().any(|command| command == "uci"));
+        assert_eq!(stockfish_go_count(&fake_uci), 0);
+
+        shutdown_raw_chess_application(application).await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_engine_completes_without_submitting_a_provider_frame() {
+        let sequence = NEXT_FAKE_UCI.fetch_add(1, Ordering::Relaxed);
+        let missing_program = std::env::temp_dir().join(format!(
+            "agentview-missing-stockfish-{}-{sequence}",
+            std::process::id()
+        ));
+        assert!(!missing_program.exists(), "test path must not exist");
+        let (provider, capture) = ScriptedProvider::new([]).unwrap();
+        let config =
+            ChessApplicationConfig::new(missing_program, Duration::from_secs(2), 10, 4).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            ChessApplication::mount(config, provider).unwrap().run(),
+        )
+        .await
+        .expect("unavailable engine must finish preparation")
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            ChessOutcome::StockfishFailed(StockfishFailure::Unavailable)
+        );
+        assert!(result.committed_moves.is_empty());
+        assert_eq!(capture.submission_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn move_publication_defers_stockfish_until_the_next_preparation() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) =
+            ScriptedProvider::new([ScriptedReaction::text([thought_then_choose_move("e2e4")])])
+                .unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 4).unwrap();
+        let mut application = ChessApplication::mount(config, provider).unwrap();
+
+        application.runtime.prepare().await.unwrap();
+        application.runtime.react().await.unwrap();
+
+        assert_eq!(capture.submission_count(), 1);
+        assert_eq!(stockfish_go_count(&fake_uci), 0);
+        assert!(current_chess_projection(&application)
+            .contains("<history notation=\"uci\" values=\"e2e4\" />"));
+
+        application.runtime.prepare().await.unwrap();
+
+        assert_eq!(capture.submission_count(), 1);
+        assert_eq!(stockfish_go_count(&fake_uci), 1);
+        assert!(current_chess_projection(&application)
+            .contains("<history notation=\"uci\" values=\"e2e4 e7e5\" />"));
+
+        shutdown_raw_chess_application(application).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_preparation_does_not_duplicate_stockfish_work() {
+        let fake_uci = FakeUciProgram::create_with_first_go_hold(true);
+        let (provider, capture) =
+            ScriptedProvider::new([ScriptedReaction::text([thought_then_choose_move("e2e4")])])
+                .unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 4).unwrap();
+        let mut application = ChessApplication::mount(config, provider).unwrap();
+
+        application.runtime.prepare().await.unwrap();
+        application.runtime.react().await.unwrap();
+
+        let mut preparation = Box::pin(application.runtime.prepare());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                tokio::select! {
+                    result = &mut preparation => {
+                        panic!("held Stockfish preparation completed unexpectedly: {result:?}");
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                        if stockfish_go_count(&fake_uci) == 1 {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("preparation must reach the held Stockfish search");
+        drop(preparation);
+
+        fake_uci.release_first_go();
+        tokio::time::timeout(Duration::from_secs(1), application.runtime.prepare())
+            .await
+            .expect("a retried preparation must finish after the held search")
+            .unwrap();
+
+        assert_eq!(capture.submission_count(), 1);
+        assert_eq!(stockfish_go_count(&fake_uci), 1);
+
+        shutdown_raw_chess_application(application).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_preparation_and_react_preparation_do_not_repeat_stockfish() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) = ScriptedProvider::new([
+            ScriptedReaction::text([thought_then_choose_move("e2e4")]),
+            ScriptedReaction::text([thought_then_choose_move("d2d4")]),
+        ])
+        .unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 4).unwrap();
+        let mut application = ChessApplication::mount(config, provider).unwrap();
+
+        application.runtime.prepare().await.unwrap();
+        application.runtime.react().await.unwrap();
+        application.runtime.prepare().await.unwrap();
+        assert_eq!(stockfish_go_count(&fake_uci), 1);
+
+        application.runtime.prepare().await.unwrap();
+        assert_eq!(stockfish_go_count(&fake_uci), 1);
+
+        application.runtime.react().await.unwrap();
+        assert_eq!(capture.submission_count(), 2);
+        assert_eq!(stockfish_go_count(&fake_uci), 1);
+
+        shutdown_raw_chess_application(application).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_preparation_does_not_submit_a_second_provider_reaction() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) =
+            ScriptedProvider::new([ScriptedReaction::text([thought_then_choose_move("e2e4")])])
+                .unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 2).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            ChessApplication::mount(config, provider).unwrap().run(),
+        )
+        .await
+        .expect("terminal preparation must complete the Chess run")
+        .unwrap();
+
+        assert_eq!(result.outcome, ChessOutcome::PlyLimitReached);
+        assert_eq!(
+            result.committed_moves,
+            vec!["e2e4".parse().unwrap(), "e7e5".parse().unwrap()]
+        );
+        assert_eq!(capture.submission_count(), 1);
+        assert_eq!(stockfish_go_count(&fake_uci), 1);
+        assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
+    }
+
+    #[tokio::test]
+    async fn preparation_and_contract_drive_the_model_and_stockfish_turns() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) = ScriptedProvider::new([
+            ScriptedReaction::text([thought_then_choose_move("e2e4")]),
+            ScriptedReaction::text([thought_then_choose_move("d2d4")]),
         ])
         .unwrap();
         let config =
@@ -825,7 +1124,7 @@ done
             frames[1]
                 .text
                 .matches(
-                    "Your response must contain exactly one registered self-closing XML action element. Text outside that action element is allowed. The rule elements below are instructions, not valid output."
+                    "Respond with exactly two XML elements and no other text: first one nonempty &lt;thought&gt;...&lt;/thought&gt; with a concise move evaluation, then exactly one registered self-closing XML action element. The rule elements below are instructions, not valid output."
                 )
                 .count(),
             1,
@@ -852,21 +1151,33 @@ done
     }
 
     #[test]
-    fn chess_prompt_policy_allows_text_without_stable_action_examples() {
+    fn chess_prompt_policy_requires_a_concise_thought_before_one_action() {
         let prompt = render_chess_prompt(ChessState::new(1));
 
         assert_eq!(prompt.matches("<chess_action_instructions>").count(), 1);
-        assert!(!prompt.contains("Return no analysis or commentary."));
         assert_eq!(
             prompt
                 .matches(
-                    "Your response must contain exactly one registered self-closing XML action element. Text outside that action element is allowed. The rule elements below are instructions, not valid output."
+                    "Respond with exactly two XML elements and no other text: first one nonempty &lt;thought&gt;...&lt;/thought&gt; with a concise move evaluation, then exactly one registered self-closing XML action element. The rule elements below are instructions, not valid output."
                 )
                 .count(),
             1
         );
         assert!(!prompt.contains("shown after this policy"));
-        assert!(!prompt.contains("Output no other text."));
+        assert!(!prompt.contains("Text outside that action element is allowed."));
+        assert!(!prompt.contains("Reason privately about"));
+        assert_eq!(
+            prompt
+                .matches("<thought_rule output_element=\"thought\">")
+                .count(),
+            1
+        );
+        assert_eq!(
+            prompt
+                .matches("State one concise move evaluation before the action.")
+                .count(),
+            1
+        );
         for action_name in ["choose_move", "resign"] {
             let action = format!("<action_rule output_element=\"{action_name}\">");
             assert_eq!(
@@ -946,12 +1257,12 @@ done
     }
 
     #[tokio::test]
-    async fn text_outside_one_registered_action_is_allowed() {
+    async fn split_thought_then_move_is_accepted() {
         let fake_uci = FakeUciProgram::create();
         let (provider, capture) = ScriptedProvider::new([ScriptedReaction::text([
-            "I will play the king's pawn. ",
+            "<thought>brief ",
+            "move evaluation</thought>",
             "<choose_move uci=\"e2e4\" />",
-            " Your turn.",
         ])])
         .unwrap();
         let config =
@@ -970,11 +1281,76 @@ done
     }
 
     #[tokio::test]
+    async fn action_without_a_thought_is_rejected() {
+        assert_thought_rejection("<choose_move uci=\"e2e4\" />", "missing_thought").await;
+    }
+
+    #[tokio::test]
+    async fn thought_after_an_action_is_rejected() {
+        assert_thought_rejection(
+            format!("<choose_move uci=\"e2e4\" />{BRIEF_THOUGHT}"),
+            "thought_after_action",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_thoughts_are_rejected() {
+        assert_thought_rejection(
+            format!(
+                "{BRIEF_THOUGHT}<thought>second move evaluation</thought><choose_move uci=\"e2e4\" />"
+            ),
+            "multiple_thoughts",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn empty_thought_is_rejected() {
+        assert_thought_rejection(
+            "<thought></thought><choose_move uci=\"e2e4\" />",
+            "invalid_thought",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn malformed_thought_is_rejected() {
+        assert_thought_rejection("<thought>brief move evaluation", "invalid_thought").await;
+    }
+
+    #[tokio::test]
+    async fn thought_then_resign_is_accepted() {
+        let fake_uci = FakeUciProgram::create();
+        let (provider, capture) =
+            ScriptedProvider::new([ScriptedReaction::text([thought_then_resign()])]).unwrap();
+        let config =
+            ChessApplicationConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 4).unwrap();
+
+        let result = ChessApplication::mount(config, provider)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            ChessOutcome::Resignation {
+                resigned: Color::White,
+                winner: Color::Black,
+            }
+        );
+        assert!(result.committed_moves.is_empty());
+        assert_eq!(capture.frames().len(), 1);
+        assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
+    }
+
+    #[tokio::test]
     async fn invalid_action_requests_a_fresh_model_attempt() {
         let fake_uci = FakeUciProgram::create();
         let (provider, capture) = ScriptedProvider::new([
-            ScriptedReaction::text(["<choose_move uci=\"E2E4\" />"]),
-            ScriptedReaction::text(["<choose_move uci=\"e2e4\" />"]),
+            ScriptedReaction::text([thought_then_choose_move("E2E4")]),
+            ScriptedReaction::text([thought_then_choose_move("e2e4")]),
         ])
         .unwrap();
         let config =
@@ -1013,8 +1389,8 @@ done
         let oversized = "x".repeat(256);
         let invalid_action = format!("<choose_move uci=\"{oversized}\" />");
         let (provider, capture) = ScriptedProvider::new([
-            ScriptedReaction::text([invalid_action]),
-            ScriptedReaction::text(["<choose_move uci=\"e2e4\" />"]),
+            ScriptedReaction::text([format!("{BRIEF_THOUGHT}{invalid_action}")]),
+            ScriptedReaction::text([thought_then_choose_move("e2e4")]),
         ])
         .unwrap();
         let config =
@@ -1041,8 +1417,8 @@ done
     async fn missing_action_is_rejected_and_requests_a_fresh_model_attempt() {
         let fake_uci = FakeUciProgram::create();
         let (provider, capture) = ScriptedProvider::new([
-            ScriptedReaction::empty(),
-            ScriptedReaction::text(["<choose_move uci=\"e2e4\" />"]),
+            ScriptedReaction::text([BRIEF_THOUGHT]),
+            ScriptedReaction::text([thought_then_choose_move("e2e4")]),
         ])
         .unwrap();
         let config =
@@ -1081,8 +1457,8 @@ done
     async fn incomplete_action_is_rejected_after_eof_before_completion_settlement() {
         let fake_uci = FakeUciProgram::create();
         let (provider, capture) = ScriptedProvider::new([
-            ScriptedReaction::text(["<choose_move uci=\"e2e4\""]),
-            ScriptedReaction::text(["<choose_move uci=\"e2e4\" />"]),
+            ScriptedReaction::text([format!("{BRIEF_THOUGHT}<choose_move uci=\"e2e4\"")]),
+            ScriptedReaction::text([thought_then_choose_move("e2e4")]),
         ])
         .unwrap();
         let config =
@@ -1111,8 +1487,10 @@ done
     async fn multiple_model_actions_are_rejected_as_one_attempt() {
         let fake_uci = FakeUciProgram::create();
         let (provider, capture) = ScriptedProvider::new([
-            ScriptedReaction::text([concat!("<resign />", "<choose_move uci=\"d2d4\" />",)]),
-            ScriptedReaction::text(["<choose_move uci=\"e2e4\" />"]),
+            ScriptedReaction::text([format!(
+                "{BRIEF_THOUGHT}<resign /><choose_move uci=\"d2d4\" />"
+            )]),
+            ScriptedReaction::text([thought_then_choose_move("e2e4")]),
         ])
         .unwrap();
         let config =
@@ -1141,9 +1519,9 @@ done
     async fn three_reactions_without_registered_actions_forfeit_the_model() {
         let fake_uci = FakeUciProgram::create();
         let (provider, capture) = ScriptedProvider::new([
-            ScriptedReaction::empty(),
-            ScriptedReaction::text(["I cannot choose a move."]),
-            ScriptedReaction::text(["<unknown />"]),
+            ScriptedReaction::text([BRIEF_THOUGHT]),
+            ScriptedReaction::text([BRIEF_THOUGHT]),
+            ScriptedReaction::text([BRIEF_THOUGHT]),
         ])
         .unwrap();
         let config =

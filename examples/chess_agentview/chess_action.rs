@@ -42,6 +42,10 @@ impl ChessActionKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InvalidActionReason {
     InvalidXml,
+    MissingThought,
+    InvalidThought,
+    MultipleThoughts,
+    ThoughtAfterAction,
     MissingAction,
     MultipleActions,
     InvalidUci {
@@ -93,6 +97,10 @@ impl InvalidActionReason {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::InvalidXml => "invalid_xml",
+            Self::MissingThought => "missing_thought",
+            Self::InvalidThought => "invalid_thought",
+            Self::MultipleThoughts => "multiple_thoughts",
+            Self::ThoughtAfterAction => "thought_after_action",
             Self::MissingAction => "missing_action",
             Self::MultipleActions => "multiple_actions",
             Self::InvalidUci { .. } => "invalid_uci",
@@ -110,7 +118,13 @@ impl InvalidActionReason {
                 Some(*action)
             }
             Self::IllegalMove(action) => Some(action.kind()),
-            Self::InvalidXml | Self::MissingAction | Self::MultipleActions => None,
+            Self::InvalidXml
+            | Self::MissingThought
+            | Self::InvalidThought
+            | Self::MultipleThoughts
+            | Self::ThoughtAfterAction
+            | Self::MissingAction
+            | Self::MultipleActions => None,
         }
     }
 
@@ -118,6 +132,10 @@ impl InvalidActionReason {
         match self {
             Self::IllegalMove(action) => Some(*action),
             Self::InvalidXml
+            | Self::MissingThought
+            | Self::InvalidThought
+            | Self::MultipleThoughts
+            | Self::ThoughtAfterAction
             | Self::MissingAction
             | Self::MultipleActions
             | Self::InvalidUci { .. }
@@ -138,9 +156,13 @@ impl InvalidActionReason {
 
     pub(crate) fn description(&self) -> &'static str {
         match self {
-            Self::InvalidXml => {
-                "The response did not match one supported empty XML action element."
+            Self::InvalidXml => "The response did not match the required XML response format.",
+            Self::MissingThought => "Write one nonempty <thought> element before the action.",
+            Self::InvalidThought => {
+                "The thought must be one closed <thought> element containing nonempty text only."
             }
+            Self::MultipleThoughts => "Write exactly one <thought> element before the action.",
+            Self::ThoughtAfterAction => "Complete the <thought> element before writing the action.",
             Self::MissingAction => "The response contained no action element.",
             Self::MultipleActions => "The response contained more than one action element.",
             Self::InvalidUci { .. } => "The uci attribute was not canonical lowercase UCI.",

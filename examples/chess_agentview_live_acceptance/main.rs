@@ -1,6 +1,7 @@
 use std::{io::Write, process::ExitCode};
 
 #[path = "../chess_agentview/chess_action.rs"]
+#[allow(dead_code)] // The legacy action-only parser does not construct thought diagnostics.
 mod chess_action;
 mod chess_actions;
 mod chess_agent;

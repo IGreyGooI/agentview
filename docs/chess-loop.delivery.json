@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "reviewedAt": "2026-09-07",
+  "scope": "当前 chess_agentview example 的主循环与准备屏障；详解包含启动、XML 决策、发布、重试、终局和取消等待。",
+  "explanation": "chess-loop-explained.md",
+  "diagrams": [
+    {
+      "diagram_type": "workflow",
+      "specification": {
+        "path": "chess-loop.workflow.json",
+        "sha256": "8f7d7ba006c5162ebe19a49507c624ee45fd3fd9ec914987084d9540ce3a3fa4",
+        "bytes": 3595
+      },
+      "artifact": {
+        "path": "chess-loop.workflow.html",
+        "sha256": "67e758c53613aaeca51632bb66b95834fd736d8fe5b9771c3794c04a4e49a155",
+        "bytes": 632246
+      },
+      "validation": {
+        "command": "deliver",
+        "exitCode": 0,
+        "checksPassed": 9,
+        "checkCount": 9,
+        "profile": "showcase",
+        "errors": 0,
+        "warnings": 0
+      },
+      "visual_review": "passed",
+      "visual_review_scope": "桌面默认视图；已逐张检查最小和最大尺寸的明暗主题截图，返回箭头避开泳道标题。",
+      "correction_rounds": 1,
+      "visual_check_receipt": "chess-loop.workflow.visual-check.json",
+      "contact_sheet": "chess-loop.workflow.visual-check.html"
+    },
+    {
+      "diagram_type": "sequence",
+      "specification": {
+        "path": "chess-loop.sequence.json",
+        "sha256": "6229ae7e1c4ad076ce9aff9203992e79094c0ec790678ac222bf7d2603ad054b",
+        "bytes": 2961
+      },
+      "artifact": {
+        "path": "chess-loop.sequence.html",
+        "sha256": "25e7a6aa69c049767cbaaa8061a36e057673cef9ceb4eb0fcb6dd0c684fd693c",
+        "bytes": 632432
+      },
+      "validation": {
+        "command": "deliver",
+        "exitCode": 0,
+        "checksPassed": 9,
+        "checkCount": 9,
+        "profile": "showcase",
+        "errors": 0,
+        "warnings": 0
+      },
+      "visual_review": "passed",
+      "visual_review_scope": "桌面默认视图；已逐张检查最小和最大尺寸的明暗主题截图，标题、消息和说明完整显示。",
+      "correction_rounds": 2,
+      "visual_check_receipt": "chess-loop.sequence.visual-check.json",
+      "contact_sheet": "chess-loop.sequence.visual-check.html"
+    }
+  ],
+  "desktopContainment": {
+    "status": "pass",
+    "viewports": [[1440, 900], [1600, 1000], [1920, 1080], [2048, 1320]],
+    "horizontalOverflow": false,
+    "verticalOverflow": false
+  },
+  "interactionChecks": {
+    "tool": "Playwright",
+    "artifacts": ["workflow", "sequence"],
+    "themeSwitch": "pass",
+    "nodeFocusAndClose": "pass",
+    "nodeSearch": "pass",
+    "exportMenu": "pass",
+    "pageErrors": []
+  },
+  "narrowViewportReview": {
+    "viewports": [[390, 844], [768, 1024]],
+    "documentHorizontalContainment": "pass",
+    "visual_review": "limited",
+    "notes": "390px 窄屏保留查看器的横向图浏览，页面可纵向滚动；工具栏左侧按钮部分超出可视区。桌面交付通过，窄屏未宣称完整视觉通过。"
+  },
+  "notes": [
+    "visual-check 自动回执中的 visualReview 固定为 pending；本文件另行记录实际截图复核结果。",
+    "检查时使用临时 Chromium 包装脚本添加 --no-sandbox；该脚本在交付前已移除，不是 HTML 运行依赖。",
+    "HTML 自包含，可直接打开；本次图文工作没有调用模型 Provider 或修改 Rust 运行逻辑。"
+  ]
+}

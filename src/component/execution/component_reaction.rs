@@ -5,8 +5,8 @@ use std::sync::{Arc, RwLock};
     reason = "this feature-gated runtime retains the legacy EventInput constructor contract"
 )]
 use crate::component::{
-    authoring::{Component, EventInput, Signal},
     ComponentHost, ComponentHostFault, ComponentHostId, SignalAccessError,
+    authoring::{Component, EventInput, Signal},
 };
 
 #[allow(

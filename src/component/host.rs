@@ -5,7 +5,7 @@ use super::authoring::Signal;
 use super::{
     authoring::{
         Component, ComponentAttemptFault, ComponentRenderStage, InternalEventInput as EventInput,
-        MountTaskStart, RenderBindings,
+        MountTaskStart, PreparationSet, RenderBindings,
     },
     execution::{DriverDemandHandle, ProjectionExecutionScope, ProviderEvent, RenderedProjection},
     signal::{MountIdentity, SignalMountTransition, SignalRenderError, SignalRuntime},
@@ -58,6 +58,7 @@ pub struct ComponentHost<Props> {
     next_projection_revision: Option<ProjectionRevision>,
     current_projection_revision: Option<ProjectionRevision>,
     current_projection: Option<RenderedProjection>,
+    current_projection_prepared: bool,
 }
 
 enum ComponentRoot<Props> {
@@ -124,6 +125,7 @@ impl<Props> ComponentHost<Props> {
             next_projection_revision: Some(ProjectionRevision::FIRST),
             current_projection_revision: None,
             current_projection: None,
+            current_projection_prepared: false,
         }
     }
 
@@ -154,6 +156,7 @@ impl<Props> ComponentHost<Props> {
         self.props = next;
         self.current_projection_revision = None;
         self.current_projection = None;
+        self.current_projection_prepared = false;
         self.signals.mark_dirty();
         Ok(self.id)
     }
@@ -189,6 +192,15 @@ impl<Props> ComponentHost<Props> {
     #[allow(dead_code)] // Read by the application snapshot API introduced after this host layer.
     pub(crate) fn current_projection_revision(&self) -> Option<ProjectionRevision> {
         self.current_projection_revision
+    }
+
+    pub(crate) const fn current_projection_is_prepared(&self) -> bool {
+        self.current_projection_prepared
+    }
+
+    pub(crate) fn mark_current_projection_prepared(&mut self) {
+        debug_assert!(self.current_projection.is_some());
+        self.current_projection_prepared = true;
     }
 
     #[cfg(feature = "legacy-provider-port")]
@@ -257,7 +269,7 @@ where
                 });
         candidate.stage_mut().set_projection(projection.clone());
         let (stage, _, mounts) = candidate.commit_deferred();
-        let (bindings, task_starts) = stage.into_execution_parts();
+        let (preparations, bindings, task_starts) = stage.into_execution_parts();
         self.next_projection_revision = projection_revision.checked_next();
 
         Ok(CommittedRenderTransition {
@@ -265,6 +277,7 @@ where
             generation,
             projection_revision,
             projection,
+            preparations,
             bindings,
             task_starts,
             mounts,
@@ -281,20 +294,24 @@ where
             generation,
             projection_revision,
             projection,
+            preparations,
             bindings,
             task_starts,
             mounts,
         } = committed;
         debug_assert_eq!(host_id, self.id);
+        let projection_prepared = preparations.is_empty();
         mounts.activate();
         self.current_projection_revision = Some(projection_revision);
         self.current_projection = Some(projection.clone());
+        self.current_projection_prepared = projection_prepared;
 
         PublishedManagedRender {
             rendered: PreparedRender {
                 host_id,
                 generation,
                 projection,
+                preparations,
                 bindings,
             },
             task_starts,
@@ -308,6 +325,7 @@ pub(crate) struct CommittedRenderTransition {
     generation: u64,
     projection_revision: ProjectionRevision,
     projection: RenderedProjection,
+    preparations: PreparationSet,
     bindings: RenderBindings<ProviderEvent>,
     task_starts: Vec<MountTaskStart>,
     mounts: SignalMountTransition,
@@ -335,6 +353,7 @@ pub struct PreparedRender {
     host_id: ComponentHostId,
     generation: u64,
     projection: RenderedProjection,
+    preparations: PreparationSet,
     bindings: RenderBindings<ProviderEvent>,
 }
 
@@ -353,8 +372,12 @@ impl PreparedRender {
 
     pub(crate) fn into_execution_parts(
         self,
-    ) -> (RenderedProjection, RenderBindings<ProviderEvent>) {
-        (self.projection, self.bindings)
+    ) -> (
+        RenderedProjection,
+        PreparationSet,
+        RenderBindings<ProviderEvent>,
+    ) {
+        (self.projection, self.preparations, self.bindings)
     }
 }
 

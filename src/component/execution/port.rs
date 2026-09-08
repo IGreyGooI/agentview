@@ -1884,8 +1884,7 @@ impl ProviderFault {
 mod response_output_identity_diagnostic_tests {
     use super::{ProviderFault, ProviderFaultCode};
 
-    const LEGACY_IDENTITY_DIAGNOSTIC: &str =
-        "response_event_type=response.completed; response_event_reason=ledger_mismatch; \
+    const LEGACY_IDENTITY_DIAGNOSTIC: &str = "response_event_type=response.completed; response_event_reason=ledger_mismatch; \
          response_ledger_reason=output_identity; \
          response_output_identity_reason=kind_at_terminal_ordinal; \
          response_output_identity_mapping_basis=ordinal_missing_id; \

@@ -16,13 +16,15 @@ use serde_json::{Map, Value};
 use crate::{
     component::execution::reaction::{
         Frame, ProviderFact, ProviderFactStream, ProviderOutputKey, ProviderToolCall, ReactionPort,
-        ReactionPortFault, SubmitFault, TargetContinuity, TargetDeclaration,
+        ReactionPortFault, ResettableReactionPort, SubmitFault, TargetContinuity,
+        TargetDeclaration,
     },
     transcript::{AssistantPhase, CanonicalInputItem},
 };
 
 use super::{
-    declaration_state_lost_fault, exceeds_limit,
+    AsyncOpenAiResponsesProvider, NativeToolLedger, OpenAiWireEvent, ResponsesExecutionMode,
+    ResponsesReactionTarget, SseWireLimiter, declaration_state_lost_fault, exceeds_limit,
     frame_request::{
         PreparedResponsesFrameRequest, PrivateOutputKind, ResponsesFrameRequestFault,
         ResponsesFrameRequestState,
@@ -32,11 +34,9 @@ use super::{
     has_unsupported_content_part, has_unsupported_lifecycle_item, is_native_tool_event,
     native_function_call,
     output::{OpenAiOutputLedger, SealedOpenAiPrivateOutput},
-    reaction_fault::{map_openai_fault, OpenAiFailureClass, OpenAiReactionFailure},
+    reaction_fault::{OpenAiFailureClass, OpenAiReactionFailure, map_openai_fault},
     sse_event_size,
-    usage::{observe_response_usage, validated_response_usage, ResponseUsageObserver},
-    AsyncOpenAiResponsesProvider, NativeToolLedger, OpenAiWireEvent, ResponsesExecutionMode,
-    ResponsesReactionTarget, SseWireLimiter,
+    usage::{ResponseUsageObserver, observe_response_usage, validated_response_usage},
 };
 
 #[async_trait]
@@ -225,6 +225,28 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         };
 
         Ok(Box::pin(futures::stream::once(pending).flatten()))
+    }
+}
+
+impl ResettableReactionPort for AsyncOpenAiResponsesProvider {
+    fn reset_model_context(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+        // Validate the current native state before changing it. In particular,
+        // an Accepted declaration without its Frame state is already terminal.
+        self.frame_native_declaration()?;
+
+        self.reaction_target.lose_continuity();
+        let declaration = self.reaction_target.declaration()?;
+        if !matches!(
+            declaration.continuity(),
+            TargetContinuity::FullRequired { .. }
+        ) {
+            return Err(declaration_state_lost_fault());
+        }
+
+        // A later Full must be rebuilt from its Frame, not reconciled against
+        // the prior wire prefix or its provider output.
+        self.reaction_frame = None;
+        Ok(declaration)
     }
 }
 
@@ -594,7 +616,13 @@ impl<S> NativeOpenAiStreamState<'_, S> {
                 .map_err(protocol_fault)?,
             "response.output_item.done" => self.record_output_done(&frame.payload)?,
             "response.completed" => self.record_completed(&frame.payload)?,
-            "response.failed" | "response.incomplete" | "error" => {
+            "response.incomplete" => {
+                return Err(port_fault(
+                    OpenAiFailureClass::ResponseIncomplete,
+                    "upstream response reached an incomplete terminal state",
+                ));
+            }
+            "response.failed" | "error" => {
                 return Err(upstream_rejected(
                     "upstream response terminated unsuccessfully",
                 ));
@@ -945,18 +973,18 @@ fn upstream_rejected(diagnostic: impl Into<String>) -> ReactionPortFault {
 mod tests {
     use std::{
         collections::{BTreeMap, VecDeque},
-        num::{NonZeroU128, NonZeroU64},
+        num::{NonZeroU64, NonZeroU128},
         sync::Arc,
         task::Poll,
     };
 
     use axum::{
+        Router,
         body::Body,
         extract::State,
-        http::{header, Response, StatusCode},
+        http::{Response, StatusCode, header},
         response::IntoResponse,
         routing::post,
-        Router,
     };
     use eventsource_stream::EventStreamError;
     use futures::StreamExt;
@@ -973,13 +1001,14 @@ mod tests {
     use crate::component::execution::{RenderedProjection, RenderedProjectionNode};
     use crate::{
         component::execution::{
+            ProviderIdentity,
             reaction::{
                 Frame, FrameBasis, FrameRevision, FrameSubmission, ProjectionSubmission,
                 ProviderFact, ProviderOutputKey, ProviderToolCall, ReactionPort,
-                ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason, SubmitFault,
-                TargetContinuity, TargetDeclaration, ToolCatalog,
+                ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason,
+                ResettableReactionPort, SubmitFault, TargetContinuity, TargetDeclaration,
+                TargetEpoch, ToolCatalog,
             },
-            ProviderIdentity,
         },
         provider::{
             async_openai::{AsyncOpenAiResponsesProvider, AsyncOpenAiTransportConfig},
@@ -1145,6 +1174,124 @@ mod tests {
                             "annotations": []
                         }]
                     }]
+                }
+            }),
+        ])
+    }
+
+    fn incomplete_text_sse() -> String {
+        encode_sse([
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {"id":"msg_incomplete","type":"message","status":"in_progress","role":"assistant","content":[]}
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "delta": "partial",
+                "item_id": "msg_incomplete",
+                "output_index": 0,
+                "content_index": 0
+            }),
+            json!({
+                "type": "response.incomplete",
+                "sequence_number": 3,
+                "response": {
+                    "id": "resp_incomplete",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"}
+                }
+            }),
+        ])
+    }
+
+    fn ark_compatible_text_sse() -> String {
+        let text = "<say>ready</say>";
+        let message_id = "msg_ark_1";
+        let completed_item = json!({
+            "id": message_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]
+        });
+        encode_sse([
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_ark_1"}
+            }),
+            json!({
+                "type": "response.in_progress",
+                "sequence_number": 1,
+                "response": {"id": "resp_ark_1"}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 2,
+                "output_index": 0,
+                "item": {
+                    "id": message_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant"
+                }
+            }),
+            json!({
+                "type": "response.content_part.added",
+                "sequence_number": 3,
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": message_id,
+                "part": {"type": "output_text", "text": ""}
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 4,
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": message_id,
+                "delta": "<say>"
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 5,
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": message_id,
+                "delta": "ready</say>"
+            }),
+            json!({
+                "type": "response.output_text.done",
+                "sequence_number": 6,
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": message_id,
+                "text": text
+            }),
+            json!({
+                "type": "response.content_part.done",
+                "sequence_number": 7,
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": message_id,
+                "part": {"type": "output_text", "text": text}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": 8,
+                "output_index": 0,
+                "item": completed_item.clone()
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 9,
+                "response": {
+                    "id": "resp_ark_1",
+                    "status": "completed",
+                    "output": [completed_item]
                 }
             }),
         ])
@@ -1607,6 +1754,206 @@ mod tests {
                 ..
             } if *accepted == revision
         ));
+
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_model_context_discards_the_prior_responses_wire_prefix() {
+        let (base, shutdown, server) = spawn_sse_server(completed_text_sse()).await;
+        let mut provider = provider(&base, None);
+        let initial = ReactionPort::declare(&mut provider).unwrap();
+        let old = crate::transcript::CanonicalInputItem::assistant_text("old-context", None);
+        let first = full_frame_with_replay(&initial, 1, vec![old]);
+        let mut stream = ReactionPort::submit(&mut provider, first).await.unwrap();
+        while let Some(fact) = stream.next().await {
+            fact.unwrap();
+        }
+        drop(stream);
+
+        let accepted = ReactionPort::declare(&mut provider).unwrap();
+        let reset = ResettableReactionPort::reset_model_context(&mut provider).unwrap();
+        assert_eq!(reset.identity(), accepted.identity());
+        assert_eq!(reset.profile(), accepted.profile());
+        assert!(matches!(
+            reset.continuity(),
+            TargetContinuity::FullRequired { epoch }
+                if *epoch > accepted.continuity().epoch()
+        ));
+        assert!(provider.reaction_frame.is_none());
+
+        let replacement =
+            crate::transcript::CanonicalInputItem::assistant_text("replacement-context", None);
+        let next = full_frame_with_replay(&reset, 2, vec![replacement]);
+        let prepared = ResponsesFrameRequestState::prepare(
+            provider.reaction_frame.as_ref(),
+            &next,
+            &provider.encoder,
+            provider.max_responses_serialized_request_body_bytes,
+        )
+        .unwrap();
+        let request = String::from_utf8(prepared.request_body).unwrap();
+        assert!(request.contains("replacement-context"));
+        assert!(!request.contains("old-context"));
+
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_model_context_after_interrupted_stream_discards_the_prior_wire_prefix() {
+        let (base, shutdown, server) = spawn_sse_server(completed_text_sse()).await;
+        let mut provider = provider(&base, None);
+        let initial = ReactionPort::declare(&mut provider).unwrap();
+        let old = crate::transcript::CanonicalInputItem::assistant_text("old-context", None);
+        let first = full_frame_with_replay(&initial, 1, vec![old]);
+        let mut stream = ReactionPort::submit(&mut provider, first).await.unwrap();
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ProviderFact::TextDelta { delta, .. } if delta == "hel"
+        ));
+        drop(stream);
+
+        let after_drop = ReactionPort::declare(&mut provider).unwrap();
+        assert!(matches!(
+            after_drop.continuity(),
+            TargetContinuity::FullRequired { epoch }
+                if *epoch > initial.continuity().epoch()
+        ));
+        assert!(provider.reaction_frame.is_some());
+
+        let reset = ResettableReactionPort::reset_model_context(&mut provider).unwrap();
+        assert!(matches!(
+            reset.continuity(),
+            TargetContinuity::FullRequired { epoch }
+                if *epoch > after_drop.continuity().epoch()
+        ));
+        assert!(provider.reaction_frame.is_none());
+
+        let replacement =
+            crate::transcript::CanonicalInputItem::assistant_text("replacement-context", None);
+        let next = full_frame_with_replay(&reset, 2, vec![replacement]);
+        let prepared = ResponsesFrameRequestState::prepare(
+            provider.reaction_frame.as_ref(),
+            &next,
+            &provider.encoder,
+            provider.max_responses_serialized_request_body_bytes,
+        )
+        .unwrap();
+        let request = String::from_utf8(prepared.request_body).unwrap();
+        assert!(request.contains("replacement-context"));
+        assert!(!request.contains("old-context"));
+        assert!(!request.contains("hel"));
+
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_response_after_partial_text_is_retryable_and_requires_a_fresh_full() {
+        let (base, shutdown, server) = spawn_sse_server(incomplete_text_sse()).await;
+        let mut provider = provider(&base, None);
+        let initial = ReactionPort::declare(&mut provider).unwrap();
+        let old = crate::transcript::CanonicalInputItem::assistant_text("old-context", None);
+        let first = full_frame_with_replay(&initial, 1, vec![old]);
+        let mut stream = ReactionPort::submit(&mut provider, first).await.unwrap();
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ProviderFact::TextDelta { delta, .. } if delta == "partial"
+        ));
+        let fault = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(fault.kind(), ReactionPortFaultKind::Retryable);
+        assert_eq!(fault.code(), ReactionPortFaultCode::Rejected);
+        assert_eq!(fault.reason(), ReactionPortFaultReason::UpstreamRejected);
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        let after_incomplete = ReactionPort::declare(&mut provider).unwrap();
+        assert!(matches!(
+            after_incomplete.continuity(),
+            TargetContinuity::FullRequired { epoch }
+                if *epoch > initial.continuity().epoch()
+        ));
+        assert!(provider.reaction_frame.is_some());
+
+        let reset = ResettableReactionPort::reset_model_context(&mut provider).unwrap();
+        assert!(matches!(
+            reset.continuity(),
+            TargetContinuity::FullRequired { epoch }
+                if *epoch > after_incomplete.continuity().epoch()
+        ));
+        assert!(provider.reaction_frame.is_none());
+
+        let replacement =
+            crate::transcript::CanonicalInputItem::assistant_text("replacement-context", None);
+        let next = full_frame_with_replay(&reset, 2, vec![replacement]);
+        let prepared = ResponsesFrameRequestState::prepare(
+            provider.reaction_frame.as_ref(),
+            &next,
+            &provider.encoder,
+            provider.max_responses_serialized_request_body_bytes,
+        )
+        .unwrap();
+        let request = String::from_utf8(prepared.request_body).unwrap();
+        assert!(request.contains("replacement-context"));
+        assert!(!request.contains("old-context"));
+        assert!(!request.contains("partial"));
+
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn reset_model_context_epoch_exhaustion_retires_the_provider() {
+        let mut provider = provider("http://127.0.0.1:1", None);
+        provider.reaction_target.epoch = TargetEpoch::new(NonZeroU64::new(u64::MAX).unwrap());
+
+        let fault = ResettableReactionPort::reset_model_context(&mut provider).unwrap_err();
+        assert_eq!(fault.kind(), ReactionPortFaultKind::Terminal);
+        assert_eq!(fault.code(), ReactionPortFaultCode::Internal);
+        assert_eq!(fault.reason(), ReactionPortFaultReason::Declaration);
+        assert_eq!(ReactionPort::declare(&mut provider).unwrap_err(), fault);
+        assert!(provider.reaction_frame.is_none());
+    }
+
+    #[tokio::test]
+    async fn native_stream_accepts_ark_compatible_optional_fields() {
+        let (base, shutdown, server) = spawn_sse_server(ark_compatible_text_sse()).await;
+        let mut provider = provider(&base, None);
+        let declaration = ReactionPort::declare(&mut provider).unwrap();
+        let mut stream = ReactionPort::submit(&mut provider, full_frame(&declaration))
+            .await
+            .unwrap();
+        let mut facts = Vec::new();
+        while let Some(fact) = stream.next().await {
+            facts.push(fact.unwrap());
+        }
+        drop(stream);
+
+        assert_eq!(
+            facts,
+            vec![
+                ProviderFact::TextDelta {
+                    output: ProviderOutputKey::new(0),
+                    phase: None,
+                    delta: "<say>".to_owned(),
+                },
+                ProviderFact::TextDelta {
+                    output: ProviderOutputKey::new(0),
+                    phase: None,
+                    delta: "ready</say>".to_owned(),
+                },
+                ProviderFact::TextSealed {
+                    output: ProviderOutputKey::new(0),
+                    phase: None,
+                    text: "<say>ready</say>".to_owned(),
+                },
+                ProviderFact::ReactionCompleted {
+                    primary_text: Some(ProviderOutputKey::new(0)),
+                },
+            ]
+        );
 
         let _ = shutdown.send(());
         server.await.unwrap();

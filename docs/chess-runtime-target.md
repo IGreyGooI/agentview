@@ -1,6 +1,10 @@
 # AgentView Chess Examples
 
-Last reviewed: 2026-09-03
+Last reviewed: 2026-09-07
+
+Detailed walkthrough: [Chess loop explanation](chess-loop-explained.md),
+[workflow diagram](chess-loop.workflow.html), and
+[sequence diagram](chess-loop.sequence.html).
 
 The repository exposes two Chess binaries with different jobs:
 
@@ -23,14 +27,16 @@ thin chess_agentview binary
         |     |     |-- Signal<ChessState> (business authority)
         |     |     |-- pure reduce(ChessState, ChessEvent) -> ChessEffect
         |     |     |-- chess_action_component
-        |     |     |     |-- two sibling XmlStreamingToolCall Components
-        |     |     |     |-- reaction-local action-result collector
-        |     |     |     `-- use_reaction_completion sends one ChessAttemptInput
-        |     |     |-- use_coroutine actor owning Stockfish
-        |     |     `-- use_reaction_request for the next model turn
+        |     |     |     `-- one multi-element XmlStreamingToolCall attempt
+        |     |     |         |-- shared parser/state for thought, choose_move, and resign
+        |     |     |         |-- accepted publication updates ChessState synchronously
+        |     |     |         `-- rejected continuation updates corrective feedback
+        |     |     |-- use_preparation awaits the Stockfish readiness barrier
+        |     |     |-- use_coroutine owns the engine and handles preparation requests
+        |     |     `-- use_reaction_request once per prepared model attempt
         |     |-- private FrameSession and canonical history
         |     `-- fixed Responses ReactionPort
-        |-- mechanical demand -> react loop
+        |-- mechanical prepare -> completion/demand -> react loop
         `-- typed actor exit/stop handshake and consuming shutdown
 ```
 
@@ -47,55 +53,63 @@ positions and automatic draw conditions, and emits one of three effects:
 - request a Stockfish move;
 - publish the terminal outcome.
 
-The long-lived Component coroutine serializes those effects. It starts and
-owns `UciEngine`, reads the authoritative history from reducer effects, feeds
-Stockfish results back as typed events, and shuts the engine down before
-publishing a normal terminal result.
+The long-lived Component coroutine owns `UciEngine` and serializes preparation
+requests. `use_preparation` awaits its reply before the Component is ready.
+On the first request it applies `Start`; when the state is `AwaitingStockfish`,
+it reads the committed position, awaits one engine move, and feeds the result
+back through the reducer. At a terminal state it shuts the engine down before
+publishing completion. Model actions are committed directly to the same Signal
+in one synchronous update, without waiting for the engine.
 
-`chess_action_component` mounts two prompt-producing, typed
-`XmlStreamingToolCall` declarations: `choose_move` and `resign`.
-They register with one parser hub for the mounted reaction's provider text route;
-the example passes neither a route nor an `EventInput`. Every matching element
-occurrence is dispatched, including repeated occurrences and occurrences for
-multiple sibling declarations. The runtime preserves their XML source order
-and awaits each async handler before starting the next one.
+`chess_action_component` mounts one prompt-producing
+`XmlStreamingToolCall::new` attempt with `thought`, `choose_move`, and `resign`
+element schemas. Each model reaction creates one parser, one reducer state
+value, and one terminal decision for all three elements. A response must contain
+exactly one nonempty `<thought>` text element, then exactly one self-closing
+`<choose_move uci="..." />` or `<resign />` element. The thought is a concise
+move evaluation, not unconstrained prose: no text may surround the two elements,
+and foreign XML is rejected by the contract-local strict parser.
 
-The prompt-free `StreamingXml::tag(...)` API uses that same per-route hub when
-a Component needs `on_open`, cumulative `on_stream`, `on_complete`, or
-`on_invalid` lifecycle events without adding another action shape to the prompt.
+The strict attempt parser is independent of other components and contracts.
+The prompt-free `StreamingXml::tag(...)` API remains available for permissive
+lifecycle subscriptions without adding a strict action shape to the prompt.
 
-The two binaries share the same action names and XML shapes, but intentionally
-use different surrounding-text policies. The readable example counts registered
-action occurrences and allows text outside exactly one action. The live
-acceptance harness retains its stricter whole-output parser: outside its one
-empty action element, only whitespace is accepted.
+The two binaries intentionally use different response contracts. The readable
+example requires its ordered thought and action pair. The live acceptance
+harness retains its independent whole-output parser for one empty action
+element; outside that action, only whitespace is accepted.
 
-Each decoded or invalid occurrence appends one typed result to a collector owned
-by that rendered reaction. After all provider events, derived XML events, and
-normal-EOF diagnostics have been handled, `use_reaction_completion` settles the
-collector exactly once:
+The attempt final reducer runs after all provider events, derived XML events,
+and normal-EOF diagnostics. It settles the shared attempt state exactly once:
 
-- no registered action becomes `MissingAction`;
-- one occurrence keeps its decoded action or validation error;
-- more than one occurrence becomes `MultipleActions`.
+- a missing thought becomes `MissingThought`;
+- an empty, malformed, repeated, or late thought becomes its typed thought
+  rejection;
+- one valid thought without an action becomes `MissingAction`;
+- one valid thought followed by one valid action becomes the staged accepted
+  action;
+- more than one action becomes `MultipleActions`.
 
-The completion callback sends that single attempt-keyed `ChessAttemptInput`
-into the Component-owned FIFO coroutine and awaits its handling receipt. The
-coroutine lowers the input to `ChessEvent::ModelAction`, runs the reducer and
-its immediate effect chain, then acknowledges the callback. The XML Components
-still do not own the board, legality policy, retry loop, or scheduling policy.
+An accepted final decision applies its attempt-keyed `ChessEvent::ModelAction`
+synchronously. An attempt-local journal records Published or NotPublished, so
+repeating publication does not repeat the state transition and stale attempts
+cannot consume a newer turn. Publication returns before any Stockfish search.
+The rejection continuation applies its typed failure directly and returns
+`Complete`; all successor requests belong to preparation.
 
-The actor is event-driven, not self-ticking. `Start` requests the first model
-reaction; every later transition requires a `ChessEvent`. The completion hook
-is what turns an otherwise eventless model response, including an empty
-reaction, prose, or unknown XML, into the typed `MissingAction` event instead of
-leaving the actor blocked on its inbox.
+After the streaming attempt has settled, the next preparation advances the
+engine work and examines the resulting state. For `AwaitingModel` it requests
+one reaction per `ModelAttemptKey`; for a terminal state it reports completion.
+Repeated explicit preparation and the preparation inside `react()` do not
+repeat a move or schedule the same attempt again. If a preparation waiter is
+cancelled, the coroutine finishes its already-started work; the next request
+observes the resulting phase instead of replaying it.
 
-`MissingAction` and `MultipleActions` follow the same reducer-owned corrective
-path as other invalid model actions. `ChessState.feedback` records the rejection,
-the next Frame exposes it through `previous_decision`, `previous_reason`, and
-`corrective_reason`, and the actor requests another reaction. The third
-consecutive rejected attempt completes with `ModelForfeit`.
+Thought and action rejections follow the same reducer-owned corrective path.
+`ChessState.feedback` records the rejection, the next Frame exposes it through
+`previous_decision`, `previous_reason`, and `corrective_reason`, and
+preparation schedules the next allowed attempt. The third consecutive
+rejected attempt completes with `ModelForfeit`.
 
 If the provider or driver fails, the facade requests actor stop and waits for
 the actor's bounded UCI cleanup result before consuming `Application`.
@@ -108,25 +122,36 @@ Component arguments. Mutable Chess business state is initialized with
 external `ChessControl`.
 
 `ChessApplication` is a small example-local facade over `Application<P>`. Its
-driver waits for either terminal completion or a Component reaction request.
-After a request it awaits exactly one complete `react()` call. The loop contains
-no Chess policy:
+driver first awaits all Component preparations, then observes completion or
+consumes one Component reaction request. It never inspects board phases or
+chooses a move. The completion check after the barrier prevents an engine move
+that ends the game from causing another provider submission:
 
 ```rust,ignore
 loop {
-    tokio::select! {
-        changed = completion.changed() => changed?,
-        demand = application.wait_for_reaction_request() => {
-            demand?;
-            application.react().await?;
-        }
+    application.prepare().await?;
+    if let Some(result) = completion.borrow().clone() {
+        return completed_result(result);
     }
+    tokio::select! {
+        biased;
+        changed = completion.changed() => {
+            changed?;
+            continue;
+        }
+        demand = application.wait_for_reaction_request() => demand?,
+    }
+    if let Some(result) = completion.borrow().clone() {
+        return completed_result(result);
+    }
+    application.react().await?;
 }
 ```
 
-An admitted `react()` is allowed to finish before terminal completion is
-observed. Cancelling it after provider handoff would terminally cancel the
-underlying `Application`. `ChessApplication::run` always consumes that runtime
+`prepare()` and `react()` each run preparation hooks. The Component's phase and
+attempt guards make that safe; readiness is not cached across operations.
+An admitted `react()` is awaited in full before completion is observed.
+`ChessApplication::run` always consumes that runtime
 with `shutdown().await` before returning. Its stop channel carries lifecycle
 only; it cannot mutate `ChessState`, choose a move, schedule a retry, or access
 the UCI process.
@@ -205,8 +230,8 @@ provider configuration.
 - [`chess_application.rs`](../examples/chess_agentview/chess_application.rs):
   facade, Component root, actor, mechanical driver, and projection.
 - [`chess_action_component.rs`](../examples/chess_agentview/chess_action_component.rs):
-  two streaming XML action Components, reaction-local collection, and
-  cardinality settlement at normal reaction completion.
+  one multi-element streaming XML attempt, final cardinality settlement, and
+  synchronous state publication/rejection adapters.
 - [`chess_action.rs`](../examples/chess_agentview/chess_action.rs): typed Chess
   actions shared by the readable example and acceptance binary.
 - [`application_state.rs`](../examples/chess_agentview/application_state.rs):

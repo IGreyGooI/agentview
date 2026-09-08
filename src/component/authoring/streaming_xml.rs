@@ -176,12 +176,20 @@ impl From<StreamingXmlTag> for Component {
 
 /// Entry point for a prompt-producing, typed streaming XML tool-call declaration.
 ///
-/// The declared element is projected as model-visible example syntax and matching empty elements
-/// are decoded before the handler runs. It shares the mounted parser for its event route with
-/// [`StreamingXml`] lifecycle subscriptions and other XML tool-call declarations.
+/// [`Self::new`] declares a complete attempt with its own parser and shared
+/// element state. The older [`Self::contract`] single-element API retains the
+/// route parser shared with [`StreamingXml`] lifecycle subscriptions.
 pub struct XmlStreamingToolCall;
 
 impl XmlStreamingToolCall {
+    /// Declare an independent typed XML contract for each provider reaction.
+    #[allow(clippy::new_ret_no_self)] // Namespace constructor returns the typed builder.
+    pub fn new<C: super::streaming_attempt::StreamingToolChannels>(
+        identity: &'static str,
+    ) -> super::streaming_attempt::XmlStreamingAttemptBuilder<C> {
+        super::streaming_attempt::XmlStreamingAttemptBuilder::new(identity)
+    }
+
     pub fn contract(
         identity: &'static str,
         implementation_version: &'static str,

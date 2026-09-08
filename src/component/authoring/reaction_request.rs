@@ -28,8 +28,11 @@ impl ReactionRequest {
 }
 
 impl From<DriverDemandFault> for ReactionRequestError {
-    fn from(_fault: DriverDemandFault) -> Self {
-        Self::StaleMount
+    fn from(fault: DriverDemandFault) -> Self {
+        match fault {
+            DriverDemandFault::StaleMount => Self::StaleMount,
+            DriverDemandFault::StreamingRecovery => Self::StreamingRecovery,
+        }
     }
 }
 
@@ -39,6 +42,8 @@ impl From<DriverDemandFault> for ReactionRequestError {
 pub enum ReactionRequestError {
     #[error("the reaction request belongs to a stale Component mount")]
     StaleMount,
+    #[error("streaming effects must settle before requesting another reaction")]
+    StreamingRecovery,
 }
 
 /// Retain a mount-scoped handle that can request a later driver turn.
