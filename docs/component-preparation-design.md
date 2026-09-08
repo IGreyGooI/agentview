@@ -2,6 +2,8 @@
 
 ## Status
 
+后续提案：[用 use_preparation 驱动模型回合](preparation-driven-react-proposal.md)，讨论固定 react 循环、并发准备和应用退出；尚未实现。
+
 Implemented and verified on 2026-09-06. The implementation replaces keyed
 `use_dependency` with operation-scoped `use_preparation` while preserving
 synchronous mount, explicit preparation, and the existing reaction lifecycle.
