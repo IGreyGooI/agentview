@@ -2,11 +2,12 @@
 
 ## Status
 
-演进提案：[用 use_preparation 驱动模型回合](preparation-driven-react-proposal.md)。固定 react 循环和应用退出已落地；同批并发尚未实现。
+演进提案：[用 use_preparation 驱动模型回合](preparation-driven-react-proposal.md)。固定 react 循环、应用退出和同批 preparation 并发均已落地。
 
-Implemented and verified on 2026-09-06. The implementation replaces keyed
-`use_dependency` with operation-scoped `use_preparation` while preserving
-synchronous mount, explicit preparation, and the existing reaction lifecycle.
+The original hook migration was implemented and verified on 2026-09-06. It
+replaces keyed `use_dependency` with operation-scoped `use_preparation` while
+preserving synchronous mount, explicit preparation, and the existing reaction
+lifecycle.
 
 ## Purpose
 
@@ -32,7 +33,13 @@ where
 There is no preparation key and no `use_dependency` compatibility contract.
 The factory is declared during synchronous render, but it is not invoked
 there. Render performs no I/O. The operation later invokes the factory and
-directly awaits its returned future before provider handoff.
+polls its returned future as part of an execution wave before provider handoff.
+
+`Ok(())` says that this hook is ready. `Err(_)` fails the current operation.
+There is no third hook result for cancellation or "move on": an exit request,
+the first observed sibling error, or dropping the operation drops unfinished
+returned futures. A hook that needs to finish the Application normally uses
+`use_application_exit()` rather than returning a different preparation value.
 
 ```rust
 #[component]
@@ -86,6 +93,15 @@ Operation-local completion is discarded when the operation returns, fails, or
 is cancelled. It is never stored as a key, readiness bit, or other
 cross-operation cache.
 
+Within one execution wave, the runtime dispatches every unfinished authorized
+slot. Factories remain synchronous direct user code, invoked in structural and
+lexical order, and must be short; their returned futures are held in
+`FuturesUnordered` and polled concurrently. That order does not impose a
+completion order or a dependency between hooks. The runtime records a success
+only after its mount-generation check. It drops every unfinished future in
+that wave on the first observed error, and proceeds to a later reconciliation
+or handoff only after every dispatched slot has succeeded.
+
 ## Declaration Snapshots and Dependencies
 
 When the runtime dispatches a slot, it uses the factory captured by that
@@ -114,7 +130,10 @@ bounded loop:
 ```text
 for waves 1 through 16:
     render/reconcile and snapshot active declarations
-    dispatch and await unfinished operation-local slots in structural/lexical order
+    dispatch all unfinished authorized operation-local slots
+    concurrently poll their returned futures
+    on the first observed error, drop the remaining futures and return the fault
+    record each mount-verified success
     discard unused declarations for slots already completed in this operation
     if the projection is clean:
         succeed
@@ -175,9 +194,10 @@ An ordinary preparation error is a retryable
 available for a later explicit `prepare()` or `react()`.
 
 Dropping a pending pre-handoff operation is cancellation, not a successful
-preparation. The caller receives no implicit retry, and all operation-local
-completion is discarded. The next explicit operation runs every active hook
-anew, not only the hook that failed or was cancelled.
+preparation. Exit and the first observed error in a concurrent wave likewise
+drop its unfinished returned futures. The caller receives no implicit retry,
+and all operation-local completion is discarded. The next explicit operation
+runs every active hook anew, not only the hook that failed or was cancelled.
 
 Preparation loaders, meaning the factory and its returned future, have no
 exactly-once guarantee. They must tolerate repeated execution, partial
@@ -214,6 +234,8 @@ This design does not add:
 
 - a global cache, resource subsystem, or readiness store;
 - a root-maintained registry of descendant futures;
+- an inferred dependency graph or ordering rule between same-wave hooks;
+- a hook-level cancellation or continuation return variant;
 - automatic reactions after preparation success, failure, or cancellation;
 - rollback for completed Signal writes or external effects; or
 - a guarantee for detached work started by a factory.

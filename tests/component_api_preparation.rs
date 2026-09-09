@@ -1,9 +1,11 @@
 use std::{
     collections::VecDeque,
     convert::Infallible,
+    future::Future,
     num::{NonZeroU128, NonZeroU64},
     ops::ControlFlow,
     panic::{catch_unwind, AssertUnwindSafe},
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
@@ -33,6 +35,7 @@ use tokio::sync::Notify;
 
 struct PreparationGate {
     started: Notify,
+    finished: Notify,
     release: Notify,
 }
 
@@ -40,9 +43,27 @@ impl PreparationGate {
     fn new() -> Self {
         Self {
             started: Notify::new(),
+            finished: Notify::new(),
             release: Notify::new(),
         }
     }
+}
+
+async fn wait_for_preparation_notification<F>(
+    operation: &mut Pin<Box<F>>,
+    notification: &Notify,
+    message: &'static str,
+) where
+    F: Future,
+{
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            _ = notification.notified() => {}
+            _ = operation => panic!("{message}"),
+        }
+    })
+    .await
+    .expect(message);
 }
 
 struct PreparationDropProbe(Arc<AtomicUsize>);
@@ -319,6 +340,97 @@ fn earlier_then_cancellable_preparation(
 }
 
 #[component]
+fn same_wave_preparation_view(
+    first_gate: Arc<PreparationGate>,
+    second_gate: Arc<PreparationGate>,
+) -> Component {
+    let first_state = use_signal(|| String::from("first-pending"));
+    let second_state = use_signal(|| String::from("second-pending"));
+    let first_ready = first_state.clone();
+    let second_ready = second_state.clone();
+
+    use_preparation(move || async move {
+        first_gate.started.notify_one();
+        first_gate.release.notified().await;
+        first_ready
+            .set(String::from("first-ready"))
+            .expect("first same-wave preparation Signal write");
+        first_gate.finished.notify_one();
+        Ok::<(), Infallible>(())
+    });
+    use_preparation(move || async move {
+        second_gate.started.notify_one();
+        second_gate.release.notified().await;
+        second_ready
+            .set(String::from("second-ready"))
+            .expect("second same-wave preparation Signal write");
+        second_gate.finished.notify_one();
+        Ok::<(), Infallible>(())
+    });
+
+    let first = first_state.with(Clone::clone).unwrap();
+    let second = second_state.with(Clone::clone).unwrap();
+    view! {
+        same_wave_preparation { "{first}" }
+        same_wave_preparation { "{second}" }
+    }
+}
+
+#[component]
+fn pending_then_failing_same_wave_preparation(
+    pending_gate: Arc<PreparationGate>,
+    failing_gate: Arc<PreparationGate>,
+    pending_runs: Arc<AtomicUsize>,
+    failing_runs: Arc<AtomicUsize>,
+    pending_drops: Arc<AtomicUsize>,
+) -> Component {
+    use_preparation(move || async move {
+        pending_runs.fetch_add(1, Ordering::AcqRel);
+        let _drop_probe = PreparationDropProbe(pending_drops);
+        pending_gate.started.notify_one();
+        pending_gate.release.notified().await;
+        Ok::<(), Infallible>(())
+    });
+    use_preparation(move || async move {
+        let attempt = failing_runs.fetch_add(1, Ordering::AcqRel);
+        failing_gate.started.notify_one();
+        failing_gate.release.notified().await;
+        if attempt == 0 {
+            Err("later same-wave preparation failed")
+        } else {
+            Ok(())
+        }
+    });
+    view! { pending_then_failing_same_wave {} }
+}
+
+#[component]
+fn same_wave_cancellable_preparations(
+    first_gate: Arc<PreparationGate>,
+    second_gate: Arc<PreparationGate>,
+    first_attempts: Arc<AtomicUsize>,
+    second_attempts: Arc<AtomicUsize>,
+    first_drops: Arc<AtomicUsize>,
+    second_drops: Arc<AtomicUsize>,
+) -> Component {
+    use_preparation(move || async move {
+        first_attempts.fetch_add(1, Ordering::AcqRel);
+        let _drop_probe = PreparationDropProbe(first_drops);
+        first_gate.started.notify_one();
+        first_gate.release.notified().await;
+        Ok::<(), Infallible>(())
+    });
+    use_preparation(move || async move {
+        second_attempts.fetch_add(1, Ordering::AcqRel);
+        let _drop_probe = PreparationDropProbe(second_drops);
+        second_gate.started.notify_one();
+        second_gate.release.notified().await;
+        Ok::<(), Infallible>(())
+    });
+    view! { same_wave_cancellable {} }
+}
+
+#[component]
 fn nested_child_preparation(loader_order: Arc<Mutex<Vec<&'static str>>>) -> Component {
     let state = use_signal(|| String::from("child-loading"));
     let ready = state.clone();
@@ -513,6 +625,25 @@ fn panicking_preparation_factory() -> Component {
 }
 
 #[component]
+fn pending_sibling_before_panicking_preparation_factory(
+    sibling_polls: Arc<AtomicUsize>,
+    sibling_drops: Arc<AtomicUsize>,
+) -> Component {
+    use_preparation(move || {
+        let drop_probe = PreparationDropProbe(sibling_drops);
+        async move {
+            sibling_polls.fetch_add(1, Ordering::AcqRel);
+            let _drop_probe = drop_probe;
+            std::future::pending::<Result<(), Infallible>>().await
+        }
+    });
+    use_preparation(|| -> std::future::Ready<Result<(), Infallible>> {
+        panic!("later preparation factory panic")
+    });
+    view! { pending_sibling_before_panicking_factory {} }
+}
+
+#[component]
 fn completed_exit_root() -> Component {
     let exit = use_application_exit();
     use_preparation(move || async move {
@@ -585,6 +716,59 @@ async fn react_waits_for_preparation_and_submits_its_signal_write() {
     assert!(probe.last_frame_text().contains("ready"));
     assert!(!probe.last_frame_text().contains("loading"));
     assert!(app.current_projection().is_prepared());
+}
+
+#[tokio::test]
+async fn same_wave_preparations_start_concurrently_and_wait_for_all_before_handoff() {
+    let first_gate = Arc::new(PreparationGate::new());
+    let second_gate = Arc::new(PreparationGate::new());
+    let (port, probe) = recording_port();
+    let mut app = Application::mount(
+        {
+            let first_gate = Arc::clone(&first_gate);
+            let second_gate = Arc::clone(&second_gate);
+            move || same_wave_preparation_view(Arc::clone(&first_gate), Arc::clone(&second_gate))
+        },
+        port,
+    )
+    .unwrap();
+
+    let mut reaction = Box::pin(app.react());
+    wait_for_preparation_notification(
+        &mut reaction,
+        &first_gate.started,
+        "the first same-wave preparation did not start",
+    )
+    .await;
+    wait_for_preparation_notification(
+        &mut reaction,
+        &second_gate.started,
+        "the second preparation did not start while the first remained pending",
+    )
+    .await;
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
+
+    second_gate.release.notify_one();
+    wait_for_preparation_notification(
+        &mut reaction,
+        &second_gate.finished,
+        "the released second same-wave preparation did not finish",
+    )
+    .await;
+    assert!(matches!(poll!(reaction.as_mut()), Poll::Pending));
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
+
+    first_gate.release.notify_one();
+    assert_continue(reaction.await.unwrap());
+
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
+    let frame = probe.last_frame_text();
+    assert!(frame.contains("first-ready"));
+    assert!(frame.contains("second-ready"));
+    assert!(!frame.contains("first-pending"));
+    assert!(!frame.contains("second-pending"));
 }
 
 #[tokio::test]
@@ -1060,6 +1244,215 @@ async fn successful_earlier_preparation_reruns_after_a_later_preparation_is_canc
 }
 
 #[tokio::test]
+async fn later_same_wave_error_returns_and_cancels_an_earlier_pending_sibling() {
+    let pending_gate = Arc::new(PreparationGate::new());
+    let failing_gate = Arc::new(PreparationGate::new());
+    let pending_runs = Arc::new(AtomicUsize::new(0));
+    let failing_runs = Arc::new(AtomicUsize::new(0));
+    let pending_drops = Arc::new(AtomicUsize::new(0));
+    let (port, probe) = recording_port();
+    let mut app = Application::mount(
+        {
+            let pending_gate = Arc::clone(&pending_gate);
+            let failing_gate = Arc::clone(&failing_gate);
+            let pending_runs = Arc::clone(&pending_runs);
+            let failing_runs = Arc::clone(&failing_runs);
+            let pending_drops = Arc::clone(&pending_drops);
+            move || {
+                pending_then_failing_same_wave_preparation(
+                    Arc::clone(&pending_gate),
+                    Arc::clone(&failing_gate),
+                    Arc::clone(&pending_runs),
+                    Arc::clone(&failing_runs),
+                    Arc::clone(&pending_drops),
+                )
+            }
+        },
+        port,
+    )
+    .unwrap();
+
+    let mut reaction = Box::pin(app.react());
+    wait_for_preparation_notification(
+        &mut reaction,
+        &pending_gate.started,
+        "the pending same-wave preparation did not start",
+    )
+    .await;
+    wait_for_preparation_notification(
+        &mut reaction,
+        &failing_gate.started,
+        "the later failing preparation did not start while its sibling was pending",
+    )
+    .await;
+
+    failing_gate.release.notify_one();
+    let fault = tokio::time::timeout(Duration::from_secs(1), reaction.as_mut())
+        .await
+        .expect("a later same-wave error was blocked by a permanently pending sibling")
+        .unwrap_err();
+    drop(reaction);
+
+    assert_eq!(fault.stage(), ApplicationFaultStage::Preparation);
+    assert_eq!(fault.kind(), ApplicationFaultKind::Retryable);
+    assert_eq!(fault.reason(), ApplicationFaultReason::Preparation);
+    assert_eq!(pending_runs.load(Ordering::Acquire), 1);
+    assert_eq!(failing_runs.load(Ordering::Acquire), 1);
+    assert_eq!(pending_drops.load(Ordering::Acquire), 1);
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
+
+    pending_gate.release.notify_one();
+    failing_gate.release.notify_one();
+    assert_continue(app.react().await.unwrap());
+    assert_eq!(pending_runs.load(Ordering::Acquire), 2);
+    assert_eq!(failing_runs.load(Ordering::Acquire), 2);
+    assert_eq!(pending_drops.load(Ordering::Acquire), 2);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn dropping_pending_same_wave_preparation_cancels_all_siblings_and_retries() {
+    for operation in [PreparationOperation::Prepare, PreparationOperation::React] {
+        let first_gate = Arc::new(PreparationGate::new());
+        let second_gate = Arc::new(PreparationGate::new());
+        let first_attempts = Arc::new(AtomicUsize::new(0));
+        let second_attempts = Arc::new(AtomicUsize::new(0));
+        let first_drops = Arc::new(AtomicUsize::new(0));
+        let second_drops = Arc::new(AtomicUsize::new(0));
+        let (port, probe) = recording_port();
+        let mut app = Application::mount(
+            {
+                let first_gate = Arc::clone(&first_gate);
+                let second_gate = Arc::clone(&second_gate);
+                let first_attempts = Arc::clone(&first_attempts);
+                let second_attempts = Arc::clone(&second_attempts);
+                let first_drops = Arc::clone(&first_drops);
+                let second_drops = Arc::clone(&second_drops);
+                move || {
+                    same_wave_cancellable_preparations(
+                        Arc::clone(&first_gate),
+                        Arc::clone(&second_gate),
+                        Arc::clone(&first_attempts),
+                        Arc::clone(&second_attempts),
+                        Arc::clone(&first_drops),
+                        Arc::clone(&second_drops),
+                    )
+                }
+            },
+            port,
+        )
+        .unwrap();
+
+        let mut preparation = Box::pin(operation.run(&mut app));
+        wait_for_preparation_notification(
+            &mut preparation,
+            &first_gate.started,
+            "the first cancellable same-wave preparation did not start",
+        )
+        .await;
+        wait_for_preparation_notification(
+            &mut preparation,
+            &second_gate.started,
+            "the second cancellable preparation did not start while its sibling was pending",
+        )
+        .await;
+        drop(preparation);
+
+        assert_eq!(first_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(second_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(first_drops.load(Ordering::Acquire), 1);
+        assert_eq!(second_drops.load(Ordering::Acquire), 1);
+        assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
+
+        first_gate.release.notify_one();
+        second_gate.release.notify_one();
+        operation.run(&mut app).await.unwrap();
+        assert_eq!(first_attempts.load(Ordering::Acquire), 2);
+        assert_eq!(second_attempts.load(Ordering::Acquire), 2);
+        assert_eq!(first_drops.load(Ordering::Acquire), 2);
+        assert_eq!(second_drops.load(Ordering::Acquire), 2);
+        assert_eq!(
+            probe.handoffs.load(Ordering::Acquire),
+            match operation {
+                PreparationOperation::Prepare => 0,
+                PreparationOperation::React => 1,
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_exit_cancels_all_started_same_wave_preparations() {
+    let first_gate = Arc::new(PreparationGate::new());
+    let second_gate = Arc::new(PreparationGate::new());
+    let first_attempts = Arc::new(AtomicUsize::new(0));
+    let second_attempts = Arc::new(AtomicUsize::new(0));
+    let first_drops = Arc::new(AtomicUsize::new(0));
+    let second_drops = Arc::new(AtomicUsize::new(0));
+    let (port, probe) = recording_port();
+    let mut app = Application::mount(
+        {
+            let first_gate = Arc::clone(&first_gate);
+            let second_gate = Arc::clone(&second_gate);
+            let first_attempts = Arc::clone(&first_attempts);
+            let second_attempts = Arc::clone(&second_attempts);
+            let first_drops = Arc::clone(&first_drops);
+            let second_drops = Arc::clone(&second_drops);
+            move || {
+                same_wave_cancellable_preparations(
+                    Arc::clone(&first_gate),
+                    Arc::clone(&second_gate),
+                    Arc::clone(&first_attempts),
+                    Arc::clone(&second_attempts),
+                    Arc::clone(&first_drops),
+                    Arc::clone(&second_drops),
+                )
+            }
+        },
+        port,
+    )
+    .unwrap();
+    let exit = app.exit_handle();
+
+    let mut reaction = Box::pin(app.react());
+    wait_for_preparation_notification(
+        &mut reaction,
+        &first_gate.started,
+        "the first same-wave preparation did not start before host exit",
+    )
+    .await;
+    wait_for_preparation_notification(
+        &mut reaction,
+        &second_gate.started,
+        "the second same-wave preparation did not start before host exit",
+    )
+    .await;
+
+    exit.request(ExitReason::Requested).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), reaction.as_mut())
+            .await
+            .expect("host exit did not interrupt same-wave preparations")
+            .unwrap(),
+        ControlFlow::Break(ExitReason::Requested)
+    );
+    drop(reaction);
+
+    assert_eq!(first_attempts.load(Ordering::Acquire), 1);
+    assert_eq!(second_attempts.load(Ordering::Acquire), 1);
+    assert_eq!(first_drops.load(Ordering::Acquire), 1);
+    assert_eq!(second_drops.load(Ordering::Acquire), 1);
+    assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
+    assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
+    assert_eq!(
+        app.react().await.unwrap(),
+        ControlFlow::Break(ExitReason::Requested)
+    );
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn preparation_stabilizes_nested_mounts_before_the_first_handoff() {
     let loader_order = Arc::new(Mutex::new(Vec::new()));
     let (port, probe) = recording_port();
@@ -1435,6 +1828,46 @@ async fn panicking_preparation_factory_unwinds_without_provider_handoff() {
             panic.downcast_ref::<&str>().copied(),
             Some("preparation factory panic")
         );
+        assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
+    }
+}
+
+#[tokio::test]
+async fn later_factory_panic_drops_an_earlier_unpolled_same_wave_future() {
+    for operation in [PreparationOperation::Prepare, PreparationOperation::React] {
+        let sibling_polls = Arc::new(AtomicUsize::new(0));
+        let sibling_drops = Arc::new(AtomicUsize::new(0));
+        let (port, probe) = recording_port();
+        let mut app = Application::mount(
+            {
+                let sibling_polls = Arc::clone(&sibling_polls);
+                let sibling_drops = Arc::clone(&sibling_drops);
+                move || {
+                    pending_sibling_before_panicking_preparation_factory(
+                        Arc::clone(&sibling_polls),
+                        Arc::clone(&sibling_drops),
+                    )
+                }
+            },
+            port,
+        )
+        .unwrap();
+
+        let panic = tokio::time::timeout(
+            Duration::from_secs(1),
+            AssertUnwindSafe(operation.run(&mut app)).catch_unwind(),
+        )
+        .await
+        .expect("a later preparation factory panic was blocked by an earlier sibling")
+        .expect_err("later preparation factory panic must unwind");
+
+        assert_eq!(
+            panic.downcast_ref::<&str>().copied(),
+            Some("later preparation factory panic")
+        );
+        assert_eq!(sibling_polls.load(Ordering::Acquire), 0);
+        assert_eq!(sibling_drops.load(Ordering::Acquire), 1);
+        assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
         assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
     }
 }

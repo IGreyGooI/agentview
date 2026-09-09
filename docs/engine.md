@@ -363,12 +363,16 @@ render只同步声明factory，绝不执行I/O。每个显式`prepare()`或`reac
 active slot；所以`prepare()`之后的`react()`也会运行它们。operation完成记录不会成为跨operation
 readiness cache或key。
 
-dispatch时使用该slot当前render declaration所捕获的factory snapshot，并按Component结构和hook词法顺序
-直接await future。另一个hook随后写Signal并改变已经完成slot的inputs，不会使该slot在同一operation重跑；
+dispatch时使用该slot当前render declaration所捕获的factory snapshot。Runtime按Component结构和hook词法顺序
+识别并同步调用本wave所有未完成且已授权的factory；factory必须短小，返回future才放入`FuturesUnordered`并发poll。
+该顺序不构成future完成顺序或hook间依赖。每个`Ok(())`都须通过mount verification才记录完成；只有本wave全部成功后才reconcile
+Signal写入或进入Frame prepare。第一个被观察到的`Err`会drop该wave其余future并返回普通retryable preparation
+fault；exit或drop operation也以drop未完成future表示取消，不增加hook的第三种返回值。另一个hook随后写Signal并改变已经完成slot的inputs，不会使该slot在同一operation重跑；
 需要顺序依赖的I/O必须放进同一个factory，或由其Signal写入挂载nested Component来表达。
 
-pre-handoff阶段最多运行16个execution waves：每一wave先render/reconcile并发现slot，dispatch本轮未完成
-slot并直接await futures，丢弃已完成slot的新declaration；若projection clean则立即success，否则进入下一wave
+pre-handoff阶段最多运行16个execution waves：每一wave先render/reconcile并发现slot，按声明顺序同步调用本轮未完成
+slot的factory，再以`FuturesUnordered`并发poll其future；只有全部成功后才丢弃已完成slot的新declaration并检查projection。
+若先观察到error则drop该wave其余future并返回；若projection clean则立即success，否则进入下一wave
 reconcile其Signal写入。只有第16个execution wave留下dirty projection时，才进行一次不得开始第17个factory
 或future的final reconcile。final reconcile后必须没有unfinished hook，且丢弃unused declarations后projection
 仍然clean才能success；若仍有unfinished declaration或dirty状态，返回terminal
@@ -647,8 +651,9 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
 3. validate fixed target/profile and monotonic epoch
 4. start an operation-scoped Component preparation
      -> synchronous render/discover active declarations in structural/hook order
-     -> dispatch each unfinished `(mount generation, lexical slot)` once
-     -> directly await factories' futures and reconcile their Signal writes
+     -> invoke each unfinished `(mount generation, lexical slot)` factory once
+     -> concurrently poll the wave's returned futures; first observed error drops the rest
+     -> after every slot succeeds, reconcile their Signal writes
      -> early success only when clean with no unfinished hooks
      -> after a dirty sixteenth execution wave, one final reconcile without a 17th dispatch
      -> complete projection + exact bindings
@@ -820,8 +825,8 @@ shutdown_result?;
 
 `reactor`是持有`Application<P>`的变量，不是另一个runtime类型。`run()`内部的每次`react()`先等待组件
 准备，再完成一整个structured reaction。Signal dirty、Provider EOF、读取latest和command名称都不会自动
-触发reaction。外界发送业务输入即可，不需要额外发送reaction demand。准备hook目前仍按声明顺序await，
-尚未并发。
+触发reaction。外界发送业务输入即可，不需要额外发送reaction demand。准备hook的factory按声明顺序同步
+调用，返回future在同批中并发poll；全部成功后才继续，首个被观察到的错误会drop其余future。
 
 手动单步和现有demand集成仍可显式控制`react()`调用时机；固定`run()`不等待或消费demand。入口任务必须
 保留输入，让取消或失败后的preparation重试复用同一业务输入；多个hook的准备条件是AND，任选一个事件到达
@@ -1115,7 +1120,8 @@ Fact不得先被Observer或Component看见、之后才commit canonical history�
 28. production owner的shutdown acknowledgement必须发生在active reaction join、mount fence和全部task destructor
     完成之后；取消shutdown waiter不能取消已经取得唯一Application ownership的cleanup。
 29. FrameSession prepare和Provider handoff前，当前operation的全部active preparation必须完成，且其
-    Signal写入必须先reconcile。最多16个execution waves，clean且无unfinished hook时early success；只有
+    Signal写入必须先reconcile。同一execution wave的所有未完成slot并发poll，只有全部`Ok(())`后才reconcile；
+    首个被观察到的error会drop该wave其余future。最多16个execution waves，clean且无unfinished hook时early success；只有
     dirty的第16 wave之后才有一个不得dispatch新factory/future的final reconcile。success必须同时clean且无
     unfinished hook；若仍需另一wave，零handoff并以`PreparationGraphUnstable` terminal fail closed。
 30. 每次显式`prepare()`或`react()`都创建新operation，并使每个active `(mount generation, lexical slot)`

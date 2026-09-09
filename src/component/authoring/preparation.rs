@@ -1,5 +1,7 @@
 use std::{collections::HashSet, fmt, future::Future, pin::Pin};
 
+use futures::{stream::FuturesUnordered, StreamExt};
+
 use crate::component::signal::{HookMount, MountIdentity};
 
 type PreparationFuture =
@@ -36,26 +38,28 @@ impl PreparationDeclaration {
             },
             mount,
             prepare: Box::new(move || {
-                Box::pin(async move { loader().await.map_err(PreparationFault::loader) })
+                let future = loader();
+                Box::pin(async move { future.await.map_err(PreparationFault::loader) })
             }),
         }
     }
 
-    async fn prepare(self, run: &mut PreparationRun) -> Result<(), PreparationFault> {
+    fn start(
+        self,
+    ) -> Option<impl Future<Output = Result<(PreparationIdentity, HookMount), PreparationFault>>>
+    {
         let Self {
             identity,
             mount,
             prepare,
         } = self;
-        if run.completed.contains(&identity) {
-            return Ok(());
-        }
-        let Some(_permit) = mount.authorize() else {
-            return Ok(());
-        };
-        prepare().await?;
-        mount.with_active(|| run.completed.insert(identity));
-        Ok(())
+        let permit = mount.authorize()?;
+        let future = prepare();
+        Some(async move {
+            let _permit = permit;
+            future.await?;
+            Ok((identity, mount))
+        })
     }
 }
 
@@ -80,8 +84,17 @@ impl PreparationSet {
     }
 
     pub(crate) async fn prepare(self, run: &mut PreparationRun) -> Result<(), PreparationFault> {
+        let mut pending = FuturesUnordered::new();
         for declaration in self.declarations {
-            declaration.prepare(run).await?;
+            if !run.completed.contains(&declaration.identity) {
+                if let Some(future) = declaration.start() {
+                    pending.push(future);
+                }
+            }
+        }
+        while let Some(result) = pending.next().await {
+            let (identity, mount) = result?;
+            mount.with_active(|| run.completed.insert(identity));
         }
         Ok(())
     }
@@ -104,8 +117,10 @@ impl PreparationFault {
 /// Declare asynchronous preparation required before Provider handoff.
 ///
 /// Each explicit `Application::prepare()` or `Application::react()` call runs
-/// this hook once per Component mount generation. Signal writes are reconciled
-/// before handoff, and preparation hooks on newly mounted Components also run.
+/// this hook once per Component mount generation. Hooks declared in the same
+/// render are awaited concurrently; all must succeed before handoff. Signal
+/// writes are reconciled after the batch, and preparation hooks on newly
+/// mounted Components also run.
 /// Rerendering an already prepared mount does not rerun its hook within that
 /// operation, even if another hook changes its inputs. Sequence dependent work
 /// in one loader or express it through newly mounted child Components.
@@ -116,9 +131,13 @@ impl PreparationFault {
 /// writes and external effects are not rolled back; external effects require
 /// their own business idempotency and deduplication policy.
 ///
-/// The loader factory and returned future execute outside the mount fence as
-/// part of the caller's operation. Only the returned future is awaited, not
-/// detached work. Panics unwind directly through `prepare()` or `react()`.
+/// Loader factories are invoked in declaration order outside the mount fence
+/// and must be synchronous and quick. Their returned futures are polled within
+/// the caller's operation, with no completion order guarantee. The first
+/// observed error drops the remaining futures; application exit or dropping
+/// the operation also cancels pending futures. Only the returned futures are
+/// awaited, not detached work. Panics unwind directly through `prepare()` or
+/// `react()`.
 ///
 /// This hook must be called directly inside a `#[component]` function so it can
 /// be bound to that lexical slot. It requires the current
@@ -160,6 +179,12 @@ mod tests {
         mount
     }
 
+    async fn prepare(declaration: PreparationDeclaration, run: &mut PreparationRun) {
+        let mut preparations = PreparationSet::default();
+        preparations.push(declaration);
+        preparations.prepare(run).await.unwrap();
+    }
+
     #[tokio::test]
     async fn same_run_prepares_a_remounted_generation_but_not_the_same_slot_twice() {
         let signals = SignalRuntime::new();
@@ -177,13 +202,13 @@ mod tests {
         };
         let mut run = PreparationRun::default();
 
-        declaration(mount.clone()).prepare(&mut run).await.unwrap();
-        declaration(mount).prepare(&mut run).await.unwrap();
+        prepare(declaration(mount.clone()), &mut run).await;
+        prepare(declaration(mount), &mut run).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         signals.remount_component(&ComponentId::root()).unwrap();
         let replacement = active_mount(&signals);
-        declaration(replacement).prepare(&mut run).await.unwrap();
+        prepare(declaration(replacement), &mut run).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -203,7 +228,7 @@ mod tests {
         signals.remount_component(&ComponentId::root()).unwrap();
         let mut run = PreparationRun::default();
 
-        declaration.prepare(&mut run).await.unwrap();
+        prepare(declaration, &mut run).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(run.completed.is_empty());
@@ -222,7 +247,7 @@ mod tests {
         );
         let mut run = PreparationRun::default();
 
-        declaration.prepare(&mut run).await.unwrap();
+        prepare(declaration, &mut run).await;
 
         assert!(run.completed.is_empty());
     }

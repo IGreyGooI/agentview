@@ -2,8 +2,8 @@
 
 日期：2026-09-08
 
-状态：部分落地。固定 react 循环、应用退出 API 和 Chess 迁移已实现；同批 preparation 并发尚未实现。
-下文保留完整提案，同批并发及其验收项仍为后续工作。
+状态：部分落地。固定 react 循环、应用退出 API、Chess 迁移和同批 preparation 并发已实现。
+下文保留完整提案；其中带 hook identity 的错误诊断仍是提案目标，不是本轮并发实现的承诺。
 当前实现仍以 [engine.md](engine.md) 和 [component-preparation-design.md](component-preparation-design.md) 为准。
 
 ## 1. 建议
@@ -23,7 +23,7 @@ runtime 并发等待这些准备工作，状态稳定后才提交 Frame。正常
 | --- | --- | --- |
 | 调用入口 | 外界调用 `react()`，部分 example 先等 demand | 固定循环直接 await `react()` |
 | 准备阶段 | `react()` 内已有 `prepare_components()` | 保留为模型调用前唯一 readiness barrier |
-| 同批 hook | 按顺序逐个 await | 同批 future 并发等待 |
+| 同批 hook | `FuturesUnordered` 并发 poll；首个被观察到的错误 drop 其余 future | 保留；全部成功后才进入下一批或提交 Frame |
 | 跨批准备 | reconcile 发现新 mount，最多 16 批 | 保留 |
 | 正常结束 | `Result<(), ApplicationFault>` 无应用完成值 | 返回 `ControlFlow::Break` |
 | Chess | 外层 prepare、completion/demand select、react | 外层只有 react；准备和终局由组件表达 |
@@ -69,6 +69,11 @@ impl<P: ReactionPort> Application<P> {
     ) -> Result<ControlFlow<ExitReason>, ApplicationFault>;
 }
 ```
+
+同批并发不改变这个返回类型：`Ok(())`只表示该 hook 已 ready，所有同批 hook 都成功后 runtime 才能继续；
+`Err(_)`结束当前 operation。exit、首个被观察到的同批错误或调用者丢弃 operation 时，runtime drop 未完成
+future 来取消等待，不增加 `Cancelled` 或 `MoveOn` 之类的 hook 返回值。需要正常结束应用的组件仍调用
+`use_application_exit()`。
 
 `ApplicationExitHandle` 可 clone。组件取得的句柄受 mount generation 约束，旧组件不能终止新一代组件所在的
 应用；宿主取得的句柄作用于整个 Application。应用已经 shutdown 时请求失败。
@@ -125,7 +130,7 @@ panic 继续遵循既有 unwind/terminal 规则，不经过 `Result`。普通返
     ↓
 reconcile，取得本批 preparation 和 projection
     ↓
-并发等待本批 hook；exit 可以结束等待
+并发等待本批 hook；首个错误或 exit drop 未完成 future
     ↓
 若状态变 dirty：reconcile，准备新挂载组件
     ↓
@@ -222,8 +227,9 @@ exit 和“取得提交许可”必须经过同一个同步状态检查，不能
 
 ### 7.3 取消不是回滚
 
-一个 hook 返回错误时，runtime 报告带 hook 身份的 preparation fault，并取消同批剩余 futures。
-多个并发错误按实际观察顺序报告，不承诺词法顺序；已完成的 Signal 写入和外部副作用不回滚。
+一个 hook 返回错误时，runtime 报告首个被观察到的 preparation fault，并取消同批剩余 futures。
+多个并发错误按实际观察顺序处理，不承诺词法顺序；已完成的 Signal 写入和外部副作用不回滚。
+带 hook identity 的 error diagnostic 是本提案的后续目标，本轮并发实现不把它变成新的公共错误契约。
 
 调用者丢弃 react future 同样不撤销已发生的工作。下一次调用创建新的 `PreparationRun`；有副作用的
 preparation 必须容忍重试。actor 已接收的工作由 actor 自己管理，丢弃等待回执的 future 不等于取消工作。
@@ -313,6 +319,7 @@ facade 随后 stop/await actor，最后 shutdown Application。
 ## 10. 兼容与实施顺序
 
 这是明确的 API 和调度语义变更：`react/prepare` 的返回类型改变，同批 hook 不再按 await 顺序执行。
+其中同批并发部分不改变 `use_preparation`、`react()` 或 `prepare()` 的返回类型。
 不引入功能相同的 `run_step/drive_next`；仍以 `react` 为唯一模型回合入口。
 
 现有 demand API 可以暂时保留给旧集成显式调用，但新循环不等待也不消费 demand。
@@ -320,7 +327,7 @@ facade 随后 stop/await actor，最后 shutdown Application。
 不能为了删除 Chess demand 顺带删除它。
 
 1. 增加退出状态、组件/宿主句柄、返回值和提交许可检查，覆盖退出竞态及恢复路径。
-2. 将 PreparationSet 改为每批并发，保留 mount fencing、完成身份和 16 批限制。
+2. PreparationSet 已改为每批并发，保留 mount fencing、完成身份和 16 批限制。
 3. 简化 Chess driver 与 hook，验证正常回合、拒绝重试、取消准备和终局。
 4. 用一个可控的外部输入场景验证等待、重试复用输入和关闭入口；迁移受影响调用方及编译测试。
 5. 更新 engine、preparation 文档和 Chess 图；盘点旧 demand 使用者后再决定公共 API 的移除范围。
@@ -333,6 +340,7 @@ facade 随后 stop/await actor，最后 shutdown Application。
 | --- | --- |
 | 固定循环 | 无业务 select、无 demand；每个 Continue 完成一轮 reaction |
 | 同批并发 | A 尚未 ready 时 B 已进入等待；两者都 ready 才提交 |
+| 同批错误 | A 永久 pending 时 B 的错误仍返回，且 A 的 future 被 drop |
 | 顺序依赖 | 父准备完成后才挂载并执行子 hook，Frame 包含子准备结果 |
 | 身份与预算 | 同一 operation 同 slot 一次；下一 operation 重跑；第 17 批无提交 |
 | 冻结批次 | A 要求卸载 pending B 不会隐式放行；B 完成或 exit 才结束等待 |
