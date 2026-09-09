@@ -1,0 +1,5 @@
+error: #[tool] functions cannot be generic
+ --> tests/ui/tool/generic.rs:4:8
+  |
+4 | fn echo<T>(value: T) -> Result<T, ToolError> {
+  |        ^^^

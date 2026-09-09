@@ -1,0 +1,5 @@
+error: #[tool] parameters do not support #[serde(flatten)]
+ --> tests/ui/tool/flatten.rs:4:19
+  |
+4 | fn lookup(#[serde(flatten)] query: String) -> Result<String, ToolError> {
+  |                   ^^^^^^^

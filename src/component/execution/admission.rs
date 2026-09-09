@@ -29,7 +29,8 @@ use super::{
     reaction::{ProviderFact, ProviderOutputKey, ProviderToolCall},
 };
 
-const CANCELLATION_FALLBACK_CONTENT: &str = "Tool execution was cancelled; its outcome is unknown.";
+pub(super) const CANCELLATION_FALLBACK_CONTENT: &str =
+    "Tool execution was cancelled; its outcome is unknown.";
 
 #[cfg(test)]
 thread_local! {

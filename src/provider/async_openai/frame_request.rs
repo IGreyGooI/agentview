@@ -140,7 +140,7 @@ impl ResponsesFrameRequestState {
             .encode_frame_request_bounded(
                 &state.wire_input,
                 &state.instructions,
-                frame.submission().tools().names(),
+                frame.submission().tools().definitions(),
                 max_serialized_request_body_bytes,
             )
             .map_err(ResponsesFrameRequestFault::Encoding)?;
@@ -475,6 +475,7 @@ mod tests {
             FrameSubmission, ProjectionSubmission, TargetContinuity, TargetEpoch, TargetIdentity,
             ToolCatalog,
         },
+        component::execution::ToolDefinition,
         pom::{Document, TextNode, XmlNode},
         pom_resolution::resolve_system_document,
         provider::codex_http_v1::{
@@ -555,6 +556,34 @@ mod tests {
             staged_inputs,
             ProjectionSubmission::new(projection),
             ToolCatalog::new(tools.into_iter().map(str::to_owned).collect()).unwrap(),
+            Vec::new(),
+        );
+        Frame::from_compiled(
+            revision,
+            target(),
+            epoch(),
+            prepared_against,
+            profile(),
+            basis,
+            submission,
+        )
+        .unwrap()
+    }
+
+    fn frame_with_tool_definitions(
+        revision: FrameRevision,
+        prepared_against: TargetContinuity,
+        basis: FrameBasis,
+        replay: Vec<CanonicalInputItem>,
+        staged_inputs: Vec<CanonicalInputItem>,
+        projection: Vec<CanonicalInputItem>,
+        tools: Vec<ToolDefinition>,
+    ) -> Frame {
+        let submission = FrameSubmission::from_compiled(
+            replay,
+            staged_inputs,
+            ProjectionSubmission::new(projection),
+            ToolCatalog::from_definitions(tools).unwrap(),
             Vec::new(),
         );
         Frame::from_compiled(
@@ -1069,6 +1098,17 @@ mod tests {
         let initial =
             ResponsesFrameRequestState::prepare(None, &initial, &encoder, 64 * 1024).unwrap();
         assert_eq!(tool_names(&initial.request_body), vec!["alpha", "zeta"]);
+        let initial_body = body(&initial.request_body);
+        assert_eq!(
+            initial_body["tools"][0]["description"],
+            "AgentView native tool"
+        );
+        assert_eq!(initial_body["tools"][0]["parameters"]["type"], "object");
+        assert_eq!(
+            initial_body["tools"][0]["parameters"]["additionalProperties"],
+            true
+        );
+        assert_eq!(initial_body["tools"][0]["strict"], false);
 
         let empty = delta(2, revision(1), Vec::new(), Vec::new(), Vec::new());
         let empty =
@@ -1093,6 +1133,86 @@ mod tests {
             ResponsesFrameRequestState::prepare(Some(&empty.state), &changed, &encoder, 64 * 1024)
                 .unwrap();
         assert_eq!(tool_names(&changed.request_body), vec!["beta"]);
+    }
+
+    #[test]
+    fn full_and_delta_requests_encode_changed_tool_descriptions_and_schemas() {
+        let initial_tool = ToolDefinition::new(
+            "lookup",
+            "Look up an account by id.",
+            json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            }),
+        )
+        .unwrap();
+        let initial = frame_with_tool_definitions(
+            revision(1),
+            TargetContinuity::FullRequired { epoch: epoch() },
+            FrameBasis::Full,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![initial_tool],
+        );
+        let initial =
+            ResponsesFrameRequestState::prepare(None, &initial, &encoder(), 64 * 1024).unwrap();
+        let initial_body = body(&initial.request_body);
+        assert_eq!(
+            initial_body["tools"][0]["description"],
+            "Look up an account by id."
+        );
+        assert_eq!(
+            initial_body["tools"][0]["parameters"]["properties"]["id"]["type"],
+            "string"
+        );
+        assert_eq!(initial_body["tools"][0]["strict"], false);
+
+        let changed_tool = ToolDefinition::new(
+            "lookup",
+            "Look up an account by id and region.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "region": {"type": "string"},
+                },
+                "required": ["id", "region"],
+                "additionalProperties": false,
+            }),
+        )
+        .unwrap()
+        .with_strict(true);
+        let changed = frame_with_tool_definitions(
+            revision(2),
+            TargetContinuity::Accepted {
+                epoch: epoch(),
+                revision: revision(1),
+            },
+            FrameBasis::DeltaFrom(revision(1)),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![changed_tool],
+        );
+        let changed = ResponsesFrameRequestState::prepare(
+            Some(&initial.state),
+            &changed,
+            &encoder(),
+            64 * 1024,
+        )
+        .unwrap();
+        let changed_body = body(&changed.request_body);
+        assert_eq!(
+            changed_body["tools"][0]["description"],
+            "Look up an account by id and region."
+        );
+        assert_eq!(
+            changed_body["tools"][0]["parameters"]["properties"]["region"]["type"],
+            "string"
+        );
+        assert_eq!(changed_body["tools"][0]["strict"], true);
     }
 
     #[test]

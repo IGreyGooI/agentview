@@ -69,7 +69,7 @@ impl ChatHistory {
         options: &OpenAiChatCompletionsOptions,
         max_serialized_request_body_bytes: usize,
     ) -> Result<PreparedChatHistory, OpenAiChatCompletionsError> {
-        if !current.native_tool_names().is_empty() {
+        if !current.native_tools().is_empty() {
             return Err(OpenAiChatCompletionsError::UnsupportedNativeToolDeclarations);
         }
         let current_system_instructions = projection_system_instructions(&current);
@@ -506,10 +506,8 @@ fn reconcile_projection(
         .into_iter()
         .map(|node| RenderedProjectionNode::new(node.identity, node.items))
         .collect();
-    let mut submitted_projection = RenderedProjection::with_native_tool_names(
-        submitted_nodes,
-        current.native_tool_names().to_vec(),
-    )?;
+    let mut submitted_projection =
+        RenderedProjection::with_native_tools(submitted_nodes, current.native_tools().to_vec())?;
     if let Some(scope) = current.execution_scope() {
         submitted_projection = submitted_projection.with_execution_scope(scope);
     }

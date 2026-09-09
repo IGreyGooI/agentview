@@ -22,9 +22,9 @@ pub mod prelude {
         spawn, use_application_exit, use_coroutine, use_future, use_preparation,
         use_provider_event_handler, use_reaction_completion, use_reaction_request, use_signal,
         ApplicationExitError, ApplicationExitHandle, Component, Coroutine, CoroutineInbox,
-        CoroutineSendError, ExitReason, NativeToolCall, ProviderEventSelector, ReactionRequest,
-        ReactionRequestError, Signal, SpawnError, StreamingXml, StreamingXmlTag,
-        XmlContractDiagnostic, XmlStreamingToolCall,
+        CoroutineSendError, ExitReason, NativeTool, NativeToolCall, ProviderEventSelector,
+        ReactionRequest, ReactionRequestError, Signal, SpawnError, StreamingXml, StreamingXmlTag,
+        ToolError, XmlContractDiagnostic, XmlStreamingToolCall,
     };
     #[cfg(feature = "legacy-provider-port")]
     #[allow(
@@ -48,5 +48,5 @@ pub mod prelude {
     #[cfg(feature = "legacy-provider-port")]
     #[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
     pub use agentview_derive::ComponentEvents;
-    pub use agentview_derive::{component, view, AgentView};
+    pub use agentview_derive::{component, tool, view, AgentView};
 }

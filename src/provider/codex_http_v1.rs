@@ -9,11 +9,12 @@ use std::{
 };
 
 use crate::{
-    pom_renderer::{PomRenderError, render_pom_document},
+    component::execution::ToolDefinition,
+    pom_renderer::{render_pom_document, PomRenderError},
     transcript::{
-        ASSISTANT_OUTPUT_INTERRUPTED_MARKER, AssistantPhase, AssistantTextStatus,
-        CanonicalInputItem, CanonicalTranscript, ConversationRole, InstructionAuthority,
-        ProviderExtension,
+        AssistantPhase, AssistantTextStatus, CanonicalInputItem, CanonicalTranscript,
+        ConversationRole, InstructionAuthority, ProviderExtension,
+        ASSISTANT_OUTPUT_INTERRUPTED_MARKER,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -501,13 +502,33 @@ impl CodexHttpV1Encoder {
         &self,
         transcript: &CanonicalTranscript,
     ) -> Result<CodexHttpV1Request, CodexHttpV1Error> {
-        self.request_with_native_tool_names(transcript, &[])
+        self.request_with_native_tools(transcript, &[])
     }
 
+    #[allow(dead_code)] // Retained for legacy name-only callers.
     pub(crate) fn request_with_native_tool_names(
         &self,
         transcript: &CanonicalTranscript,
         native_tool_names: &[String],
+    ) -> Result<CodexHttpV1Request, CodexHttpV1Error> {
+        let native_tools = native_tool_names
+            .iter()
+            .map(|name| {
+                if name.is_empty() {
+                    return Err(CodexHttpV1Error::InvalidToolName { name: name.clone() });
+                }
+                Ok(ToolDefinition::legacy_name_only(name.clone())
+                    .expect("a non-empty compatibility native tool name is valid"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.request_with_native_tools(transcript, &native_tools)
+    }
+
+    /// Builds a request from complete Component-native tool definitions.
+    pub(crate) fn request_with_native_tools(
+        &self,
+        transcript: &CanonicalTranscript,
+        native_tools: &[ToolDefinition],
     ) -> Result<CodexHttpV1Request, CodexHttpV1Error> {
         let history = project_codex_items(
             transcript.items(),
@@ -518,10 +539,10 @@ impl CodexHttpV1Encoder {
                 AssistantStatusEncoding::Omit
             },
         )?;
-        let tools = if native_tool_names.is_empty() {
+        let tools = if native_tools.is_empty() {
             self.options.tools.clone()
         } else {
-            Some(native_function_tools(native_tool_names)?)
+            Some(native_function_tools(native_tools)?)
         };
         Ok(self.request_from_history(history, tools))
     }
@@ -565,7 +586,7 @@ impl CodexHttpV1Encoder {
         &self,
         input: &[Value],
         instructions: &str,
-        exact_tool_names: &[String],
+        exact_tools: &[ToolDefinition],
         limit: usize,
     ) -> Result<Vec<u8>, CodexHttpV1Error> {
         let request = self.request_from_history(
@@ -573,7 +594,7 @@ impl CodexHttpV1Encoder {
                 instructions: String::new(),
                 input: Vec::new(),
             },
-            Some(native_function_tools(exact_tool_names)?),
+            Some(native_function_tools(exact_tools)?),
         );
         request.encode_with_input_and_instructions_bounded(input, instructions, limit)
     }
@@ -621,19 +642,16 @@ impl CodexHttpV1Encoder {
 }
 
 fn native_function_tools(
-    native_tool_names: &[String],
+    native_tools: &[ToolDefinition],
 ) -> Result<Vec<CodexFunctionTool>, CodexHttpV1Error> {
-    native_tool_names
+    native_tools
         .iter()
-        .map(|name| {
+        .map(|tool| {
             CodexFunctionTool::new(
-                name.clone(),
-                "AgentView native tool",
-                serde_json::json!({
-                    "type": "object",
-                    "additionalProperties": true,
-                }),
-                false,
+                tool.name(),
+                tool.description(),
+                tool.input_schema().clone(),
+                tool.strict(),
             )
         })
         .collect()
@@ -931,6 +949,7 @@ pub enum CodexHttpV1Error {
 mod tests {
     use super::*;
     use crate::{
+        component::execution::ToolDefinition,
         pom::{Document, TextNode, XmlNode},
         pom_resolution::resolve_artifact_document,
     };
@@ -1119,9 +1138,13 @@ mod tests {
         let encoder = CodexHttpV1Encoder::new(
             CodexHttpV1Options::new(
                 "gpt-5.6-codex",
-                Some(vec![
-                    CodexFunctionTool::new("configured_tool", "old", json!({}), false).unwrap(),
-                ]),
+                Some(vec![CodexFunctionTool::new(
+                    "configured_tool",
+                    "old",
+                    json!({}),
+                    false,
+                )
+                .unwrap()]),
                 None,
                 None::<String>,
             )
@@ -1164,6 +1187,45 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["tools"], json!([]));
         assert!(!body.to_string().contains("configured_tool"));
+    }
+
+    #[test]
+    fn native_frame_request_uses_the_complete_tool_definition() {
+        let encoder = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+        );
+        let tool = ToolDefinition::new(
+            "lookup_status",
+            "Look up the latest status for an account.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "string", "description": "Stable account id."},
+                    "verbose": {"type": "boolean"},
+                },
+                "required": ["account_id"],
+                "additionalProperties": false,
+            }),
+        )
+        .unwrap()
+        .with_strict(true);
+
+        let body = encoder
+            .encode_frame_request_bounded(&[], "", &[tool], usize::MAX)
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "lookup_status");
+        assert_eq!(
+            body["tools"][0]["description"],
+            "Look up the latest status for an account."
+        );
+        assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+        assert_eq!(
+            body["tools"][0]["parameters"]["properties"]["account_id"]["description"],
+            "Stable account id."
+        );
+        assert_eq!(body["tools"][0]["strict"], true);
     }
 
     #[test]

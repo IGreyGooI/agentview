@@ -151,9 +151,12 @@ declare a stable diff boundary, `#[view(diff)]` for changing fields, and
 `#[view(diff(append))]` for growing business records. The Frame compiler selects
 complete values, supported deltas, or omission from its retained baseline.
 
-Declare native tools with `NativeToolCall::named(...).on_call(...)` and return
-the current call's output. The runtime retains canonical conversation and tool
-history; the port owns provider encoding and private session state.
+Declare native tools with `#[tool]` and mount them using `NativeToolCall::new(add)`.
+Each tool Component declares all calls and results from its latest two tool
+interaction rounds, also retaining pending rounds. The runtime merges those
+records into canonical conversation history without
+resubmitting them on re-render. The port owns provider encoding, history compaction,
+and private session state. Raw handlers can still use `NativeToolCall::named(...).on_call(...)`.
 
 See [HELP.md: Business History](HELP.md#business-history) for code, delta
 requirements, native tool usage, and the established tree fold rules.
@@ -270,6 +273,7 @@ cargo run --no-default-features --example frame_agent
 cargo run --no-default-features --example frame_skill
 cargo run --no-default-features --example frame_plugin
 cargo run --no-default-features --example signal_reaction
+cargo run --no-default-features --example native_tool
 cargo run --no-default-features --example support_preparation
 ```
 
@@ -288,6 +292,8 @@ driver behavior over the same runtime:
 - [`signal_reaction`](examples/signal_reaction.rs): native text facts update a
   Signal; `run()` submits the updated review state on the next Frame before the
   Component exits.
+- [`native_tool`](examples/native_tool.rs): the live model calls `#[tool] add`
+  mounted with `NativeToolCall::new(add)`, then receives the result and answers `42`.
 - [`support_preparation`](examples/support_preparation.rs): inbox waiting,
   account and policy loading, reply drafts, and normal queue-drained exit using
   `use_preparation` and `run()`.

@@ -1,0 +1,5 @@
+error: #[tool] parameters must be owned; borrowed parameters are unsupported
+ --> tests/ui/tool/borrowed_argument.rs:4:18
+  |
+4 | fn lookup(query: &str) -> Result<String, ToolError> {
+  |                  ^^^^

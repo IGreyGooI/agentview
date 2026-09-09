@@ -1,0 +1,5 @@
+error: #[tool] functions cannot take a self receiver
+ --> tests/ui/tool/receiver.rs:7:15
+  |
+7 |     fn lookup(&self, value: String) -> Result<String, ToolError> {
+  |               ^^^^^

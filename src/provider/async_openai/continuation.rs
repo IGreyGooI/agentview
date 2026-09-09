@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::{
     component::execution::{
         ProjectionAppendPolicy, ProjectionDiffState, ProjectionExecutionScope, RenderedProjection,
-        RenderedProjectionFragment, RenderedProjectionNode, ToolOutput,
+        RenderedProjectionFragment, RenderedProjectionNode, ToolDefinition, ToolOutput,
     },
     provider::codex_http_v1::{CodexHttpV1Encoder, CodexHttpV1Error},
     transcript::{
@@ -29,7 +29,7 @@ pub(super) struct OpenAiContinuation {
     wire_input: Vec<Value>,
     history_epoch: u64,
     semantic_budget: ContinuationSemanticBudget,
-    native_tool_names: Vec<String>,
+    native_tools: Vec<ToolDefinition>,
     open_text_outputs: BTreeMap<u64, OpenTextOutput>,
     partial_records: Vec<PartialTextRecord>,
     sealed_text_outputs: HashSet<u64>,
@@ -199,10 +199,8 @@ impl OpenAiContinuation {
                         .iter()
                         .chain(&reconciled.unclaimed_provider_outputs),
                 )?;
-                let typed_request = encoder.request_with_native_tool_names(
-                    &current_transcript,
-                    current.native_tool_names(),
-                )?;
+                let typed_request = encoder
+                    .request_with_native_tools(&current_transcript, current.native_tools())?;
                 let canonical_input = typed_request.canonical_input()?;
                 if provider_input_items(&current).count() != canonical_input.len() {
                     return Err(OpenAiContinuationError::InvalidEncodedRequest);
@@ -238,7 +236,7 @@ impl OpenAiContinuation {
                         wire_input,
                         history_epoch: candidate_history_epoch,
                         semantic_budget,
-                        native_tool_names: current.native_tool_names().to_vec(),
+                        native_tools: current.native_tools().to_vec(),
                         open_text_outputs: BTreeMap::new(),
                         partial_records: Vec::new(),
                         sealed_text_outputs: HashSet::new(),
@@ -259,14 +257,12 @@ impl OpenAiContinuation {
                     semantic_budget,
                 )?;
                 ensure_all_tool_calls_closed(current_transcript.items())?;
-                let typed_request = encoder.request_with_native_tool_names(
-                    &current_transcript,
-                    current.native_tool_names(),
-                )?;
+                let typed_request = encoder
+                    .request_with_native_tools(&current_transcript, current.native_tools())?;
                 let current_binding =
                     OpenAiInlineArtifactBinding::new(typed_request.instructions().to_owned())
                         .with_projection_diff_memo(candidate_memo);
-                let native_tool_names = current.native_tool_names().to_vec();
+                let native_tools = current.native_tools().to_vec();
                 let request_body =
                     typed_request.encode_bounded(max_serialized_request_body_bytes)?;
                 let canonical_input = typed_request.canonical_input()?;
@@ -282,7 +278,7 @@ impl OpenAiContinuation {
                         wire_input: canonical_input,
                         history_epoch: candidate_history_epoch,
                         semantic_budget,
-                        native_tool_names,
+                        native_tools,
                         open_text_outputs: BTreeMap::new(),
                         partial_records: Vec::new(),
                         sealed_text_outputs: HashSet::new(),
@@ -712,8 +708,7 @@ impl OpenAiContinuation {
                 .chain(&self.unclaimed_provider_outputs),
         )?;
         let transcript = crate::transcript::CanonicalTranscript::new();
-        let typed_request =
-            encoder.request_with_native_tool_names(&transcript, &self.native_tool_names)?;
+        let typed_request = encoder.request_with_native_tools(&transcript, &self.native_tools)?;
         Ok(typed_request.encode_with_input_and_instructions_bounded(
             &self.wire_input,
             artifact_binding.instructions(),
@@ -732,8 +727,7 @@ impl OpenAiContinuation {
         max_serialized_request_body_bytes: usize,
     ) -> Result<Vec<u8>, OpenAiContinuationError> {
         let transcript = crate::transcript::CanonicalTranscript::new();
-        let typed_request =
-            encoder.request_with_native_tool_names(&transcript, &self.native_tool_names)?;
+        let typed_request = encoder.request_with_native_tools(&transcript, &self.native_tools)?;
         Ok(typed_request.encode_with_input_and_instructions_bounded(
             &self.wire_input,
             artifact_binding.instructions(),

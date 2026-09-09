@@ -27,7 +27,7 @@ use super::{
         TargetIdentity, ToolCatalog,
     },
     ProjectionDiffState, ProjectionReconciliationState, ReconciledProjectionPlan,
-    RenderedProjection,
+    RenderedProjection, ToolDefinition,
 };
 
 const FRAME_METER_VERSION: u8 = 1;
@@ -115,6 +115,9 @@ struct ProjectionSubmissionV1<'a> {
 #[derive(Serialize)]
 struct ToolCatalogEntryV1<'a> {
     name: &'a str,
+    description: &'a str,
+    input_schema: &'a Value,
+    strict: bool,
 }
 
 #[derive(Serialize)]
@@ -137,11 +140,11 @@ pub(super) struct FrameMeter;
 impl FrameMeter {
     pub(super) fn compile_component(
         items: Vec<CanonicalInputItem>,
-        tool_names: Vec<String>,
+        tool_definitions: Vec<ToolDefinition>,
         constraints: &FrameConstraints,
     ) -> Result<CompiledComponent, FrameBudgetFault> {
         validate_canonical_items(&items)?;
-        let tools = ToolCatalog::new(tool_names)?;
+        let tools = ToolCatalog::from_definitions(tool_definitions)?;
         let projection = ProjectionSubmission::new(items);
         let canonical_bytes = canonical_component_bytes(&projection, &tools)?;
         if canonical_bytes.len() > constraints.max_component_bytes {
@@ -364,12 +367,12 @@ impl FrameSession {
         // projection, even when this exact submission is a much smaller Delta.
         FrameMeter::compile_component(
             complete_component_items,
-            complete_projection.native_tool_names().to_vec(),
+            complete_projection.native_tools().to_vec(),
             constraints,
         )?;
         let component = FrameMeter::compile_component(
             projection_items.clone(),
-            complete_projection.native_tool_names().to_vec(),
+            complete_projection.native_tools().to_vec(),
             constraints,
         )?;
 
@@ -960,9 +963,14 @@ fn component_envelope<'a>(
             items: projection.items(),
         },
         tools: tools
-            .names()
+            .definitions()
             .iter()
-            .map(|name| ToolCatalogEntryV1 { name })
+            .map(|definition| ToolCatalogEntryV1 {
+                name: definition.name(),
+                description: definition.description(),
+                input_schema: definition.input_schema(),
+                strict: definition.strict(),
+            })
             .collect(),
     }
 }
@@ -1058,7 +1066,7 @@ mod tests {
                 ProviderFact, ProviderOutputKey, ProviderToolCall, TargetContinuity,
                 TargetDeclaration, TargetEpoch, TargetIdentity,
             },
-            ProviderEvent, RenderedProjection, RenderedProjectionNode,
+            ProviderEvent, RenderedProjection, RenderedProjectionNode, ToolDefinition,
         },
         pom::{Document, TextNode, XmlNode},
         pom_renderer::render_pom_document,
@@ -1103,6 +1111,18 @@ mod tests {
             .map(|text| vec![CanonicalInputItem::assistant_text(text, None)])
             .unwrap_or_default();
         RenderedProjection::from_nodes(vec![RenderedProjectionNode::new("root", items)]).unwrap()
+    }
+
+    fn projection_with_tools(tools: Vec<ToolDefinition>) -> RenderedProjection {
+        RenderedProjection::with_native_tools(
+            vec![RenderedProjectionNode::new("root", Vec::new())],
+            tools,
+        )
+        .unwrap()
+    }
+
+    fn tool(name: &str, description: &str, input_schema: serde_json::Value) -> ToolDefinition {
+        ToolDefinition::new(name, description, input_schema).unwrap()
     }
 
     fn system_fragment(name: &str, text: &str) -> CanonicalInputItem {
@@ -1264,9 +1284,17 @@ mod tests {
         let component = FrameMeter::compile_component(
             Vec::new(),
             vec![
-                "\u{e000}".to_owned(),
-                "\u{10000}".to_owned(),
-                "ascii".to_owned(),
+                tool(
+                    "\u{e000}",
+                    "private-use",
+                    serde_json::json!({"type": "object"}),
+                ),
+                tool(
+                    "\u{10000}",
+                    "supplementary",
+                    serde_json::json!({"type": "object"}),
+                ),
+                tool("ascii", "ascii", serde_json::json!({"type": "object"})),
             ],
             &limits,
         )
@@ -1279,6 +1307,92 @@ mod tests {
                 "\u{e000}".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn full_and_delta_frames_carry_complete_changed_tool_definitions() {
+        let profile = profile(true);
+        let declaration = full(profile.clone(), 1);
+        let mut session = FrameSession::new(&declaration).unwrap();
+        let initial = projection_with_tools(vec![tool(
+            "lookup",
+            "Look up the current status.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            }),
+        )]);
+        let prepared = session.prepare(&declaration, &initial).unwrap();
+        let first_payload: serde_json::Value =
+            serde_json::from_slice(prepared.frame.submission().canonical_bytes()).unwrap();
+        assert_eq!(
+            first_payload["component"]["tools"][0]["description"],
+            "Look up the current status."
+        );
+        assert_eq!(
+            first_payload["component"]["tools"][0]["input_schema"]["properties"]["id"]["type"],
+            "string"
+        );
+        assert_eq!(first_payload["component"]["tools"][0]["strict"], false);
+        let (first_frame, first_commit) = prepared.into_parts();
+        let first_revision = first_frame.revision();
+        session.commit(first_commit);
+
+        let changed = projection_with_tools(vec![tool(
+            "lookup",
+            "Look up a status with an optional region.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "region": {"type": "string"},
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+            }),
+        )
+        .with_strict(true)]);
+        let resumed = TargetDeclaration::resume(first_revision, profile);
+        let changed = session.prepare(&resumed, &changed).unwrap();
+        assert_eq!(changed.frame.basis(), FrameBasis::DeltaFrom(first_revision));
+        let changed_payload: serde_json::Value =
+            serde_json::from_slice(changed.frame.submission().canonical_bytes()).unwrap();
+        assert_eq!(
+            changed_payload["component"]["tools"][0]["description"],
+            "Look up a status with an optional region."
+        );
+        assert_eq!(
+            changed_payload["component"]["tools"][0]["input_schema"]["properties"]["region"]
+                ["type"],
+            "string"
+        );
+        assert_eq!(changed_payload["component"]["tools"][0]["strict"], true);
+    }
+
+    #[test]
+    fn tool_schema_bytes_count_against_component_budget() {
+        let definition = tool(
+            "search",
+            &"Search ".repeat(256),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "x".repeat(512)}},
+                "required": ["query"],
+            }),
+        );
+        let generous = constraints(8 * 1024, 16 * 1024);
+        let component =
+            FrameMeter::compile_component(Vec::new(), vec![definition.clone()], &generous).unwrap();
+        let exact = component.canonical_bytes().len();
+        let too_small = constraints(exact - 1, 16 * 1024);
+        assert!(matches!(
+            FrameMeter::compile_component(Vec::new(), vec![definition], &too_small),
+            Err(FrameBudgetFault::ComponentTooLarge {
+                actual_bytes,
+                max_component_bytes,
+            }) if actual_bytes == exact && max_component_bytes == exact - 1
+        ));
     }
 
     #[test]

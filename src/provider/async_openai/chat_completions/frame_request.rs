@@ -28,7 +28,7 @@ impl ChatFrameRequestState {
         options: &OpenAiChatCompletionsOptions,
         max_serialized_request_body_bytes: usize,
     ) -> Result<PreparedChatFrameRequest, ChatFrameRequestFault> {
-        if !frame.submission().tools().names().is_empty() {
+        if !frame.submission().tools().definitions().is_empty() {
             return Err(ChatFrameRequestFault::UnsupportedNativeToolDeclarations);
         }
 

@@ -34,6 +34,7 @@ use super::{
 use crate::component::{
     authoring::{
         application_exit::ApplicationExitControl,
+        native_tool::NativeToolRecord,
         streaming_attempt::{StreamingToolAbortCause, StreamingToolDriverFault},
         ApplicationExitHandle, Component, ComponentAttemptFault, ExitReason,
         InternalEventInput as EventInput, MountTaskStart, PreparationFault, PreparationRun,
@@ -203,6 +204,7 @@ struct ReactionCancellationRecovery<'a> {
     admission: ReactionAdmissionGuard<'a>,
     control: ReactionCancellationControl,
     armed: bool,
+    tool_records: Vec<NativeToolRecord>,
 }
 
 impl<'a> ReactionCancellationRecovery<'a> {
@@ -211,6 +213,7 @@ impl<'a> ReactionCancellationRecovery<'a> {
             admission,
             control,
             armed: true,
+            tool_records: Vec::new(),
         }
     }
 
@@ -227,6 +230,9 @@ impl Drop for ReactionCancellationRecovery<'_> {
     fn drop(&mut self) {
         if self.armed && self.control.should_recover() {
             self.admission.finish_cancelled();
+            for record in &self.tool_records {
+                record.finish_cancelled(super::admission::CANCELLATION_FALLBACK_CONTENT);
+            }
         }
     }
 }
@@ -1123,12 +1129,14 @@ async fn pump_provider_facts(
                         .into_structured_parts();
                     match (event, ticket) {
                         (Some(ProviderEvent::ToolCall(call)), Some(ticket)) => {
-                            let future = bindings.start_native_tool(call).map_err(|source| {
-                                ApplicationFault::from_attempt(
-                                    ApplicationFaultStage::Binding,
-                                    source,
-                                )
-                            })?;
+                            let (future, record) =
+                                bindings.start_native_tool_record(call).map_err(|source| {
+                                    ApplicationFault::from_attempt(
+                                        ApplicationFaultStage::Binding,
+                                        source,
+                                    )
+                                })?;
+                            recovery.tool_records.push(record);
                             lanes.push(Box::pin(async move {
                                 let output =
                                     future.await.map_err(ComponentAttemptFault::native_tool)?;

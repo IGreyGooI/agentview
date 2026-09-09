@@ -313,6 +313,18 @@ poll claim，确定的pre-handoff local failure不claim，claim后另一入口ty
 ToolCall Component 声明 target 可调用的能力。它接收完整 ToolCall，执行、拒绝或报告失败，然后产生
 同一 `call_id` 的 typed ToolOutput。它不编码 Provider wire item，也不直接写 canonical history。
 
+`#[tool]` 从同步或异步 Rust 函数生成工具定义值、参数结构和 JSON Schema；
+`NativeToolCall::new(add)` 将该值挂载为有状态 Component。每个工具实例保留最近两轮工具交互：
+一轮指包含该工具调用的一次 provider response，同一响应中的多个 call/result 整组保留；尚未完成
+的轮次不能淘汰。普通 render、prepare 和未调用该工具的响应不推进窗口。接纳调用时先追加
+ToolCall，handler 完成后追加 ToolResult。render 输出保留窗口内的完整记录，不执行 handler，
+也不重复追加。工具定义和原生记录共同构成该 Component 的 projection。
+Frame compiler 将这些记录与已接纳调用、staged results 对应起来，只保留一份 canonical fact；
+多个工具的线缆顺序仍由全局 admission 和 call ordinal 决定，不按 Component tree 拼接局部日志。
+旧轮次退出 projection 不生成删除 patch；provider 历史和 compact 由 port 管理。卸载后不再暴露
+该工具，但不能删除已接纳的全局历史。取消产生的 unknown-outcome result 同样追加
+到原工具实例的记录。普通业务 POM 不因此获得任意写入 native history 的能力。
+
 `call_id` 只能标识这一次模型调用，不能保证业务重试仍使用相同 ID。有外部副作用的工具默认只能
 承诺 at-least-once；需要 exactly-once 时，业务 Component 必须使用稳定业务幂等键或持久 effect
 journal。Engine 的取消不能撤销已经发生的外部动作。

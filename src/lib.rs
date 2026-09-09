@@ -60,7 +60,15 @@ pub mod view_state;
 pub type StorageString = ecow::EcoString;
 
 pub use agent_view::AgentView;
-pub use agentview_derive::AgentView;
+pub use agentview_derive::{tool, AgentView};
+
+/// Re-exports used by generated code so downstream tool declarations do not
+/// need direct `serde` or `schemars` dependencies.
+#[doc(hidden)]
+pub mod __private {
+    pub use schemars;
+    pub use serde;
+}
 
 /// Common imports for building an agent-facing ViewModel runtime.
 pub mod prelude {
@@ -107,5 +115,5 @@ pub mod prelude {
     pub use crate::view_awake::{ViewAwake, ViewAwakeHandle, ViewAwakeSubscription, ViewEpoch};
     pub use crate::view_state::{ViewPatch, ViewSnapshot, ViewTurnId, ViewUpdate, ViewUpdateBody};
     pub use crate::StorageString;
-    pub use agentview_derive::AgentView;
+    pub use agentview_derive::{tool, AgentView};
 }

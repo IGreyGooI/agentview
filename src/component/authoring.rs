@@ -11,7 +11,7 @@ mod declaration;
 mod event_input;
 mod event_listener;
 mod handler;
-mod native_tool;
+pub(crate) mod native_tool;
 mod preparation;
 mod provider_event_handler;
 mod reaction_completion;
@@ -20,6 +20,7 @@ mod render_context;
 mod signal;
 pub mod streaming_attempt;
 mod streaming_xml;
+mod tool;
 
 pub use application_exit::{
     use_application_exit, ApplicationExitError, ApplicationExitHandle, ExitReason,
@@ -53,6 +54,7 @@ pub use streaming_attempt::*;
 pub use streaming_xml::{
     StreamingXml, StreamingXmlTag, XmlContractDiagnostic, XmlStreamingToolCall,
 };
+pub use tool::{NativeTool, ToolError};
 
 /// Macro expansion helpers. They are public only because proc-macro output is
 /// type-checked in the consuming crate.

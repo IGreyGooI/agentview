@@ -4,12 +4,19 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, LitInt, LitStr};
 
 mod component_attr;
 mod component_events;
+mod tool_attr;
 mod view_macro;
 
 /// Mark a synchronous function as a retained target Component scope.
 #[proc_macro_attribute]
 pub fn component(attribute: TokenStream, item: TokenStream) -> TokenStream {
     component_attr::expand(attribute, item)
+}
+
+/// Turn an owned, typed Rust function into a native provider tool definition.
+#[proc_macro_attribute]
+pub fn tool(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    tool_attr::expand(attribute, item)
 }
 
 /// Build the target Component declaration tree.

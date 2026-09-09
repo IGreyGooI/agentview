@@ -17,7 +17,7 @@ is the authoritative runtime contract; this file is its authoring guide.
 | End normal application work | `use_application_exit`, then owner calls `shutdown()` |
 | Drive a single model turn | `app.react().await` |
 | Receive ordinary provider output | `use_provider_event_handler` |
-| Declare a native model tool | `NativeToolCall::named(name).on_call(handler)` |
+| Declare a native model tool | `#[tool]` and `NativeToolCall::new(tool)` |
 | Encode a provider request or retain remote state | a `ReactionPort`, outside the business Component |
 
 ## Business History
@@ -131,20 +131,48 @@ followed by the child node. Do not use parent/child source interleaving as a bus
 
 ## Native Tools
 
-Declare a native tool as a Component. Parse and validate completed raw arguments, then return
-`call.output(...)` so the runtime preserves the provider-issued call ID with the result.
+Declare a typed tool with `#[tool]`, then mount its definition with `NativeToolCall::new`.
+The macro exports a tool definition value under the original function name, generates an owned
+argument struct and JSON Schema, and supports synchronous and asynchronous handlers returning
+`Result<T, E>`. It does not preserve an ordinary callable function under that name.
+
+Run the live [`native_tool`](examples/native_tool.rs) example with
+`cargo run --no-default-features --example native_tool` to see a complete call/result exchange.
 
 ```rust
 use agentview::component::prelude::*;
 
+/// Add two integers.
+#[tool]
+fn add(a: i32, b: i32) -> Result<i32, ToolError> {
+    Ok(a + b)
+}
+
 #[component]
-fn status_tool() -> Component {
-    NativeToolCall::named("get_status").on_call(|call| async move {
-        let _arguments = call.raw_arguments();
-        Ok::<_, std::convert::Infallible>(call.output(r#"{"status":"ready"}"#))
-    })
+fn calculator() -> Component {
+    view! { { NativeToolCall::new(add) } }
 }
 ```
+
+`#[tool(name = "...", description = "...")]` can override metadata. Otherwise the function
+name and documentation supply it; parameter documentation becomes schema field descriptions.
+Complex argument types implement `serde::Deserialize` and `schemars::JsonSchema`; successful
+return values implement `serde::Serialize`. Missing or invalid typed arguments produce an
+`invalid_arguments` tool result without running the handler. A handler `Err` remains a reaction
+fault, so represent expected business failures as an explicit successful return value.
+
+Each mounted `NativeToolCall` records an admitted `ToolCall` before invoking the handler, then
+appends its `ToolResult`. It retains the latest two provider responses containing calls to that
+tool, including every call and result in each response. Pending rounds remain until completed.
+Rendering, preparation, and responses without calls to that tool do not advance this window.
+Render declares the complete retained record sequence in that tool's projection node.
+Re-rendering never executes or appends a call again.
+The Frame compiler claims already-admitted calls and staged results instead of submitting them
+twice. Global history preserves provider call order and results are submitted in call order even
+when handlers finish concurrently. Older records leaving the projection produce no deletion
+patch; the port manages provider history and compaction. Unmounting removes future tool
+availability while accepted session history remains. Cancellation appends the runtime's
+unknown-outcome result to the original component record as well as staging it for the next reaction.
 
 Mount the tool in the same tree as the state it serves. One `react()` can admit a model tool call,
 run its handler, and stage output; it does not start another provider request. The default
@@ -159,17 +187,18 @@ app.react().await?; // submits that staged result on the next reaction
 # }
 ```
 
-Return an explicit ToolOutput for expected domain failures. A handler error is a reaction failure;
-make external effects idempotent with a business key when retries matter.
+For raw argument handling, `NativeToolCall::named(name).on_call(handler)` remains available and
+uses the same component history. Return `call.output(...)` to preserve the original call ID.
+Make external effects idempotent with a business key when retries matter.
 
 For a live business example with an inbox and prepared account context, see
 [`support_preparation`](examples/support_preparation.rs) and its
 [walkthrough](docs/preparation-examples.md). Its deterministic provider
 fixtures are kept under `tests/examples`.
 
-The current public declaration is name-only. It has no public description or input-schema API, and
-a handler type does not create one. The Chat Completions target is text-only: a nonempty native
-ToolCatalog is rejected before handoff. Use native tools only with a supporting target.
+The Responses target receives each mounted tool's complete definition, including its description
+and input schema. The raw name-only API retains its permissive object schema. The Chat Completions
+target is text-only: a nonempty native ToolCatalog is rejected before handoff.
 
 ## Check the Contract
 

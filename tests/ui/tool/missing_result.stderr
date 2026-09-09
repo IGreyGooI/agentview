@@ -1,0 +1,5 @@
+error: #[tool] functions must return `Result<Output, Error>`
+ --> tests/ui/tool/missing_result.rs:4:29
+  |
+4 | fn lookup(query: String) -> String {
+  |                             ^^^^^^

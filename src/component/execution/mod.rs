@@ -21,6 +21,7 @@ mod projection_diff;
 #[cfg(feature = "legacy-provider-port")]
 mod prompt_render;
 mod streaming;
+mod tool_definition;
 
 pub(crate) use driver_demand::{DriverDemandFault, DriverDemandHandle};
 
@@ -111,3 +112,4 @@ pub use reaction::{
     SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
 };
 pub use streaming::{StreamingToolRecoveryReport, StreamingToolRecoveryStatus};
+pub use tool_definition::{ToolDefinition, ToolDefinitionError};

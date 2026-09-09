@@ -88,9 +88,9 @@ impl ProjectionDiffState {
             .iter()
             .map(|node| lower_node(node, &previous, &mut candidate, &mut append_policy))
             .collect();
-        let submission = RenderedProjection::with_native_tool_names(
+        let submission = RenderedProjection::with_native_tools(
             nodes,
-            complete.native_tool_names().to_vec(),
+            complete.native_tools().to_vec(),
         )
         .expect("lowering a validated projection preserves node identities");
         let submission = match complete.execution_scope() {
@@ -211,7 +211,7 @@ fn reconcile_projection_submission(
         .filter_map(|(output, claimed)| (!claimed).then_some(output))
         .collect();
     let submission =
-        RenderedProjection::with_native_tool_names(nodes, lowered.native_tool_names().to_vec())
+        RenderedProjection::with_native_tools(nodes, lowered.native_tools().to_vec())
             .expect("reconciling a validated projection preserves its identities");
     let submission = match lowered.execution_scope() {
         Some(scope) => submission.with_execution_scope(scope),

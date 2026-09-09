@@ -14,11 +14,13 @@ use crate::{
     transcript::{CanonicalInputItem, CanonicalTranscript, CanonicalTranscriptError},
 };
 
+use super::ToolDefinition;
+
 /// One complete provider-neutral projection of current Component state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedProjection {
     nodes: Vec<RenderedProjectionNode>,
-    native_tool_names: Vec<String>,
+    native_tools: Vec<ToolDefinition>,
     execution_scope: Option<ProjectionExecutionScope>,
 }
 
@@ -46,7 +48,7 @@ impl RenderedProjection {
         }
         Ok(Self {
             nodes,
-            native_tool_names: Vec::new(),
+            native_tools: Vec::new(),
             execution_scope: None,
         })
     }
@@ -55,27 +57,46 @@ impl RenderedProjection {
         &self.nodes
     }
 
+    #[allow(dead_code)] // Retained for name-only compatibility fixtures.
     pub(crate) fn with_native_tool_names(
         nodes: Vec<RenderedProjectionNode>,
         native_tool_names: Vec<String>,
     ) -> Result<Self, RenderedProjectionError> {
+        let native_tools = native_tool_names
+            .into_iter()
+            .map(|name| {
+                let error_name = name.clone();
+                ToolDefinition::legacy_name_only(name).map_err(|_| {
+                    RenderedProjectionError::DuplicateNativeToolName { name: error_name }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::with_native_tools(nodes, native_tools)
+    }
+
+    /// Attaches complete native tool declarations to this projection.
+    pub fn with_native_tools(
+        nodes: Vec<RenderedProjectionNode>,
+        native_tools: Vec<ToolDefinition>,
+    ) -> Result<Self, RenderedProjectionError> {
         let projection = Self::from_nodes(nodes)?;
-        let mut seen = HashSet::new();
-        for name in &native_tool_names {
-            if name.is_empty() || !seen.insert(name) {
+        let mut seen = HashSet::with_capacity(native_tools.len());
+        for tool in &native_tools {
+            if !seen.insert(tool.name()) {
                 return Err(RenderedProjectionError::DuplicateNativeToolName {
-                    name: name.clone(),
+                    name: tool.name().to_owned(),
                 });
             }
         }
         Ok(Self {
-            native_tool_names,
+            native_tools,
             ..projection
         })
     }
 
-    pub(crate) fn native_tool_names(&self) -> &[String] {
-        &self.native_tool_names
+    /// Complete native tool declarations in Component structural order.
+    pub fn native_tools(&self) -> &[ToolDefinition] {
+        &self.native_tools
     }
 
     pub(crate) fn with_execution_scope(mut self, scope: ProjectionExecutionScope) -> Self {

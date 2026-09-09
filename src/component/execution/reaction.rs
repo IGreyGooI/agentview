@@ -14,6 +14,8 @@ use futures::Stream;
 
 use crate::transcript::{AssistantPhase, CanonicalInputItem, CanonicalTranscriptError};
 
+use super::ToolDefinition;
+
 /// Mount-stable identity of the logical target owned by one reaction port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetIdentity(NonZeroU128);
@@ -253,31 +255,62 @@ impl ProjectionSubmission {
     }
 }
 
-/// Component-declared tool identities in stable canonical order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Component-declared tools in stable canonical order.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCatalog {
+    definitions: Vec<ToolDefinition>,
     names: Vec<String>,
 }
 
 impl ToolCatalog {
-    #[allow(dead_code)] // Constructed only by Component reconciliation.
-    pub(crate) fn new(mut names: Vec<String>) -> Result<Self, ToolCatalogFault> {
-        names.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
-        for name in &names {
+    /// Builds a compatibility catalog using the historical permissive native
+    /// tool schema for every supplied name.
+    #[allow(dead_code)] // Used by compatibility tests and manual Frame fixtures.
+    pub(crate) fn new(names: Vec<String>) -> Result<Self, ToolCatalogFault> {
+        let mut definitions = Vec::with_capacity(names.len());
+        for name in names {
             if name.is_empty() {
                 return Err(ToolCatalogFault::EmptyName);
             }
+            let definition = ToolDefinition::legacy_name_only(name)
+                .expect("a non-empty compatibility native tool name is valid");
+            definitions.push(definition);
         }
-        if let Some(name) = names
+        Self::from_definitions(definitions)
+    }
+
+    #[allow(dead_code)] // Constructed only by Component reconciliation.
+    pub(crate) fn from_definitions(
+        mut definitions: Vec<ToolDefinition>,
+    ) -> Result<Self, ToolCatalogFault> {
+        definitions
+            .sort_by(|left, right| left.name().encode_utf16().cmp(right.name().encode_utf16()));
+        for definition in &definitions {
+            if definition.name().is_empty() {
+                return Err(ToolCatalogFault::EmptyName);
+            }
+        }
+        if let Some(name) = definitions
             .windows(2)
-            .find_map(|pair| (pair[0] == pair[1]).then(|| pair[0].clone()))
+            .find_map(|pair| (pair[0].name() == pair[1].name()).then(|| pair[0].name().to_owned()))
         {
             return Err(ToolCatalogFault::DuplicateName { name });
         }
-        Ok(Self { names })
+        let names = definitions
+            .iter()
+            .map(|definition| definition.name().to_owned())
+            .collect();
+        Ok(Self { definitions, names })
+    }
+
+    /// Complete Component-declared tools in canonical order.
+    pub fn definitions(&self) -> &[ToolDefinition] {
+        &self.definitions
     }
 
     /// Component-declared tool identities in canonical order.
+    ///
+    /// This compatibility view intentionally omits descriptions and schemas.
     pub fn names(&self) -> &[String] {
         &self.names
     }

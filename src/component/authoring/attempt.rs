@@ -26,7 +26,10 @@ use super::{
     declaration::{ComponentNode, Placement, RepeatableRender, ScopeRender},
     event_input::EventInputOrigin,
     event_listener::EventListenerDispatchFault,
-    native_tool::{await_output, NativeToolCallDeclaration, NativeToolDispatchFault},
+    native_tool::{
+        await_output, NativeToolCallDeclaration, NativeToolDispatchFault, NativeToolHistory,
+        NativeToolRecord,
+    },
     preparation::PreparationSet,
     reaction_completion::{ReactionCompletionDeclaration, ReactionCompletionDispatchFault},
     render_context::HookRenderContext,
@@ -217,11 +220,15 @@ where
         let streaming_contracts = std::mem::take(&mut capture.streaming_contracts);
         let system_candidate = capture.resolve_system_candidate()?;
         let projection = capture.into_projection(system_candidate.as_ref())?;
-        let projection = RenderedProjection::with_native_tool_names(
+        let projection = RenderedProjection::with_native_tools(
             projection.nodes().to_vec(),
             native_tools
                 .iter()
-                .map(|tool| tool.name().to_owned())
+                .map(|tool| {
+                    tool.definition()
+                        .expect("tool definitions were validated during render")
+                        .clone()
+                })
                 .collect(),
         )
         .map_err(|error| ComponentAttemptFault::RuntimeInvariant {
@@ -301,10 +308,19 @@ where
         }
     }
 
+    #[cfg(feature = "legacy-provider-port")]
     pub(crate) fn start_native_tool(
         &mut self,
         call: crate::component::execution::ToolCall,
     ) -> Result<NativeToolFuture, ComponentAttemptFault> {
+        self.start_native_tool_record(call)
+            .map(|(future, _)| future)
+    }
+
+    pub(crate) fn start_native_tool_record(
+        &mut self,
+        call: crate::component::execution::ToolCall,
+    ) -> Result<(NativeToolFuture, NativeToolRecord), ComponentAttemptFault> {
         self.ensure_open()?;
         let call_id = call.call_id().to_owned();
         let mut matching = self
@@ -325,10 +341,16 @@ where
                 bindings: 2,
             });
         }
+        let record = tool
+            .append_call(&call)
+            .map_err(ComponentAttemptFault::native_tool)?;
         let future = tool
             .start(call)
             .map_err(ComponentAttemptFault::native_tool)?;
-        Ok(Box::pin(await_output(call_id, future)))
+        Ok((
+            Box::pin(await_output(call_id, future, record.clone())),
+            record,
+        ))
     }
 
     async fn dispatch_inner(&mut self, event: Root) -> Result<(), ComponentAttemptFault> {
@@ -672,13 +694,38 @@ fn visit_render(
             capture.push(owner, placement, document.into_children(), None)?;
             capture.streaming_contracts.push(*declaration);
         }
-        ComponentNode::NativeToolCall(declaration) => {
+        ComponentNode::NativeToolCall(mut declaration) => {
             if forced == Some(Placement::SystemOnce) {
                 return Err(ComponentAttemptFault::SystemAttemptLocal {
                     component: owner.to_string(),
                     capability: "NativeToolCall",
                 });
             }
+            declaration
+                .definition()
+                .map_err(|error| ComponentAttemptFault::RuntimeInvariant {
+                    message: error.to_string(),
+                })?;
+            let position = *scope_cursor;
+            *scope_cursor = scope_cursor.saturating_add(1);
+            let component_id = owner.child(
+                &format!("agentview::NativeToolCall({})", declaration.name()),
+                position,
+            );
+            let history = signal_render
+                .render_component(component_id.clone(), |scope| {
+                    scope.use_signal_at(0, NativeToolHistory::default)
+                })
+                .map_err(ComponentAttemptFault::signal)?;
+            let items = history
+                .with(|history| history.items().cloned().collect())
+                .map_err(|error| ComponentAttemptFault::RuntimeInvariant {
+                    message: error.to_string(),
+                })?;
+            capture.register_component(component_id.clone())?;
+            let index = capture.node_indexes[&component_id];
+            capture.nodes[index].native_items = items;
+            declaration.mount(history);
             native_tools.push(*declaration);
         }
     }
@@ -786,6 +833,7 @@ impl RenderCapture {
             nodes: vec![ProjectionNodeCapture {
                 identity: root,
                 runs: Vec::new(),
+                native_items: Vec::new(),
             }],
             last_run: None,
             node_indexes,
@@ -803,6 +851,7 @@ impl RenderCapture {
         self.nodes.push(ProjectionNodeCapture {
             identity: identity.clone(),
             runs: Vec::new(),
+            native_items: Vec::new(),
         });
         self.node_indexes.insert(identity, index);
         Ok(())
@@ -897,7 +946,8 @@ impl RenderCapture {
             .enumerate()
             .map(|(index, node)| {
                 let node_system = if index == 0 { system } else { None };
-                let built = build_projection_items(node_system, node.runs)?;
+                let mut built = build_projection_items(node_system, node.runs)?;
+                built.items.extend(node.native_items);
                 Ok(RenderedProjectionNode::with_diff_templates(
                     node.identity.to_string(),
                     built.items,
@@ -943,6 +993,7 @@ impl RenderCapture {
 struct ProjectionNodeCapture {
     identity: ComponentId,
     runs: Vec<ProjectionRunCapture>,
+    native_items: Vec<crate::transcript::CanonicalInputItem>,
 }
 
 #[derive(Clone, Copy)]
