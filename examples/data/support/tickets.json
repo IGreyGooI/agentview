@@ -1,0 +1,12 @@
+[
+  {
+    "id": "ticket-101",
+    "account_id": "acct-1042",
+    "request": "My export download from 35 days ago has expired. How can I get it again?"
+  },
+  {
+    "id": "ticket-102",
+    "account_id": "acct-2050",
+    "request": "Yesterday's export is unavailable. Is that expected for my plan?"
+  }
+]

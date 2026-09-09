@@ -58,13 +58,9 @@ name = "signal_reaction"
 path = "examples/signal_reaction.rs"
 
 [[example]]
-name = "component_runtime_visual_acceptance"
-path = "examples/component_runtime_visual_acceptance.rs"
-
-[[example]]
 name = "chess_agentview"
 path = "examples/chess_agentview/main.rs"
 
-[[example]]
+[[test]]
 name = "chess_agentview_live_acceptance"
-path = "examples/chess_agentview_live_acceptance/main.rs"
+path = "tests/acceptance/chess_agentview/main.rs"

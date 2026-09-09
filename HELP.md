@@ -12,7 +12,10 @@ is the authoritative runtime contract; this file is its authoring guide.
 | Mark a semantic state region | `#[diff(slot = "...")]` around one POM root |
 | Describe field changes | `#[view(diff)]`, `#[view(diff(append))]`, or another field strategy |
 | Publish System instructions | `#[system_once]` on ordinary POM |
-| Run provider work | `Application::mount(...)`, then explicit `app.react().await` |
+| Run an application | `Application::mount(...)`, then `app.run().await` |
+| Wait for required business inputs | `use_preparation` inside the owning Component |
+| End normal application work | `use_application_exit`, then owner calls `shutdown()` |
+| Drive a single model turn | `app.react().await` |
 | Receive ordinary provider output | `use_provider_event_handler` |
 | Declare a native model tool | `NativeToolCall::named(name).on_call(handler)` |
 | Encode a provider request or retain remote state | a `ReactionPort`, outside the business Component |
@@ -29,7 +32,8 @@ encoding, remote cursors, and other provider-private state.
 
 Full versus Delta is a delivery decision below the Component API. A Full frame can replay required
 input without asking business code to reconstruct old provider output. Signal writes only mark a
-projection dirty; they never start a request. Have the driver call `react()` explicitly.
+projection dirty; they never start a request. The default `run()` loop calls `react()`;
+Components use preparation to wait for inputs and an exit handle to end the loop.
 
 Keep System instructions as a separate snapshot using `#[system_once]` on ordinary POM, beside the
 Component that renders business state.
@@ -86,7 +90,7 @@ fn work_state_component() -> Component {
 ```
 
 Capture a `Signal` in an event handler, task, or application callback to append a record outside
-render. Do not write a Signal during render. On the next explicit reaction, render the complete
+render. Do not write a Signal during render. On the next reaction, render the complete
 value again; the accepted baseline determines whether the tail becomes an `append` operation.
 
 Use `append` only for an append-only domain collection. Select the strategy that matches other
@@ -143,8 +147,8 @@ fn status_tool() -> Component {
 ```
 
 Mount the tool in the same tree as the state it serves. One `react()` can admit a model tool call,
-run its handler, and stage output; it does not start another provider request. Explicitly run the
-next reaction to submit the staged result and let the model continue:
+run its handler, and stage output; it does not start another provider request. The default
+`run()` loop submits the staged result on its next reaction. A manual driver can do the same:
 
 ```rust
 # use agentview::component::execution::{Application, ApplicationFault, ReactionPort};
@@ -157,6 +161,11 @@ app.react().await?; // submits that staged result on the next reaction
 
 Return an explicit ToolOutput for expected domain failures. A handler error is a reaction failure;
 make external effects idempotent with a business key when retries matter.
+
+For a live business example with an inbox and prepared account context, see
+[`support_preparation`](examples/support_preparation.rs) and its
+[walkthrough](docs/preparation-examples.md). Its deterministic provider
+fixtures are kept under `tests/examples`.
 
 The current public declaration is name-only. It has no public description or input-schema API, and
 a handler type does not create one. The Chat Completions target is text-only: a nonempty native

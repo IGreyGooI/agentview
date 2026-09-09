@@ -763,17 +763,6 @@ impl SecureTraceCreateError {
     }
 }
 
-impl TraceArtifactDisposition {
-    pub(crate) fn code(self) -> &'static str {
-        match self {
-            Self::NotCreated => "not_created",
-            Self::Preserved => "preserved",
-            Self::Removed => "removed",
-            Self::RemovalFailed => "removal_failed",
-        }
-    }
-}
-
 pub(crate) trait CompleteLineWriter {
     fn write_complete_line(&mut self, line: &[u8]) -> Result<(), LineWriteError>;
     fn flush(&mut self) -> Result<(), LineWriteError>;
@@ -1477,21 +1466,6 @@ fn provider_response_inbox_is_drained<T>(result: Result<T, TryRecvError>) -> boo
     )
 }
 
-#[cfg(test)]
-mod provider_response_tests {
-    use super::*;
-
-    #[test]
-    fn a_drained_inbox_remains_valid_after_the_provider_sender_is_dropped() {
-        let (capture, inbox) = provider_response_capture(1);
-        drop(capture);
-
-        assert!(provider_response_inbox_is_drained(
-            inbox.receiver.try_recv()
-        ));
-    }
-}
-
 impl<S, C> LiveObserver<S, SecureTraceFile, C> {
     pub(crate) fn discard_trace(self) -> TraceArtifactDisposition {
         self.trace.into_inner().discard()
@@ -1538,5 +1512,20 @@ where
 
     fn status_output_complete(&self) -> bool {
         !self.status_failed
+    }
+}
+
+#[cfg(test)]
+mod provider_response_tests {
+    use super::*;
+
+    #[test]
+    fn a_drained_inbox_remains_valid_after_the_provider_sender_is_dropped() {
+        let (capture, inbox) = provider_response_capture(1);
+        drop(capture);
+
+        assert!(provider_response_inbox_is_drained(
+            inbox.receiver.try_recv()
+        ));
     }
 }

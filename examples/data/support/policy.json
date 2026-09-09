@@ -1,0 +1,4 @@
+{
+  "expired_export": "Expired downloads cannot be restored. Regenerate the export from the original report.",
+  "escalation": "If an export is unavailable within the account's retention window, route it to the export support queue."
+}

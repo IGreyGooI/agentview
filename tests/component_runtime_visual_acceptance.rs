@@ -1,4 +1,4 @@
-//! Component runtime acceptance for complete DOM and private provider history.
+//! Component runtime regression coverage for complete DOM and private provider history.
 
 use std::{
     fmt::Write as _,
@@ -877,25 +877,6 @@ async fn run_acceptance() -> anyhow::Result<AcceptanceEvidence> {
         success_cleanup_completed,
         error_cleanup_completed,
     })
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let acceptance = run_acceptance().await?;
-    anyhow::ensure!(acceptance.requests_per_reaction == vec![1; 6]);
-    anyhow::ensure!(acceptance.mount_was_passive);
-    anyhow::ensure!(acceptance.handlers_completed_before_return);
-    anyhow::ensure!(acceptance.fresh_target_was_distinct);
-    anyhow::ensure!(acceptance.old_task_dropped);
-    anyhow::ensure!(acceptance.fresh_task_dropped);
-    anyhow::ensure!(acceptance.success_server_joined);
-    anyhow::ensure!(acceptance.error_task_dropped);
-    anyhow::ensure!(acceptance.error_server_joined);
-    anyhow::ensure!(acceptance.operation_error_and_request_observed);
-    anyhow::ensure!(acceptance.success_cleanup_completed);
-    anyhow::ensure!(acceptance.error_cleanup_completed);
-    print!("{}", acceptance.report);
-    Ok(())
 }
 
 #[cfg(test)]

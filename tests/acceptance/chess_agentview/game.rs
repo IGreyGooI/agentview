@@ -770,7 +770,6 @@ pub struct GameEvidence {
     pub attempts: Vec<AttemptEvidence>,
     pub provider_execute_count: usize,
     pub component_turn_executions: usize,
-    pub(crate) effective_provider: crate::observability::EffectiveProviderConfig,
     pub(crate) provider_responses: Vec<crate::observability::ProviderResponseEvidence>,
     pub component_host_id_retained: bool,
     pub uci_commands: Vec<String>,
@@ -834,7 +833,6 @@ where
             },
             run_started_ms,
             0,
-            effective_provider,
             observer,
         )
         .await;
@@ -881,7 +879,6 @@ where
                 },
                 run_started_ms,
                 provider_execute_count.load(Ordering::SeqCst),
-                effective_provider,
                 observer,
             )
             .await;
@@ -906,7 +903,6 @@ where
             },
             run_started_ms,
             provider_execute_count.load(Ordering::SeqCst),
-            effective_provider,
             observer,
         )
         .await;
@@ -951,7 +947,6 @@ where
                 },
                 run_started_ms,
                 provider_execute_count.load(Ordering::SeqCst),
-                effective_provider,
                 observer,
             )
             .await;
@@ -1066,7 +1061,6 @@ where
         attempts: result.attempts,
         provider_execute_count,
         component_turn_executions,
-        effective_provider,
         provider_responses,
         component_host_id_retained,
         uci_commands,
@@ -1124,7 +1118,6 @@ async fn finish_before_runtime<O>(
     failure: BeforeRuntimeFailure,
     run_started_ms: u64,
     provider_execute_count: usize,
-    effective_provider: crate::observability::EffectiveProviderConfig,
     observer: &mut O,
 ) -> anyhow::Result<GameEvidence>
 where
@@ -1166,7 +1159,6 @@ where
         attempts: Vec::new(),
         provider_execute_count,
         component_turn_executions: failure.component_turn_executions,
-        effective_provider,
         provider_responses,
         component_host_id_retained: failure.component_host_id_retained,
         uci_commands: Vec::new(),

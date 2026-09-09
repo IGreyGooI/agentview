@@ -1,119 +1,65 @@
-use std::{ops::ControlFlow, sync::Arc};
+//! A two-turn agent that publishes a Signal update as the second Frame.
+
+use std::convert::Infallible;
 
 use agentview::component::{
-    execution::{Application, ApplicationFault, DebugPromptCapture, DebugProviderPort, ExitReason},
+    execution::{Application, ReactionPort},
     prelude::*,
 };
-use tokio::sync::Notify;
-
-#[cfg(test)]
-use agentview::component::execution::FrameBasis;
-
-#[cfg(test)]
-#[path = "support/frame_workflow_golden.rs"]
-mod frame_workflow_golden;
-
-#[derive(Clone)]
-struct AgentProps {
-    release: Arc<Notify>,
-}
+#[path = "support/live_provider.rs"]
+mod live_provider;
 
 #[component]
-fn frame_agent_component(props: AgentProps) -> Component {
+fn frame_agent_component() -> Component {
     let state = use_signal(|| String::from("initial"));
-    let request = use_reaction_request();
-    let release = Arc::clone(&props.release);
-    let update = state.clone();
-    use_future(move || async move {
-        release.notified().await;
-        update
-            .set(String::from("published"))
-            .expect("mounted Signal update");
-        request.request().expect("mounted reaction request");
+    let application_exit = use_application_exit();
+
+    use_provider_event_handler(ProviderEvent::TEXT, |event| async move {
+        if let TextTurnEvent::TextComplete(text) = event {
+            println!("{text}");
+        }
+        Ok::<(), Infallible>(())
     });
+
+    let completed_state = state.clone();
+    use_reaction_completion(move || async move {
+        if completed_state.with(|value| value == "initial")? {
+            completed_state.set(String::from("published"))?;
+        } else {
+            application_exit.request(ExitReason::Completed)?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
     let value = state.with(Clone::clone).expect("mounted Signal read");
-    view! { frame_agent { "{value}" } }
+    view! {
+        #[system_once]
+        publication_policy { "State the publication status in one concise sentence." }
+        publication_status { "{value}" }
+    }
 }
 
-async fn run_agent() -> Result<ControlFlow<ExitReason, DebugPromptCapture>, ApplicationFault> {
-    let release = Arc::new(Notify::new());
-    let root_release = Arc::clone(&release);
-    let (port, capture) = DebugProviderPort::new();
-    let mut application = Application::mount(
-        move || {
-            frame_agent_component(AgentProps {
-                release: Arc::clone(&root_release),
-            })
-        },
-        port,
-    )?;
+async fn run_agent(provider: impl ReactionPort) -> anyhow::Result<()> {
+    let mut application = Application::mount(frame_agent_component, provider)?;
+    let operation = application.run().await.map_err(anyhow::Error::from);
+    let shutdown = application.shutdown().await.map_err(anyhow::Error::from);
 
-    let result = async {
-        match application.react().await? {
-            ControlFlow::Continue(()) => {}
-            ControlFlow::Break(reason) => return Ok(ControlFlow::Break(reason)),
+    match (operation, shutdown) {
+        (Ok(ExitReason::Completed), Ok(())) => Ok(()),
+        (Ok(reason), Ok(())) => anyhow::bail!("frame agent exited unexpectedly: {reason:?}"),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => {
+            Err(operation.context(format!("frame agent shutdown also failed: {shutdown:#}")))
         }
-        release.notify_one();
-        application.wait_for_reaction_request().await?;
-        application.react().await
     }
-    .await;
-    let shutdown = application.shutdown().await;
-    let flow = result?;
-    shutdown?;
-    Ok(match flow {
-        ControlFlow::Continue(()) => ControlFlow::Continue(capture),
-        ControlFlow::Break(reason) => ControlFlow::Break(reason),
-    })
 }
 
 #[tokio::main]
-async fn main() {
-    match run_agent().await {
-        Ok(ControlFlow::Continue(_)) | Ok(ControlFlow::Break(_)) => {}
-        Err(error) => {
-            eprintln!("frame agent failed: {error}");
-            std::process::exit(1);
-        }
-    }
+async fn main() -> anyhow::Result<()> {
+    run_agent(live_provider::from_env("frame-agent")?).await
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn public_agent_driver_matches_the_shared_exact_first_frame_golden() {
-        let (port, capture) = DebugProviderPort::new();
-        let mut application =
-            Application::mount(frame_workflow_golden::shared_frame_workflow_root, port).unwrap();
-
-        assert_eq!(
-            application.react().await.unwrap(),
-            ControlFlow::Continue(())
-        );
-        let frame = capture.latest_frame().unwrap();
-        let basis = frame.basis();
-        let payload = frame.canonical_payload().to_vec();
-        application.shutdown().await.unwrap();
-
-        assert_eq!(basis, FrameBasis::Full);
-        frame_workflow_golden::assert_exact_first_frame(&payload);
-    }
-
-    #[tokio::test]
-    async fn component_future_requests_a_second_delta_reaction_after_publishing_state() {
-        let capture = match run_agent().await.unwrap() {
-            ControlFlow::Continue(capture) => capture,
-            ControlFlow::Break(reason) => panic!("frame agent exited early: {reason:?}"),
-        };
-        let frames = capture.frame_snapshots();
-
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].basis(), FrameBasis::Full);
-        assert!(matches!(frames[1].basis(), FrameBasis::DeltaFrom(_)));
-        assert!(String::from_utf8(frames[1].canonical_payload().to_vec())
-            .unwrap()
-            .contains("published"));
-    }
-}
+#[path = "../tests/examples/frame_agent.rs"]
+mod tests;

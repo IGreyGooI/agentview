@@ -83,6 +83,15 @@ impl ScriptedReaction {
         Self::text_with_seal(deltas, sealed)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn duplicate_completion(mut self) -> Self {
+        self.facts.push(ProviderFact::ReactionCompleted {
+            primary_text: Some(TEXT_OUTPUT),
+        });
+        self
+    }
+
     fn text_with_seal(
         deltas: impl IntoIterator<Item = impl Into<String>>,
         sealed: impl Into<String>,

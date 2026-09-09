@@ -9,7 +9,7 @@ use agentview::{
 };
 use anyhow::Context as _;
 
-use super::chess_application::ChessApplicationConfig;
+use super::chess_application::ChessConfig;
 
 const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-5.6-terra";
@@ -71,8 +71,8 @@ impl LiveConfig {
         })
     }
 
-    pub(crate) fn application_config(&self) -> anyhow::Result<ChessApplicationConfig> {
-        ChessApplicationConfig::new(
+    pub(crate) fn application_config(&self) -> anyhow::Result<ChessConfig> {
+        ChessConfig::new(
             self.stockfish_program.clone(),
             self.engine_timeout,
             self.engine_nodes,

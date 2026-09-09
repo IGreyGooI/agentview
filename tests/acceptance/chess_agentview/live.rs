@@ -94,18 +94,6 @@ pub(crate) enum LiveEvidenceError {
     InconsistentGameEvidence,
 }
 
-impl LiveConfigError {
-    pub(crate) fn reason_code(self) -> &'static str {
-        match self {
-            Self::InvalidModel => "invalid_model",
-            Self::MissingApiKey => "missing_api_key",
-            Self::InvalidApiKey => "invalid_api_key",
-            Self::InvalidApiBase => "invalid_api_base",
-            Self::InvalidStockfishProgram => "invalid_stockfish_program",
-        }
-    }
-}
-
 pub(crate) fn build_responses_provider(
     config: &LiveConfig,
     prompt_cache_key: &str,
@@ -198,40 +186,6 @@ fn classify_finished_run(error: anyhow::Error) -> LiveRunError {
             artifact_disposition: Some(failure.artifact_disposition()),
         })
         .unwrap_or(LiveRunError::RunnerSetup)
-}
-
-impl LiveRunError {
-    pub(crate) fn reason_code(self) -> &'static str {
-        match self {
-            Self::ProviderInitialization => "provider_initialization_failed",
-            Self::InvalidStockfishProgram => "stockfish_configuration_failed",
-            Self::RunIdentifier => "run_identifier_failed",
-            Self::TraceSetup { .. } => "trace_setup_failed",
-            Self::RunnerSetup => "live_runner_setup_failed",
-        }
-    }
-
-    pub(crate) fn artifact_disposition(self) -> Option<TraceArtifactDisposition> {
-        match self {
-            Self::TraceSetup {
-                artifact_disposition,
-            } => artifact_disposition,
-            _ => None,
-        }
-    }
-}
-
-impl LiveEvidenceError {
-    pub(crate) fn reason_code(self) -> &'static str {
-        match self {
-            Self::InfrastructureAbort { .. } => "live_infrastructure_abort",
-            Self::NonTerminalOutcome => "live_non_terminal_outcome",
-            Self::MissingCompletedReaction => "live_missing_completed_reaction",
-            Self::MissingStockfishMove => "live_missing_stockfish_move",
-            Self::IncompleteCleanup => "live_incomplete_cleanup",
-            Self::InconsistentGameEvidence => "live_inconsistent_game_evidence",
-        }
-    }
 }
 
 pub(crate) fn validate_live_evidence(evidence: &GameEvidence) -> Result<(), LiveEvidenceError> {

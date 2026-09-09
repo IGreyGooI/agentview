@@ -1,89 +1,50 @@
-//! Minimal Component composition without provider I/O.
+//! A one-turn agent that says Hello World through the OpenAI Responses API.
+//!
+//! Set `OPENAI_API_KEY`, then run `cargo run --example hello_world`.
 
-use agentview::{
-    component::{execution::RenderedProjection, prelude::*, ComponentHost},
-    pom_renderer::render_pom_document,
-    transcript::CanonicalInputItem,
+use std::convert::Infallible;
+
+use agentview::component::{
+    execution::{Application, ReactionPort},
+    prelude::*,
 };
-
-#[derive(Clone)]
-struct HelloProps {
-    recipient: String,
-}
+#[path = "support/live_provider.rs"]
+mod live_provider;
 
 #[component]
-fn greeting_policy() -> Component {
+fn hello_agent() -> Component {
+    use_provider_event_handler(ProviderEvent::TEXT, |event| async move {
+        if let TextTurnEvent::TextComplete(text) = event {
+            println!("{text}");
+        }
+        Ok::<(), Infallible>(())
+    });
+
+    let exit = use_application_exit();
+    use_reaction_completion(move || async move { exit.request(ExitReason::Completed) });
+
     view! {
-        #[system_once]
-        greeting_policy { "Greet the named person in one short sentence." }
+        greeting_request { "Say exactly: Hello World" }
     }
 }
 
-#[component]
-fn greeting_request(recipient: String) -> Component {
-    view! {
-        greeting_request {
-            recipient { "{recipient}" }
+async fn run_agent(provider: impl ReactionPort) -> anyhow::Result<()> {
+    let mut application = Application::mount(hello_agent, provider)?;
+    let operation = application.run().await.map_err(anyhow::Error::from);
+    let shutdown = application.shutdown().await.map_err(anyhow::Error::from);
+
+    match (operation, shutdown) {
+        (Ok(ExitReason::Completed), Ok(())) => Ok(()),
+        (Ok(reason), Ok(())) => anyhow::bail!("hello agent exited unexpectedly: {reason:?}"),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => {
+            Err(operation.context(format!("hello agent shutdown also failed: {shutdown:#}")))
         }
     }
 }
 
-#[component]
-fn hello_application(props: HelloProps) -> Component {
-    view! {
-        greeting_policy()
-        greeting_request(props.recipient)
-    }
-}
-
-fn render_hello(recipient: &str) -> anyhow::Result<RenderedProjection> {
-    let mut components = ComponentHost::new_root(
-        hello_application,
-        HelloProps {
-            recipient: recipient.to_owned(),
-        },
-    );
-    Ok(components.render()?.projection().clone())
-}
-
-fn projection_text(projection: &RenderedProjection) -> anyhow::Result<String> {
-    Ok(projection
-        .to_transcript()?
-        .items()
-        .iter()
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom)),
-            _ => None,
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .join("\n"))
-}
-
-fn main() -> anyhow::Result<()> {
-    let projection = render_hello("world")?;
-    println!("{}", projection_text(&projection)?);
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn composes_policy_and_request_components() {
-        let projection = render_hello("Ada").expect("hello projection renders");
-        let identities = projection
-            .nodes()
-            .iter()
-            .map(|node| node.identity())
-            .collect::<Vec<_>>();
-
-        assert!(identities
-            .iter()
-            .any(|name| name.contains("greeting_policy")));
-        assert!(identities
-            .iter()
-            .any(|name| name.contains("greeting_request")));
-    }
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    run_agent(live_provider::from_env("hello-world")?).await
 }

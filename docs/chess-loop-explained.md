@@ -2,27 +2,45 @@
 
 本文描述仓库中当前的 `chess_agentview` example，解释模型白方回合、Stockfish 黑方回合、重试和终局如何由默认的 `Application::run()` 驱动。
 
+可运行的 example 使用真实 OpenAI Responses provider，因此需要
+`OPENAI_API_KEY`、可用的 Stockfish 和网络连接；自定义 gateway 的
+`OPENAI_BASE_URL` 必须以 `/v1` 结尾，custom CA 使用 `SSL_CERT_FILE`。
+具体环境和运行命令见 [Chess runtime target](chess-runtime-target.md)。确定性的
+provider 与 fake-UCI 测试实现在 `tests/` 下，而不作为运行时 provider 选项。
+
 配套图仍保留在仓库中，但它们描述的是旧的 `prepare -> demand -> react` 编排，等待重新生成：
 
 - [历史工作流图](chess-loop.workflow.html)
 - [历史准备屏障时序图](chess-loop.sequence.html)
 - [图源与旧交付校验记录](chess-loop.delivery.json)
 
-本文件是当前行为的权威说明。源码入口：[Chess facade、driver、准备 hook 与 UCI actor](../examples/chess_agentview/chess_application.rs)、[状态机和事件处理结果](../examples/chess_agentview/application_state.rs)、[XML streaming contract 与发布器](../examples/chess_agentview/chess_action_component.rs)、[`Application` runtime](../src/component/execution/application.rs)、[`use_preparation`](../src/component/authoring/preparation.rs) 和 `use_application_exit`。
+本文件是当前行为的权威说明。源码入口：[直接的 `play_chess` driver](../examples/chess_agentview/main.rs)、[根组件、准备 hook 与 UCI actor](../examples/chess_agentview/chess_application.rs)、[状态机和事件处理结果](../examples/chess_agentview/application_state.rs)、[XML streaming contract 与发布器](../examples/chess_agentview/chess_action_component.rs)、[`Application` runtime](../src/component/execution/application.rs)、[`use_preparation`](../src/component/authoring/preparation.rs) 和 `use_application_exit`。
 
 ## 默认 run
 
-`ChessApplication` 只持有 `Application<P>`（在此例中命名为 `reactor`）、停止信号和 actor 的 typed completion。它不保存 provider reaction 队列，也不直接调用 Stockfish。
+`play_chess(config, provider)` 是普通的 async 函数。它创建停止、结果和 cleanup 三个 `watch` 通道，把 `ChessConfig`、停止 receiver、结果 sender 和 cleanup sender 作为根组件参数，再直接挂载 `Application<P>`。它不保存 provider reaction 队列，也不直接调用 Stockfish。
 
-Chess 直接调用默认入口，不再定义 `drive_application`：
+Chess 直接调用默认入口，不再定义 `drive_application` 或额外的 Application owner 类型：
 
 ```rust,ignore
-let run_result = reactor.run().await;
+let result = application
+    .run()
+    .await
+    .context("Chess model reaction failed")
+    .and_then(|_| {
+        result_receiver
+            .borrow()
+            .clone()
+            .context("Chess application exited before producing a terminal result")
+    });
+let cleanup = stop_stockfish(&stop, &mut cleanup_receiver).await;
+let shutdown = application.shutdown().await;
+finish_run(result, cleanup, shutdown)
 ```
 
-`Application::run()` 内部反复调用 `react()`：`Continue(())` 继续下一轮，`Break(reason)` 返回 `Ok(reason)`，错误直接返回。它借用 Application，不自动执行 shutdown。`ExitReason` 只表示生命周期，Chess facade 随后从 `ChessActorExit::Completed(Result<ChessResult, ChessActorFailure>)` 读取最终棋局结果。需要手动单步时仍可直接调用 `react()`。
+`Application::run()` 内部反复调用 `react()`：`Continue(())` 继续下一轮，`Break(reason)` 返回 `Ok(reason)`，错误直接返回。它借用 Application，不自动执行 shutdown。`ExitReason` 只表示生命周期；`play_chess` 在 run 返回后从独立的结果通道读取 `ChessResult`。需要手动单步时仍可直接调用 `react()`。
 
-`ChessApplication::run` 在运行出错且 actor 尚未给出 completion 时，先调用 `stop_actor`，等待 UCI actor 的停止结果，再消费 `Application` 做 `shutdown()`。正常终局已经由 actor 清理 UCI 并发布 completion，因而不会重复停止。外部 `Requested` 退出若没有 typed completion，会让 Chess facade 报错，并沿用这条收尾路径。
+`play_chess` 在每个 run 结果后都会调用 `stop_stockfish`，等待 UCI actor 写入 cleanup 状态，再消费 `Application` 做 `shutdown()`，最后由 `finish_run` 合并操作、cleanup 和 shutdown 错误。正常终局已经由 actor 写入成功 cleanup 状态，因而这个等待立即完成。外部 `Requested` 退出若没有结果通道中的 `ChessResult` 会报错，但仍走同一条 stop、cleanup 和 shutdown 收尾路径。
 
 ## 准备是唯一就绪屏障
 
@@ -30,20 +48,21 @@ let run_result = reactor.run().await;
 
 - `ChessState`：棋盘、历史、phase、重试计数和最终 outcome；
 - 容量为 1 的 `Coroutine<ChessPreparationRequest>`：唯一的 UCI actor 入口；
+- 由 `play_chess` 注入的 `stop: watch::Receiver<bool>`、`result: watch::Sender<Option<ChessResult>>` 和 `cleanup: watch::Sender<Option<Result<(), ChessActorFailure>>>`；
 - `use_application_exit()` 返回的应用级退出 capability。
 
 它不再有 `requested_attempt`，也不调用 `use_reaction_request`。一次成功的外层 `react()` 已经足以提交一个 provider frame，因此没有独立 demand 需要去重或等待。
 
 `react()` 在构造 frame 前运行 `use_preparation`。hook 对每次准备请求执行以下顺序：
 
-1. 先检查 `actor_exit`；若 actor 已正常完成，请求 `ExitReason::Completed`，而不是让 provider 接管终局。
+1. 先检查 cleanup 状态。`Some(Ok(()))` 只有在结果通道为 `Some(ChessResult)` 时才请求 `ExitReason::Completed`；`Some(Err(ChessActorFailure::StockfishCleanup))` 和成功 cleanup 但没有结果都是 preparation error；`None` 则继续。
 2. 向 actor 发送带 `oneshot` 回执的 `ChessPreparationRequest`，并等待回执。
-3. 发送或回执结束后统一检查 typed completion，再传播发送或回执错误。只有 `Completed(Ok(_))` 会请求 `Completed` 退出；`Completed(Err(_))` 和 `Stopped(_)` 是 preparation error。actor 仍在运行时 `completion = None` 是正常状态，随后由 `AwaitingModel` 放行；只有发送或回执失败后仍没有 completion，或状态已经 `Finished` 但仍没有 completion 时，才是 preparation error。
-4. 若 actor 仍在运行，读取 `ChessState::phase()`。只有 `AwaitingModel` 可以放行到 frame；`Ready`、`AwaitingStockfish` 和没有 completion 的 `Finished` 都会失败，绝不会提交 provider frame。
+3. 发送或回执结束后再次检查 cleanup，再传播发送或回执错误。cleanup 成功仍要求结果通道中有 `ChessResult`；cleanup error 或没有结果仍是 preparation error。actor 仍在运行时 cleanup 为 `None` 是正常状态。
+4. cleanup 仍为 `None` 时读取 `ChessState::phase()`。只有 `AwaitingModel` 可以放行到 frame；`Ready`、`AwaitingStockfish` 和没有 cleanup 的 `Finished` 都会失败，绝不会提交 provider frame。
 
-actor 只有在关掉 UCI 后才发布正常 `Completed` completion。因此 hook 发出 `Completed` 退出时，清理已经完成；`react()` 返回 `Break` 前不会产生额外模型请求。
+对于持有 UCI 的终局 actor，只有在关掉 UCI 后才会写入 cleanup 状态。若关闭成功，它先写入 `ChessResult`，再写入 `Ok(())` cleanup；若关闭失败，只写入 `Err(ChessActorFailure::StockfishCleanup)`。随后它回执当前 preparation request 并退出。没有活跃 UCI 的启动失败会在确认无需 child cleanup 后写入终局结果和成功 cleanup；未确认的 child cleanup 只写入 failure。因此 hook 发出 `Completed` 退出时，清理已经完成；`react()` 返回 `Break` 前不会产生额外模型请求。
 
-`Application::prepare()` 仍可供低层验证使用，但 facade 不再把它当作外部编排步骤。`react()` 内部自己执行同一条准备屏障。
+`Application::prepare()` 仍可供低层验证使用，但 `play_chess` 不把它当作外部编排步骤。`react()` 内部自己执行同一条准备屏障。
 
 ## 状态机与 actor
 
@@ -63,7 +82,7 @@ UCI actor 按 preparation request 串行运行，但每次都以当前 phase 为
 - `Ready`：归约 `Start`；
 - `AwaitingStockfish`：复制一份已提交 history，并用它执行一次搜索；
 - `AwaitingModel`：不做 engine work，只回执 ready；
-- 终局：先关闭 UCI，发布 `ChessActorExit::Completed`，再回执并退出。
+- 终局：先关闭 UCI；仅在成功时发布 `ChessResult`，随后发布 cleanup 状态，再回执并退出。
 
 这个 phase guard 也是取消安全的关键：同一请求被后续准备再次观察时，已经完成的黑方搜索不会被重复执行。
 
@@ -101,10 +120,16 @@ UCI actor 按 preparation request 串行运行，但每次都以当前 phase 为
 
 ## 终局、取消和故障
 
-若模型走子、Stockfish 走子或启动失败使状态终局，actor 在下一次准备 request 中收尾 UCI，并发布 typed completion。hook 请求 `ExitReason::Completed`，当前 `react()` 在提交 frame 前返回 `Break`。facade 随后读取 actor 的 `ChessResult`。
+若模型走子、Stockfish 走子或启动失败使状态终局，actor 在下一次准备 request 中收尾 UCI。关闭成功时它发布 `ChessResult` 和成功 cleanup；关闭失败时只发布 cleanup failure。成功 cleanup 且结果通道中有 `ChessResult` 会使 hook 请求 `ExitReason::Completed`，当前 `react()` 在提交 frame 前返回 `Break`。`play_chess` 随后读取结果通道中的 `ChessResult`。
 
 如果调用者在准备期间丢弃 `react()` future，已成功送入 coroutine 的 request 和已开始的 UCI 搜索仍由 actor 持续完成。之后的 `react()` 会再次请求准备，但 phase 已经是 `AwaitingModel`，所以 actor 只回执，不会再次运行 `go`。
 
-发送 request 失败、oneshot 断开而 actor 没有成功 completion、actor 停止、UCI 清理失败和 provider fault 都是错误路径。错误路径不会把未确认的 actor 状态当成 provider-ready，并由 facade 聚合 actor stop 与 Application shutdown 的错误。
+发送 request 失败、oneshot 断开而没有成功 cleanup、UCI 清理失败和 provider fault 都是错误路径。错误路径不会把未确认的 actor 状态当成 provider-ready；`play_chess` 仍会等待 cleanup、执行 Application shutdown，并由 `finish_run` 聚合这些错误。外部 `Requested` 退出若没有 `ChessResult` 也走这条错误路径。
 
-Unix fake-UCI tests 覆盖首次就绪不提交 frame、黑方搜索在下一次 `react()` 准备阶段发生、取消后不重复 `go`、重试、无可用 engine 零 provider 提交，以及终局不会多提交 frame。
+[Unix fake-UCI tests](../tests/examples/chess_agentview/chess_application.rs)
+和 scripted-provider fixtures 覆盖首次就绪不提交 frame、黑方搜索在下一次
+`react()` 准备阶段发生、取消后不重复 `go`、重试、无可用 engine 零 provider
+提交，以及终局不会多提交 frame。它们通过
+`cargo test --no-default-features --example chess_agentview` 运行，不发送 live
+请求；单独的 live acceptance test 以 ignored 方式保留在
+`chess_agentview_live_acceptance` integration target 中。

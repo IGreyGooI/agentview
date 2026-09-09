@@ -125,6 +125,25 @@ shutdown_result?;
 For text admission and state publication, see
 [`signal_reaction`](examples/signal_reaction.rs).
 
+### Preparation Before Model Work
+
+Use `use_preparation` for work required before the next Frame: waiting for an
+inbox item, loading account data, or checking a business prerequisite. The outer
+owner only calls `application.run().await`; Components own readiness and call
+`use_application_exit` when their work is complete.
+
+[`support_preparation`](examples/support_preparation.rs) processes a support
+inbox with real asynchronous channel and JSON file reads. It waits for a ticket,
+loads its account in a newly mounted child Component, and loads a session policy
+in another Component. No Frame is submitted until every preparation succeeds.
+Normal reaction completion stores a reply draft; closing the drained inbox
+ends the application without an extra model request.
+
+The runnable support example uses the live OpenAI Responses provider. Its
+deterministic provider fixtures live under `tests/examples`; see [the
+walkthrough](docs/preparation-examples.md) for the data flow, caching, retry
+behavior, and how these boundaries map to services.
+
 ### Business History
 
 Render complete business state as typed POM. Use `#[diff(slot = "state")]` to
@@ -195,44 +214,100 @@ port. A port cannot mutate shared canonical history or the retained Component
 projection. The repository includes native Responses, Chat Completions, Debug,
 and External `ReactionPort` implementations.
 
-## Offline Examples
+## Live Examples
 
-These commands require no credentials or external network access:
+Runnable examples use the OpenAI Responses API, so `cargo run` makes
+token-bearing requests. Set `OPENAI_API_KEY` in the environment or `.env`.
+`AGENTVIEW_MODEL` defaults to `gpt-5.6-terra`; `OPENAI_BASE_URL` defaults to
+`https://api.openai.com/v1`.
+
+When present, `.env` entries override existing values with the same name,
+including Cargo-injected certificate defaults. Without `.env`, the examples use
+the launching process environment unchanged.
+
+Repository convention: executable examples use configured real credentials and
+demonstrate end-to-end behavior. Test implementations and mock fixtures belong
+under `tests/`; example files retain only `#[cfg(test)]` module links to them.
+
+`OPENAI_BASE_URL` is the versioned API base and must end in `/v1`; do not set
+it to a `/responses` endpoint. For a gateway with a custom TLS certificate,
+point `SSL_CERT_FILE` at its CA bundle:
+
+```dotenv
+OPENAI_BASE_URL=https://gateway.example/v1
+SSL_CERT_FILE=/path/to/gateway-ca.crt
+```
+
+For the configured Lazycat gateway, use this base URL and the CA path visible
+to the process. In a container:
+
+```dotenv
+OPENAI_BASE_URL=https://10.8.8.139:4000/v1
+SSL_CERT_FILE=/opt/bootstrap/pki/lazycat-ai-gateway-ca.crt
+```
+
+On the host:
+
+```dotenv
+OPENAI_BASE_URL=https://10.8.8.139:4000/v1
+SSL_CERT_FILE=/srv/xiaohei-agent/assets/pki/lazycat-ai-gateway-ca.crt
+```
+
+### Hello World
+
+[`hello_world`](examples/hello_world.rs) runs one agent reaction, prints the
+model's greeting, and exits:
 
 ```bash
 cargo run --no-default-features --example hello_world
+```
+
+The other live examples use the same environment:
+
+```bash
 cargo run --no-default-features --example component_composition
 cargo run --no-default-features --example frame_agent
 cargo run --no-default-features --example frame_skill
 cargo run --no-default-features --example frame_plugin
 cargo run --no-default-features --example signal_reaction
-cargo run --no-default-features --example component_runtime_visual_acceptance
+cargo run --no-default-features --example support_preparation
 ```
 
 The examples start from Component roots and cover composition plus different
 driver behavior over the same runtime:
 
-- [`hello_world`](examples/hello_world.rs): the smallest nested Component tree,
-  rendered without provider I/O.
 - [`component_composition`](examples/component_composition.rs): several
   business Components contribute ordered canonical input to one root.
-- [`frame_agent`](examples/frame_agent.rs): Component demand wakes the external
-  driver for a later Full-to-Delta reaction after state publication.
-- [`frame_skill`](examples/frame_skill.rs): latest-read and a typed command stay
-  passive; only an explicit exchange observes the dirty state.
-- [`frame_plugin`](examples/frame_plugin.rs): one `Application` is owned per
-  parent; stale ingress is fenced, same-parent continuity is retained, and all
-  owners are consumed during cleanup.
+- [`frame_agent`](examples/frame_agent.rs): a minimal `run()` loop; the Component
+  publishes new state after the first reaction and exits after the second.
+- [`frame_skill`](examples/frame_skill.rs): a typed command updates state, then
+  `ExternalApplication::observe()` provides the explicit exchange.
+- [`frame_plugin`](examples/frame_plugin.rs): one `ExternalApplication` per
+  parent, driven by `observe()` and `act()` with independent session continuity
+  and cleanup of every owner. Low-level ingress checks stay in tests.
 - [`signal_reaction`](examples/signal_reaction.rs): native text facts update a
-  Signal, while the updated state reaches the target only on the second
-  explicit reaction.
-- [`component_runtime_visual_acceptance`](examples/component_runtime_visual_acceptance.rs):
-  a loopback Responses server validates complete Component state, Full/Delta
-  lowering, provider-private wire history, fresh-target Full behavior, and
-  cleanup. It ends with `ACCEPTANCE PASSED` only after every assertion passes.
+  Signal; `run()` submits the updated review state on the next Frame before the
+  Component exits.
+- [`support_preparation`](examples/support_preparation.rs): inbox waiting,
+  account and policy loading, reply drafts, and normal queue-drained exit using
+  `use_preparation` and `run()`.
 
-The ordinary Chess executable has deterministic offline tests and a
-credential-free help path:
+## Deterministic Tests
+
+Test implementations and fixtures live under `tests/`, rather than being a
+runtime provider choice in the examples. Examples with deterministic behavioral
+coverage can be run without API credentials:
+
+```bash
+cargo test --no-default-features --example frame_agent
+cargo test --no-default-features --example frame_plugin
+cargo test --no-default-features --example signal_reaction
+cargo test --no-default-features --example support_preparation
+cargo test --no-default-features --test component_runtime_visual_acceptance
+```
+
+The ordinary Chess executable uses a live provider and Stockfish. Its
+deterministic tests and credential-free check/help paths are:
 
 ```bash
 cargo test --no-default-features --example chess_agentview
@@ -246,34 +321,38 @@ owns legal moves, retries, terminal decisions, and turn policy; a retained
 `use_coroutine` owns Stockfish, and `use_preparation` waits for its work before
 the next model turn. One strict multi-element streaming
 contract requires a nonempty `thought` before one `choose_move` or `resign`;
-the thin `ChessApplication` driver awaits `reactor.run()`.
+the top-level `play_chess` function mounts and runs the `Application`, then
+waits for Stockfish cleanup before consuming it with `shutdown()`.
 The Component owns preparation and requests normal exit after terminal engine
-cleanup. Offline verification uses reducer, scripted
-port, and fake-UCI fixtures without an API key or installed Stockfish.
+cleanup. Its test coverage uses reducer, scripted-provider, and fake-UCI
+fixtures outside the runnable example.
 
-## Paid Chess Runs
+## Live Chess Runs
 
-The readable application example makes paid model requests and starts
-Stockfish:
+The readable application example makes live model requests and starts
+Stockfish. Configure `OPENAI_API_KEY`, the optional provider/model settings,
+and an absolute `AGENTVIEW_STOCKFISH_BIN` when Stockfish is not installed at
+`/usr/games/stockfish`:
 
 ```bash
+export AGENTVIEW_STOCKFISH_BIN=/absolute/path/to/stockfish
 cargo run --no-default-features --example chess_agentview
 ```
 
-Configure `OPENAI_API_KEY` and the optional provider/model/Stockfish variables
-first. The ordinary example also accepts optional ply, engine-node, and engine
-timeout limits.
-
-Run the separate production-evidence harness when JSONL, usage correlation,
-deadlines, cleanup arbitration, and post-terminal validation are required:
+The separate production-evidence target contains deterministic coverage and an
+ignored live game test for JSONL, usage correlation, deadlines, cleanup
+arbitration, and post-terminal validation:
 
 ```bash
-cargo run --no-default-features --example chess_agentview_live_acceptance
+cargo test --no-default-features --test chess_agentview_live_acceptance
+# Intentionally execute the live game after configuring credentials and Stockfish:
+cargo test --no-default-features --test chess_agentview_live_acceptance -- --ignored --exact live_acceptance
 ```
 
 See [`docs/chess-runtime-target.md`](docs/chess-runtime-target.md) for the exact
 environment variables, ownership boundary, UCI lifecycle, and evidence
-contract. Neither paid command is part of credential-free validation.
+contract. Of these acceptance-test commands, only the ignored test sends live
+Chess requests.
 
 ## Compatibility
 

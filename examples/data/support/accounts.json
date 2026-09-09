@@ -1,0 +1,12 @@
+[
+  {
+    "id": "acct-1042",
+    "plan": "Team",
+    "export_retention_days": 30
+  },
+  {
+    "id": "acct-2050",
+    "plan": "Starter",
+    "export_retention_days": 7
+  }
+]

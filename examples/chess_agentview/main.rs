@@ -1,5 +1,9 @@
 use std::process::ExitCode;
 
+use agentview::component::execution::{Application, ApplicationFault, ReactionPort};
+use anyhow::Context as _;
+use tokio::sync::watch;
+
 mod application_state;
 mod chess_action;
 mod chess_action_component;
@@ -8,15 +12,9 @@ mod chess_draw_state;
 mod live_provider;
 mod uci;
 
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "the shared scripted provider exposes cases used by other example tests"
-)]
-#[path = "../support/scripted_provider.rs"]
-mod scripted_provider;
-
-use chess_application::{outcome_name, ChessApplication};
+use chess_application::{
+    chess_application, outcome_name, stop_stockfish, ChessConfig, ChessResult,
+};
 use live_provider::LiveConfig;
 
 #[tokio::main]
@@ -45,8 +43,7 @@ async fn run() -> anyhow::Result<()> {
     let provider = live.build_provider()?;
     let config = live.application_config()?;
 
-    let application = ChessApplication::mount(config, provider)?;
-    let result = application.run().await?;
+    let result = play_chess(config, provider).await?;
 
     println!("outcome={}", outcome_name(&result.outcome));
     println!("final_fen={}", result.final_board);
@@ -62,8 +59,70 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn play_chess(
+    config: ChessConfig,
+    provider: impl ReactionPort,
+) -> anyhow::Result<ChessResult> {
+    let (stop, stop_receiver) = watch::channel(false);
+    let (result_sender, result_receiver) = watch::channel(None);
+    let (cleanup_sender, mut cleanup_receiver) = watch::channel(None);
+    let mut application = Application::mount(
+        move || {
+            chess_application(
+                config.clone(),
+                stop_receiver.clone(),
+                result_sender.clone(),
+                cleanup_sender.clone(),
+            )
+        },
+        provider,
+    )?;
+
+    let result = application
+        .run()
+        .await
+        .context("Chess model reaction failed")
+        .and_then(|_| {
+            result_receiver
+                .borrow()
+                .clone()
+                .context("Chess application exited before producing a terminal result")
+        });
+    // Await UCI cleanup before shutdown aborts the component-owned coroutine.
+    let cleanup = stop_stockfish(&stop, &mut cleanup_receiver).await;
+    let shutdown = application.shutdown().await;
+    finish_run(result, cleanup, shutdown)
+}
+
+fn finish_run(
+    result: anyhow::Result<ChessResult>,
+    actor_cleanup: anyhow::Result<()>,
+    application_shutdown: Result<(), ApplicationFault>,
+) -> anyhow::Result<ChessResult> {
+    match result {
+        Ok(result) => {
+            actor_cleanup.context("Chess actor cleanup failed")?;
+            application_shutdown.context("Application shutdown failed")?;
+            Ok(result)
+        }
+        Err(operation) => {
+            if let Err(cleanup) = actor_cleanup {
+                anyhow::bail!(
+                    "Chess operation failed ({operation:#}); Chess actor cleanup also failed ({cleanup:#})"
+                );
+            }
+            if let Err(shutdown) = application_shutdown {
+                anyhow::bail!(
+                    "Chess operation failed ({operation:#}); Application shutdown also failed ({shutdown})"
+                );
+            }
+            Err(operation)
+        }
+    }
+}
+
 fn load_dotenv() -> anyhow::Result<()> {
-    match dotenvy::dotenv() {
+    match dotenvy::dotenv_override() {
         Ok(_) => Ok(()),
         Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
