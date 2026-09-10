@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc, Mutex},
     task::Poll,
 };
 
@@ -23,8 +23,7 @@ use crate::{
 };
 
 use super::{
-    AsyncOpenAiResponsesProvider, NativeToolLedger, OpenAiWireEvent, ResponsesExecutionMode,
-    ResponsesReactionTarget, SseWireLimiter, declaration_state_lost_fault, exceeds_limit,
+    declaration_state_lost_fault, exceeds_limit,
     frame_request::{
         PreparedResponsesFrameRequest, PrivateOutputKind, ResponsesFrameRequestFault,
         ResponsesFrameRequestState,
@@ -34,9 +33,15 @@ use super::{
     has_unsupported_content_part, has_unsupported_lifecycle_item, is_native_tool_event,
     native_function_call,
     output::{OpenAiOutputLedger, SealedOpenAiPrivateOutput},
-    reaction_fault::{OpenAiFailureClass, OpenAiReactionFailure, map_openai_fault},
+    reaction_fault::{map_openai_fault, OpenAiFailureClass, OpenAiReactionFailure},
+    responses_observation::{
+        capture_error_response, observation_fault, observe_facts, CapturedResponse,
+        OpenAiResponsesObservation,
+    },
     sse_event_size,
-    usage::{ResponseUsageObserver, observe_response_usage, validated_response_usage},
+    usage::{observe_response_usage, validated_response_usage, ResponseUsageObserver},
+    AsyncOpenAiResponsesProvider, NativeToolLedger, OpenAiWireEvent, ResponsesExecutionMode,
+    ResponsesReactionTarget, SseWireLimiter,
 };
 
 #[async_trait]
@@ -76,6 +81,24 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                     format!("request build failed: {error:?}"),
                 )
             })?;
+
+        if let Some(observer) = &self.observer {
+            observer
+                .observe(OpenAiResponsesObservation::Request {
+                    path: request.url().path().to_owned(),
+                    body: prepared.request_body.clone(),
+                })
+                .await
+                .map_err(|_| {
+                    self.observation_failed.store(true, Ordering::Release);
+                    SubmitFault::Rejected(observation_fault())
+                })?;
+        }
+        let observer = self.observer.clone();
+        let observation_failed = self.observation_failed.clone();
+        let capture = Arc::new(Mutex::new(CapturedResponse::default()));
+        let stream_capture = capture.clone();
+        let capture_enabled = observer.is_some();
 
         let client = self.client.clone();
         let execution_mode = &mut self.execution_mode;
@@ -142,7 +165,20 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             };
 
             let status = response.status();
+            stream_capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status = Some(status.as_u16());
             if !status.is_success() {
+                if capture_enabled {
+                    capture_error_response(
+                        response,
+                        &stream_capture,
+                        read_timeout,
+                        max_response_body_bytes,
+                    )
+                    .await;
+                }
                 return continuity.fail(map_openai_fault(&OpenAiReactionFailure::http_status(
                     status,
                 )));
@@ -156,6 +192,15 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                     media_type.trim().eq_ignore_ascii_case("text/event-stream")
                 });
             if !is_event_stream {
+                if capture_enabled {
+                    capture_error_response(
+                        response,
+                        &stream_capture,
+                        read_timeout,
+                        max_response_body_bytes,
+                    )
+                    .await;
+                }
                 return continuity.fail(port_fault(
                     OpenAiFailureClass::ResponseProtocolRetryable,
                     "successful response did not use text/event-stream",
@@ -175,6 +220,15 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             let response_stream = response.bytes_stream().map(move |chunk| {
                 let chunk = chunk
                     .map_err(|error| NativeBodyStreamFault::Transport(format!("{error:?}")))?;
+                if capture_enabled {
+                    let mut captured = stream_capture
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let remaining = max_response_body_bytes.saturating_sub(captured.body.len());
+                    captured
+                        .body
+                        .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                }
                 let next_size = response_body_bytes
                     .checked_add(chunk.len())
                     .ok_or(NativeBodyStreamFault::BodyLimit)?;
@@ -224,7 +278,12 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             Box::pin(futures::stream::unfold(state, next_native_fact)) as ProviderFactStream<'a>
         };
 
-        Ok(Box::pin(futures::stream::once(pending).flatten()))
+        Ok(observe_facts(
+            Box::pin(futures::stream::once(pending).flatten()),
+            observer,
+            capture,
+            observation_failed,
+        ))
     }
 }
 
@@ -252,6 +311,9 @@ impl ResettableReactionPort for AsyncOpenAiResponsesProvider {
 
 impl AsyncOpenAiResponsesProvider {
     fn frame_native_declaration(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+        if self.observation_failed.load(Ordering::Acquire) {
+            return Err(observation_fault());
+        }
         self.ensure_frame_native_mode()?;
         let declaration = self.reaction_target.declaration()?;
         if let Err(fault) = validate_native_frame_state(&declaration, self.reaction_frame.as_ref())
@@ -973,18 +1035,21 @@ fn upstream_rejected(diagnostic: impl Into<String>) -> ReactionPortFault {
 mod tests {
     use std::{
         collections::{BTreeMap, VecDeque},
-        num::{NonZeroU64, NonZeroU128},
-        sync::Arc,
+        num::{NonZeroU128, NonZeroU64},
+        sync::{Arc, Mutex},
         task::Poll,
     };
 
+    use crate::provider::async_openai::{
+        OpenAiResponsesObservation, OpenAiResponsesObservationError, OpenAiResponsesObserver,
+    };
     use axum::{
-        Router,
         body::Body,
         extract::State,
-        http::{Response, StatusCode, header},
+        http::{header, Response, StatusCode},
         response::IntoResponse,
         routing::post,
+        Router,
     };
     use eventsource_stream::EventStreamError;
     use futures::StreamExt;
@@ -1001,7 +1066,6 @@ mod tests {
     use crate::component::execution::{RenderedProjection, RenderedProjectionNode};
     use crate::{
         component::execution::{
-            ProviderIdentity,
             reaction::{
                 Frame, FrameBasis, FrameRevision, FrameSubmission, ProjectionSubmission,
                 ProviderFact, ProviderOutputKey, ProviderToolCall, ReactionPort,
@@ -1009,6 +1073,7 @@ mod tests {
                 ResettableReactionPort, SubmitFault, TargetContinuity, TargetDeclaration,
                 TargetEpoch, ToolCatalog,
             },
+            ProviderIdentity,
         },
         provider::{
             async_openai::{AsyncOpenAiResponsesProvider, AsyncOpenAiTransportConfig},
@@ -1035,6 +1100,143 @@ mod tests {
         let options = CodexHttpV1Options::new("test-model", None, None, None::<String>).unwrap();
         AsyncOpenAiResponsesProvider::try_new(config, identity, CodexHttpV1Encoder::new(options))
             .unwrap()
+    }
+
+    #[derive(Default)]
+    struct Audit {
+        events: Mutex<Vec<OpenAiResponsesObservation>>,
+        reject_request: bool,
+        reject_response: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl OpenAiResponsesObserver for Audit {
+        async fn observe(
+            &self,
+            event: OpenAiResponsesObservation,
+        ) -> Result<(), OpenAiResponsesObservationError> {
+            let reject = matches!(event, OpenAiResponsesObservation::Request { .. })
+                && self.reject_request
+                || matches!(event, OpenAiResponsesObservation::Response { .. })
+                    && self.reject_response;
+            self.events.lock().unwrap().push(event);
+            if reject {
+                Err(OpenAiResponsesObservationError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_observation_preserves_bodies_and_precedes_reaction_completion() {
+        let body = completed_text_sse();
+        let (base, shutdown, server) = spawn_sse_server(body.clone()).await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = provider(&base, None).with_observer(audit.clone());
+        let frame = full_frame(&provider.declare().unwrap());
+        let mut facts = provider.submit(frame).await.unwrap();
+        while let Some(fact) = facts.next().await {
+            if matches!(fact, Ok(ProviderFact::ReactionCompleted { .. })) {
+                assert_eq!(audit.events.lock().unwrap().len(), 2);
+            }
+            assert!(fact.is_ok());
+        }
+        drop(facts);
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], OpenAiResponsesObservation::Request { path, body }
+            if path == "/responses" && serde_json::from_slice::<serde_json::Value>(body).unwrap()["model"] == "test-model")
+        );
+        assert!(
+            matches!(&events[1], OpenAiResponsesObservation::Response { status: 200, body: captured, completed: true }
+            if captured == body.as_bytes())
+        );
+        drop(events);
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_observation_failure_rejects_before_transport() {
+        let mut provider = provider("http://127.0.0.1:1", None).with_observer(Arc::new(Audit {
+            reject_request: true,
+            ..Audit::default()
+        }));
+        let frame = full_frame(&provider.declare().unwrap());
+        assert!(matches!(
+            provider.submit(frame).await,
+            Err(SubmitFault::Rejected(_))
+        ));
+        assert_eq!(
+            provider.declare().unwrap_err().kind(),
+            ReactionPortFaultKind::Terminal
+        );
+    }
+
+    #[tokio::test]
+    async fn response_observation_failure_keeps_native_output_order_but_blocks_completion() {
+        let (base, shutdown, server) = spawn_sse_server(completed_text_sse()).await;
+        let mut provider = provider(&base, None).with_observer(Arc::new(Audit {
+            reject_response: true,
+            ..Audit::default()
+        }));
+        let frame = full_frame(&provider.declare().unwrap());
+        let facts: Vec<_> = provider.submit(frame).await.unwrap().collect().await;
+        assert!(facts
+            .iter()
+            .any(|fact| matches!(fact, Ok(ProviderFact::TextSealed { .. }))));
+        assert!(!facts
+            .iter()
+            .any(|fact| matches!(fact, Ok(ProviderFact::ReactionCompleted { .. }))));
+        assert!(facts.iter().any(Result::is_err));
+        assert_eq!(
+            provider.declare().unwrap_err().kind(),
+            ReactionPortFaultKind::Terminal
+        );
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retryable_http_failure_records_raw_body_and_error() {
+        let body = r#"{"error":{"message":"busy"}}"#;
+        let (base, shutdown, server) = spawn_response_server(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            body.into(),
+        )
+        .await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = provider(&base, None).with_observer(audit.clone());
+        let first = provider.declare().unwrap();
+        let facts: Vec<_> = provider
+            .submit(full_frame(&first))
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(
+            matches!(facts.as_slice(), [Err(fault)] if fault.kind() == ReactionPortFaultKind::Retryable)
+        );
+        assert!(
+            provider.declare().unwrap().continuity().epoch().get()
+                > first.continuity().epoch().get()
+        );
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(&events[1], OpenAiResponsesObservation::Response { status: 429, body: captured, completed: false }
+            if captured == body.as_bytes())
+        );
+        assert!(matches!(
+            &events[2],
+            OpenAiResponsesObservation::Error { .. }
+        ));
+        drop(events);
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
     }
 
     fn full_frame(declaration: &TargetDeclaration) -> Frame {

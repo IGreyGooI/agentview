@@ -18,9 +18,7 @@ use crate::{
     },
 };
 
-use super::OpenAiChatCompletionsError;
-#[cfg(feature = "legacy-provider-port")]
-use super::OpenAiChatCompletionsOptions;
+use super::{OpenAiChatCompletionsError, OpenAiChatCompletionsOptions};
 
 #[cfg(feature = "legacy-provider-port")]
 #[derive(Clone)]
@@ -132,7 +130,7 @@ impl ChatHistory {
         )?;
         let candidate_epoch = candidate.history_epoch;
         let request_body = encode_request(
-            options.model(),
+            options,
             &candidate.wire_messages,
             max_serialized_request_body_bytes,
         )?;
@@ -237,6 +235,17 @@ struct ChatRequest<'a> {
     messages: &'a [ChatMessage],
     stream: bool,
     tool_choice: ToolChoice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<&'a serde_json::Number>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ChatStreamOptions>,
+}
+
+#[derive(Clone, Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -405,15 +414,20 @@ pub(super) fn lower_item(
 }
 
 pub(super) fn encode_request(
-    model: &str,
+    options: &OpenAiChatCompletionsOptions,
     messages: &[ChatMessage],
     max_serialized_request_body_bytes: usize,
 ) -> Result<Vec<u8>, OpenAiChatCompletionsError> {
     let request_body = serde_json::to_vec(&ChatRequest {
-        model,
+        model: options.model(),
         messages,
         stream: true,
         tool_choice: ToolChoice::None,
+        max_tokens: options.max_tokens,
+        temperature: options.temperature.as_ref(),
+        stream_options: options.include_usage.then_some(ChatStreamOptions {
+            include_usage: true,
+        }),
     })?;
     if request_body.len() > max_serialized_request_body_bytes {
         return Err(OpenAiChatCompletionsError::SerializedRequestBodyLimit);

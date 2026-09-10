@@ -51,12 +51,9 @@ impl ChatFrameRequestState {
             wire_messages.extend(lower_item(item).map_err(ChatFrameRequestFault::Lowering)?);
         }
 
-        let request_body = encode_request(
-            options.model(),
-            &wire_messages,
-            max_serialized_request_body_bytes,
-        )
-        .map_err(ChatFrameRequestFault::Lowering)?;
+        let request_body =
+            encode_request(options, &wire_messages, max_serialized_request_body_bytes)
+                .map_err(ChatFrameRequestFault::Lowering)?;
         Ok(PreparedChatFrameRequest {
             request_body,
             state: Self {

@@ -106,6 +106,7 @@ pub struct CodexHttpV1Options {
     reasoning: Option<CodexReasoning>,
     prompt_cache_key: Option<String>,
     max_output_tokens: Option<u32>,
+    temperature: Option<f64>,
     context_management: bool,
     explicit_assistant_status: bool,
 }
@@ -137,6 +138,7 @@ impl CodexHttpV1Options {
             reasoning,
             prompt_cache_key,
             max_output_tokens: None,
+            temperature: None,
             context_management: true,
             explicit_assistant_status: false,
         })
@@ -151,6 +153,16 @@ impl CodexHttpV1Options {
             return Err(CodexHttpV1Error::ZeroMaxOutputTokens);
         }
         self.max_output_tokens = Some(max_output_tokens);
+        Ok(self)
+    }
+
+    /// Sets sampling temperature for endpoints and models supporting it.
+    /// The default omits this optional field for reasoning-model compatibility.
+    pub fn with_temperature(mut self, temperature: f64) -> Result<Self, CodexHttpV1Error> {
+        if !(0.0..=2.0).contains(&temperature) {
+            return Err(CodexHttpV1Error::InvalidTemperature);
+        }
+        self.temperature = Some(temperature);
         Ok(self)
     }
 
@@ -181,6 +193,8 @@ pub struct CodexHttpV1Request {
     model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "String::is_empty")]
     instructions: String,
     input: Vec<CodexInputItem>,
@@ -203,6 +217,8 @@ struct CodexHttpV1WireRequest<'a> {
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "str::is_empty")]
     instructions: &'a str,
     input: &'a [Value],
@@ -229,6 +245,7 @@ impl<'a> CodexHttpV1WireRequest<'a> {
         Self {
             model: &request.model,
             max_output_tokens: request.max_output_tokens,
+            temperature: request.temperature,
             instructions,
             input,
             tools: request.tools.as_deref(),
@@ -607,6 +624,7 @@ impl CodexHttpV1Encoder {
         CodexHttpV1Request {
             model: self.options.model.clone(),
             max_output_tokens: self.options.max_output_tokens,
+            temperature: self.options.temperature,
             instructions: history.instructions,
             input: history.input,
             tools,
@@ -923,6 +941,8 @@ pub enum CodexHttpV1Error {
     EmptyPromptCacheKey,
     #[error("Codex max output tokens must be positive when configured")]
     ZeroMaxOutputTokens,
+    #[error("Responses temperature must be finite and between zero and two")]
+    InvalidTemperature,
     #[error("codex-http-v1 accepts at most one System instruction")]
     MultipleSystemInstructions,
     #[error("legacy codex-http-v1 history cannot encode interrupted assistant text")]
@@ -1018,16 +1038,20 @@ mod tests {
             .unwrap();
         let default_public: Value = serde_json::to_value(default_public).unwrap();
         assert!(default_public.get("max_output_tokens").is_none());
+        assert!(default_public.get("temperature").is_none());
         let default_native = default_encoder
             .encode_frame_request_bounded(&[], "", &[], usize::MAX)
             .unwrap();
         let default_native: Value = serde_json::from_slice(&default_native).unwrap();
         assert!(default_native.get("max_output_tokens").is_none());
+        assert!(default_native.get("temperature").is_none());
 
         let configured_encoder = CodexHttpV1Encoder::new(
             CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)
                 .unwrap()
                 .with_max_output_tokens(1_024)
+                .unwrap()
+                .with_temperature(0.2)
                 .unwrap(),
         );
         let configured_public = configured_encoder
@@ -1035,11 +1059,13 @@ mod tests {
             .unwrap();
         let configured_public: Value = serde_json::to_value(configured_public).unwrap();
         assert_eq!(configured_public["max_output_tokens"], json!(1_024));
+        assert_eq!(configured_public["temperature"], json!(0.2));
         let configured_native = configured_encoder
             .encode_frame_request_bounded(&[], "", &[], usize::MAX)
             .unwrap();
         let configured_native: Value = serde_json::from_slice(&configured_native).unwrap();
         assert_eq!(configured_native["max_output_tokens"], json!(1_024));
+        assert_eq!(configured_native["temperature"], json!(0.2));
     }
 
     #[test]
@@ -1050,6 +1076,18 @@ mod tests {
                 .with_max_output_tokens(0),
             Err(CodexHttpV1Error::ZeroMaxOutputTokens)
         ));
+    }
+
+    #[test]
+    fn temperature_rejects_nonfinite_and_out_of_range_values() {
+        for temperature in [f64::NAN, f64::INFINITY, -0.1, 2.1] {
+            assert!(matches!(
+                CodexHttpV1Options::new("test-model", None, None, None::<String>)
+                    .unwrap()
+                    .with_temperature(temperature),
+                Err(CodexHttpV1Error::InvalidTemperature)
+            ));
+        }
     }
 
     #[test]

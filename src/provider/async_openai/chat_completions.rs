@@ -2,7 +2,10 @@
 use std::{future::Future, task::Poll};
 use std::{
     num::{NonZeroU128, NonZeroU64},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -59,6 +62,9 @@ use super::{
 mod frame_request;
 mod history;
 mod native_reaction;
+mod observation;
+
+pub use observation::{OpenAiChatObservation, OpenAiChatObservationError, OpenAiChatObserver};
 
 #[cfg(feature = "legacy-provider-port")]
 use history::{ChatDiffMemo, ChatHistory, PreparedChatHistory};
@@ -70,6 +76,9 @@ static NEXT_CHAT_TARGET_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAiChatCompletionsOptions {
     model: String,
+    max_tokens: Option<u64>,
+    temperature: Option<serde_json::Number>,
+    include_usage: bool,
 }
 
 impl OpenAiChatCompletionsOptions {
@@ -78,7 +87,40 @@ impl OpenAiChatCompletionsOptions {
         if model.is_empty() {
             return Err(OpenAiChatCompletionsError::EmptyModel);
         }
-        Ok(Self { model })
+        Ok(Self {
+            model,
+            max_tokens: None,
+            temperature: None,
+            include_usage: false,
+        })
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: u64) -> Result<Self, OpenAiChatCompletionsError> {
+        if max_tokens == 0 {
+            return Err(OpenAiChatCompletionsError::ZeroMaxTokens);
+        }
+        self.max_tokens = Some(max_tokens);
+        Ok(self)
+    }
+
+    pub fn with_temperature(
+        mut self,
+        temperature: f64,
+    ) -> Result<Self, OpenAiChatCompletionsError> {
+        if !(0.0..=2.0).contains(&temperature) {
+            return Err(OpenAiChatCompletionsError::InvalidTemperature);
+        }
+        self.temperature = Some(
+            serde_json::Number::from_f64(temperature)
+                .ok_or(OpenAiChatCompletionsError::InvalidTemperature)?,
+        );
+        Ok(self)
+    }
+
+    /// Requests the optional final usage chunk from compatible gateways.
+    pub fn with_usage(mut self, include_usage: bool) -> Self {
+        self.include_usage = include_usage;
+        self
     }
 
     fn model(&self) -> &str {
@@ -103,6 +145,8 @@ pub struct AsyncOpenAiChatCompletionsProvider {
     execution_mode: ChatExecutionMode,
     reaction_target: ChatReactionTarget,
     reaction_frame: Option<frame_request::ChatFrameRequestState>,
+    observer: Option<Arc<dyn OpenAiChatObserver>>,
+    observation_failed: Arc<AtomicBool>,
 }
 
 impl AsyncOpenAiChatCompletionsProvider {
@@ -142,11 +186,20 @@ impl AsyncOpenAiChatCompletionsProvider {
             execution_mode: ChatExecutionMode::Unclaimed,
             reaction_target,
             reaction_frame: None,
+            observer: None,
+            observation_failed: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub fn identity(&self) -> &ProviderIdentity {
         &self.identity
+    }
+
+    /// Observes exact bodies, without credentials or HTTP headers, on the native
+    /// ReactionPort path. A failed observation prevents successful completion.
+    pub fn with_observer(mut self, observer: Arc<dyn OpenAiChatObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     fn ensure_frame_native_mode(&self) -> Result<(), ReactionPortFault> {
@@ -421,16 +474,6 @@ impl AsyncOpenAiChatCompletionsProvider {
                             state,
                         ));
                     }
-                    if state.finish_seen {
-                        state.finished = true;
-                        return Some((
-                            Err(ProviderFault::model_rejected(
-                                "Chat Completions emitted a frame after the terminal choice",
-                            )
-                            .with_code(ProviderFaultCode::ResponseProtocol)),
-                            state,
-                        ));
-                    }
                     let frame = match serde_json::from_str::<ChatWireChunk>(&event.data) {
                         Ok(frame) => frame,
                         Err(_) => {
@@ -661,7 +704,7 @@ fn validate_frame<S>(
     if frame.id.is_empty()
         || frame.model.is_empty()
         || frame.object != "chat.completion.chunk"
-        || frame.choices.len() != 1
+        || (frame.choices.len() != 1 && !(frame.choices.is_empty() && frame.usage.is_some()))
     {
         return Err(invalid_lifecycle());
     }
@@ -674,6 +717,16 @@ fn validate_frame<S>(
         Some(model) if model != &frame.model => return Err(invalid_lifecycle()),
         None => state.response_model = Some(frame.model),
         _ => {}
+    }
+
+    if frame.choices.is_empty() && state.finish_seen {
+        return Ok(None);
+    }
+    if state.finish_seen {
+        return Err(ProviderFault::model_rejected(
+            "Chat Completions emitted a frame after the terminal choice",
+        )
+        .with_code(ProviderFaultCode::ResponseProtocol));
     }
 
     let choice = frame
@@ -736,6 +789,7 @@ struct ChatWireChunk {
     object: String,
     model: String,
     choices: Vec<ChatWireChoice>,
+    usage: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -759,6 +813,10 @@ struct ChatWireDelta {
 pub enum OpenAiChatCompletionsError {
     #[error("Chat Completions model must be non-empty")]
     EmptyModel,
+    #[error("Chat Completions max_tokens must be greater than zero")]
+    ZeroMaxTokens,
+    #[error("Chat Completions temperature must be finite and between zero and two")]
+    InvalidTemperature,
     #[error(
         "Chat Completions does not accept provider extension {provider}/{capability}@{schema_version}"
     )]
@@ -798,6 +856,24 @@ mod frame_profile_tests {
 
     fn config() -> AsyncOpenAiTransportConfig {
         AsyncOpenAiTransportConfig::new("http://127.0.0.1:1/v1", "test-token").unwrap()
+    }
+
+    #[test]
+    fn temperature_rejects_nonfinite_or_out_of_range_values() {
+        for temperature in [f64::NAN, f64::INFINITY, -0.1, 2.1] {
+            assert!(matches!(
+                OpenAiChatCompletionsOptions::new("test-model")
+                    .unwrap()
+                    .with_temperature(temperature),
+                Err(OpenAiChatCompletionsError::InvalidTemperature)
+            ));
+        }
+        for temperature in [0.0, 0.2, 2.0] {
+            assert!(OpenAiChatCompletionsOptions::new("test-model")
+                .unwrap()
+                .with_temperature(temperature)
+                .is_ok());
+        }
     }
 
     fn provider(config: AsyncOpenAiTransportConfig) -> AsyncOpenAiChatCompletionsProvider {

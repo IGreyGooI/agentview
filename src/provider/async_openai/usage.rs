@@ -16,6 +16,8 @@ pub(super) type ResponseUsageObserver = dyn Fn(OpenAiResponsesUsage) + Send + Sy
 pub struct OpenAiResponsesUsage {
     input_tokens: Option<u64>,
     cached_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
 }
 
 impl OpenAiResponsesUsage {
@@ -27,6 +29,14 @@ impl OpenAiResponsesUsage {
     /// Returns the provider-reported cached input token count when present.
     pub fn cached_tokens(self) -> Option<u64> {
         self.cached_tokens
+    }
+
+    pub fn output_tokens(self) -> Option<u64> {
+        self.output_tokens
+    }
+
+    pub fn total_tokens(self) -> Option<u64> {
+        self.total_tokens
     }
 }
 
@@ -76,6 +86,8 @@ pub(super) fn validated_response_usage(
     Ok(OpenAiResponsesUsage {
         input_tokens: Some(input_tokens),
         cached_tokens,
+        output_tokens,
+        total_tokens,
     })
 }
 
@@ -83,6 +95,8 @@ fn unreported_usage() -> OpenAiResponsesUsage {
     OpenAiResponsesUsage {
         input_tokens: None,
         cached_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
     }
 }
 

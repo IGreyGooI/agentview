@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     num::{NonZeroU128, NonZeroU64},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -74,6 +74,7 @@ mod frame_request;
 mod native_reaction;
 mod output;
 mod reaction_fault;
+mod responses_observation;
 mod transport;
 mod usage;
 
@@ -81,6 +82,7 @@ mod usage;
 use self::artifact_binding::OpenAiInlineArtifactBinding;
 pub use self::chat_completions::{
     AsyncOpenAiChatCompletionsProvider, OpenAiChatCompletionsError, OpenAiChatCompletionsOptions,
+    OpenAiChatObservation, OpenAiChatObservationError, OpenAiChatObserver,
     OPENAI_CHAT_COMPLETIONS_PROFILE,
 };
 use self::faults::{
@@ -96,6 +98,9 @@ use self::faults::{
     serialized_request_body_limit_fault, stream_error_code, stream_event_limit_fault,
     stream_transport_fault, unsupported_content_part_fault, unsupported_output_item_fault,
     unsupported_reasoning_content_fault, OpenAiApi, ResponseEventReason,
+};
+pub use self::responses_observation::{
+    OpenAiResponsesObservation, OpenAiResponsesObservationError, OpenAiResponsesObserver,
 };
 pub use self::usage::OpenAiResponsesUsage;
 
@@ -377,6 +382,8 @@ pub struct AsyncOpenAiResponsesProvider {
     #[cfg(feature = "legacy-provider-port")]
     tool_outputs: Arc<Mutex<ToolOutputStaging>>,
     response_usage_observer: Option<Arc<ResponseUsageObserver>>,
+    observer: Option<Arc<dyn OpenAiResponsesObserver>>,
+    observation_failed: Arc<AtomicBool>,
     execution_mode: ResponsesExecutionMode,
     reaction_target: ResponsesReactionTarget,
     reaction_frame: Option<frame_request::ResponsesFrameRequestState>,
@@ -573,6 +580,8 @@ impl AsyncOpenAiResponsesProvider {
             #[cfg(feature = "legacy-provider-port")]
             tool_outputs: Arc::new(Mutex::new(ToolOutputStaging::default())),
             response_usage_observer: None,
+            observer: None,
+            observation_failed: Arc::new(AtomicBool::new(false)),
             execution_mode: ResponsesExecutionMode::Unclaimed,
             reaction_target,
             reaction_frame: None,
@@ -581,6 +590,13 @@ impl AsyncOpenAiResponsesProvider {
 
     pub fn identity(&self) -> &ProviderIdentity {
         &self.identity
+    }
+
+    /// Observes exact bodies on the native ReactionPort path without exposing
+    /// credentials or HTTP headers. Failure prevents successful completion.
+    pub fn with_observer(mut self, observer: Arc<dyn OpenAiResponsesObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Observes validated terminal usage without adding provider accounting to ProviderPort events.

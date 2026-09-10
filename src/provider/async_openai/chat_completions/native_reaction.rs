@@ -1,6 +1,10 @@
 //! Frame-native `ReactionPort` implementation for OpenAI Chat Completions.
 
-use std::{future::Future, task::Poll};
+use std::{
+    future::Future,
+    sync::{atomic::Ordering, Arc, Mutex},
+    task::Poll,
+};
 
 use ::async_openai::config::Config;
 use async_trait::async_trait;
@@ -10,9 +14,12 @@ use serde_json::Value;
 
 use crate::component::execution::reaction::{
     Frame, ProviderFact, ProviderFactStream, ProviderOutputKey, ReactionPort, ReactionPortFault,
-    SubmitFault, TargetContinuity, TargetDeclaration,
+    ResettableReactionPort, SubmitFault, TargetContinuity, TargetDeclaration,
 };
 
+use super::observation::{
+    observation_fault, observe_facts, CapturedResponse, OpenAiChatObservation, ResponseCapture,
+};
 use super::{
     exceeds_limit,
     frame_request::{ChatFrameRequestFault, ChatFrameRequestState, PreparedChatFrameRequest},
@@ -61,6 +68,24 @@ impl ReactionPort for AsyncOpenAiChatCompletionsProvider {
                     format!("native Chat request build failed: {error:?}"),
                 )
             })?;
+
+        if let Some(observer) = &self.observer {
+            observer
+                .observe(OpenAiChatObservation::Request {
+                    path: request.url().path().to_owned(),
+                    body: prepared.request_body.clone(),
+                })
+                .await
+                .map_err(|_| {
+                    self.observation_failed.store(true, Ordering::Release);
+                    SubmitFault::Rejected(observation_fault())
+                })?;
+        }
+        let observer = self.observer.clone();
+        let observation_failed = self.observation_failed.clone();
+        let capture = Arc::new(Mutex::new(CapturedResponse::default()));
+        let stream_capture = capture.clone();
+        let capture_enabled = observer.is_some();
 
         let client = self.client.clone();
         let execution_mode = &mut self.execution_mode;
@@ -129,7 +154,20 @@ impl ReactionPort for AsyncOpenAiChatCompletionsProvider {
             };
 
             let status = response.status();
+            stream_capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status = Some(status.as_u16());
             if !status.is_success() {
+                if capture_enabled {
+                    capture_error_response(
+                        response,
+                        &stream_capture,
+                        read_timeout,
+                        max_response_body_bytes,
+                    )
+                    .await;
+                }
                 return continuity.fail(map_openai_fault(&OpenAiReactionFailure::http_status(
                     status,
                 )));
@@ -143,6 +181,15 @@ impl ReactionPort for AsyncOpenAiChatCompletionsProvider {
                     media_type.trim().eq_ignore_ascii_case("text/event-stream")
                 });
             if !is_event_stream {
+                if capture_enabled {
+                    capture_error_response(
+                        response,
+                        &stream_capture,
+                        read_timeout,
+                        max_response_body_bytes,
+                    )
+                    .await;
+                }
                 return continuity.fail(port_fault(
                     OpenAiFailureClass::ResponseProtocolRetryable,
                     "successful Chat response did not use text/event-stream",
@@ -159,9 +206,19 @@ impl ReactionPort for AsyncOpenAiChatCompletionsProvider {
 
             let mut response_body_bytes = 0_usize;
             let mut sse_wire_limiter = SseWireLimiter::new(max_sse_event_bytes);
+            let body_capture = stream_capture.clone();
             let response_stream = response.bytes_stream().map(move |chunk| {
                 let chunk = chunk
                     .map_err(|error| NativeChatBodyStreamFault::Transport(format!("{error:?}")))?;
+                if capture_enabled {
+                    let mut captured = body_capture
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let remaining = max_response_body_bytes.saturating_sub(captured.body.len());
+                    captured
+                        .body
+                        .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                }
                 let next_size = response_body_bytes
                     .checked_add(chunk.len())
                     .ok_or(NativeChatBodyStreamFault::BodyLimit)?;
@@ -195,17 +252,47 @@ impl ReactionPort for AsyncOpenAiChatCompletionsProvider {
                 read_timeout,
                 max_sse_event_bytes,
                 max_output_text_bytes,
+                capture: stream_capture,
             };
             Box::pin(futures::stream::unfold(state, next_native_chat_fact))
                 as ProviderFactStream<'a>
         };
 
-        Ok(Box::pin(futures::stream::once(pending).flatten()))
+        Ok(observe_facts(
+            Box::pin(futures::stream::once(pending).flatten()),
+            observer,
+            capture,
+            observation_failed,
+        ))
+    }
+}
+
+async fn capture_error_response(
+    response: reqwest::Response,
+    capture: &ResponseCapture,
+    read_timeout: std::time::Duration,
+    max_body_bytes: usize,
+) {
+    let mut body = response.bytes_stream();
+    while let Ok(Some(Ok(chunk))) = tokio::time::timeout(read_timeout, body.next()).await {
+        let mut captured = capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remaining = max_body_bytes.saturating_sub(captured.body.len());
+        captured
+            .body
+            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() >= remaining {
+            break;
+        }
     }
 }
 
 impl AsyncOpenAiChatCompletionsProvider {
     fn frame_native_declaration(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+        if self.observation_failed.load(Ordering::Acquire) {
+            return Err(observation_fault());
+        }
         self.ensure_frame_native_mode()?;
         let declaration = self.reaction_target.declaration()?;
         if let Err(fault) = validate_native_frame_state(&declaration, self.reaction_frame.as_ref())
@@ -214,6 +301,20 @@ impl AsyncOpenAiChatCompletionsProvider {
             return Err(fault);
         }
         Ok(declaration)
+    }
+}
+
+impl ResettableReactionPort for AsyncOpenAiChatCompletionsProvider {
+    fn reset_model_context(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+        self.frame_native_declaration()?;
+        self.reaction_target.lose_continuity();
+        self.reaction_frame = None;
+        #[cfg(feature = "legacy-provider-port")]
+        {
+            self.history = None;
+            self.diff_memo = None;
+        }
+        self.frame_native_declaration()
     }
 }
 
@@ -303,6 +404,7 @@ struct NativeChatStreamState<'a, S> {
     read_timeout: std::time::Duration,
     max_sse_event_bytes: usize,
     max_output_text_bytes: usize,
+    capture: ResponseCapture,
 }
 
 async fn next_native_chat_fact<S>(
@@ -427,15 +529,6 @@ where
                 state,
             ));
         }
-        if state.finish_seen {
-            return failed_native_chat_stream(
-                state,
-                port_fault(
-                    OpenAiFailureClass::ResponseProtocolViolation,
-                    "Chat event followed the terminal choice",
-                ),
-            );
-        }
         let frame = match serde_json::from_str::<ChatWireChunk>(&event.data) {
             Ok(frame) => frame,
             Err(error) => {
@@ -501,7 +594,7 @@ fn validate_native_chunk<S>(
     if frame.id.is_empty()
         || frame.model.is_empty()
         || frame.object != "chat.completion.chunk"
-        || frame.choices.len() != 1
+        || (frame.choices.len() != 1 && !(frame.choices.is_empty() && frame.usage.is_some()))
     {
         return Err(protocol("invalid Chat chunk envelope"));
     }
@@ -516,6 +609,23 @@ fn validate_native_chunk<S>(
         }
         None => state.response_model = Some(frame.model),
         _ => {}
+    }
+
+    if let Some(usage) = frame.usage {
+        state
+            .capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .usage = Some(usage);
+    }
+    if frame.choices.is_empty() {
+        if !state.finish_seen {
+            return Err(protocol("Chat usage arrived before terminal choice"));
+        }
+        return Ok(None);
+    }
+    if state.finish_seen {
+        return Err(protocol("Chat event followed the terminal choice"));
     }
 
     let choice = frame
@@ -572,10 +682,17 @@ fn upstream_rejected(diagnostic: impl Into<String>) -> ReactionPortFault {
 mod tests {
     use std::{
         num::{NonZeroU128, NonZeroU64},
-        sync::Arc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
         task::Poll,
     };
 
+    use crate::component::{
+        execution::{Application, ApplicationFaultKind, ApplicationFaultReason},
+        prelude::*,
+    };
     use axum::{
         body::{Body, Bytes},
         extract::State,
@@ -601,14 +718,15 @@ mod tests {
             reaction::{
                 Frame, FrameBasis, FrameRevision, FrameSubmission, ProjectionSubmission,
                 ProviderFact, ProviderOutputKey, ReactionPort, ReactionPortFaultCode,
-                ReactionPortFaultKind, ReactionPortFaultReason, SubmitFault, TargetContinuity,
-                TargetDeclaration, ToolCatalog,
+                ReactionPortFaultKind, ReactionPortFaultReason, ResettableReactionPort,
+                SubmitFault, TargetContinuity, TargetDeclaration, ToolCatalog,
             },
             ProviderIdentity,
         },
         provider::async_openai::{
             AsyncOpenAiChatCompletionsProvider, AsyncOpenAiTransportConfig,
-            OpenAiChatCompletionsOptions,
+            OpenAiChatCompletionsOptions, OpenAiChatObservation, OpenAiChatObservationError,
+            OpenAiChatObserver,
         },
         transcript::CanonicalInputItem,
     };
@@ -774,6 +892,272 @@ mod tests {
             .unwrap()
             .collect()
             .await
+    }
+
+    #[derive(Default)]
+    struct Audit {
+        events: Mutex<Vec<OpenAiChatObservation>>,
+        reject_request: bool,
+        reject_response: bool,
+    }
+
+    #[component]
+    fn retry_test_application(completions: Arc<AtomicUsize>) -> Component {
+        let exit = use_application_exit();
+        use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+            let completions = completions.clone();
+            async move {
+                if let TextTurnEvent::TextComplete(text) = event {
+                    assert_eq!(text, "accepted");
+                    completions.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok::<(), String>(())
+            }
+        });
+        use_reaction_completion(move || async move {
+            exit.request(ExitReason::Completed)?;
+            Ok::<(), anyhow::Error>(())
+        });
+        view! { retry_probe { "Complete this single request." } }
+    }
+
+    #[tokio::test]
+    async fn application_run_resumes_after_transient_http_error_without_duplicate_completion() {
+        let requests = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let captured = requests.clone();
+        let server_app = Router::new().route(
+            "/chat/completions",
+            post(move |body: Bytes| {
+                let captured = captured.clone();
+                async move {
+                    let first = {
+                        let mut requests = captured.lock().unwrap();
+                        requests.push(body.to_vec());
+                        requests.len() == 1
+                    };
+                    if first {
+                        Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(r#"{"error":{"message":"busy"}}"#))
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from(completed_sse("accepted")))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, server_app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let completions = Arc::new(AtomicUsize::new(0));
+        let accepted = completions.clone();
+        let mut application = Application::mount(
+            move || retry_test_application(accepted.clone()),
+            provider(&base, None),
+        )
+        .unwrap();
+        let failure = application.run().await.unwrap_err();
+        assert_eq!(failure.kind(), ApplicationFaultKind::Retryable);
+        assert_eq!(
+            failure.reason(),
+            ApplicationFaultReason::Port(ReactionPortFaultReason::RateLimited)
+        );
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        assert_eq!(application.run().await.unwrap(), ExitReason::Completed);
+        application.shutdown().await.unwrap();
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let first: Value = serde_json::from_slice(&requests[0]).unwrap();
+        let second: Value = serde_json::from_slice(&requests[1]).unwrap();
+        assert_eq!(first["messages"], second["messages"]);
+        drop(requests);
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[async_trait::async_trait]
+    impl OpenAiChatObserver for Audit {
+        async fn observe(
+            &self,
+            event: OpenAiChatObservation,
+        ) -> Result<(), OpenAiChatObservationError> {
+            let reject = matches!(event, OpenAiChatObservation::Request { .. })
+                && self.reject_request
+                || matches!(event, OpenAiChatObservation::Response { .. }) && self.reject_response;
+            self.events.lock().unwrap().push(event);
+            if reject {
+                Err(OpenAiChatObservationError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn observes_exact_bodies_and_usage_before_sealed_text() {
+        let usage = json!({"prompt_tokens": 41, "completion_tokens": 7, "total_tokens": 48});
+        let usage_chunk = json!({
+            "id": "chatcmpl_native", "object": "chat.completion.chunk", "model": "test-model",
+            "choices": [], "usage": usage,
+        });
+        let response = completed_sse("<answer />").replace(
+            "data: [DONE]",
+            &format!("data: {usage_chunk}\n\ndata: [DONE]"),
+        );
+        let (base, mut requests, shutdown, server) =
+            spawn_server(StatusCode::OK, "text/event-stream", response.clone()).await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = provider(&base, None).with_observer(audit.clone());
+        provider.options = OpenAiChatCompletionsOptions::new("test-model")
+            .unwrap()
+            .with_max_tokens(321)
+            .unwrap()
+            .with_temperature(0.2)
+            .unwrap()
+            .with_usage(true);
+        let frame = full_frame(&provider.declare().unwrap());
+        let mut facts = provider.submit(frame).await.unwrap();
+        while let Some(fact) = facts.next().await {
+            if matches!(fact, Ok(ProviderFact::TextSealed { .. })) {
+                assert_eq!(audit.events.lock().unwrap().len(), 2);
+            }
+            assert!(fact.is_ok());
+        }
+        drop(facts);
+        let request = requests.recv().await.unwrap();
+        let wire: Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(wire["max_tokens"], 321);
+        assert_eq!(wire["temperature"], 0.2);
+        assert_eq!(wire["stream_options"]["include_usage"], true);
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], OpenAiChatObservation::Request { body, path } if body == &request && path == "/chat/completions")
+        );
+        assert!(
+            matches!(&events[1], OpenAiChatObservation::Response { body, status: 200, completed: true, usage: Some(observed) } if body == response.as_bytes() && observed == &usage)
+        );
+        drop(events);
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_request_audit_blocks_transport_and_is_terminal() {
+        let (base, mut requests, shutdown, server) =
+            spawn_server(StatusCode::OK, "text/event-stream", completed_sse("ok")).await;
+        let mut provider = provider(&base, None).with_observer(Arc::new(Audit {
+            reject_request: true,
+            ..Audit::default()
+        }));
+        let frame = full_frame(&provider.declare().unwrap());
+        assert!(matches!(
+            provider.submit(frame).await,
+            Err(SubmitFault::Rejected(_))
+        ));
+        assert!(requests.try_recv().is_err());
+        assert_eq!(
+            provider.declare().unwrap_err().kind(),
+            ReactionPortFaultKind::Terminal
+        );
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retryable_provider_failure_records_raw_body_and_rebuilds_continuity() {
+        let response = r#"{"error":{"message":"busy"}}"#;
+        let (base, _requests, shutdown, server) = spawn_server(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            response.into(),
+        )
+        .await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = provider(&base, None).with_observer(audit.clone());
+        let first = provider.declare().unwrap();
+        let facts = collect_facts(&mut provider, full_frame(&first)).await;
+        assert!(
+            matches!(facts.as_slice(), [Err(fault)] if fault.kind() == ReactionPortFaultKind::Retryable)
+        );
+        let next = provider.declare().unwrap();
+        assert!(next.continuity().epoch().get() > first.continuity().epoch().get());
+        let events = audit.events.lock().unwrap();
+        assert!(
+            matches!(&events[1], OpenAiChatObservation::Response { status: 429, body, completed: false, .. } if body == response.as_bytes())
+        );
+        assert!(matches!(&events[2], OpenAiChatObservation::Error { .. }));
+        drop(events);
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_response_audit_never_exposes_sealed_text_or_completion() {
+        let (base, _requests, shutdown, server) =
+            spawn_server(StatusCode::OK, "text/event-stream", completed_sse("ok")).await;
+        let mut provider = provider(&base, None).with_observer(Arc::new(Audit {
+            reject_response: true,
+            ..Audit::default()
+        }));
+        let frame = full_frame(&provider.declare().unwrap());
+        let facts = collect_facts(&mut provider, frame).await;
+        assert!(facts.iter().any(Result::is_err));
+        assert!(!facts.iter().any(|fact| matches!(
+            fact,
+            Ok(ProviderFact::TextSealed { .. } | ProviderFact::ReactionCompleted { .. })
+        )));
+        assert_eq!(
+            provider.declare().unwrap_err().kind(),
+            ReactionPortFaultKind::Terminal
+        );
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_reset_discards_accepted_wire_history() {
+        let (base, mut requests, shutdown, server) = spawn_server(
+            StatusCode::OK,
+            "text/event-stream",
+            completed_sse("old output"),
+        )
+        .await;
+        let mut provider = provider(&base, None);
+        let first = provider.declare().unwrap();
+        let input = frame(
+            &first,
+            1,
+            FrameBasis::Full,
+            vec![CanonicalInputItem::assistant_text("old baseline", None)],
+            vec![],
+            vec![],
+        );
+        let _ = collect_facts(&mut provider, input).await;
+        let _ = requests.recv().await.unwrap();
+        let reset = provider.reset_model_context().unwrap();
+        assert_eq!(reset.identity(), first.identity());
+        assert!(reset.continuity().epoch().get() > first.continuity().epoch().get());
+        let input = full_frame(&reset);
+        let _ = collect_facts(&mut provider, input).await;
+        let request: Value = serde_json::from_slice(&requests.recv().await.unwrap()).unwrap();
+        assert_eq!(request["messages"], json!([]));
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
