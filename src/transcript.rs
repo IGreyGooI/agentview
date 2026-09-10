@@ -268,7 +268,8 @@ impl CanonicalInputItem {
         raw_arguments: impl Into<String>,
     ) -> Result<Self, CanonicalTranscriptError> {
         let call_id = validate_identifier("tool call id", call_id.into())?;
-        let name = validate_identifier("tool name", name.into())?;
+        let name = name.into();
+        validate_tool_name_ref(&name)?;
         let raw_arguments = raw_arguments.into();
         validate_tool_arguments(&call_id, &raw_arguments)?;
         Ok(Self::ToolCall {
@@ -301,7 +302,7 @@ impl CanonicalInputItem {
                 raw_arguments,
             } => {
                 validate_identifier_ref("tool call id", call_id)?;
-                validate_identifier_ref("tool name", name)?;
+                validate_tool_name_ref(name)?;
                 validate_tool_arguments(call_id, raw_arguments)
             }
             Self::ToolResult { call_id, .. } => validate_identifier_ref("tool call id", call_id),
@@ -493,7 +494,9 @@ impl<'de> Deserialize<'de> for CanonicalTranscript {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CanonicalTranscriptError {
-    #[error("invalid {kind} `{value}`; identifiers must be non-empty ASCII tokens")]
+    #[error(
+        "invalid {kind} `{value}`; expected a non-empty identifier using supported characters"
+    )]
     InvalidIdentifier { kind: &'static str, value: String },
 
     #[error("tool call `{call_id}` arguments are not valid JSON: {message}")]
@@ -537,6 +540,21 @@ fn validate_identifier_ref(
         Err(CanonicalTranscriptError::InvalidIdentifier {
             kind,
             value: value.to_owned(),
+        })
+    }
+}
+
+fn validate_tool_name_ref(name: &str) -> Result<(), CanonicalTranscriptError> {
+    let valid = !name.is_empty()
+        && name.chars().all(|character| {
+            unicode_ident::is_xid_continue(character) || matches!(character, '-' | '.' | ':' | '/')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(CanonicalTranscriptError::InvalidIdentifier {
+            kind: "tool name",
+            value: name.to_owned(),
         })
     }
 }

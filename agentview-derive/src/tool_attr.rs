@@ -23,7 +23,6 @@ pub(crate) fn expand(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
 #[derive(Default)]
 struct ToolOptions {
-    name: Option<LitStr>,
     description: Option<LitStr>,
 }
 
@@ -35,18 +34,16 @@ impl Parse for ToolOptions {
             let Meta::NameValue(attribute) = attribute else {
                 return Err(Error::new_spanned(
                     attribute,
-                    "expected `name = \"...\"` or `description = \"...\"`",
+                    "expected `description = \"...\"`",
                 ));
             };
-            let value = string_literal(&attribute.value)?;
             if attribute.path.is_ident("name") {
-                if options.name.replace(value).is_some() {
-                    return Err(Error::new_spanned(
-                        attribute.path,
-                        "duplicate `name` option",
-                    ));
-                }
+                return Err(Error::new_spanned(
+                    attribute.path,
+                    "#[tool] uses the function name; `name` overrides are not supported",
+                ));
             } else if attribute.path.is_ident("description") {
+                let value = string_literal(&attribute.value)?;
                 if options.description.replace(value).is_some() {
                     return Err(Error::new_spanned(
                         attribute.path,
@@ -56,7 +53,7 @@ impl Parse for ToolOptions {
             } else {
                 return Err(Error::new_spanned(
                     attribute.path,
-                    "unsupported #[tool] option; expected `name` or `description`",
+                    "unsupported #[tool] option; expected `description`",
                 ));
             }
         }
@@ -91,12 +88,7 @@ fn expand_function(
 
     let function_ident = function.sig.ident.clone();
     let function_name = unraw_ident(&function_ident);
-    let tool_name = options
-        .name
-        .unwrap_or_else(|| LitStr::new(&function_name, function_ident.span()));
-    if tool_name.value().is_empty() {
-        return Err(Error::new_spanned(tool_name, "tool names cannot be empty"));
-    }
+    let tool_name = LitStr::new(&function_name, function_ident.span());
     let description = options
         .description
         .unwrap_or_else(|| LitStr::new(&doc_description(&function.attrs), function_ident.span()));

@@ -14,6 +14,7 @@ pub fn component(attribute: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Turn an owned, typed Rust function into a native provider tool definition.
+/// The tool name is the function name; only `description` can be overridden.
 #[proc_macro_attribute]
 pub fn tool(attribute: TokenStream, item: TokenStream) -> TokenStream {
     tool_attr::expand(attribute, item)

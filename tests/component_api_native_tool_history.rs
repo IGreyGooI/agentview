@@ -277,6 +277,24 @@ fn assert_call_is_replayed_and_result_is_staged(
     assert_eq!(submission_occurrences(frame, &result), 1);
 }
 
+fn native_submission_items(frame: &CapturedFrame) -> Vec<CanonicalInputItem> {
+    let mut items = native_items(&frame.replay);
+    items.extend(native_items(&frame.staged_inputs));
+    items.extend(native_items(&frame.projection));
+    items
+}
+
+fn assert_native_submission_has_no_duplicates(frame: &CapturedFrame) {
+    let items = native_submission_items(frame);
+    for item in &items {
+        assert_eq!(
+            occurrences(&items, item),
+            1,
+            "native item is submitted at most once per frame: {item:?}"
+        );
+    }
+}
+
 #[derive(Clone)]
 struct RepeatedToolProps {
     calls: Arc<AtomicUsize>,
@@ -628,6 +646,142 @@ async fn reset_model_context_replays_the_retained_native_tool_component_rounds_i
     );
 }
 
+#[tokio::test]
+async fn native_tool_history_continues_after_reset_without_duplicate_later_rounds() {
+    let rerender = Arc::new(Mutex::new(None));
+    let props = RoundHistoryProps {
+        rerender: Arc::clone(&rerender),
+    };
+    let (port, capture, force_full) = ScriptedPort::new_with_forced_full([
+        Script::Finite(vec![
+            tool_fact(1, 1, "continued-round-one", "rounds"),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::Finite(vec![
+            tool_fact(2, 1, "continued-round-two", "rounds"),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::completed(),
+        Script::Finite(vec![
+            tool_fact(3, 1, "continued-round-three", "rounds"),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::completed(),
+        Script::completed(),
+        Script::completed(),
+    ]);
+    let root_props = props.clone();
+    let mut application =
+        Application::mount(move || round_history_application(root_props.clone()), port)
+            .expect("mount continuing reset history application");
+
+    for description in [
+        "first completed tool round",
+        "second completed tool round",
+        "handoff second completed tool result",
+    ] {
+        assert!(matches!(
+            application.react().await.expect(description),
+            ControlFlow::Continue(())
+        ));
+    }
+
+    application
+        .reset_model_context()
+        .expect("completed native tool rounds allow a context reset");
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("reset Full accepts a later native tool round"),
+        ControlFlow::Continue(())
+    ));
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("later native tool result is submitted after reset"),
+        ControlFlow::Continue(())
+    ));
+
+    force_full.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("a later provider-required Full replays native history once"),
+        ControlFlow::Continue(())
+    ));
+
+    application
+        .reset_model_context()
+        .expect("the later completed native tool round allows another reset");
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("second reset replays the current retained window"),
+        ControlFlow::Continue(())
+    ));
+
+    let frames = capture.frames();
+    assert_eq!(frames.len(), 7);
+    assert_eq!(frames[3].basis, FrameBasis::Full);
+    assert!(frames[3].replay.is_empty());
+    assert!(frames[3].staged_inputs.is_empty());
+    assert_eq!(
+        native_items(&frames[3].projection),
+        vec![
+            tool_call("continued-round-one", "rounds"),
+            tool_result("continued-round-one", "result:continued-round-one"),
+            tool_call("continued-round-two", "rounds"),
+            tool_result("continued-round-two", "result:continued-round-two"),
+        ],
+        "the first reset projects each retained completed round in call/result order"
+    );
+    assert_native_submission_has_no_duplicates(&frames[3]);
+
+    assert!(matches!(frames[4].basis, FrameBasis::DeltaFrom(_)));
+    assert_call_is_replayed_and_result_is_staged(
+        &frames[4],
+        "continued-round-three",
+        "rounds",
+        "result:continued-round-three",
+    );
+    assert_native_submission_has_no_duplicates(&frames[4]);
+
+    assert_eq!(frames[5].basis, FrameBasis::Full);
+    assert_eq!(
+        submission_occurrences(&frames[5], &tool_call("continued-round-three", "rounds")),
+        1,
+        "the forced Full carries the later call only once"
+    );
+    assert_eq!(
+        submission_occurrences(
+            &frames[5],
+            &tool_result("continued-round-three", "result:continued-round-three"),
+        ),
+        1,
+        "the forced Full carries the later result only once"
+    );
+    assert_native_submission_has_no_duplicates(&frames[5]);
+
+    assert_eq!(frames[6].basis, FrameBasis::Full);
+    assert!(frames[6].replay.is_empty());
+    assert!(frames[6].staged_inputs.is_empty());
+    assert_eq!(
+        native_items(&frames[6].projection),
+        vec![
+            tool_call("continued-round-two", "rounds"),
+            tool_result("continued-round-two", "result:continued-round-two"),
+            tool_call("continued-round-three", "rounds"),
+            tool_result("continued-round-three", "result:continued-round-three"),
+        ],
+        "the second reset contains the latest two completed rounds without duplication"
+    );
+    assert_native_submission_has_no_duplicates(&frames[6]);
+}
+
 #[derive(Clone)]
 struct ParallelToolProps {
     first_calls: Arc<AtomicUsize>,
@@ -790,6 +944,217 @@ async fn parallel_native_tool_results_follow_provider_ordinals_not_tree_or_compl
         "ToolResult staging follows provider ordinal although second completed first"
     );
     assert!(native_items(&frames[1].projection).is_empty());
+}
+
+#[derive(Clone)]
+struct SameToolParallelProps {
+    calls: Arc<AtomicUsize>,
+    first_started: Arc<Notify>,
+    second_started: Arc<Notify>,
+    release_first: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    release_second: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    second_finished: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+#[component]
+fn same_tool_parallel_application(props: SameToolParallelProps) -> Component {
+    let calls = Arc::clone(&props.calls);
+    let first_started = Arc::clone(&props.first_started);
+    let second_started = Arc::clone(&props.second_started);
+    let release_first = Arc::clone(&props.release_first);
+    let release_second = Arc::clone(&props.release_second);
+    let second_finished = Arc::clone(&props.second_finished);
+
+    NativeToolCall::named("parallel").on_call(move |call| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        let call_id = call.call_id().to_owned();
+        let (started, release, finished, content) = match call_id.as_str() {
+            "same-tool-parallel-first" => (
+                Arc::clone(&first_started),
+                release_first
+                    .lock()
+                    .expect("first release lock")
+                    .take()
+                    .expect("first tool has one release receiver"),
+                None,
+                "result-first",
+            ),
+            "same-tool-parallel-second" => (
+                Arc::clone(&second_started),
+                release_second
+                    .lock()
+                    .expect("second release lock")
+                    .take()
+                    .expect("second tool has one release receiver"),
+                Some(
+                    second_finished
+                        .lock()
+                        .expect("second finish lock")
+                        .take()
+                        .expect("second tool has one finish sender"),
+                ),
+                "result-second",
+            ),
+            other => panic!("unexpected same-tool native call {other}"),
+        };
+        async move {
+            started.notify_one();
+            release
+                .await
+                .expect("same-tool release sender remains open");
+            if let Some(finished) = finished {
+                finished
+                    .send(())
+                    .expect("second finish receiver remains open");
+            }
+            Ok::<_, Infallible>(call.output(content))
+        }
+    })
+}
+
+#[tokio::test]
+async fn same_native_tool_parallel_reverse_completion_continues_after_context_reset() {
+    let (release_first, release_first_rx) = oneshot::channel();
+    let (release_second, release_second_rx) = oneshot::channel();
+    let (second_finished, mut second_finished_rx) = oneshot::channel();
+    let props = SameToolParallelProps {
+        calls: Arc::new(AtomicUsize::new(0)),
+        first_started: Arc::new(Notify::new()),
+        second_started: Arc::new(Notify::new()),
+        release_first: Arc::new(Mutex::new(Some(release_first_rx))),
+        release_second: Arc::new(Mutex::new(Some(release_second_rx))),
+        second_finished: Arc::new(Mutex::new(Some(second_finished))),
+    };
+    let (port, capture) = ScriptedPort::new([
+        Script::Finite(vec![
+            tool_fact(1, 1, "same-tool-parallel-first", "parallel"),
+            tool_fact(2, 2, "same-tool-parallel-second", "parallel"),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::completed(),
+        Script::completed(),
+        Script::completed(),
+    ]);
+    let root_props = props.clone();
+    let mut application = Application::mount(
+        move || same_tool_parallel_application(root_props.clone()),
+        port,
+    )
+    .expect("mount same-tool parallel native application");
+
+    let first_started = props.first_started.notified();
+    let second_started = props.second_started.notified();
+    tokio::pin!(first_started);
+    tokio::pin!(second_started);
+    let mut reaction = Box::pin(application.react());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = &mut reaction => panic!("reaction completed before the first same-tool lane started: {result:?}"),
+            _ = &mut first_started => {}
+        }
+    })
+    .await
+    .expect("first same-tool lane starts");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = &mut reaction => panic!("reaction completed before the second same-tool lane started: {result:?}"),
+            _ = &mut second_started => {}
+        }
+    })
+    .await
+    .expect("second same-tool lane starts");
+
+    release_second
+        .send(())
+        .expect("second same-tool lane receiver remains open");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = &mut reaction => panic!("reaction completed before the second same-tool lane finished: {result:?}"),
+            result = &mut second_finished_rx => result.expect("second same-tool finish sender remains open"),
+        }
+    })
+    .await
+    .expect("second same-tool lane finishes before the first is released");
+    release_first
+        .send(())
+        .expect("first same-tool lane receiver remains open");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), &mut reaction)
+            .await
+            .expect("same-tool parallel reaction settles")
+            .expect("same-tool parallel reaction succeeds"),
+        ControlFlow::Continue(())
+    ));
+    drop(reaction);
+
+    assert_eq!(props.calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("same-tool parallel result continuation"),
+        ControlFlow::Continue(())
+    ));
+
+    application
+        .reset_model_context()
+        .expect("completed same-tool parallel results allow a context reset");
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("same-tool reset Full replays both completed calls"),
+        ControlFlow::Continue(())
+    ));
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("same-tool reset continuation has no pending calls"),
+        ControlFlow::Continue(())
+    ));
+
+    let frames = capture.frames();
+    assert_eq!(frames.len(), 4);
+    assert_eq!(
+        native_items(&frames[1].replay),
+        vec![
+            tool_call("same-tool-parallel-first", "parallel"),
+            tool_call("same-tool-parallel-second", "parallel"),
+        ],
+        "same-tool calls replay in provider order"
+    );
+    assert_eq!(
+        native_items(&frames[1].staged_inputs),
+        vec![
+            tool_result("same-tool-parallel-first", "result-first"),
+            tool_result("same-tool-parallel-second", "result-second"),
+        ],
+        "same-tool results stage in provider order despite reverse handler completion"
+    );
+    assert!(native_items(&frames[1].projection).is_empty());
+    assert_native_submission_has_no_duplicates(&frames[1]);
+
+    assert_eq!(frames[2].basis, FrameBasis::Full);
+    assert!(frames[2].replay.is_empty());
+    assert!(frames[2].staged_inputs.is_empty());
+    assert_eq!(
+        native_items(&frames[2].projection),
+        vec![
+            tool_call("same-tool-parallel-first", "parallel"),
+            tool_call("same-tool-parallel-second", "parallel"),
+            tool_result("same-tool-parallel-first", "result-first"),
+            tool_result("same-tool-parallel-second", "result-second"),
+        ],
+        "the reset Full preserves same-tool call order and its paired results"
+    );
+    assert_native_submission_has_no_duplicates(&frames[2]);
+
+    assert!(matches!(frames[3].basis, FrameBasis::DeltaFrom(_)));
+    assert!(
+        native_submission_items(&frames[3]).is_empty(),
+        "the post-reset continuation neither repeats completed calls nor leaves them pending"
+    );
 }
 
 #[derive(Clone)]
@@ -1048,5 +1413,124 @@ async fn typed_native_tool_component_records_successful_and_invalid_argument_cal
             tool_result("typed-invalid", &invalid_output),
         ],
         "each typed tool dispatch appends one call and one result in response order"
+    );
+}
+
+/// Adds two integers through a Unicode-named native function.
+#[tool]
+fn 计算总和(left: i64, right: i64) -> Result<i64, ToolError> {
+    Ok(left + right)
+}
+
+#[component]
+fn unicode_named_tool_application() -> Component {
+    NativeToolCall::new(计算总和)
+}
+
+#[tokio::test]
+async fn unicode_named_tool_executes_stages_results_and_continues_after_context_reset() {
+    let first_arguments = r#"{"left":19,"right":23}"#;
+    let second_arguments = r#"{"left":5,"right":8}"#;
+    let (port, capture) = ScriptedPort::new([
+        Script::Finite(vec![
+            tool_fact_with_arguments(1, 1, "unicode-first", "计算总和", first_arguments),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::completed(),
+        Script::Finite(vec![
+            tool_fact_with_arguments(2, 1, "unicode-second", "计算总和", second_arguments),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::completed(),
+        Script::completed(),
+    ]);
+    let mut application = Application::mount(unicode_named_tool_application, port)
+        .expect("mount Unicode-named native tool");
+
+    assert!(matches!(
+        application.react().await.expect("first Unicode tool call"),
+        ControlFlow::Continue(())
+    ));
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("first Unicode tool result continuation"),
+        ControlFlow::Continue(())
+    ));
+
+    application
+        .reset_model_context()
+        .expect("completed Unicode tool result allows a context reset");
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("reset Full accepts a later Unicode tool call"),
+        ControlFlow::Continue(())
+    ));
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("later Unicode tool result continuation"),
+        ControlFlow::Continue(())
+    ));
+    assert!(matches!(
+        application
+            .react()
+            .await
+            .expect("post-reset Unicode continuation"),
+        ControlFlow::Continue(())
+    ));
+
+    let frames = capture.frames();
+    assert_eq!(frames.len(), 5);
+    assert_eq!(frames[0].tools, ["计算总和"]);
+    let first_call = tool_call_with_arguments("unicode-first", "计算总和", first_arguments);
+    let first_result = tool_result("unicode-first", "42");
+    assert_eq!(occurrences(&frames[1].replay, &first_call), 1);
+    assert_eq!(occurrences(&frames[1].staged_inputs, &first_result), 1);
+    assert_eq!(occurrences(&frames[1].projection, &first_call), 0);
+    assert_eq!(occurrences(&frames[1].projection, &first_result), 0);
+    assert_eq!(submission_occurrences(&frames[1], &first_call), 1);
+    assert_eq!(submission_occurrences(&frames[1], &first_result), 1);
+
+    assert_eq!(frames[2].basis, FrameBasis::Full);
+    assert_eq!(frames[2].tools, ["计算总和"]);
+    assert_eq!(
+        native_items(&frames[2].projection),
+        vec![
+            tool_call_with_arguments("unicode-first", "计算总和", first_arguments),
+            tool_result("unicode-first", "42"),
+        ],
+        "the reset Full preserves the completed Unicode-named call and result"
+    );
+    assert_native_submission_has_no_duplicates(&frames[2]);
+
+    let second_call = tool_call_with_arguments("unicode-second", "计算总和", second_arguments);
+    let second_result = tool_result("unicode-second", "13");
+    assert_eq!(occurrences(&frames[3].replay, &second_call), 1);
+    assert_eq!(occurrences(&frames[3].staged_inputs, &second_result), 1);
+    assert_eq!(occurrences(&frames[3].projection, &second_call), 0);
+    assert_eq!(occurrences(&frames[3].projection, &second_result), 0);
+    assert_eq!(submission_occurrences(&frames[3], &second_call), 1);
+    assert_eq!(submission_occurrences(&frames[3], &second_result), 1);
+    assert_native_submission_has_no_duplicates(&frames[3]);
+    assert!(matches!(frames[4].basis, FrameBasis::DeltaFrom(_)));
+    assert!(
+        native_submission_items(&frames[4]).is_empty(),
+        "the continuation after reset does not repeat completed Unicode tool items"
+    );
+
+    assert_eq!(
+        native_log(application.current_projection().projection(), "计算总和"),
+        vec![
+            tool_call_with_arguments("unicode-first", "计算总和", first_arguments),
+            tool_result("unicode-first", "42"),
+            tool_call_with_arguments("unicode-second", "计算总和", second_arguments),
+            tool_result("unicode-second", "13"),
+        ],
+        "macro-generated Unicode names retain both completed rounds across the reset"
     );
 }

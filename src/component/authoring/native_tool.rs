@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
     pin::Pin,
@@ -22,6 +22,7 @@ type ToolFuture = Pin<Box<dyn Future<Output = Result<ToolOutput, String>> + Send
 ///
 /// A round is one provider response containing calls to this mounted tool.
 /// All calls in a round stay together, and pending rounds remain until completed.
+/// Each round projects calls first, then results in the same call order.
 /// Older records may remain in provider history until the port compacts it.
 pub struct NativeToolCall;
 
@@ -141,7 +142,7 @@ impl NativeToolCallDeclaration {
                 if history
                     .rounds
                     .iter()
-                    .any(|round| round.calls.contains(call.call_id()))
+                    .any(|round| round.call_ids.contains(call.call_id()))
                 {
                     return Err(NativeToolDispatchFault::DuplicateCall {
                         call_id: call.call_id().to_owned(),
@@ -156,15 +157,15 @@ impl NativeToolCallDeclaration {
                     None => {
                         history.rounds.push_back(NativeToolRound {
                             identity: Arc::clone(&self.round),
-                            items: Vec::new(),
-                            calls: HashSet::new(),
-                            results: HashSet::new(),
+                            calls: Vec::new(),
+                            call_ids: HashSet::new(),
+                            results: HashMap::new(),
                         });
                         history.rounds.back_mut().expect("just appended a round")
                     }
                 };
-                round.calls.insert(call.call_id().to_owned());
-                round.items.push(item);
+                round.call_ids.insert(call.call_id().to_owned());
+                round.calls.push(item);
                 history.prune();
                 Ok(())
             })
@@ -212,14 +213,25 @@ pub(crate) struct NativeToolHistory {
 
 struct NativeToolRound {
     identity: Arc<()>,
-    items: Vec<CanonicalInputItem>,
-    calls: HashSet<String>,
-    results: HashSet<String>,
+    calls: Vec<CanonicalInputItem>,
+    call_ids: HashSet<String>,
+    results: HashMap<String, CanonicalInputItem>,
 }
 
 impl NativeToolHistory {
     pub(crate) fn items(&self) -> impl Iterator<Item = &CanonicalInputItem> {
-        self.rounds.iter().flat_map(|round| &round.items)
+        self.rounds.iter().flat_map(|round| {
+            // Reset replays this projection directly, without ToolOutputStaging.
+            round
+                .calls
+                .iter()
+                .chain(round.calls.iter().filter_map(|call| {
+                    let CanonicalInputItem::ToolCall { call_id, .. } = call else {
+                        unreachable!("native tool rounds contain only admitted calls")
+                    };
+                    round.results.get(call_id)
+                }))
+        })
     }
 
     fn prune(&mut self) {
@@ -258,12 +270,16 @@ impl NativeToolRecord {
                         call_id: self.call_id.clone(),
                     });
                 };
-                if !round.results.insert(self.call_id.clone()) {
-                    return Err(NativeToolDispatchFault::DuplicateResult {
-                        call_id: self.call_id.clone(),
-                    });
+                match round.results.entry(self.call_id.clone()) {
+                    Entry::Occupied(_) => {
+                        return Err(NativeToolDispatchFault::DuplicateResult {
+                            call_id: self.call_id.clone(),
+                        });
+                    }
+                    Entry::Vacant(result) => {
+                        result.insert(item);
+                    }
                 }
-                round.items.push(item);
                 history.prune();
                 Ok(())
             })
@@ -280,7 +296,7 @@ impl NativeToolRecord {
                     .rounds
                     .iter()
                     .find(|round| Arc::ptr_eq(&round.identity, &self.round))
-                    .is_none_or(|round| round.results.contains(&self.call_id))
+                    .is_none_or(|round| round.results.contains_key(&self.call_id))
             })
             .expect("a cancelled reaction retains its Component mount");
         if !completed {
@@ -352,8 +368,8 @@ mod tests {
             .unwrap();
         let expected = [
             CanonicalInputItem::tool_call("first-completed", "work", "{}").unwrap(),
-            CanonicalInputItem::tool_result("first-completed", "done").unwrap(),
             CanonicalInputItem::tool_call("first-pending", "work", "{}").unwrap(),
+            CanonicalInputItem::tool_result("first-completed", "done").unwrap(),
             CanonicalInputItem::tool_call("second", "work", "{}").unwrap(),
             CanonicalInputItem::tool_result("second", "done").unwrap(),
             CanonicalInputItem::tool_call("third", "work", "{}").unwrap(),

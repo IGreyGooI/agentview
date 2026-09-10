@@ -152,6 +152,7 @@ declare a stable diff boundary, `#[view(diff)]` for changing fields, and
 complete values, supported deltas, or omission from its retained baseline.
 
 Declare native tools with `#[tool]` and mount them using `NativeToolCall::new(add)`.
+The tool name is always the Rust function name; name overrides are rejected.
 Each tool Component declares all calls and results from its latest two tool
 interaction rounds, also retaining pending rounds. The runtime merges those
 records into canonical conversation history without

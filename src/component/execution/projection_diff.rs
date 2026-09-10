@@ -199,6 +199,13 @@ fn reconcile_projection_submission(
                 return Err(ProjectionReconciliationFault::AmbiguousProjectionProvenance);
             }
             candidate.nodes[ledger_node_index].items.push(item.clone());
+            if matches!(
+                item,
+                CanonicalInputItem::ToolCall { .. } | CanonicalInputItem::ToolResult { .. }
+            ) {
+                // Snapshot tool records retain provenance across execution scopes.
+                candidate.provider_outputs.push(item.clone());
+            }
             items.push(item.clone());
         }
         nodes.push(RenderedProjectionNode::new(node.identity(), items));
@@ -955,6 +962,25 @@ mod tests {
 
         assert!(text_projection_items(&plan.submission).is_empty());
         assert!(plan.reconciliation.unclaimed_provider_outputs.is_empty());
+    }
+
+    #[test]
+    fn snapshot_tool_claims_remain_fenced_after_an_execution_scope_change() {
+        let complete = RenderedProjection::from_nodes(vec![RenderedProjectionNode::new(
+            "tool",
+            vec![
+                CanonicalInputItem::tool_call("call-1", "lookup", "{}").unwrap(),
+                CanonicalInputItem::tool_result("call-1", "result").unwrap(),
+            ],
+        )])
+        .unwrap();
+        let first = ReconciledProjectionPlan::prepare(None, None, &[], &complete).unwrap();
+        let reset = first.reconciliation.reset_authored_for_scope(&[]);
+
+        assert!(matches!(
+            ReconciledProjectionPlan::prepare(None, Some(&reset), &[], &complete),
+            Err(ProjectionReconciliationFault::AmbiguousProjectionProvenance)
+        ));
     }
 
     #[test]

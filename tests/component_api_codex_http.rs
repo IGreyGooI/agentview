@@ -217,10 +217,48 @@ fn interrupted_assistant_text_fails_closed_until_wire_grouping_is_supported() {
 }
 
 #[test]
+fn function_names_are_preserved_in_tools_and_call_history_without_a_length_limit() {
+    for name in [
+        "\u{67e5}\u{8be2}\u{8ba2}\u{5355}".to_owned(),
+        "caf\u{e9}".to_owned(),
+        "cafe\u{301}".to_owned(),
+        "x".repeat(129),
+        "\u{e9}".repeat(65),
+        "\u{67e5}".repeat(129),
+    ] {
+        let tool =
+            CodexFunctionTool::new(&name, "lookup", json!({"type": "object"}), false).unwrap();
+        let options =
+            CodexHttpV1Options::new("model", Some(vec![tool]), None, None::<String>).unwrap();
+        let transcript = CanonicalTranscript::new()
+            .appended(CanonicalInputItem::tool_call("call_1", &name, "{}").unwrap())
+            .unwrap()
+            .appended(CanonicalInputItem::tool_result("call_1", "done").unwrap())
+            .unwrap();
+        let encoded = CodexHttpV1Encoder::new(options)
+            .encode_request(&transcript)
+            .unwrap();
+        let body: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(body["tools"][0]["name"], name);
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][0]["name"], name);
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert_eq!(body["input"][1]["call_id"], "call_1");
+    }
+}
+
+#[test]
 fn codex_function_names_fail_before_an_invalid_request_is_encoded() {
-    for name in ["bad.name".to_owned(), "x".repeat(129)] {
+    for name in [
+        String::new(),
+        "bad.name".to_owned(),
+        "bad name".to_owned(),
+        "bad\nname".to_owned(),
+        "bad\u{2003}name".to_owned(),
+        "bad\u{200b}name".to_owned(),
+    ] {
         let error = CodexFunctionTool::new(name.clone(), "invalid", json!({}), false)
-            .expect_err("Responses function names must match the pinned Codex limits");
+            .expect_err("function names must be non-empty and use supported characters");
         assert!(matches!(
             error,
             CodexHttpV1Error::InvalidToolName { name: ref actual } if actual == &name

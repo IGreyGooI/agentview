@@ -154,8 +154,11 @@ fn calculator() -> Component {
 }
 ```
 
-`#[tool(name = "...", description = "...")]` can override metadata. Otherwise the function
-name and documentation supply it; parameter documentation becomes schema field descriptions.
+The tool name is always the Rust function name; `#[tool(name = "...")]` is rejected.
+Unicode function names are preserved in canonical history and encoded request JSON.
+Tool names have no separate byte-length limit; Frame and request size budgets still apply.
+`#[tool(description = "...")]` can override the description supplied by function documentation.
+Parameter documentation becomes schema field descriptions.
 Complex argument types implement `serde::Deserialize` and `schemars::JsonSchema`; successful
 return values implement `serde::Serialize`. Missing or invalid typed arguments produce an
 `invalid_arguments` tool result without running the handler. A handler `Err` remains a reaction
@@ -166,13 +169,19 @@ appends its `ToolResult`. It retains the latest two provider responses containin
 tool, including every call and result in each response. Pending rounds remain until completed.
 Rendering, preparation, and responses without calls to that tool do not advance this window.
 Render declares the complete retained record sequence in that tool's projection node.
+Within each round, calls precede results, and results follow call order even after a context reset.
 Re-rendering never executes or appends a call again.
 The Frame compiler claims already-admitted calls and staged results instead of submitting them
-twice. Global history preserves provider call order and results are submitted in call order even
-when handlers finish concurrently. Older records leaving the projection produce no deletion
+twice. Records restored by a context reset retain this ownership as the history window advances.
+During normal continuation, accepted history preserves provider call order. Results are submitted
+in call order even when handlers finish concurrently. Older records leaving the projection produce no deletion
 patch; the port manages provider history and compaction. Unmounting removes future tool
 availability while accepted session history remains. Cancellation appends the runtime's
 unknown-outcome result to the original component record as well as staging it for the next reaction.
+
+An explicit `reset_model_context()` rebuilds history from the current Component projection.
+Across tools, this snapshot follows Component structural order. Business facts that depend on
+the original cross-tool chronology must be projected explicitly.
 
 Mount the tool in the same tree as the state it serves. One `react()` can admit a model tool call,
 run its handler, and stage output; it does not start another provider request. The default

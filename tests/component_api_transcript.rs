@@ -118,6 +118,50 @@ fn raw_tool_arguments_are_validated_without_reserialization() {
 }
 
 #[test]
+fn unicode_tool_names_survive_canonical_validation_and_json_roundtrip() {
+    for name in [
+        "\u{67e5}\u{8be2}\u{8ba2}\u{5355}",
+        "caf\u{e9}",
+        "cafe\u{301}",
+    ] {
+        let transcript = CanonicalTranscript::new()
+            .appended(CanonicalInputItem::tool_call("call_1", name, "{}").unwrap())
+            .unwrap()
+            .appended(CanonicalInputItem::tool_result("call_1", "done").unwrap())
+            .unwrap();
+        let encoded = serde_json::to_vec(&transcript).unwrap();
+        let restored: CanonicalTranscript = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored, transcript);
+        let CanonicalInputItem::ToolCall { name: stored, .. } = &restored.items()[0] else {
+            panic!("the first item must remain a tool call");
+        };
+        assert_eq!(stored, name);
+    }
+}
+
+#[test]
+fn unicode_tool_names_do_not_relax_other_identifiers_or_allow_whitespace() {
+    assert!(CanonicalInputItem::tool_call("call_\u{e9}", "lookup", "{}").is_err());
+    assert!(CanonicalInputItem::tool_result("call_\u{e9}", "done").is_err());
+    assert!(ProviderExtension::new("prov\u{e9}", "capability", 1, json!({})).is_err());
+    assert!(ProviderExtension::new("provider", "capabilit\u{e9}", 1, json!({})).is_err());
+    for name in [
+        "",
+        "bad name",
+        "bad\nname",
+        "bad\u{2003}name",
+        "bad\u{200b}name",
+    ] {
+        assert!(CanonicalInputItem::tool_call("call_1", name, "{}").is_err());
+        assert!(serde_json::from_value::<CanonicalInputItem>(json!({
+            "kind": "tool_call",
+            "payload": { "call_id": "call_1", "name": name, "raw_arguments": "{}" }
+        }))
+        .is_err());
+    }
+}
+
+#[test]
 fn tool_results_require_one_earlier_matching_call() {
     let result = CanonicalInputItem::tool_result("call_7", r#"["e2e4"]"#).unwrap();
     let error = CanonicalTranscript::new()

@@ -1,0 +1,11 @@
+error: #[tool] uses the function name; `name` overrides are not supported
+ --> tests/ui/tool/name_override.rs:3:8
+  |
+3 | #[tool(name = "lookup order")]
+  |        ^^^^
+
+error: #[tool] uses the function name; `name` overrides are not supported
+ --> tests/ui/tool/name_override.rs:8:8
+  |
+8 | #[tool(name = "valid_alias")]
+  |        ^^^^

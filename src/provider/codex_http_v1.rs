@@ -28,7 +28,6 @@ pub const CODEX_HTTP_V1_CODEX_REVISION: &str = "4f1992732c832fe125608980a03ec2b6
 const OPENAI_PROVIDER: &str = "openai";
 const REASONING_CAPABILITY: &str = "reasoning.encrypted_content";
 const REASONING_SCHEMA_VERSION: u32 = 1;
-const FUNCTION_NAME_MAX_LEN: usize = 128;
 const DEFAULT_COMPACTION_THRESHOLD: u32 = 200_000;
 
 /// One function tool in the Codex Responses request schema.
@@ -910,10 +909,9 @@ fn duplicate_tool_name(tools: &[CodexFunctionTool]) -> Option<String> {
 
 fn validate_function_name(name: &str) -> Result<(), CodexHttpV1Error> {
     let valid = !name.is_empty()
-        && name.len() <= FUNCTION_NAME_MAX_LEN
         && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+            .chars()
+            .all(|character| unicode_ident::is_xid_continue(character) || character == '-');
     if valid {
         Ok(())
     } else {
@@ -930,7 +928,7 @@ pub enum CodexHttpV1Error {
     #[error("Codex model must be non-empty")]
     EmptyModel,
     #[error(
-        "invalid Codex function tool name `{name}`; expected 1-128 ASCII [A-Za-z0-9_-] characters"
+        "invalid Codex function tool name `{name}`; expected a non-empty name using Unicode identifier characters or hyphens"
     )]
     InvalidToolName { name: String },
     #[error("Codex function tool `{name}` parameters must be a JSON object")]
