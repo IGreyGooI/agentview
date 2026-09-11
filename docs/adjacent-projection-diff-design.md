@@ -125,7 +125,7 @@ view! {
 repeat 每次提交完整当前 POM，优先于 `#[diff]` 的 delta/omit 输出选择；diff baseline 仍在成功 handoff
 后正常维护。render、prepare 或 handoff 前取消不推进基线。重复内容消失时仍按普通 user/developer
 规则撤下 XML，text 不输出删除。repeat 是私有交付元数据，不渲染为标签；assistant/System 不支持
-repeat 参数。Chess 示例的 `chess_action_policy` 用 `#[developer(repeat)]` 显式声明每轮重发。
+repeat 参数。Chess 示例的 Markdown action policy 用 `#[developer(repeat)]` 显式声明每轮重发。
 
 依据：[投影类型](../src/component/execution/port.rs)、
 [捕获和合并](../src/component/authoring/attempt.rs)、

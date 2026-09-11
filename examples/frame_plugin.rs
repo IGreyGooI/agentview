@@ -45,11 +45,16 @@ fn frame_plugin_component(props: PluginProps) -> Component {
         .expect("mounted Plugin response")
         .map(|text| view! { parent_response { "{text}" } })
         .unwrap_or_else(|| view! {});
+    let prompt = r#"## Plugin request
+
+Provide one concise status update for this plugin."#;
     view! {
+        #[developer]
+        { prompt }
+
         #[developer]
         frame_plugin {
             parent { "{parent_id}" }
-            plugin_request { "Provide one concise status update for this plugin." }
         }
         { response }
     }
@@ -207,11 +212,12 @@ fn response_parent(props: ParentProps) -> Component {
     use_reaction_completion(move || async move { exit.request(ExitReason::Completed) });
 
     let delegated_frames = props.delegated_frames;
+    let prompt = r#"## Parent instructions
+
+You are the parent agent for two independent plugins. Return one concise status update that is safe for both plugins."#;
     view! {
         #[system_once]
-        parent_instructions {
-            "You are the parent agent for two independent plugins. Return one concise status update that is safe for both plugins."
-        }
+        { prompt }
         delegated_plugin_frames { "{delegated_frames}" }
     }
 }

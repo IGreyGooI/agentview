@@ -101,13 +101,18 @@ fn support_policy(data_dir: PathBuf) -> Component {
         Some(SupportPolicy {
             expired_export,
             escalation,
-        }) => view! {
-            #[developer]
-            support_policy {
-                expired_export { "{expired_export}" }
-                escalation { "{escalation}" }
+        }) => {
+            let prompt = format!(
+                r#"## Export support policy
+
+- Expired exports: {expired_export}
+- Escalation: {escalation}"#
+            );
+            view! {
+                #[developer]
+                { prompt }
             }
-        },
+        }
         None => view! {},
     }
 }
@@ -184,11 +189,15 @@ fn support_agent(inbox: SupportInbox) -> Component {
             },
         )
         .unwrap_or_else(|| view! {});
+    let prompt = r#"## Support response
+
+Draft a concise response to the current ticket using its account and support policy.
+
+- Do not send it to the customer.
+- Do not reuse another ticket's account context."#;
     view! {
         #[system_once]
-        support_agent {
-            "Draft a concise response to the current ticket using its account and support policy. Do not send it to the customer. Do not reuse another ticket's account context."
-        }
+        { prompt }
         support_policy(inbox.data_dir)
         { active }
     }

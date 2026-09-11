@@ -32,9 +32,12 @@ fn frame_agent_component() -> Component {
     });
 
     let value = state.with(Clone::clone).expect("mounted Signal read");
+    let prompt = r#"## Publication policy
+
+State the publication status in one concise sentence."#;
     view! {
         #[system_once]
-        publication_policy { "State the publication status in one concise sentence." }
+        { prompt }
         publication_status { "{value}" }
     }
 }

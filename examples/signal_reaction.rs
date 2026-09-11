@@ -41,9 +41,12 @@ fn completed_status(text: &str) -> ReviewStatus {
 
 #[component]
 fn review_policy() -> Component {
+    let prompt = r#"## Review policy
+
+Return exactly one token: approved or changes-requested."#;
     view! {
         #[system_once]
-        review_policy { "Return exactly one token: approved or changes-requested." }
+        { prompt }
     }
 }
 

@@ -6,8 +6,14 @@ use std::{
     },
 };
 
-use agentview::component::execution::{ExternalAct, ExternalObservationKind, FrameBasis};
-use agentview::component::prelude::*;
+use agentview::{
+    component::{
+        execution::{ExternalAct, ExternalObservationKind, FrameBasis},
+        prelude::*,
+    },
+    pom_renderer::render_pom_document,
+    transcript::{CanonicalInputItem, InstructionAuthority},
+};
 use anyhow::{Context, Result};
 use futures::FutureExt;
 
@@ -89,6 +95,30 @@ async fn plugin_parents_keep_independent_external_sessions() {
     assert_ne!(first_a.frame().target(), first_b.frame().target());
     assert!(first_a.content().contains("parent-a"));
     assert!(first_b.content().contains("parent-b"));
+    let first_a_developer = first_a
+        .frame()
+        .submission()
+        .projection()
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            CanonicalInputItem::Instruction {
+                authority: InstructionAuthority::Developer,
+                pom,
+            } => Some(render_pom_document(pom)),
+            _ => None,
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("render developer projection");
+    assert!(first_a_developer.iter().any(|content| {
+        content.contains("## Plugin request\n\nProvide one concise status update for this plugin.")
+    }));
+    assert!(first_a_developer
+        .iter()
+        .any(|content| content.contains("<frame_plugin>")));
+    assert!(!first_a_developer
+        .iter()
+        .any(|content| content.contains("<plugin_request>")));
 
     let second_a = registry
         .get_mut("parent-a")

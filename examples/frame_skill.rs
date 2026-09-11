@@ -41,11 +41,10 @@ fn frame_skill_component(props: SkillProps) -> Component {
         .expect("mounted Skill response")
         .map(|text| view! { skill_response { "{text}" } })
         .unwrap_or_else(|| view! {});
+    let prompt = format!("## Skill request\n\n{request}");
     view! {
         #[developer]
-        frame_skill {
-            skill_request { "{request}" }
-        }
+        { prompt }
         { response }
     }
 }
@@ -80,11 +79,12 @@ fn response_parent(props: ParentProps) -> Component {
     use_reaction_completion(move || async move { exit.request(ExitReason::Completed) });
 
     let delegated_frame = props.delegated_frame;
+    let prompt = r#"## Parent instructions
+
+You are the parent agent for a delegated frame skill. Answer the skill request concisely."#;
     view! {
         #[system_once]
-        parent_instructions {
-            "You are the parent agent for a delegated frame skill. Answer the skill request concisely."
-        }
+        { prompt }
         delegated_skill_frame { "{delegated_frame}" }
     }
 }

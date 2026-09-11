@@ -337,6 +337,21 @@ fn chess_projection(state: ChessState) -> Component {
     let phase = phase_name(state.phase());
     let side_to_move = side_name(board.side_to_move());
     let agent_side = side_name(state.agent_side());
+    let chess_system = format!(
+        r#"# Chess agent
+
+You are the chess agent playing {agent_side}.
+
+Evaluate the authoritative position briefly, then choose one legal action."#
+    );
+    let chess_action_policy = r#"## XML action protocol
+
+Respond with exactly two XML elements and no other text:
+
+1. First emit one nonempty `<thought>...</thought>` element with a concise move evaluation. Its content must be plain text without nested XML.
+2. Then emit exactly one self-closing action element using its registered syntax:
+   - `choose_move` plays one legal move. Set its `uci` attribute to exactly one space-delimited canonical lowercase UCI token copied unchanged from `/chess_game_state/legal_moves/@values`.
+   - `resign` concedes the game immediately."#;
     let fen = standard_fen(&board, state.committed_moves());
     let legal_moves = legal_moves(&board);
     let history = move_history(state.committed_moves());
@@ -363,10 +378,7 @@ fn chess_projection(state: ChessState) -> Component {
 
     view! {
         #[system_once]
-        chess_player {
-            identity { "You are the chess agent playing {agent_side}." }
-            objective { "Evaluate the authoritative position briefly, then choose one legal action." }
-        }
+        { chess_system }
         #[developer]
         chess_game_state {
             phase: phase,
@@ -390,35 +402,7 @@ fn chess_projection(state: ChessState) -> Component {
             previous_reason { "{previous_reason}" }
         }
         #[developer(repeat)]
-        chess_action_policy {
-            chess_action_instructions {
-                response {
-                    "Respond with exactly two XML elements and no other text: first one nonempty <thought>...</thought> with a concise move evaluation, then exactly one registered self-closing XML action element. The rule elements below are instructions, not valid output."
-                }
-                thought_rule {
-                    output_element: "thought",
-                    purpose { "State one concise move evaluation before the action." }
-                    requirement { "Use nonempty plain text without nested XML." }
-                }
-                action_rule {
-                    output_element: "choose_move",
-                    purpose { "Play one legal move." }
-                    attribute {
-                        name: "uci",
-                        source {
-                            xml_path: "/chess_game_state/legal_moves/@values",
-                        }
-                        requirement {
-                            "Choose exactly one space-delimited canonical lowercase UCI token from this XML attribute and copy it unchanged into the action's uci attribute."
-                        }
-                    }
-                }
-                action_rule {
-                    output_element: "resign",
-                    purpose { "Concede the game immediately." }
-                }
-            }
-        }
+        { chess_action_policy }
     }
 }
 

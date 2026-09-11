@@ -18,9 +18,12 @@ struct SupportCase {
 
 #[component]
 fn support_policy() -> Component {
+    let prompt = r#"## Support policy
+
+Resolve the request using only the supplied account context."#;
     view! {
         #[system_once]
-        support_policy { "Resolve the request using only the supplied account context." }
+        { prompt }
     }
 }
 
@@ -37,15 +40,19 @@ fn account_context(account_id: String, plan: String) -> Component {
 
 #[component]
 fn customer_request(request: String) -> Component {
+    let prompt = format!("## Customer request\n\n{request}");
     view! {
-        customer_request { "{request}" }
+        { prompt }
     }
 }
 
 #[component]
 fn response_requirements() -> Component {
+    let prompt = r#"## Response requirements
+
+Return a concise answer and the next action."#;
     view! {
-        response_requirements { "Return a concise answer and the next action." }
+        { prompt }
     }
 }
 

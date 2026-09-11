@@ -28,9 +28,10 @@ fn review_prompt(status: String) -> Component {
 
 Use `{ prompt }` for a complete multiline string. `"{prompt}"` is a formatted
 paragraph with inline validation, and `state { "{value}" }` is text inside an XML
-node. A disappearing raw string does not retract earlier instructions from model
-history. `#[developer(repeat)]` resends the whole current instruction on every
-submitted frame.
+node. A disappearing ordinary user/developer raw string does not retract earlier
+instructions from model history. System strings follow the separate
+`#[system_once]` snapshot replacement and clearing rules. `#[developer(repeat)]`
+resends the whole current instruction on every submitted frame.
 
 Run the credential-free example to inspect both raw Markdown and escaped XML:
 

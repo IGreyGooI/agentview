@@ -95,10 +95,18 @@ async fn every_ticket_waits_for_its_account_and_policy_before_handoff() {
     assert!(frames[0]
         .text
         .contains("<account_id>acct-1042</account_id>"));
+    assert!(frames[0].text.contains("<customer_request>"));
+    assert!(frames[0].text.contains("<ticket_id>ticket-101</ticket_id>"));
     assert!(frames[0]
         .text
         .contains("<export_retention_days>30</export_retention_days>"));
-    assert!(frames[0].text.contains("<support_policy>"));
+    assert!(frames[0].text.contains(
+        "## Export support policy\n\n- Expired exports: Expired downloads cannot be restored. Regenerate the export from the original report.\n- Escalation: If an export is unavailable within the account's retention window, route it to the export support queue."
+    ));
+    assert!(!frames[0].text.contains("<support_policy>"));
+    assert!(frames[0].text.contains(
+        "## Support response\n\nDraft a concise response to the current ticket using its account and support policy."
+    ));
     assert!(frames[1]
         .text
         .contains("<account_id>acct-2050</account_id>"));

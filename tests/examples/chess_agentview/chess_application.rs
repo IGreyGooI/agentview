@@ -566,12 +566,12 @@ async fn preparation_and_contract_drive_the_model_and_stockfish_turns() {
         .text
         .contains("fen>rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2"));
     assert_eq!(
-        frames[1].text.matches("<chess_action_policy>").count(),
+        frames[1].text.matches("## XML action protocol").count(),
         1,
         "developer(repeat) sends the current action policy once on every turn"
     );
     assert!(!frames[1].text.contains("<remove>"));
-    assert!(!frames[1].text.contains("<chess_player>"));
+    assert!(!frames[1].text.contains("# Chess agent"));
     assert_eq!(
         frames[1].replay,
         [CanonicalInputItem::assistant_text(
@@ -603,7 +603,18 @@ async fn preparation_and_contract_drive_the_model_and_stockfish_turns() {
     ] {
         assert!(!frames[0].text.contains(removed_action_syntax));
     }
-    assert!(frames[0].text.contains("<chess_action_policy>"));
+    assert!(frames[0]
+        .text
+        .contains("# Chess agent\n\nYou are the chess agent playing white."));
+    assert!(frames[0].text.contains("## XML action protocol"));
+    assert!(frames[0].text.contains("`<thought>...</thought>`"));
+    assert!(frames[0]
+        .text
+        .contains("`/chess_game_state/legal_moves/@values`"));
+    assert!(frames[0].text.contains("<chess_game_state"));
+    assert!(frames[0].text.contains("<model_attempt"));
+    assert!(!frames[0].text.contains("<chess_player>"));
+    assert!(!frames[0].text.contains("<chess_action_policy>"));
     assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
 }
 

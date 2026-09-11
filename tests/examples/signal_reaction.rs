@@ -25,7 +25,10 @@ async fn completed_review_is_published_in_the_next_frame() -> anyhow::Result<()>
     assert_eq!(frames[0].basis, FrameBasis::Full);
     assert!(matches!(frames[1].basis, FrameBasis::DeltaFrom(_)));
     assert!(frames[0].text.contains("<review_status>pending"));
-    assert!(frames[0].text.contains("<review_policy>"));
+    assert!(frames[0]
+        .text
+        .contains("## Review policy\n\nReturn exactly one token: approved or changes-requested."));
+    assert!(!frames[0].text.contains("<review_policy>"));
     assert!(frames[0].text.contains("<document_request>"));
     assert_eq!(frames[1].text, "<review_status>approved</review_status>");
     assert!(matches!(
