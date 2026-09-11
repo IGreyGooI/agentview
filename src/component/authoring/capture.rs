@@ -29,6 +29,7 @@ pub(crate) enum ProjectionFragmentCapture {
 
 pub(crate) struct BuiltProjectionItems {
     pub(crate) items: Vec<CanonicalInputItem>,
+    pub(crate) repeat_items: Vec<usize>,
     pub(crate) diffs: Vec<RenderedProjectionDiffMarker>,
     pub(crate) diff_templates: Vec<RenderedProjectionItemTemplate>,
 }
@@ -38,6 +39,7 @@ pub(crate) fn build_projection_items(
     runs: Vec<ProjectionRunCapture>,
 ) -> Result<BuiltProjectionItems, ComponentCaptureError> {
     let mut transcript = CanonicalTranscript::new();
+    let mut repeat_items = Vec::new();
     let mut diffs = Vec::new();
     let mut diff_templates = Vec::new();
     if let Some(system) = sealed_system {
@@ -90,13 +92,22 @@ pub(crate) fn build_projection_items(
         }
         let pom = ResolvedDocument::new(complete_children);
         let item = match run.placement {
-            Placement::Developer => {
+            Placement::Developer | Placement::DeveloperRepeat => {
                 CanonicalInputItem::instruction(InstructionAuthority::Developer, pom)
             }
-            Placement::User => CanonicalInputItem::message(ConversationRole::User, pom),
+            Placement::User | Placement::UserRepeat => {
+                CanonicalInputItem::message(ConversationRole::User, pom)
+            }
+            Placement::Assistant => CanonicalInputItem::message(ConversationRole::Assistant, pom),
             Placement::SystemOnce => unreachable!("late System is rejected during capture"),
         };
         transcript = transcript.appended(item)?;
+        if matches!(
+            run.placement,
+            Placement::DeveloperRepeat | Placement::UserRepeat
+        ) {
+            repeat_items.push(item_index);
+        }
         if has_diff {
             diff_templates.push(RenderedProjectionItemTemplate::new(
                 item_index,
@@ -106,6 +117,7 @@ pub(crate) fn build_projection_items(
     }
     Ok(BuiltProjectionItems {
         items: transcript.items().to_vec(),
+        repeat_items,
         diffs,
         diff_templates,
     })

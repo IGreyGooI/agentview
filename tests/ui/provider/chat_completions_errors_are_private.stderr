@@ -1,0 +1,29 @@
+error[E0599]: no variant, associated function, or constant named `InvalidChatCompletionsSerializedRequestBodyLimit` found for enum `AsyncOpenAiConfigError` in the current scope
+ --> tests/ui/provider/chat_completions_errors_are_private.rs:4:37
+  |
+4 |     let _ = AsyncOpenAiConfigError::InvalidChatCompletionsSerializedRequestBodyLimit;
+  |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ variant, associated function, or constant not found in `AsyncOpenAiConfigError`
+  |
+help: there is a variant with a similar name
+  |
+4 -     let _ = AsyncOpenAiConfigError::InvalidChatCompletionsSerializedRequestBodyLimit;
+4 +     let _ = AsyncOpenAiConfigError::InvalidSerializedRequestBodyLimit;
+  |
+
+error[E0599]: no variant, associated function, or constant named `InvalidChatCompletionsFrameProfile` found for enum `AsyncOpenAiConfigError` in the current scope
+ --> tests/ui/provider/chat_completions_errors_are_private.rs:5:37
+  |
+5 |     let _ = AsyncOpenAiConfigError::InvalidChatCompletionsFrameProfile;
+  |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ variant, associated function, or constant not found in `AsyncOpenAiConfigError`
+
+error[E0599]: no variant, associated function, or constant named `ChatCompletionsTargetIdentityExhausted` found for enum `AsyncOpenAiConfigError` in the current scope
+ --> tests/ui/provider/chat_completions_errors_are_private.rs:6:37
+  |
+6 |     let _ = AsyncOpenAiConfigError::ChatCompletionsTargetIdentityExhausted;
+  |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ variant, associated function, or constant not found in `AsyncOpenAiConfigError`
+  |
+help: there is a variant with a similar name
+  |
+6 -     let _ = AsyncOpenAiConfigError::ChatCompletionsTargetIdentityExhausted;
+6 +     let _ = AsyncOpenAiConfigError::ResponsesTargetIdentityExhausted;
+  |

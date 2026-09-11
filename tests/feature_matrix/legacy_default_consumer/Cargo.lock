@@ -43,6 +43,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "unicode-ident",
  "url",
 ]
 

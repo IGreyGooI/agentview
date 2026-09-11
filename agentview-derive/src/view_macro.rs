@@ -44,7 +44,10 @@ impl ViewBody {
 enum Placement {
     SystemOnce,
     Developer,
+    DeveloperRepeat,
     User,
+    UserRepeat,
+    Assistant,
 }
 
 struct ViewNode {
@@ -164,9 +167,27 @@ impl ViewNode {
                     #node,
                 )
             },
+            Some(Placement::DeveloperRepeat) => quote! {
+                ::agentview::component::authoring::__private::placed(
+                    ::agentview::component::authoring::__private::Placement::DeveloperRepeat,
+                    #node,
+                )
+            },
             Some(Placement::User) => quote! {
                 ::agentview::component::authoring::__private::placed(
                     ::agentview::component::authoring::__private::Placement::User,
+                    #node,
+                )
+            },
+            Some(Placement::UserRepeat) => quote! {
+                ::agentview::component::authoring::__private::placed(
+                    ::agentview::component::authoring::__private::Placement::UserRepeat,
+                    #node,
+                )
+            },
+            Some(Placement::Assistant) => quote! {
+                ::agentview::component::authoring::__private::placed(
+                    ::agentview::component::authoring::__private::Placement::Assistant,
                     #node,
                 )
             },
@@ -241,21 +262,25 @@ fn parse_directives(attributes: Vec<Attribute>) -> Result<ViewDirectives> {
     let mut directives = ViewDirectives::default();
     for attribute in attributes {
         let placement = if attribute.path().is_ident("system_once") {
-            Some(Placement::SystemOnce)
+            Some(parse_plain_placement(&attribute, Placement::SystemOnce)?)
         } else if attribute.path().is_ident("developer") {
-            Some(Placement::Developer)
+            Some(parse_repeat_placement(
+                &attribute,
+                Placement::Developer,
+                Placement::DeveloperRepeat,
+            )?)
         } else if attribute.path().is_ident("user") {
-            Some(Placement::User)
+            Some(parse_repeat_placement(
+                &attribute,
+                Placement::User,
+                Placement::UserRepeat,
+            )?)
+        } else if attribute.path().is_ident("assistant") {
+            Some(parse_plain_placement(&attribute, Placement::Assistant)?)
         } else {
             None
         };
         if let Some(placement) = placement {
-            if !matches!(attribute.meta, Meta::Path(_)) {
-                return Err(syn::Error::new_spanned(
-                    attribute,
-                    "prompt placement directives do not accept arguments",
-                ));
-            }
             if directives.placement.replace(placement).is_some() {
                 return Err(syn::Error::new_spanned(
                     attribute,
@@ -298,10 +323,58 @@ fn parse_directives(attributes: Vec<Attribute>) -> Result<ViewDirectives> {
 
         return Err(syn::Error::new_spanned(
             attribute,
-            "view roots support #[system_once], #[developer], #[user], and #[diff(slot = \"...\")]",
+            "view roots support #[system_once], #[developer], #[developer(repeat)], #[user], #[user(repeat)], #[assistant], and #[diff(slot = \"...\")]",
         ));
     }
     Ok(directives)
+}
+
+fn parse_plain_placement(attribute: &Attribute, placement: Placement) -> Result<Placement> {
+    if matches!(&attribute.meta, Meta::Path(_)) {
+        Ok(placement)
+    } else {
+        Err(syn::Error::new_spanned(
+            attribute,
+            "prompt placement directives do not accept arguments",
+        ))
+    }
+}
+
+fn parse_repeat_placement(
+    attribute: &Attribute,
+    ordinary: Placement,
+    repeat: Placement,
+) -> Result<Placement> {
+    if matches!(&attribute.meta, Meta::Path(_)) {
+        return Ok(ordinary);
+    }
+    if !matches!(&attribute.meta, Meta::List(_)) {
+        return Err(syn::Error::new_spanned(
+            attribute,
+            "placement accepts only the `repeat` argument",
+        ));
+    }
+
+    let mut repeat_seen = false;
+    attribute.parse_nested_meta(|meta| {
+        if !meta.path.is_ident("repeat") {
+            return Err(meta.error("placement accepts only the `repeat` argument"));
+        }
+        if meta.input.peek(syn::Token![=]) || meta.input.peek(syn::token::Paren) {
+            return Err(meta.error("the `repeat` placement argument does not accept a value"));
+        }
+        if std::mem::replace(&mut repeat_seen, true) {
+            return Err(meta.error("the `repeat` placement argument may occur only once"));
+        }
+        Ok(())
+    })?;
+    if !repeat_seen {
+        return Err(syn::Error::new_spanned(
+            attribute,
+            "placement requires the `repeat` argument",
+        ));
+    }
+    Ok(repeat)
 }
 
 struct XmlElement {

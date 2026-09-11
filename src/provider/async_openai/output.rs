@@ -1019,7 +1019,7 @@ impl OpenAiOutputLedger {
         error: &ResponseOutputLedgerError,
     ) -> Option<ProviderResponseCompletedReconciliation> {
         let branch = error.response_message_text_reason()?;
-        let response_completed_sequence = optional_sequence(payload)?;
+        let response_completed_sequence = optional_sequence(payload);
         let response = payload.get("response").and_then(Value::as_object);
         let terminal_output = response
             .and_then(|response| response.get("output"))
@@ -2918,6 +2918,44 @@ mod tests {
         assert_eq!(phase_snapshot["terminal_phase"], "final_answer");
         assert_eq!(phase_snapshot["observed_phase"], "commentary");
         assert_eq!(phase_snapshot["text_relation"], "equal");
+    }
+
+    #[test]
+    fn completed_reconciliation_snapshot_keeps_missing_completed_sequence() {
+        let terminal = message("msg_1", "completed", Some("different-text"));
+
+        let (missing_sequence_ledger, _) = completed_message_ledger();
+        let missing_sequence_error =
+            completion_error(missing_sequence_ledger.complete(&completed(vec![terminal.clone()])));
+        let missing_sequence_snapshot = missing_sequence_error
+            .response_completed_reconciliation()
+            .expect("text mismatch keeps diagnostics without a completed sequence number");
+        assert_eq!(
+            missing_sequence_snapshot.response_completed_sequence(),
+            None
+        );
+        let missing_sequence_value = serde_json::to_value(missing_sequence_snapshot).unwrap();
+        assert_eq!(
+            missing_sequence_value["branch"],
+            "terminal_observed_text_mismatch"
+        );
+        assert_eq!(
+            missing_sequence_value["response_completed_sequence"],
+            Value::Null
+        );
+
+        let (numbered_ledger, _) = completed_message_ledger();
+        let numbered_error = completion_error(
+            numbered_ledger.complete(&completed_with_sequence(vec![terminal], 17)),
+        );
+        let numbered_snapshot = numbered_error
+            .response_completed_reconciliation()
+            .expect("text mismatch keeps diagnostics with a completed sequence number");
+        assert_eq!(numbered_snapshot.response_completed_sequence(), Some(17));
+        assert_eq!(
+            serde_json::to_value(numbered_snapshot).unwrap()["response_completed_sequence"],
+            17
+        );
     }
 
     #[test]

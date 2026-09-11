@@ -27,6 +27,8 @@ const TEXT_OUTPUT: ProviderOutputKey = ProviderOutputKey::new(1);
 pub struct AcceptedFrame {
     pub basis: FrameBasis,
     pub text: String,
+    pub projection: Vec<CanonicalInputItem>,
+    pub replay: Vec<CanonicalInputItem>,
 }
 
 #[derive(Clone, Default)]
@@ -244,6 +246,8 @@ impl ReactionPort for ScriptedProvider {
             .push(AcceptedFrame {
                 basis: frame.basis(),
                 text,
+                projection: frame.submission().projection().items().to_vec(),
+                replay: frame.submission().replay().to_vec(),
             });
         *self
             .capture

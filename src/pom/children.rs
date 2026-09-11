@@ -3,7 +3,8 @@ use crate::StorageString;
 use super::{
     content::ContentEdge, BlockContent, CodeBlockNode, CodeSpanNode, ContentNode, ContentRef,
     DiffSlot, HeadingLevel, HeadingNode, InlineContent, ListBuilder, ListKind, ListNode,
-    MarkdownNode, MixedContent, ParagraphNode, PomError, StrongNode, TextNode, XmlNode,
+    MarkdownNode, MixedContent, ParagraphNode, PomError, RawTextNode, StrongNode, TextNode,
+    XmlNode,
 };
 
 fn normalize_text_edge(
@@ -19,6 +20,7 @@ fn normalize_text_edge(
             }
             Some(ContentEdge::Node(ContentNode::Markdown(_)))
             | Some(ContentEdge::Node(ContentNode::Xml(_)))
+            | Some(ContentEdge::Node(ContentNode::RawText(_)))
             | Some(ContentEdge::Diff(_))
             | None => Some(ContentEdge::Node(ContentNode::Text(text))),
         },
@@ -27,6 +29,9 @@ fn normalize_text_edge(
         }
         ContentEdge::Node(ContentNode::Xml(node)) => {
             Some(ContentEdge::Node(ContentNode::Xml(node)))
+        }
+        ContentEdge::Node(ContentNode::RawText(node)) => {
+            Some(ContentEdge::Node(ContentNode::RawText(node)))
         }
         ContentEdge::Diff(slot) => Some(ContentEdge::Diff(slot)),
     }
@@ -137,6 +142,10 @@ impl<'a> BlockBuilder<'a> {
 
     pub fn thematic_break(&mut self) {
         self.push(BlockContent::thematic_break());
+    }
+
+    pub fn raw_text(&mut self, node: RawTextNode) {
+        self.push(BlockContent::raw_text(node));
     }
 
     pub fn xml(&mut self, node: XmlNode) {
@@ -303,6 +312,10 @@ impl<'a> MixedBuilder<'a> {
 
     pub fn text(&mut self, node: TextNode) {
         self.push(MixedContent::text(node));
+    }
+
+    pub fn raw_text(&mut self, node: RawTextNode) {
+        self.push(MixedContent::raw_text(node));
     }
 
     pub fn markdown(&mut self, node: MarkdownNode) {

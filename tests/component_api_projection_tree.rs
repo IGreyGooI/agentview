@@ -3,7 +3,10 @@ use agentview::component::{
     prelude::{component, view, Component},
     ComponentHost,
 };
-use agentview::{pom_renderer::render_pom_document, transcript::CanonicalInputItem};
+use agentview::{
+    pom_renderer::render_pom_document,
+    transcript::{CanonicalInputItem, ConversationRole},
+};
 
 #[derive(Clone, Copy)]
 struct ProjectionProps;
@@ -111,6 +114,41 @@ fn diff_projection_application(props: DiffProjectionProps) -> Component {
     }
 }
 
+#[component]
+fn authored_assistant_application(_props: ProjectionProps) -> Component {
+    view! {
+        #[assistant]
+        "Example answer."
+
+        #[assistant]
+        answer { "First." }
+
+        #[user]
+        question { "Next?" }
+
+        #[assistant]
+        answer { "Second." }
+    }
+}
+
+#[component]
+fn inherited_assistant_application(_props: ProjectionProps) -> Component {
+    view! {
+        #[assistant]
+        history_feature()
+    }
+}
+
+#[component]
+fn repeat_placement_scope_application(_props: ProjectionProps) -> Component {
+    view! {
+        #[developer(repeat)]
+        history_feature()
+
+        sibling_turn { "ordinary user" }
+    }
+}
+
 fn rendered(item: &CanonicalInputItem) -> String {
     let pom = match item {
         CanonicalInputItem::Instruction { pom, .. } | CanonicalInputItem::Message { pom, .. } => {
@@ -202,6 +240,88 @@ fn render_treats_components_as_ordered_ownership_units() {
             .iter()
             .flat_map(|node| node.items().iter().cloned())
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn authored_assistant_items_merge_only_across_contiguous_same_role_content() {
+    let mut host = ComponentHost::new_root(authored_assistant_application, ProjectionProps);
+    let projection = host.render().unwrap().projection().clone();
+    let transcript = projection.to_transcript().unwrap();
+    let items = transcript.items();
+
+    assert!(matches!(
+        items,
+        [
+            CanonicalInputItem::Message {
+                role: ConversationRole::Assistant,
+                ..
+            },
+            CanonicalInputItem::Message {
+                role: ConversationRole::User,
+                ..
+            },
+            CanonicalInputItem::Message {
+                role: ConversationRole::Assistant,
+                ..
+            }
+        ]
+    ));
+    assert_eq!(
+        rendered(&items[0]),
+        "Example answer.\n\n<answer>First.</answer>"
+    );
+    assert_eq!(rendered(&items[1]), "<question>Next?</question>");
+    assert_eq!(rendered(&items[2]), "<answer>Second.</answer>");
+}
+
+#[test]
+fn outer_assistant_placement_overrides_descendant_roles() {
+    let mut host = ComponentHost::new_root(inherited_assistant_application, ProjectionProps);
+    let projection = host.render().unwrap().projection().clone();
+    let transcript = projection.to_transcript().unwrap();
+
+    assert!(matches!(
+        transcript.items(),
+        [CanonicalInputItem::Message {
+            role: ConversationRole::Assistant,
+            ..
+        }]
+    ));
+    assert_eq!(
+        rendered(&transcript.items()[0]),
+        "<history_policy>policy</history_policy>\n\n<history_turn>turn-1</history_turn>"
+    );
+}
+
+#[test]
+fn repeat_placement_applies_to_one_subtree_and_outer_placement_wins() {
+    let mut host = ComponentHost::new_root(repeat_placement_scope_application, ProjectionProps);
+    let projection = host.render().unwrap().projection().clone();
+    let transcript = projection.to_transcript().unwrap();
+    let items = transcript.items();
+
+    assert!(matches!(
+        items,
+        [
+            CanonicalInputItem::Message {
+                role: ConversationRole::User,
+                ..
+            },
+            CanonicalInputItem::Instruction {
+                authority: agentview::transcript::InstructionAuthority::Developer,
+                ..
+            }
+        ]
+    ));
+    assert_eq!(
+        rendered(&items[0]),
+        "<sibling_turn>ordinary user</sibling_turn>"
+    );
+    assert_eq!(
+        rendered(&items[1]),
+        "<history_policy>policy</history_policy>\n\n<history_turn>turn-1</history_turn>",
+        "the outer repeat placement overrides the child's explicit developer root and default user root"
     );
 }
 

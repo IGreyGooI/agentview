@@ -58,7 +58,10 @@ pub(crate) enum ScopeRender {
 pub(crate) enum Placement {
     SystemOnce,
     Developer,
+    DeveloperRepeat,
     User,
+    UserRepeat,
+    Assistant,
 }
 
 #[doc(hidden)]
@@ -66,7 +69,10 @@ pub(crate) enum Placement {
 pub enum MacroPlacement {
     SystemOnce,
     Developer,
+    DeveloperRepeat,
     User,
+    UserRepeat,
+    Assistant,
 }
 
 /// One prompt-facing text template retained as static segments and typed slots.
@@ -133,7 +139,10 @@ impl From<MacroPlacement> for Placement {
         match value {
             MacroPlacement::SystemOnce => Self::SystemOnce,
             MacroPlacement::Developer => Self::Developer,
+            MacroPlacement::DeveloperRepeat => Self::DeveloperRepeat,
             MacroPlacement::User => Self::User,
+            MacroPlacement::UserRepeat => Self::UserRepeat,
+            MacroPlacement::Assistant => Self::Assistant,
         }
     }
 }
@@ -188,8 +197,10 @@ impl MarkdownInlineTemplate {
 
 /// Sealed conversion for a dynamic `view!` root expression.
 ///
-/// This is intentionally narrower than `Display`: ordinary domain scalars do
-/// not become prompt text unless the author writes a quoted formatted literal.
+/// This is intentionally narrower than `Display`: `String`, `&String`, and
+/// `&str` become opaque source-text document roots, while ordinary domain
+/// scalars remain rejected until the author uses a quoted template or
+/// `format!(...)`.
 #[doc(hidden)]
 pub trait IntoViewRoot: private::Sealed {
     fn into_view_root(self) -> Component;
@@ -213,6 +224,54 @@ impl IntoViewRoot for Component {
 impl IntoViewRoot for StreamingXmlTag {
     fn into_view_root(self) -> Component {
         self.into_component()
+    }
+}
+
+fn raw_text_root(value: impl Into<crate::StorageString>) -> Component {
+    Component::from_node(ComponentNode::Pom(PomFragment::Document(Ok(
+        Document::from_raw_text(value),
+    ))))
+}
+
+impl private::Sealed for String {}
+
+impl IntoViewRoot for String {
+    fn into_view_root(self) -> Component {
+        raw_text_root(self)
+    }
+}
+
+impl IntoDiffViewRoot for String {
+    fn into_diff_view_root(self) -> Component {
+        raw_text_root(self)
+    }
+}
+
+impl<'a> private::Sealed for &'a str {}
+
+impl<'a> IntoViewRoot for &'a str {
+    fn into_view_root(self) -> Component {
+        raw_text_root(self)
+    }
+}
+
+impl<'a> IntoDiffViewRoot for &'a str {
+    fn into_diff_view_root(self) -> Component {
+        raw_text_root(self)
+    }
+}
+
+impl<'a> private::Sealed for &'a String {}
+
+impl<'a> IntoViewRoot for &'a String {
+    fn into_view_root(self) -> Component {
+        raw_text_root(self.as_str())
+    }
+}
+
+impl<'a> IntoDiffViewRoot for &'a String {
+    fn into_diff_view_root(self) -> Component {
+        raw_text_root(self.as_str())
     }
 }
 

@@ -1,0 +1,26 @@
+error[E0277]: the trait bound `TextNode: agentview::agent_view::IntoBlockChildren` is not satisfied
+ --> tests/ui/component_target/fail_dynamic_scalar.rs:5:11
+  |
+4 |       let _ = view! {
+  |  _____________-
+5 | |         { 42_u32 }
+  | |           ^^^^^^ the trait `agentview::agent_view::IntoBlockChildren` is not implemented for `TextNode`
+6 | |     };
+  | |_____- required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `agentview::agent_view::IntoBlockChildren`:
+            BlockContent
+            CodeBlockNode
+            Document
+            HeadingNode
+            ListNode
+            Option<T>
+            ParagraphNode
+            RawTextNode
+            XmlNode
+  = note: required for `u32` to implement `agentview::component::authoring::__private::IntoViewRoot`
+note: required by a bound in `agentview::component::authoring::__private::dynamic_root`
+ --> src/component/authoring.rs
+  |
+  |     pub fn dynamic_root(value: impl IntoViewRoot) -> Component {
+  |                                     ^^^^^^^^^^^^ required by this bound in `dynamic_root`

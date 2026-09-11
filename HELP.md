@@ -12,6 +12,9 @@ is the authoritative runtime contract; this file is its authoring guide.
 | Mark a semantic state region | `#[diff(slot = "...")]` around one POM root |
 | Describe field changes | `#[view(diff)]`, `#[view(diff(append))]`, or another field strategy |
 | Publish System instructions | `#[system_once]` on ordinary POM |
+| Insert an existing multiline prompt unchanged | `{ prompt_string }` as a `view!` root |
+| Resend current policy or context on every submitted frame | `#[developer(repeat)]` or `#[user(repeat)]` |
+| Declare an authored assistant message | `#[assistant]` on ordinary POM or a Component call |
 | Run an application | `Application::mount(...)`, then `app.run().await` |
 | Wait for required business inputs | `use_preparation` inside the owning Component |
 | End normal application work | `use_application_exit`, then owner calls `shutdown()` |
@@ -22,13 +25,26 @@ is the authoritative runtime contract; this file is its authoring guide.
 
 ## Business History
 
-Render the complete, current business POM on every Component render. Keep domain facts in Signals
-or durable application state; do not construct a per-Component transcript or emit past provider
-messages yourself.
+On every Component render, declare the complete current state this Component must deliver to the
+LLM. This can include rules, context, business state, records, or explicitly authored messages.
+"Complete" applies only to that current Component delivery requirement. It is not a transcript of
+everything the LLM knows, canonical history, or the final provider request. Keep domain facts in
+Signals or durable application state. Ordinary assistant output belongs to the runtime/provider
+history path; a Component does not need to repeat past model replies. An explicitly authored
+assistant message instead belongs to the Component projection.
 
 The runtime derives new or changed input from that complete projection. Its private `FrameSession`
 owns canonical causal history, including admitted tool calls and results. A `ReactionPort` owns wire
 encoding, remote cursors, and other provider-private state.
+Together they use effective history and current input to satisfy the Component declaration. That
+history can contain prior state, earlier conversation, provider assistant output, and admitted tool
+facts. Its retention and actual wire representation are not Component-visible guarantees. Reusing
+history is a best-effort delivery optimization; the complete Component declaration remains the
+content contract.
+
+An item disappearing from a projection does not by itself make the LLM forget prior history. A
+user/developer XML `<remove>` declares the old XML state semantically invalid; it does not erase
+historical messages. System snapshots, compaction, and context reset retain their dedicated rules.
 
 Full versus Delta is a delivery decision below the Component API. A Full frame can replay required
 input without asking business code to reconstruct old provider output. Signal writes only mark a
@@ -37,6 +53,95 @@ Components use preparation to wait for inputs and an exit handle to end the loop
 
 Keep System instructions as a separate snapshot using `#[system_once]` on ordinary POM, beside the
 Component that renders business state.
+
+Use `#[assistant]` when the application itself supplies an assistant message, such as an example
+answer. It follows the same placement and contiguous-merge rules as `#[user]` and `#[developer]`:
+
+```rust
+use agentview::component::prelude::*;
+
+#[component]
+fn answer_example() -> Component {
+    view! {
+        #[user]
+        "What is the status?"
+
+        #[assistant]
+        "The request is pending."
+    }
+}
+```
+
+Authored assistant messages compare against the previous complete projection. Changed ordinary
+messages send their complete current POM; omission sends no deletion patch, and reappearance sends
+the message again. Existing `#[diff]` field strategies can also be combined with `#[assistant]`.
+Provider output remains a separate canonical fact even when it has identical rendered text.
+
+## Existing Prompt Strings
+
+Put an existing complete prompt in a dynamic root. `String`, `&String`, and `&str` become a POM
+`RawTextNode`, preserving multiline Markdown, XML examples, indentation, and line endings:
+
+```rust
+use agentview::component::prelude::*;
+
+#[component]
+fn existing_prompt(system: String) -> Component {
+    view! {
+        #[system_once]
+        { system }
+
+        { String::from("## Request\n\nContinue.\n") }
+    }
+}
+```
+
+The string is one opaque POM block. It is not parsed as Markdown or XML and has no added wrapper.
+At document level its contents render verbatim. Adjacent blocks still use the normal blank-line
+separator. Ordinary user/developer strings compare as complete values; unchanged content is omitted,
+changed content is sent in full, and disappearance produces no XML removal even if the string contains
+XML-looking text. `#[diff]` retains whole-value comparison; `repeat` still sends the whole current value.
+System strings use the existing System snapshot rules.
+
+Quoted `"{system}"` remains a formatted paragraph with inline validation. Use `{ system }` or
+`{ format!("{system}") }` for a complete multiline prompt. Text inside explicit Markdown/XML nodes
+retains its existing validation and escaping. Low-level callers can use `Document::from_raw_text(...)`.
+
+Run `cargo run --no-default-features --example raw_prompt` for a credential-free example.
+
+## Repeated Content and Placement Scope
+
+Use `#[developer(repeat)]` or `#[user(repeat)]` when the complete current content must be sent on
+every submitted frame, even when it is unchanged:
+
+```rust
+use agentview::component::prelude::*;
+
+#[component]
+fn repeated_policy() -> Component {
+    view! {
+        #[developer(repeat)]
+        policy { "Answer using the current workspace state." }
+
+        #[developer]
+        context { "The workspace is read-only." }
+    }
+}
+```
+
+Each placement applies to the immediately following `view!` declaration node and its subtree.
+On a Component call it applies to the Component's output subtree, including child Components.
+It does not affect following siblings or automatically cover an entire `RenderedProjectionNode`.
+The outer placement takes precedence over inner placements, including their repeat setting.
+
+Contiguous content with the same role and repeat setting can merge into one item. Ordinary and
+repeated content never merge together, even with the same role. The example therefore produces
+two developer items: `policy` repeats, while unchanged `context` is omitted after its first frame.
+
+Repeat takes precedence over `#[diff]` when choosing output: send the complete current POM while
+still maintaining the committed diff baseline. Rendering or preparing alone does not submit it.
+Disappearing repeat content follows the ordinary user/developer XML removal rule. Repeat is private
+delivery metadata; it adds no POM wrapper. Assistant and System placements do not accept `repeat`.
 
 ## Complete State and Diff
 
@@ -100,31 +205,43 @@ from a record count, current content, or a transient request ID.
 A single-child root can legitimately fall back to its complete root when that child changes.
 Preserve the truthful POM shape; do not add dummy fields solely to force a Delta.
 
-## Stable Identity and Ordinary Tree Fold
+## Stable Identity and Adjacent Snapshots
 
-Keep a Component mounted at a stable identity and keep each diff slot address stable if its baseline
-and occurrence ledger must continue. Moving, remounting, or conditionally replacing a Component
-changes that assumption.
+Keep a Component mounted at a stable identity and keep each diff slot address stable to retain its
+baseline. The Frame compiler compares ordinary items with the previous successfully handed-off
+complete projection. A render or a cancelled preparation does not advance that snapshot.
 
-This is the established occurrence fold for **ordinary canonical input items after POM lowering**.
-It does not describe `#[diff]` operations, System replacement, native tools, or provider wire state.
+Ordinary output needs no `#[diff]` annotation for this comparison. Items remain ordered values,
+including duplicate occurrences; there is no additional item syntax or slot to declare.
 
-| Current node lists | Newly submitted ordinary items | Accumulated submitted history |
+| Previous node items | Current node items | Submission |
 | --- | --- | --- |
-| `left: [A]`, `right: [O]` | `[A, O]` | `[A, O]` |
-| `left: [A, B]`, `right: [O, P]` | `[B, P]` | `[A, O, B, P]` |
-| `left: [A, B, C]`, `right: [O]` | `[C]` | `[A, O, B, P, C]` |
-| unchanged | `[]` | `[A, O, B, P, C]` |
+| none | `[A]` | complete A |
+| `[A]` | `[A]` | omitted |
+| `[A]` | `[B]` | compare A's POM with B's POM |
+| `[B]` | `[A]` | compare B's POM with A's POM, even if A appeared earlier |
+| `[A]` | `[A, A]` | one new complete A |
+| `[A, B]` | `[A]` | removal POM for B's XML, using B's old role |
+| `[]` | `[A]` | complete A again |
 
-At row two, the current projection flattens to `[A, B, O, P]`, while submitted history remains
-`[A, O, B, P]`. Visit nodes in projection order and items within each node in order. First claim a
-matching submitted occurrence in the same node; then claim an unclaimed matching provider occurrence
-from the same execution scope; append only what remains.
+The compiler retains an equal prefix. When equal-length sequences differ at only one item of the
+same role, that item compares its POM and the equal suffix stays in place. Other changed suffixes
+remove old XML and resend complete current items in order. Node insertion
+or reordering likewise refreshes the affected suffix. This favors correct current content over a
+minimal patch. Node identities remain internal and are not rendered as wrappers.
 
-A `#[view(diff(append))]` tail is deliberately forced through as a diff submission and does not take
-part in ordinary occurrence deduplication. Count equal ordinary occurrences rather than treating
-values as a set: `[A]` becoming `[A, A]` appends one `A`. Later omission, insertion, or reordering
-does not retract or reorder prior submissions.
+XML changes emit a semantic patch or a complete current root. A disappearing user/developer XML root emits
+`<remove>...</remove>` around its old content. Mixed documents are supported; ambiguous root layouts
+remove their old XML roots and emit the complete current document. Plain text and Markdown changes
+emit complete values, and their disappearance emits no retraction. Use XML for state that must
+express removal or invalidation. Canonical history remains append-only; these updates do not remove
+or reorder old messages, and equal XML content does not identify a particular historical occurrence.
+
+Existing `#[diff]` field strategies still produce authored semantic deltas. Removed diff addresses
+leave the committed baseline, so reappearance sends a complete value. Provider/tool occurrences
+retain separate provenance claims, and System retains its independent replace/clear behavior.
+Disappearance of ToolCall, ToolResult, assistant, provider-extension, or System items produces no
+deletion patch.
 
 Parent content is grouped by node: source `before`, child, `after` produces parent `[before, after]`
 followed by the child node. Do not use parent/child source interleaving as a business-history primitive.
@@ -206,8 +323,8 @@ For a live business example with an inbox and prepared account context, see
 fixtures are kept under `tests/examples`.
 
 The Responses target receives each mounted tool's complete definition, including its description
-and input schema. The raw name-only API retains its permissive object schema. The Chat Completions
-target is text-only: a nonempty native ToolCatalog is rejected before handoff.
+and input schema. The raw name-only API retains its permissive object schema. Public OpenAI
+integrations use the Responses API; the internal Chat Completions adapter is not a public provider.
 
 ## Check the Contract
 

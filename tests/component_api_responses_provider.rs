@@ -139,6 +139,8 @@ fn native_tool_lifecycle_application(
 #[derive(Clone, Copy)]
 enum ServerReply {
     Completed,
+    CompletedWithoutSequenceNumbers,
+    CompletedWithOnlyCompletedSequenceNumber,
     CompletedWithUsage,
     CompletedWithInconsistentUsage,
     CompletedWithUsageFixture(UsageFixture),
@@ -208,8 +210,8 @@ enum ServerReply {
     EventMissingType,
     EventMissingTypeAfterTerminal,
     EventNonStringType,
-    EventMissingSequence,
     EventNonIntegerSequence,
+    EventNullSequence,
     InvalidUtf8Sse,
     NativeTool,
     NativeToolLifecycleToolOnly,
@@ -228,6 +230,7 @@ enum ServerReply {
     DuplicateTerminal,
     EventAfterTerminal,
     NonMonotonicSequence,
+    NonMonotonicSequenceAfterUnnumberedGap,
     MismatchedTextIdentity,
     OutputItemAddedLifecycle(OutputItemAddedLifecycleFault),
     UnsealedPrivateAtTerminal(UnsealedPrivateKind),
@@ -359,6 +362,82 @@ fn completed_response() -> Response {
         ),
     )
         .into_response()
+}
+
+fn completed_response_with_optional_sequence_numbers(
+    sequence_numbers: [Option<u64>; 6],
+) -> Response {
+    let message_added = serde_json::json!({
+        "id": "msg_optional_sequence",
+        "type": "message",
+        "status": "in_progress",
+        "role": "assistant",
+        "content": [],
+    });
+    let message_done = serde_json::json!({
+        "id": "msg_optional_sequence",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": "<result value=\"alpha\" />",
+            "annotations": [],
+        }],
+    });
+    let mut events = vec![
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": message_added,
+        }),
+        serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "<result value=\"al",
+            "item_id": "msg_optional_sequence",
+            "output_index": 0,
+            "content_index": 0,
+        }),
+        serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "pha\" />",
+            "item_id": "msg_optional_sequence",
+            "output_index": 0,
+            "content_index": 0,
+        }),
+        serde_json::json!({
+            "type": "response.output_text.done",
+            "text": "<result value=\"alpha\" />",
+            "item_id": "msg_optional_sequence",
+            "output_index": 0,
+            "content_index": 0,
+        }),
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": message_done.clone(),
+        }),
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_optional_sequence",
+                "status": "completed",
+                "output": [message_done],
+            },
+        }),
+    ];
+    for (event, sequence_number) in events.iter_mut().zip(sequence_numbers) {
+        if let Some(sequence_number) = sequence_number {
+            event
+                .as_object_mut()
+                .expect("optional-sequence fixture event is an object")
+                .insert(
+                    "sequence_number".to_owned(),
+                    serde_json::Value::from(sequence_number),
+                );
+        }
+    }
+    sse_response(events)
 }
 
 fn completed_with_usage_response() -> Response {
@@ -1600,6 +1679,19 @@ async fn responses_endpoint(State(state): State<ServerState>, body: Bytes) -> Re
 
     match reply {
         ServerReply::Completed => completed_response(),
+        ServerReply::CompletedWithoutSequenceNumbers => {
+            completed_response_with_optional_sequence_numbers([None; 6])
+        }
+        ServerReply::CompletedWithOnlyCompletedSequenceNumber => {
+            completed_response_with_optional_sequence_numbers([
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(6),
+            ])
+        }
         ServerReply::CompletedWithUsage => completed_with_usage_response(),
         ServerReply::CompletedWithInconsistentUsage => {
             completed_with_inconsistent_usage_response()
@@ -2154,16 +2246,16 @@ async fn responses_endpoint(State(state): State<ServerState>, body: Bytes) -> Re
             "data: {\"type\":{},\"sequence_number\":1,\"detail\":\"event-shape-secret-sentinel\"}\n\n",
         )
             .into_response(),
-        ServerReply::EventMissingSequence => (
-            [(header::CONTENT_TYPE, "text/event-stream")],
-            "data: {\"type\":\"response.heartbeat\",\"detail\":\"event-shape-secret-sentinel\"}\n\n",
-        )
-            .into_response(),
-        ServerReply::EventNonIntegerSequence => (
-            [(header::CONTENT_TYPE, "text/event-stream")],
-            "data: {\"type\":\"response.heartbeat\",\"sequence_number\":\"1\",\"detail\":\"event-shape-secret-sentinel\"}\n\n",
-        )
-            .into_response(),
+        ServerReply::EventNonIntegerSequence => sse_response(vec![serde_json::json!({
+            "type": "response.heartbeat",
+            "sequence_number": "1",
+            "detail": "event-shape-secret-sentinel",
+        })]),
+        ServerReply::EventNullSequence => sse_response(vec![serde_json::json!({
+            "type": "response.heartbeat",
+            "sequence_number": null,
+            "detail": "event-shape-secret-sentinel",
+        })]),
         ServerReply::InvalidUtf8Sse => Response::builder()
             .header(header::CONTENT_TYPE, "text/event-stream")
             .body(Body::from(Bytes::from_static(b"data: \xff\n\n")))
@@ -2311,6 +2403,16 @@ async fn responses_endpoint(State(state): State<ServerState>, body: Bytes) -> Re
             ),
         )
             .into_response(),
+        ServerReply::NonMonotonicSequenceAfterUnnumberedGap => {
+            completed_response_with_optional_sequence_numbers([
+                Some(6),
+                None,
+                None,
+                None,
+                None,
+                Some(6),
+            ])
+        }
         ServerReply::MismatchedTextIdentity => (
             [(header::CONTENT_TYPE, "text/event-stream")],
             concat!(
@@ -5901,6 +6003,42 @@ async fn response_failure_stages_have_distinct_payload_free_codes() {
 }
 
 #[tokio::test]
+async fn responses_accept_absent_sequence_numbers_in_completed_text_streams() {
+    let cases = [
+        (
+            "all-sequences-absent",
+            ServerReply::CompletedWithoutSequenceNumbers,
+        ),
+        (
+            "only-completed-sequence-present",
+            ServerReply::CompletedWithOnlyCompletedSequenceNumber,
+        ),
+    ];
+
+    for (name, reply) in cases {
+        let (api_base, attempts, _bodies, shutdown, server) = spawn_server(reply).await;
+        let mut provider = provider(api_base);
+
+        let events = execute_provider(&mut provider, default_sample_projection())
+            .await
+            .unwrap_or_else(|fault| panic!("case {name} rejected: {fault}"));
+
+        assert_eq!(
+            text_trace(events),
+            vec![
+                ("delta", String::from("<result value=\"al")),
+                ("delta", String::from("pha\" />")),
+                ("complete", String::from("<result value=\"alpha\" />")),
+            ],
+            "case {name}"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "case {name}");
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn response_event_shape_fault_kind_and_code_policy_is_explicit() {
     let cases = [
         (
@@ -5914,13 +6052,13 @@ async fn response_event_shape_fault_kind_and_code_policy_is_explicit() {
             ProviderFaultKind::RetryableTransport,
         ),
         (
-            "missing-sequence",
-            ServerReply::EventMissingSequence,
+            "non-integer-sequence",
+            ServerReply::EventNonIntegerSequence,
             ProviderFaultKind::RetryableTransport,
         ),
         (
-            "non-integer-sequence",
-            ServerReply::EventNonIntegerSequence,
+            "null-sequence",
+            ServerReply::EventNullSequence,
             ProviderFaultKind::RetryableTransport,
         ),
         (
@@ -5931,6 +6069,11 @@ async fn response_event_shape_fault_kind_and_code_policy_is_explicit() {
         (
             "non-monotonic-sequence",
             ServerReply::NonMonotonicSequence,
+            ProviderFaultKind::ModelRejected,
+        ),
+        (
+            "non-monotonic-sequence-after-unnumbered-gap",
+            ServerReply::NonMonotonicSequenceAfterUnnumberedGap,
             ProviderFaultKind::ModelRejected,
         ),
         (

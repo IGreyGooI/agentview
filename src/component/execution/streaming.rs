@@ -3,12 +3,12 @@
 use std::{
     any::Any,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
     },
 };
 
-use futures::{FutureExt, future::join_all};
+use futures::{future::join_all, FutureExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -20,9 +20,9 @@ use crate::{
 };
 
 use super::{
-    ProviderOutputKey,
     admission::{AdmittedReactionSummary, AdmittedTextFact},
     application::ApplicationFault,
+    ProviderOutputKey,
 };
 
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);

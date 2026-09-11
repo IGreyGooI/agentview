@@ -12,9 +12,7 @@ use agentview::{
     component::execution::ProviderIdentity,
     provider::{
         async_openai::{
-            AsyncOpenAiChatCompletionsProvider, AsyncOpenAiConfigError,
-            AsyncOpenAiResponsesProvider, AsyncOpenAiTransportConfig, OpenAiChatCompletionsOptions,
-            OPENAI_CHAT_COMPLETIONS_PROFILE,
+            AsyncOpenAiConfigError, AsyncOpenAiResponsesProvider, AsyncOpenAiTransportConfig,
         },
         codex_http_v1::{CodexHttpV1Encoder, CodexHttpV1Options, CODEX_HTTP_V1_PROFILE},
     },
@@ -78,87 +76,6 @@ fn responses_try_new_returns_a_sanitized_initialization_error_without_requesting
         &format!("{error:?}\n{error}"),
         &[&api_base, API_KEY_SENTINEL, RAW_SOURCE_SENTINEL],
     );
-}
-
-#[cfg(all(
-    unix,
-    not(target_os = "android"),
-    not(target_vendor = "apple"),
-    not(target_arch = "wasm32")
-))]
-#[test]
-fn chat_try_new_returns_a_sanitized_initialization_error_without_requesting() {
-    if std::env::var_os(CHILD_ENV).is_none() {
-        run_chat_failure_child();
-        return;
-    }
-
-    assert_credentialed_url_is_sanitized();
-    let api_base = std::env::var(BASE_URL_ENV).expect("parent supplies a synthetic base URL");
-    let config = AsyncOpenAiTransportConfig::new(&api_base, API_KEY_SENTINEL).unwrap();
-    let identity =
-        ProviderIdentity::new("openai", OPENAI_CHAT_COMPLETIONS_PROFILE, 1, BINDING).unwrap();
-    let options = OpenAiChatCompletionsOptions::new("test-chat-model").unwrap();
-
-    let error = match AsyncOpenAiChatCompletionsProvider::try_new(config, identity, options) {
-        Ok(_) => panic!("missing CA configuration unexpectedly initialized Chat Completions"),
-        Err(error) => error,
-    };
-
-    assert_eq!(error, AsyncOpenAiConfigError::TransportInitialization);
-    assert_eq!(format!("{error:?}"), "TransportInitialization");
-    assert_eq!(error.to_string(), "OpenAI transport initialization failed");
-    assert!(error.source().is_none());
-    assert_sanitized(
-        &format!("{error:?}\n{error}"),
-        &[&api_base, API_KEY_SENTINEL, RAW_SOURCE_SENTINEL],
-    );
-}
-
-#[cfg(all(
-    unix,
-    not(target_os = "android"),
-    not(target_vendor = "apple"),
-    not(target_arch = "wasm32")
-))]
-fn run_chat_failure_child() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let api_base = format!("https://{}/v1", listener.local_addr().unwrap());
-    let missing_ca = std::env::current_exe().unwrap().join(MISSING_CA_SENTINEL);
-    assert!(!missing_ca.exists());
-
-    let output = Command::new(std::env::current_exe().unwrap())
-        .arg("chat_try_new_returns_a_sanitized_initialization_error_without_requesting")
-        .arg("--exact")
-        .arg("--nocapture")
-        .env(CHILD_ENV, "chat")
-        .env(BASE_URL_ENV, &api_base)
-        .env(URL_CREDENTIAL_ENV, credentialed_url())
-        .env("SSL_CERT_FILE", &missing_ca)
-        .env_remove("SSL_CERT_DIR")
-        .output()
-        .unwrap();
-
-    let output_text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_sanitized(
-        &output_text,
-        &[
-            &missing_ca.to_string_lossy(),
-            &api_base,
-            API_KEY_SENTINEL,
-            RAW_SOURCE_SENTINEL,
-        ],
-    );
-    assert!(
-        output.status.success(),
-        "isolated Chat initialization child failed"
-    );
-    assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
 }
 
 #[cfg(all(
@@ -231,32 +148,6 @@ fn responses_legacy_new_panics_with_only_a_fixed_sanitized_message() {
     let _provider =
         AsyncOpenAiResponsesProvider::new(config, identity, CodexHttpV1Encoder::new(options));
     panic!("legacy Responses constructor unexpectedly returned");
-}
-
-#[cfg(all(
-    unix,
-    not(target_os = "android"),
-    not(target_vendor = "apple"),
-    not(target_arch = "wasm32")
-))]
-#[test]
-fn chat_legacy_new_panics_with_only_a_fixed_sanitized_message() {
-    if std::env::var_os(CHILD_ENV).is_none() {
-        run_legacy_panic_child(
-            "chat_legacy_new_panics_with_only_a_fixed_sanitized_message",
-            "chat-legacy",
-        );
-        return;
-    }
-
-    assert_credentialed_url_is_sanitized();
-    let api_base = std::env::var(BASE_URL_ENV).expect("parent supplies a synthetic base URL");
-    let config = AsyncOpenAiTransportConfig::new(api_base, API_KEY_SENTINEL).unwrap();
-    let identity =
-        ProviderIdentity::new("openai", OPENAI_CHAT_COMPLETIONS_PROFILE, 1, BINDING).unwrap();
-    let options = OpenAiChatCompletionsOptions::new("test-chat-model").unwrap();
-    let _provider = AsyncOpenAiChatCompletionsProvider::new(config, identity, options);
-    panic!("legacy Chat Completions constructor unexpectedly returned");
 }
 
 #[cfg(all(

@@ -2,7 +2,8 @@ use crate::StorageString;
 
 use super::{
     CodeBlockNode, CodeSpanNode, ContentContext, ContentKind, DiffSlot, HeadingNode, ListNode,
-    MarkdownKind, MarkdownNode, ParagraphNode, PomError, StrongNode, TextNode, XmlNode,
+    MarkdownKind, MarkdownNode, ParagraphNode, PomError, RawTextNode, StrongNode, TextNode,
+    XmlNode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -10,6 +11,7 @@ pub enum ContentNode {
     Markdown(MarkdownNode),
     Xml(XmlNode),
     Text(TextNode),
+    RawText(RawTextNode),
 }
 
 impl ContentNode {
@@ -18,6 +20,7 @@ impl ContentNode {
             Self::Markdown(node) => ContentKind::Markdown(node.kind()),
             Self::Xml(_) => ContentKind::Xml,
             Self::Text(_) => ContentKind::Text,
+            Self::RawText(_) => ContentKind::RawText,
         }
     }
 }
@@ -90,6 +93,10 @@ impl BlockContent {
         Self(ContentEdge::Node(ContentNode::Xml(node)))
     }
 
+    pub fn raw_text(node: RawTextNode) -> Self {
+        Self(ContentEdge::Node(ContentNode::RawText(node)))
+    }
+
     pub fn xml_slot(slot: DiffSlot) -> Self {
         Self(ContentEdge::Diff(slot))
     }
@@ -103,7 +110,8 @@ impl BlockContent {
                 | MarkdownKind::CodeBlock
                 | MarkdownKind::ThematicBreak,
             )
-            | ContentKind::Xml => Ok(Self(ContentEdge::Node(node))),
+            | ContentKind::Xml
+            | ContentKind::RawText => Ok(Self(ContentEdge::Node(node))),
             ContentKind::Markdown(MarkdownKind::Strong | MarkdownKind::CodeSpan)
             | ContentKind::Text => Err(PomError::WrongContentContext {
                 expected: ContentContext::Block,
@@ -162,6 +170,10 @@ impl InlineContent {
         match node {
             ContentNode::Text(node) => Self::try_text_node(node),
             ContentNode::Xml(node) => Ok(Self::xml(node)),
+            ContentNode::RawText(_) => Err(PomError::WrongContentContext {
+                expected: ContentContext::Inline,
+                actual: ContentKind::RawText,
+            }),
             ContentNode::Markdown(node) => match node.kind() {
                 MarkdownKind::Strong | MarkdownKind::CodeSpan => Ok(Self::markdown(node)),
                 kind @ (MarkdownKind::Heading
@@ -215,6 +227,10 @@ impl MixedContent {
         Self::node(node.into())
     }
 
+    pub fn raw_text(node: RawTextNode) -> Self {
+        Self::node(node.into())
+    }
+
     pub fn markdown(node: MarkdownNode) -> Self {
         Self::node(node.into())
     }
@@ -254,5 +270,11 @@ impl From<XmlNode> for ContentNode {
 impl From<TextNode> for ContentNode {
     fn from(node: TextNode) -> Self {
         Self::Text(node)
+    }
+}
+
+impl From<RawTextNode> for ContentNode {
+    fn from(node: RawTextNode) -> Self {
+        Self::RawText(node)
     }
 }

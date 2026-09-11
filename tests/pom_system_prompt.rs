@@ -19,6 +19,7 @@ fn assert_slot_free<'a>(children: impl Iterator<Item = ContentRef<'a>>) {
                 panic!("resolved document retained diff slot `{}`", slot.role())
             }
             ContentRef::Node(ContentNode::Text(_)) => {}
+            ContentRef::Node(ContentNode::RawText(_)) => {}
             ContentRef::Node(ContentNode::Xml(xml)) => {
                 assert_slot_free(xml.children().iter());
             }

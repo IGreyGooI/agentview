@@ -41,7 +41,7 @@ pub mod prelude {
         ContentKind, ContentNode, ContentRef, DiffSlot, DiffStrategy, Document, HeadingLevel,
         HeadingNode, InlineBuilder, InlineChildren, InlineContent, ListBuilder, ListItem, ListKind,
         ListNode, MarkdownKind, MarkdownNode, MixedBuilder, MixedChildren, MixedContent,
-        ParagraphNode, PomError, ResolvedDocument, StrongNode, TextNode, XmlAttribute,
+        ParagraphNode, PomError, RawTextNode, ResolvedDocument, StrongNode, TextNode, XmlAttribute,
         XmlAttributes, XmlName, XmlNode,
     };
     pub use crate::stream_parser::XmlElement;

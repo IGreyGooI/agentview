@@ -19,6 +19,65 @@ AgentView 把 LLM 应用组织成 retained Component tree：
 - `Application::run()` 是默认 fixed driver；需要手动调度的 external owner 可以显式调用
   `Application::react()` 开始一次 reaction。
 
+### Component 输出契约
+
+Component 输出的是当前组件必须告诉 LLM 的完整状态声明：规则、环境、业务状态、记录或应用显式
+提供的消息。这里“完整”只约束当前组件的交付要求；它不是 LLM 已知内容、canonical history
+或最终 provider 请求上下文的全集。Component 不需要判断模型历史里已经有什么，也不需要自行输出
+“本轮新增的消息”或 patch。`RenderedProjection` 中的完整 items 表达这份声明；成功提交时，Runtime
+和交付层必须通过有效历史与本轮输入共同满足它，不要求每次请求都重复序列化全部内容。
+
+有效历史可能含有旧状态、较早对话、provider assistant output 及已接纳的 ToolCall/ToolOutput
+等事实。projection 中的内容消失不自动让 LLM 忘记这些历史；普通 user/developer XML 的
+`<remove>` 只声明对应状态已经语义失效，不物理删除既有 history。历史保留与实际 wire context
+仍由 FrameSession、port 以及既有 System snapshot、compaction 和 context reset 规则决定，
+Component 不把它当作永久保留或可精确观测的集合。
+
+从作者视角，Runtime 与 provider port 根据各自可用的有效历史 best effort 地生成 diff 或补齐缺失内容。
+best effort 指尽量复用历史、减少重复的交付优化；无法可靠复用时使用完整内容或明确报告无法提交。
+普通 POM 的状态变化仍只与上次成功提交的完整快照比较；更早的同值历史不能吞掉 `A -> B -> A`。
+
+当前 Frame 架构将这项职责分成两部分：private FrameSession 编译 canonical replay、projection diff
+及缺失输入；`ReactionPort` 根据自己的 wire history、continuation 和 provider 能力编码最终请求。
+因此 port 不另行推断组件语义 diff，也不持有第二份组件 baseline。旧 `ProviderPort` 是兼容接口名称。
+
+通常的 assistant output 由 provider/runtime 的历史路径保留和管理，Component 无需重新声明模型
+之前说过的话。FrameSession 保留已接纳的 canonical output，port 保留 provider-specific history
+和私有协议状态。若 Component 自己显式提供 assistant message，它属于组件 authored projection，
+按当前完整声明处理；assistant role 本身不意味着它是 provider 产生的 output。
+这类 authored assistant message 的新增和变化仍参与普通快照比较，其消失按既定规则不生成删除 patch。
+组件通过 `view! { #[assistant] ... }` 声明它，沿用 `#[user]` / `#[developer]` 的角色继承和连续合并规则。
+捕获结果为 `Message(Assistant, POM)`，provider 自动输出仍为独立的 `AssistantText`；即使最终文字相同，
+也不把这两类 canonical 内容按文本合并。普通 authored assistant 变化时发送完整当前 POM，
+显式组合 `#[diff]` 时仍使用已有字段策略。
+
+需要每轮重发的 policy 或上下文使用 `#[developer(repeat)]` / `#[user(repeat)]`。这类声明在每次
+提交的 Frame 中发送完整当前 POM，即使内容没有变化。`repeat` 优先于 `#[diff]` 的输出选择，
+但 diff baseline 仍随成功 handoff 正常维护；仅 render 或 prepare 不算提交。
+
+placement 作用于 `view!` 中紧接着的声明节点及其子树。标在组件调用前时，覆盖该组件及其子组件
+输出的普通 POM；不影响后续兄弟声明，也不表示作用于整个 `RenderedProjectionNode` 归属分组。
+外层 placement 优先于内层 placement，role 和 repeat 设置一起继承。捕获时只有同组件、同 role、
+同 repeat 设置的连续内容才可合并；普通内容与 repeat 内容即使同 role 也生成不同 item。
+repeat 是内部交付元数据，不渲染为 POM 标签，不要求声明 item 或 slot。repeat 内容消失仍按普通
+user/developer XML 删除规则处理；assistant 和 System placement 不支持 repeat 参数。
+
+### 完整提示词字符串
+
+`view!` 根级动态表达式中的 `String`、`&String`、`&str` 转成一个 `RawTextNode`，承载已有的完整
+提示词。它是 POM document 内的原文 block，不是 paragraph 或 inline text。document 级渲染保留
+其中的换行、缩进、Markdown 和 XML 样例，不解析内部格式、不添加 XML 包装、不做 Markdown/XML
+转义。多个 block 之间仍使用既有 document 分隔符；不承诺跨 block 拼接后与字符串直接连接相同。
+
+`#[system_once] { system }` 将这个节点放入 System snapshot；角色属性不决定文本解析方式。
+普通 user/developer 原文按完整值进行相邻比较，相同省略、变化完整输出，消失不产生删除 patch。
+原文中的 `<tag>` 不构成 POM XML，不能被 XML diff 或 slot 扫描解释。显式 `#[diff]` 不会将原文
+拆成字符或行级 patch；`repeat` 仍完整发送当前值。System 保持独立的 replace/clear 路径。
+
+quoted 文本模板和显式 Markdown/XML 内的文本仍按既有 inline / XML 上下文校验与转义。
+根级字符串适配不改变 `String` 的字段编码，也不放宽 `TextNode` 的 block 转换约束。底层 API
+通过 `Document::from_raw_text(...)` 构造同样的原文内容。
+
 ```text
 application owner
       |
@@ -468,12 +527,25 @@ ComponentId + mount/execution scope + node-local structural path + diff slot
 
 compiler 对照 private complete checkpoint，决定一个 slot是 full、semantic delta还是omit。首次出现、
 baseline缺失、mount改变或target要求Full时发送完整值；v1 non-append replay view按下一节fail closed，
-不能绕过provenance要求直接生成Full。mount/execution scope改变时清空authored occurrence ledger和diff
-baseline。`#[diff]` lowering产生的append-forced item始终直接提交，不参与provider occurrence claim。
+不能绕过provenance要求直接生成Full。mount/execution scope改变时清空普通快照比较基线和当前scope的
+provider claims，并重置diff baseline。消失的diff地址也随成功handoff离开baseline，再次出现时发送完整值。
+`#[diff]` lowering产生的append-forced item始终直接提交，不参与provider occurrence claim。
 这个过程不对最终渲染字符串做任意文本 diff，也不泄漏完整 checkpoint给Delta port。
 
-普通projection item在同一execution scope内采用稳定的canonical value/count等价规则：先claim同node
-已经提交的occurrence，再claim本scope尚未claim的provider occurrence，否则作为authored item提交。
+普通projection item默认对比同scope内上一次成功handoff的完整`RenderedProjection`，不查询累计authored
+历史。相同前缀省略；长度相同且只有一个同role item变化时比较其POM，其后的相等item继续保留；
+其他变动后缀先撤下旧XML，再按当前顺序发送
+完整item。重复值按出现次数保留。node序列变化同样保留相同前缀并刷新受影响的后缀；node不渲染成wrapper。
+XML可以输出局部patch或完整当前root；旧root消失时以旧role输出`<remove>旧XML</remove>`。
+删除仅处理普通user/developer POM；ToolCall、ToolResult、assistant、provider extension及System
+item的消失不生成删除patch。System仍走独立snapshot流程。
+混合document可比较，无法稳定对齐root时撤下旧XML roots并输出完整当前document。text/Markdown变化
+发送完整值，消失不输出撤回。删除POM只进入本轮submission，新checkpoint仅保留完整当前投影。
+同scope的transport Full仍使用本地完整快照比较普通内容，显式`#[diff]`的target patch基线则重置。
+
+Provider/tool来源认领独立保留：先claim同node已经认领过的provider occurrence，再claim本scope尚未
+认领的provider occurrence；与上次普通快照相同的authored item不消耗新的provider occurrence。
+普通authored回归满足`A -> B -> A`每轮发送，已认领的provider fact省略后重现仍不重复提交。
 v1 projection没有逐item origin，因此scope改变时不能把旧provider value继续当成provenance：旧scope
 累计provider outputs、checkpoint之后尚未reconcile的replay tail和staged inputs全部转入持久的
 ambiguous multiset。普通item若在完成本scopeclaim后仍匹配该multiset，Frame prepare返回typed terminal
@@ -482,7 +554,8 @@ ambiguous multiset。普通item若在完成本scopeclaim后仍匹配该multiset�
 
 ### HistoryPolicy 与 canonical replay
 
-面向编写 Component 代码的 agent 的用法与 tree fold 说明见 [HELP.md](../HELP.md#business-history)。
+面向编写 Component 代码的 agent 的用法见 [HELP.md](../HELP.md#business-history)，
+相邻投影比较的详细规则见 [设计说明](adjacent-projection-diff-design.md)。
 
 Component每次render完整的业务POM状态；变化字段使用`#[view(diff)]`，增长的业务记录使用
 `#[view(diff(append))]`，外层通过`#[diff(slot = "state")]`声明稳定边界。Frame compiler根据baseline
@@ -494,13 +567,12 @@ Native tool由Component声明并处理当前call，返回绑定该call的output�
 canonical conversation/tool history与待提交结果，port负责provider编码和private session state。
 下一次显式`react()`提交待处理结果；tool完成本身不会自动发起下一轮模型请求。
 
-固定同一execution scope和Component identity时，ordinary projection item的tree fold示例如下
-（省略System和provider outputs）：已提交`[A, O]`，当前node vector为`[[A, B], [O, P]]`，
-本轮新增`[B, P]`，累计history为`[A, O, B, P]`。之后projection变成`[[A, B, C], [O]]`，
-本轮只新增`[C]`，缺少的`P`不撤回，累计history为`[A, O, B, P, C]`。
-完整projection的node-order展开与跨reaction累计的canonical顺序是两个不同的值；
-每轮新增项保持当前node顺序和node内item顺序，已有history不重排。该例描述ordinary occurrence规则；
-`#[diff]`产生的append-forced操作沿用上一节的独立提交规则，不参与ordinary occurrence去重。
+固定同一execution scope和Component identity时，上一轮node vector为`[[A], [O]]`，
+当前为`[[A, B], [O, P]]`，本轮新增`[B, P]`。之后变成`[[A, B, C], [O]]`，本轮发送C，
+并对P中的XML发送删除POM；若P为纯text则没有删除输出。P再次出现时发送完整P。
+完整projection的node-order展开与跨reaction累计的canonical顺序是两个不同的值；历史只追加，
+POM更新不物理撤回或重排旧消息，也不通过相同内容定位某条历史消息。需要精确业务身份和集合顺序时，
+由XML结构及已有diff策略表达。`#[diff]`产物沿用上一节的独立提交规则。
 
 `HistoryPolicy` 是 crate-private pure function：它从只读 `CanonicalTranscript` 和mount-stable
 `FrameProfile` 选择 replay view。它不拥有history、不提交Event、不推进revision，也不参与ToolOutput
@@ -780,7 +852,8 @@ terminal/ordering grammar固定如下：
 - ReactionCompleted恰好一次且是最后一个fact。duplicate completion、post-terminal item、unknown/unsealed
   primary key、open text和normal EOF without terminal都是protocol fault。
 
-Built-in target capability在v1仍可比公共fact grammar更窄。Chat Completions target当前是text-only：
+公开OpenAI provider使用Responses API；Chat Completions保留为私有兼容实现。
+Built-in target capability在v1仍可比公共fact grammar更窄。内部Chat Completions target当前是text-only：
 非空`ToolCatalog`必须在handoff前typed reject，上游返回tool call也必须作为terminal upstream rejection；
 这不表示Responses或公共`ReactionPort`失去ToolCall能力。`FrameCapabilities`尚未表达tool support，后续若让
 Chat支持streamed tool calls，必须先扩展mount-stable capability negotiation，不能静默改变现有profile。

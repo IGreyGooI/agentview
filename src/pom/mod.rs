@@ -18,5 +18,5 @@ pub use markdown::{
     CodeBlockNode, CodeSpanNode, HeadingLevel, HeadingNode, ListBuilder, ListItem, ListKind,
     ListNode, MarkdownNode, ParagraphNode, StrongNode,
 };
-pub use text::TextNode;
+pub use text::{RawTextNode, TextNode};
 pub use xml::{XmlAttribute, XmlAttributes, XmlName, XmlNode};

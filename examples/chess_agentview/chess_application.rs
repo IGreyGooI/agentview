@@ -389,7 +389,7 @@ fn chess_projection(state: ChessState) -> Component {
             }
             previous_reason { "{previous_reason}" }
         }
-        #[developer]
+        #[developer(repeat)]
         chess_action_policy {
             chess_action_instructions {
                 response {

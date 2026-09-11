@@ -1,0 +1,5 @@
+error: placement accepts only the `repeat` argument
+ --> tests/ui/component_target/fail_developer_repeat_unknown_argument.rs:5:21
+  |
+5 |         #[developer(unknown)]
+  |                     ^^^^^^^

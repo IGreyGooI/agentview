@@ -1,0 +1,27 @@
+error[E0624]: method `with_chat_completions_serialized_request_body_limit` is private
+ --> tests/ui/provider/chat_completions_config_is_private.rs:4:41
+  |
+4 |       let _ = AsyncOpenAiTransportConfig::with_chat_completions_serialized_request_body_limit;
+  |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private method
+  |
+ ::: src/provider/async_openai.rs
+  |
+  | /     fn with_chat_completions_serialized_request_body_limit(
+  | |         self,
+  | |         max_serialized_request_body_bytes: usize,
+  | |     ) -> Result<Self, chat_completions::ChatCompletionsConfigError> {
+  | |___________________________________________________________________- private method defined here
+
+error[E0624]: method `with_chat_completions_frame_constraints` is private
+ --> tests/ui/provider/chat_completions_config_is_private.rs:5:41
+  |
+5 |       let _ = AsyncOpenAiTransportConfig::with_chat_completions_frame_constraints;
+  |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private method
+  |
+ ::: src/provider/async_openai.rs
+  |
+  | /     fn with_chat_completions_frame_constraints(
+  | |         self,
+  | |         constraints: FrameConstraints,
+  | |     ) -> Result<Self, chat_completions::ChatCompletionsConfigError> {
+  | |___________________________________________________________________- private method defined here

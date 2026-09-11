@@ -125,6 +125,7 @@ impl UserResolver<'_> {
                 Some(BlockContent::thematic_break())
             }
             ContentNode::Xml(node) => Some(BlockContent::xml(self.resolve_ordinary_xml(node)?)),
+            ContentNode::RawText(node) => Some(BlockContent::raw_text(node.clone())),
             ContentNode::Markdown(MarkdownNode::Strong(_) | MarkdownNode::CodeSpan(_))
             | ContentNode::Text(_) => {
                 unreachable!("block children only contain block-level content")
@@ -175,6 +176,9 @@ impl UserResolver<'_> {
                 InlineContent::try_from_node(node.clone().into())
                     .expect("existing inline text has already been validated"),
             ),
+            ContentNode::RawText(_) => {
+                unreachable!("inline children cannot contain raw text blocks")
+            }
             ContentNode::Markdown(
                 MarkdownNode::Heading(_)
                 | MarkdownNode::Paragraph(_)
@@ -233,6 +237,7 @@ impl UserResolver<'_> {
             ContentNode::Markdown(node) => self.resolve_markdown_node(node)?.map(Into::into),
             ContentNode::Xml(node) => Some(self.resolve_ordinary_xml(node)?.into()),
             ContentNode::Text(node) => Some(node.clone().into()),
+            ContentNode::RawText(node) => Some(node.clone().into()),
         })
     }
 
@@ -404,7 +409,8 @@ fn scan_content_node(
         ContentNode::Markdown(
             MarkdownNode::CodeBlock(_) | MarkdownNode::CodeSpan(_) | MarkdownNode::ThematicBreak,
         )
-        | ContentNode::Text(_) => Ok(()),
+        | ContentNode::Text(_)
+        | ContentNode::RawText(_) => Ok(()),
     }
 }
 
@@ -477,6 +483,7 @@ fn resolve_block_node(
         }
         ContentNode::Markdown(MarkdownNode::ThematicBreak) => Some(BlockContent::thematic_break()),
         ContentNode::Xml(node) => Some(BlockContent::xml(resolve_xml_node(node, policy)?)),
+        ContentNode::RawText(node) => Some(BlockContent::raw_text(node.clone())),
         ContentNode::Markdown(MarkdownNode::Strong(_) | MarkdownNode::CodeSpan(_))
         | ContentNode::Text(_) => {
             unreachable!("block children only contain block-level content")
@@ -534,6 +541,7 @@ fn resolve_inline_node(
             InlineContent::try_from_node(node.clone().into())
                 .expect("existing inline text has already been validated"),
         ),
+        ContentNode::RawText(_) => unreachable!("inline children cannot contain raw text blocks"),
         ContentNode::Markdown(
             MarkdownNode::Heading(_)
             | MarkdownNode::Paragraph(_)
@@ -599,6 +607,7 @@ fn resolve_mixed_node(
         ContentNode::Markdown(node) => resolve_markdown_node(node, policy)?.map(Into::into),
         ContentNode::Xml(node) => Some(resolve_xml_node(node, policy)?.into()),
         ContentNode::Text(node) => Some(node.clone().into()),
+        ContentNode::RawText(node) => Some(node.clone().into()),
     };
     Ok(resolved)
 }

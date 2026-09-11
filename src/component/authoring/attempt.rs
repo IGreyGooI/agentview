@@ -953,7 +953,8 @@ impl RenderCapture {
                     built.items,
                     built.diffs,
                     built.diff_templates,
-                ))
+                )
+                .with_repeat_items(built.repeat_items))
             })
             .collect::<Result<Vec<_>, ComponentCaptureError>>()?;
         RenderedProjection::from_nodes(nodes)

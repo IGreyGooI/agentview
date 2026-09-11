@@ -1,0 +1,22 @@
+error[E0432]: unresolved imports `agentview::provider::async_openai::AsyncOpenAiChatCompletionsProvider`, `agentview::provider::async_openai::OpenAiChatCompletionsError`, `agentview::provider::async_openai::OpenAiChatCompletionsOptions`, `agentview::provider::async_openai::OPENAI_CHAT_COMPLETIONS_PROFILE`
+ --> tests/ui/provider/chat_completions_is_private.rs:3:5
+  |
+3 |     AsyncOpenAiChatCompletionsProvider, OpenAiChatCompletionsError, OpenAiChatCompletionsOptions,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `OpenAiChatCompletionsOptions` in `provider::async_openai`
+  |     |                                   |
+  |     |                                   no `OpenAiChatCompletionsError` in `provider::async_openai`
+  |     no `AsyncOpenAiChatCompletionsProvider` in `provider::async_openai`
+4 |     OPENAI_CHAT_COMPLETIONS_PROFILE,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `OPENAI_CHAT_COMPLETIONS_PROFILE` in `provider::async_openai`
+
+error[E0603]: module `chat_completions` is private
+ --> tests/ui/provider/chat_completions_is_private.rs:1:40
+  |
+1 | use agentview::provider::async_openai::chat_completions;
+  |                                        ^^^^^^^^^^^^^^^^ private module
+  |
+note: the module `chat_completions` is defined here
+ --> src/provider/async_openai.rs
+  |
+  | mod chat_completions;
+  | ^^^^^^^^^^^^^^^^^^^^

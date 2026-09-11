@@ -1,10 +1,10 @@
 use std::{collections::HashSet, convert::Infallible, future::Future, pin::Pin};
 
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::component::{
-    ComponentHost, ComponentHostFault, ComponentHostId,
     authoring::{ComponentAttemptFault, RenderBindings},
+    ComponentHost, ComponentHostFault, ComponentHostId,
 };
 
 #[allow(
@@ -476,8 +476,8 @@ mod tests {
         convert::Infallible,
         future::pending,
         sync::{
-            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
         },
         time::Duration,
     };
@@ -488,19 +488,19 @@ mod tests {
 
     use crate::{
         component::{
-            ComponentHost,
             execution::{
                 ProviderEvent, ProviderEventStream, ProviderFault, ProviderPort, ToolCall,
                 ToolOutput, ToolOutputSink,
             },
             prelude::*,
+            ComponentHost,
         },
         llm_call::TextTurnEvent,
     };
 
     use super::{
-        ApplicationHost, ApplicationHostFault, CompletedLane, EngineObservation, EngineObserver,
-        ReactionLane, ReactionLifecycle, await_bindings_with_lanes, finish_lane,
+        await_bindings_with_lanes, finish_lane, ApplicationHost, ApplicationHostFault,
+        CompletedLane, EngineObservation, EngineObserver, ReactionLane, ReactionLifecycle,
     };
 
     #[derive(Debug, Default)]

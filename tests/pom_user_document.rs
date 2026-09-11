@@ -760,6 +760,7 @@ fn assert_slot_free(document: &ResolvedDocument) {
                     | agentview::pom::MarkdownNode::ThematicBreak => {}
                 },
                 ContentRef::Node(ContentNode::Text(_)) => {}
+                ContentRef::Node(ContentNode::RawText(_)) => {}
             }
         }
     }

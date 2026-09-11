@@ -1,5 +1,5 @@
-error: view roots support #[system_once], #[developer], #[user], and #[diff(slot = "...")]
+error: view roots support #[system_once], #[developer], #[developer(repeat)], #[user], #[user(repeat)], #[assistant], and #[diff(slot = "...")]
  --> tests/ui/component_target/fail_unknown_placement.rs:5:9
   |
-5 |         #[assistant]
-  |         ^^^^^^^^^^^^
+5 |         #[unknown]
+  |         ^^^^^^^^^^

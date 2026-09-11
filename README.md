@@ -5,7 +5,7 @@ provider-neutral Frames and admitting ordered model facts back into
 application-owned state.
 
 Coding agents: start with [HELP.md](HELP.md) for business POM and diff authoring,
-native tools, the tree fold contract, and focused verification.
+native tools, adjacent projection snapshots, and focused verification.
 
 ## Runtime Boundary
 
@@ -146,7 +146,10 @@ behavior, and how these boundaries map to services.
 
 ### Business History
 
-Render complete business state as typed POM. Use `#[diff(slot = "state")]` to
+Render complete business state as typed POM. Ordinary output compares with the
+previous successfully submitted complete projection, so A -> B -> A sends each
+change. User/developer XML disappearance emits removal POM; deletion of other
+item types is ignored. Use `#[diff(slot = "state")]` to
 declare a stable diff boundary, `#[view(diff)]` for changing fields, and
 `#[view(diff(append))]` for growing business records. The Frame compiler selects
 complete values, supported deltas, or omission from its retained baseline.
@@ -160,7 +163,7 @@ resubmitting them on re-render. The port owns provider encoding, history compact
 and private session state. Raw handlers can still use `NativeToolCall::named(...).on_call(...)`.
 
 See [HELP.md: Business History](HELP.md#business-history) for code, delta
-requirements, native tool usage, and the established tree fold rules.
+requirements, native tool usage, and adjacent snapshot rules.
 
 ### Streaming XML
 
@@ -215,8 +218,9 @@ does not roll back facts that were already admitted.
 Provider wire continuation, response identifiers, prompt-cache artifacts,
 wire compaction, HTTP payloads, and tokenizer limits remain private to the
 port. A port cannot mutate shared canonical history or the retained Component
-projection. The repository includes native Responses, Chat Completions, Debug,
-and External `ReactionPort` implementations.
+projection. The public providers include native Responses, Debug, and External
+`ReactionPort` implementations. OpenAI integrations use the Responses API;
+Chat Completions is retained as a private compatibility implementation.
 
 ## Live Examples
 
@@ -275,6 +279,7 @@ cargo run --no-default-features --example frame_skill
 cargo run --no-default-features --example frame_plugin
 cargo run --no-default-features --example signal_reaction
 cargo run --no-default-features --example native_tool
+cargo run --no-default-features --example debug_prompt
 cargo run --no-default-features --example support_preparation
 ```
 
@@ -295,9 +300,66 @@ driver behavior over the same runtime:
   Component exits.
 - [`native_tool`](examples/native_tool.rs): the live model calls `#[tool] add`
   mounted with `NativeToolCall::new(add)`, then receives the result and answers `42`.
+- [`debug_prompt`](examples/debug_prompt.rs): a two-turn native-tool exchange
+  that prints and saves complete Component projections alongside the exact
+  Responses JSON body handed to transport for both turns. It includes System,
+  Developer, User, tool call, and tool result input for inspecting continuation.
 - [`support_preparation`](examples/support_preparation.rs): inbox waiting,
   account and policy loading, reply drafts, and normal queue-drained exit using
   `use_preparation` and `run()`.
+
+### Debugging Exact Requests
+
+[`debug_prompt`](examples/debug_prompt.rs) captures rendered Component projections
+and exact provider requests by default:
+
+```bash
+cargo run --no-default-features --example debug_prompt
+```
+
+Before each reaction, the example runs `Application::prepare()` and exports
+`current_projection()`. Each handed-off request is also captured. Both are
+printed to stderr and written below a unique run directory:
+
+```text
+target/agentview-debug/run-<timestamp>-<pid>-<attempt>/0001/projection.json
+target/agentview-debug/run-<timestamp>-<pid>-<attempt>/0001/projection.txt
+target/agentview-debug/run-<timestamp>-<pid>-<attempt>/0001/request.json
+target/agentview-debug/run-<timestamp>-<pid>-<attempt>/0001/prompt.txt
+```
+
+`projection.json` contains the committed Component nodes, typed POM items, diff
+markers, native tool definitions, and projection revision/readiness metadata.
+`projection.txt` shows the same nodes with POM rendered to XML/Markdown by
+`render_pom_document`. Its scope is `current_component_requirements`: the complete
+content the Components currently require the model to receive. Earlier states,
+messages, and tool interactions may still be present in retained context after
+they leave this declaration. A projection is not an inventory of model knowledge.
+
+The first projection declares `task_state=awaiting_tool`; the second declares
+`task_state=answer_ready` and includes the native tool call and its result.
+The second request still contains the earlier state in its history, followed by
+the update. Compare `0002/projection.txt` with `0002/prompt.txt` to inspect both.
+
+These are read-only snapshots after explicit preparation, not an atomic
+submission hook: Components with background updates can change before `react()`.
+`react()` runs its own preparation pass, so preparation callbacks can run again
+and its projection revision can differ from the inspected snapshot. This example
+has no preparation callbacks or concurrent state writers between those steps.
+
+`request.json` is the exact body supplied to the Responses HTTP transport,
+including the provider's retained context and this turn's encoded input.
+`prompt.txt` renders its system instructions, role messages, function calls,
+function results, tools, and any unknown input item as JSON. The capture event
+means the provider accepted the Frame and polled transport; it does not mean
+the HTTP server received or successfully processed the request. The body has
+prompt data but no HTTP authentication headers. It records outbound context,
+not the model's internal knowledge or a guarantee that it remembers every item.
+
+Reuse [`prompt_debug.rs`](examples/support/prompt_debug.rs) by creating
+`PromptDebugCapture`, attaching `capture.observer()` with
+`with_request_observer`, then calling `capture.finish().await` after
+`Application::shutdown()` drops the provider and lets the writer drain.
 
 ## Deterministic Tests
 
@@ -309,6 +371,7 @@ coverage can be run without API credentials:
 cargo test --no-default-features --example frame_agent
 cargo test --no-default-features --example frame_plugin
 cargo test --no-default-features --example signal_reaction
+cargo test --no-default-features --example debug_prompt
 cargo test --no-default-features --example support_preparation
 cargo test --no-default-features --test component_runtime_visual_acceptance
 ```

@@ -57,6 +57,7 @@ use crate::{
 
 #[cfg(feature = "legacy-provider-port")]
 use self::continuation::{OpenAiContinuation, ResponsesInputGateReady};
+use self::request_observation::RequestObserver;
 use self::usage::ResponseUsageObserver;
 #[cfg(feature = "legacy-provider-port")]
 use self::{
@@ -66,6 +67,10 @@ use self::{
 
 #[cfg(feature = "legacy-provider-port")]
 mod artifact_binding;
+#[allow(
+    dead_code,
+    reason = "Chat Completions is retained as a private compatibility implementation"
+)]
 mod chat_completions;
 #[cfg(feature = "legacy-provider-port")]
 mod continuation;
@@ -74,17 +79,13 @@ mod frame_request;
 mod native_reaction;
 mod output;
 mod reaction_fault;
+mod request_observation;
 mod responses_observation;
 mod transport;
 mod usage;
 
 #[cfg(feature = "legacy-provider-port")]
 use self::artifact_binding::OpenAiInlineArtifactBinding;
-pub use self::chat_completions::{
-    AsyncOpenAiChatCompletionsProvider, OpenAiChatCompletionsError, OpenAiChatCompletionsOptions,
-    OpenAiChatObservation, OpenAiChatObservationError, OpenAiChatObserver,
-    OPENAI_CHAT_COMPLETIONS_PROFILE,
-};
 use self::faults::{
     has_plaintext_reasoning_completed_content, has_plaintext_reasoning_lifecycle_content,
     has_unsupported_completed_item, has_unsupported_content_part, has_unsupported_lifecycle_item,
@@ -99,6 +100,7 @@ use self::faults::{
     stream_transport_fault, unsupported_content_part_fault, unsupported_output_item_fault,
     unsupported_reasoning_content_fault, OpenAiApi, ResponseEventReason,
 };
+pub use self::request_observation::OpenAiResponsesRequestSnapshot;
 pub use self::responses_observation::{
     OpenAiResponsesObservation, OpenAiResponsesObservationError, OpenAiResponsesObserver,
 };
@@ -277,12 +279,15 @@ impl AsyncOpenAiTransportConfig {
     ///
     /// The limit is applied to the exact final JSON body after history
     /// reconciliation, before transport handoff.
-    pub fn with_chat_completions_serialized_request_body_limit(
+    #[allow(dead_code, reason = "used by the private Chat Completions tests")]
+    fn with_chat_completions_serialized_request_body_limit(
         self,
         max_serialized_request_body_bytes: usize,
-    ) -> Result<Self, AsyncOpenAiConfigError> {
+    ) -> Result<Self, chat_completions::ChatCompletionsConfigError> {
         if max_serialized_request_body_bytes == 0 {
-            return Err(AsyncOpenAiConfigError::InvalidChatCompletionsSerializedRequestBodyLimit);
+            return Err(
+                chat_completions::ChatCompletionsConfigError::InvalidSerializedRequestBodyLimit,
+            );
         }
         Ok(Self {
             max_chat_completions_serialized_request_body_bytes: max_serialized_request_body_bytes,
@@ -295,10 +300,11 @@ impl AsyncOpenAiTransportConfig {
     ///
     /// These limits apply to AgentView's canonical Frame encoding. The exact
     /// serialized Chat request retains its independent transport limit.
-    pub fn with_chat_completions_frame_constraints(
+    #[allow(dead_code, reason = "used by the private Chat Completions tests")]
+    fn with_chat_completions_frame_constraints(
         self,
         constraints: FrameConstraints,
-    ) -> Result<Self, AsyncOpenAiConfigError> {
+    ) -> Result<Self, chat_completions::ChatCompletionsConfigError> {
         chat_completions_frame_profile(constraints.clone())?;
         Ok(Self {
             chat_completions_frame_constraints: constraints,
@@ -319,11 +325,11 @@ fn responses_frame_profile(
 
 fn chat_completions_frame_profile(
     constraints: FrameConstraints,
-) -> Result<FrameProfile, AsyncOpenAiConfigError> {
+) -> Result<FrameProfile, chat_completions::ChatCompletionsConfigError> {
     let profile = FrameProfile::new(constraints, FrameCapabilities::new(true));
     profile
         .validate()
-        .map_err(|_| AsyncOpenAiConfigError::InvalidChatCompletionsFrameProfile)?;
+        .map_err(|_| chat_completions::ChatCompletionsConfigError::InvalidFrameProfile)?;
     Ok(profile)
 }
 
@@ -382,6 +388,7 @@ pub struct AsyncOpenAiResponsesProvider {
     #[cfg(feature = "legacy-provider-port")]
     tool_outputs: Arc<Mutex<ToolOutputStaging>>,
     response_usage_observer: Option<Arc<ResponseUsageObserver>>,
+    request_observer: Option<Arc<RequestObserver>>,
     observer: Option<Arc<dyn OpenAiResponsesObserver>>,
     observation_failed: Arc<AtomicBool>,
     execution_mode: ResponsesExecutionMode,
@@ -580,6 +587,7 @@ impl AsyncOpenAiResponsesProvider {
             #[cfg(feature = "legacy-provider-port")]
             tool_outputs: Arc::new(Mutex::new(ToolOutputStaging::default())),
             response_usage_observer: None,
+            request_observer: None,
             observer: None,
             observation_failed: Arc::new(AtomicBool::new(false)),
             execution_mode: ResponsesExecutionMode::Unclaimed,
@@ -596,6 +604,24 @@ impl AsyncOpenAiResponsesProvider {
     /// credentials or HTTP headers. Failure prevents successful completion.
     pub fn with_observer(mut self, observer: Arc<dyn OpenAiResponsesObserver>) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    /// Observes each exact Frame-native request after its first transport poll.
+    ///
+    /// The callback runs once after the provider accepts the Frame, even if the
+    /// transport subsequently fails. Requests rejected before handoff are not
+    /// observed. It receives the complete JSON body, including prompt contents,
+    /// but no HTTP headers. This hook does not apply to legacy ProviderPort calls.
+    ///
+    /// The callback must be bounded and nonblocking; enqueue the owned snapshot
+    /// for file I/O. A callback panic is contained and cannot undo the handoff.
+    /// Capturing is disabled by default and allocates no snapshot when disabled.
+    pub fn with_request_observer(
+        mut self,
+        observer: impl Fn(OpenAiResponsesRequestSnapshot) + Send + Sync + 'static,
+    ) -> Self {
+        self.request_observer = Some(Arc::new(observer));
         self
     }
 
@@ -1666,18 +1692,19 @@ fn advance_sequence(
     event_type: &str,
     payload: &Map<String, Value>,
 ) -> Result<(), ProviderFault> {
-    let sequence = payload
-        .get("sequence_number")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            response_event_shape_fault(
-                event_type,
-                ResponseEventReason::Sequence,
-                ProviderFault::retryable_transport(
-                    "OpenAI streaming event is missing sequence_number",
-                ),
-            )
-        })?;
+    // Some gateways omit event numbers; retain the last known number across gaps.
+    let Some(sequence) = payload.get("sequence_number") else {
+        return Ok(());
+    };
+    let sequence = sequence.as_u64().ok_or_else(|| {
+        response_event_shape_fault(
+            event_type,
+            ResponseEventReason::Sequence,
+            ProviderFault::retryable_transport(
+                "OpenAI streaming event has invalid sequence_number",
+            ),
+        )
+    })?;
     if previous.is_some_and(|previous| sequence <= previous) {
         return Err(response_event_shape_fault(
             event_type,
@@ -2116,16 +2143,10 @@ pub enum AsyncOpenAiConfigError {
     InvalidResponseLimit { name: &'static str },
     #[error("OpenAI Responses serialized outbound request body limit must be non-zero")]
     InvalidSerializedRequestBodyLimit,
-    #[error("OpenAI Chat Completions serialized outbound request body limit must be non-zero")]
-    InvalidChatCompletionsSerializedRequestBodyLimit,
     #[error("OpenAI Responses Frame profile is invalid")]
     InvalidResponsesFrameProfile,
-    #[error("OpenAI Chat Completions Frame profile is invalid")]
-    InvalidChatCompletionsFrameProfile,
     #[error("OpenAI Responses target identity space is exhausted")]
     ResponsesTargetIdentityExhausted,
-    #[error("OpenAI Chat Completions target identity space is exhausted")]
-    ChatCompletionsTargetIdentityExhausted,
     #[error("OpenAI transport initialization failed")]
     TransportInitialization,
 }

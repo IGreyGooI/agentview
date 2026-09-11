@@ -11,12 +11,15 @@ use crate::{
     component::authoring::__private::EventSelector,
     llm_call::TextTurnEvent,
     pom::{Document, ResolvedDocument},
-    transcript::{CanonicalInputItem, CanonicalTranscript, CanonicalTranscriptError},
+    transcript::{
+        CanonicalInputItem, CanonicalTranscript, CanonicalTranscriptError, ConversationRole,
+        InstructionAuthority,
+    },
 };
 
 use super::ToolDefinition;
 
-/// One complete provider-neutral projection of current Component state.
+/// The complete current Component delivery declaration, not the full model context or history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedProjection {
     nodes: Vec<RenderedProjectionNode>,
@@ -122,6 +125,7 @@ pub struct RenderedProjectionNode {
     items: Vec<CanonicalInputItem>,
     diffs: Vec<RenderedProjectionDiffMarker>,
     diff_templates: Vec<RenderedProjectionItemTemplate>,
+    repeat_items: Vec<usize>,
 }
 
 impl RenderedProjectionNode {
@@ -131,6 +135,7 @@ impl RenderedProjectionNode {
             items,
             diffs: Vec::new(),
             diff_templates: Vec::new(),
+            repeat_items: Vec::new(),
         }
     }
 
@@ -145,7 +150,17 @@ impl RenderedProjectionNode {
             items,
             diffs,
             diff_templates,
+            repeat_items: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_repeat_items(mut self, repeat_items: Vec<usize>) -> Self {
+        self.repeat_items = repeat_items;
+        self
+    }
+
+    pub(crate) fn repeats_item(&self, item_index: usize) -> bool {
+        self.repeat_items.contains(&item_index)
     }
 
     pub fn identity(&self) -> &str {
@@ -166,6 +181,28 @@ impl RenderedProjectionNode {
     }
 
     fn validate(&self) -> Result<(), RenderedProjectionError> {
+        let mut repeated = HashSet::with_capacity(self.repeat_items.len());
+        for &item_index in &self.repeat_items {
+            if !repeated.insert(item_index)
+                || !matches!(
+                    self.items.get(item_index),
+                    Some(
+                        CanonicalInputItem::Instruction {
+                            authority: InstructionAuthority::Developer,
+                            ..
+                        } | CanonicalInputItem::Message {
+                            role: ConversationRole::User,
+                            ..
+                        }
+                    )
+                )
+            {
+                return Err(RenderedProjectionError::InvalidRepeatItem {
+                    identity: self.identity.clone(),
+                    item_index,
+                });
+            }
+        }
         let mut item_indexes = HashSet::with_capacity(self.diffs.len());
         let mut addresses = HashSet::with_capacity(self.diffs.len());
         for diff in &self.diffs {
@@ -340,6 +377,8 @@ pub enum RenderedProjectionError {
     DuplicateDiffAddress { identity: String, slot: String },
     #[error("rendered projection node `{identity}` has an invalid diff template: {message}")]
     InvalidDiffTemplate { identity: String, message: String },
+    #[error("rendered projection node `{identity}` has an invalid repeat item index {item_index}")]
+    InvalidRepeatItem { identity: String, item_index: usize },
     #[error("rendered projection contains duplicate or empty native tool name `{name}`")]
     DuplicateNativeToolName { name: String },
 }
@@ -991,7 +1030,8 @@ pub struct ProviderResponseCompletedReconciliation {
     pub(crate) response_created_sequence: Option<u64>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) response_in_progress_sequence: Option<u64>,
-    pub(crate) response_completed_sequence: u64,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub(crate) response_completed_sequence: Option<u64>,
     pub(crate) response_status: ProviderResponseReconciliationResponseStatus,
     pub(crate) terminal_output_count: u64,
     pub(crate) observed_lifecycle_count: u64,
@@ -1052,7 +1092,7 @@ impl ProviderResponseCompletedReconciliation {
         self.branch
     }
 
-    pub fn response_completed_sequence(self) -> u64 {
+    pub fn response_completed_sequence(self) -> Option<u64> {
         self.response_completed_sequence
     }
 
@@ -1905,7 +1945,8 @@ impl ProviderFault {
 mod response_output_identity_diagnostic_tests {
     use super::{ProviderFault, ProviderFaultCode};
 
-    const LEGACY_IDENTITY_DIAGNOSTIC: &str = "response_event_type=response.completed; response_event_reason=ledger_mismatch; \
+    const LEGACY_IDENTITY_DIAGNOSTIC: &str =
+        "response_event_type=response.completed; response_event_reason=ledger_mismatch; \
          response_ledger_reason=output_identity; \
          response_output_identity_reason=kind_at_terminal_ordinal; \
          response_output_identity_mapping_basis=ordinal_missing_id; \

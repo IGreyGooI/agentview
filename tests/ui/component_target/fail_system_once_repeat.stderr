@@ -1,0 +1,5 @@
+error: prompt placement directives do not accept arguments
+ --> tests/ui/component_target/fail_system_once_repeat.rs:5:9
+  |
+5 |         #[system_once(repeat)]
+  |         ^^^^^^^^^^^^^^^^^^^^^^

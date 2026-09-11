@@ -10,7 +10,12 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use agentview::{
+use super::super::AsyncOpenAiTransportConfig;
+use super::{
+    AsyncOpenAiChatCompletionsProvider, ChatCompletionsConfigError, OpenAiChatCompletionsOptions,
+    OPENAI_CHAT_COMPLETIONS_PROFILE,
+};
+use crate::{
     component::{
         execution::{
             ApplicationHost, ProviderEvent, ProviderFault, ProviderFaultCode, ProviderFaultKind,
@@ -22,10 +27,6 @@ use agentview::{
     llm_call::TextTurnEvent,
     pom::{Document, ResolvedDocument, TextNode, XmlNode},
     pom_resolution::resolve_artifact_document,
-    provider::async_openai::{
-        AsyncOpenAiChatCompletionsProvider, AsyncOpenAiConfigError, AsyncOpenAiTransportConfig,
-        OpenAiChatCompletionsOptions, OPENAI_CHAT_COMPLETIONS_PROFILE,
-    },
     transcript::{CanonicalInputItem, ConversationRole, InstructionAuthority},
 };
 use axum::{
@@ -404,7 +405,7 @@ fn serialized_chat_request_body_limit_must_be_nonzero() {
 
     assert_eq!(
         error,
-        AsyncOpenAiConfigError::InvalidChatCompletionsSerializedRequestBodyLimit
+        ChatCompletionsConfigError::InvalidSerializedRequestBodyLimit
     );
     assert_eq!(
         error.to_string(),
@@ -415,20 +416,30 @@ fn serialized_chat_request_body_limit_must_be_nonzero() {
 #[tokio::test]
 async fn explicit_api_base_ignores_ambient_openai_routing_headers() {
     if std::env::var_os(AMBIENT_HEADERS_CHILD_ENV).is_none() {
-        let status = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .arg("explicit_api_base_ignores_ambient_openai_routing_headers")
+        let test_name = concat!(
+            module_path!(),
+            "::explicit_api_base_ignores_ambient_openai_routing_headers"
+        )
+        .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+        .expect("the test module belongs to the current crate");
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .arg(test_name)
             .arg("--exact")
             .arg("--nocapture")
             .env(AMBIENT_HEADERS_CHILD_ENV, "1")
             .env("OPENAI_API_KEY", "ambient-token")
             .env("OPENAI_ORG_ID", "invalid\norganization")
             .env("OPENAI_PROJECT_ID", "invalid\nproject")
-            .status()
+            .output()
             .await
             .unwrap();
         assert!(
-            status.success(),
+            output.status.success(),
             "isolated ambient-header regression child failed"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!("test {test_name} ... ok")),
+            "isolated ambient-header regression child did not execute the test"
         );
         return;
     }

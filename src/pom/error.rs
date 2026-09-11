@@ -14,6 +14,7 @@ pub enum ContentKind {
     Markdown(MarkdownKind),
     Xml,
     Text,
+    RawText,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

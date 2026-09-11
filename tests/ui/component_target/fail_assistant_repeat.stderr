@@ -1,0 +1,5 @@
+error: prompt placement directives do not accept arguments
+ --> tests/ui/component_target/fail_assistant_repeat.rs:5:9
+  |
+5 |         #[assistant(repeat)]
+  |         ^^^^^^^^^^^^^^^^^^^^

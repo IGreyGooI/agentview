@@ -10,7 +10,7 @@ use crate::{
     pom::{
         BlockChildren, BlockContent, CodeBlockNode, ContentNode, DiffSlot, DiffStrategy, Document,
         HeadingNode, ListNode, MarkdownNode, MixedChildren, MixedContent, ParagraphNode, PomError,
-        TextNode, XmlAttribute, XmlName, XmlNode,
+        RawTextNode, TextNode, XmlAttribute, XmlName, XmlNode,
     },
     StorageString,
 };
@@ -135,6 +135,18 @@ impl IntoBlockChildren for CodeBlockNode {
     }
 }
 
+impl IntoBlockContent for RawTextNode {
+    fn into_block_content(self) -> Option<BlockContent> {
+        Some(BlockContent::raw_text(self))
+    }
+}
+
+impl IntoBlockChildren for RawTextNode {
+    fn into_block_children(self) -> BlockChildren {
+        one_block(self.into_block_content())
+    }
+}
+
 impl IntoBlockContent for XmlNode {
     fn into_block_content(self) -> Option<BlockContent> {
         Some(BlockContent::xml(self))
@@ -179,6 +191,12 @@ impl IntoViewContent for ContentNode {
 }
 
 impl IntoViewContent for TextNode {
+    fn into_view_content(self) -> Option<ContentNode> {
+        Some(self.into())
+    }
+}
+
+impl IntoViewContent for RawTextNode {
     fn into_view_content(self) -> Option<ContentNode> {
         Some(self.into())
     }
@@ -350,6 +368,14 @@ where
 
 impl AgentView for XmlNode {
     type Root = XmlNode;
+
+    fn build_root(&self) -> Result<Self::Root, PomError> {
+        Ok(self.clone())
+    }
+}
+
+impl AgentView for RawTextNode {
+    type Root = RawTextNode;
 
     fn build_root(&self) -> Result<Self::Root, PomError> {
         Ok(self.clone())
@@ -613,6 +639,11 @@ where
             ContentNode::Markdown(markdown) => {
                 let mut item = XmlNode::new(XmlName::try_from("item")?);
                 item.push(MixedContent::markdown(markdown));
+                children.push(MixedContent::xml(item));
+            }
+            ContentNode::RawText(text) => {
+                let mut item = XmlNode::new(XmlName::try_from("item")?);
+                item.push(MixedContent::raw_text(text));
                 children.push(MixedContent::xml(item));
             }
         }

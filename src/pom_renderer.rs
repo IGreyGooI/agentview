@@ -77,6 +77,13 @@ impl Renderer {
                 };
                 self.render_xml(node, placement)
             }
+            ContentRef::Node(ContentNode::RawText(node)) => {
+                if xml_context {
+                    self.escape_xml_text(node.value())
+                } else {
+                    Ok(node.value().to_owned())
+                }
+            }
             ContentRef::Node(ContentNode::Text(_)) => {
                 unreachable!("resolved block children cannot contain direct text")
             }
@@ -147,6 +154,9 @@ impl Renderer {
                 }
                 ContentRef::Node(ContentNode::Xml(node)) => {
                     self.render_xml(node, XmlPlacement::Embedded)?
+                }
+                ContentRef::Node(ContentNode::RawText(_)) => {
+                    unreachable!("inline children cannot contain raw text blocks")
                 }
                 ContentRef::Node(ContentNode::Markdown(
                     MarkdownNode::Heading(_)
@@ -390,13 +400,20 @@ impl Renderer {
     ) -> Result<RenderedMixed, PomRenderError> {
         let mut units = Vec::new();
         let mut flow = String::new();
+        let mut flow_starts_raw = false;
         let mut has_block = false;
 
         for content in children.iter() {
             match content {
                 ContentRef::Node(ContentNode::Markdown(node)) if node.is_block() => {
                     if !flow.is_empty() {
-                        units.push(encode_rendered_indentation(&std::mem::take(&mut flow)));
+                        let flow = std::mem::take(&mut flow);
+                        units.push(if flow_starts_raw {
+                            flow
+                        } else {
+                            encode_rendered_indentation(&flow)
+                        });
+                        flow_starts_raw = false;
                     }
                     units.push(self.render_block_markdown(node, true)?);
                     has_block = true;
@@ -421,6 +438,13 @@ impl Renderer {
                         flow.is_empty(),
                     )?);
                 }
+                ContentRef::Node(ContentNode::RawText(node)) => {
+                    let raw = self.escape_xml_text(node.value())?;
+                    if flow.is_empty() && !raw.is_empty() {
+                        flow_starts_raw = true;
+                    }
+                    flow.push_str(&raw);
+                }
                 ContentRef::Node(ContentNode::Xml(node)) => {
                     flow.push_str(&self.render_xml(node, XmlPlacement::Embedded)?);
                 }
@@ -430,7 +454,11 @@ impl Renderer {
             }
         }
         if !flow.is_empty() {
-            units.push(encode_rendered_indentation(&flow));
+            units.push(if flow_starts_raw {
+                flow
+            } else {
+                encode_rendered_indentation(&flow)
+            });
         }
 
         Ok(RenderedMixed {
@@ -562,7 +590,8 @@ fn content_contains_block_markdown(content: ContentRef<'_>) -> bool {
             node.children().iter().any(content_contains_block_markdown)
         }
         ContentRef::Node(ContentNode::Markdown(MarkdownNode::CodeSpan(_)))
-        | ContentRef::Node(ContentNode::Text(_)) => false,
+        | ContentRef::Node(ContentNode::Text(_))
+        | ContentRef::Node(ContentNode::RawText(_)) => false,
         ContentRef::Node(ContentNode::Markdown(
             MarkdownNode::Heading(_)
             | MarkdownNode::Paragraph(_)

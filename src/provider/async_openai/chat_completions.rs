@@ -64,17 +64,37 @@ mod history;
 mod native_reaction;
 mod observation;
 
-pub use observation::{OpenAiChatObservation, OpenAiChatObservationError, OpenAiChatObserver};
+pub(super) use observation::{
+    OpenAiChatObservation, OpenAiChatObservationError, OpenAiChatObserver,
+};
+
+#[cfg(test)]
+mod integration_tests;
+
+#[cfg(test)]
+mod transport_tests;
 
 #[cfg(feature = "legacy-provider-port")]
 use history::{ChatDiffMemo, ChatHistory, PreparedChatHistory};
 
-pub const OPENAI_CHAT_COMPLETIONS_PROFILE: &str = "openai-chat-completions-v1";
+pub(super) const OPENAI_CHAT_COMPLETIONS_PROFILE: &str = "openai-chat-completions-v1";
 const CHAT_TARGET_ID_DOMAIN: u128 = 1_u128 << 64;
 static NEXT_CHAT_TARGET_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(super) enum ChatCompletionsConfigError {
+    #[error("OpenAI Chat Completions serialized outbound request body limit must be non-zero")]
+    InvalidSerializedRequestBodyLimit,
+    #[error("OpenAI Chat Completions Frame profile is invalid")]
+    InvalidFrameProfile,
+    #[error("OpenAI Chat Completions target identity space is exhausted")]
+    TargetIdentityExhausted,
+    #[error(transparent)]
+    SharedTransport(#[from] super::AsyncOpenAiConfigError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenAiChatCompletionsOptions {
+pub(super) struct OpenAiChatCompletionsOptions {
     model: String,
     max_tokens: Option<u64>,
     temperature: Option<serde_json::Number>,
@@ -82,7 +102,7 @@ pub struct OpenAiChatCompletionsOptions {
 }
 
 impl OpenAiChatCompletionsOptions {
-    pub fn new(model: impl Into<String>) -> Result<Self, OpenAiChatCompletionsError> {
+    pub(super) fn new(model: impl Into<String>) -> Result<Self, OpenAiChatCompletionsError> {
         let model = model.into();
         if model.is_empty() {
             return Err(OpenAiChatCompletionsError::EmptyModel);
@@ -128,7 +148,7 @@ impl OpenAiChatCompletionsOptions {
     }
 }
 
-pub struct AsyncOpenAiChatCompletionsProvider {
+pub(super) struct AsyncOpenAiChatCompletionsProvider {
     client: reqwest::Client,
     config: OpenAIConfig,
     identity: ProviderIdentity,
@@ -150,7 +170,7 @@ pub struct AsyncOpenAiChatCompletionsProvider {
 }
 
 impl AsyncOpenAiChatCompletionsProvider {
-    pub fn new(
+    pub(super) fn new(
         config: AsyncOpenAiTransportConfig,
         identity: ProviderIdentity,
         options: OpenAiChatCompletionsOptions,
@@ -160,14 +180,16 @@ impl AsyncOpenAiChatCompletionsProvider {
     }
 
     /// Builds a Chat Completions provider without exposing HTTP-client source errors.
-    pub fn try_new(
+    pub(super) fn try_new(
         config: AsyncOpenAiTransportConfig,
         identity: ProviderIdentity,
         options: OpenAiChatCompletionsOptions,
-    ) -> Result<Self, super::AsyncOpenAiConfigError> {
+    ) -> Result<Self, ChatCompletionsConfigError> {
+        let chat_completions_frame_profile = super::chat_completions_frame_profile(
+            config.chat_completions_frame_constraints.clone(),
+        )?;
         let initialized = super::transport::initialize(config)?;
-        let reaction_target =
-            ChatReactionTarget::new(initialized.chat_completions_frame_profile.clone())?;
+        let reaction_target = ChatReactionTarget::new(chat_completions_frame_profile)?;
         Ok(Self {
             client: initialized.client,
             config: initialized.config,
@@ -191,7 +213,7 @@ impl AsyncOpenAiChatCompletionsProvider {
         })
     }
 
-    pub fn identity(&self) -> &ProviderIdentity {
+    pub(super) fn identity(&self) -> &ProviderIdentity {
         &self.identity
     }
 
@@ -593,7 +615,7 @@ struct ChatReactionTarget {
 }
 
 impl ChatReactionTarget {
-    fn new(profile: FrameProfile) -> Result<Self, super::AsyncOpenAiConfigError> {
+    fn new(profile: FrameProfile) -> Result<Self, ChatCompletionsConfigError> {
         Ok(Self {
             identity: next_chat_target_identity(&NEXT_CHAT_TARGET_ID)?,
             epoch: TargetEpoch::new(NonZeroU64::MIN),
@@ -653,12 +675,12 @@ impl ChatReactionTarget {
 
 fn next_chat_target_identity(
     counter: &AtomicU64,
-) -> Result<TargetIdentity, super::AsyncOpenAiConfigError> {
+) -> Result<TargetIdentity, ChatCompletionsConfigError> {
     let value = counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
-        .map_err(|_| super::AsyncOpenAiConfigError::ChatCompletionsTargetIdentityExhausted)?;
+        .map_err(|_| ChatCompletionsConfigError::TargetIdentityExhausted)?;
     Ok(TargetIdentity::new(
         NonZeroU128::new(CHAT_TARGET_ID_DOMAIN | u128::from(value))
             .expect("Chat target domain is non-zero"),
@@ -810,7 +832,7 @@ struct ChatWireDelta {
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum OpenAiChatCompletionsError {
+pub(super) enum OpenAiChatCompletionsError {
     #[error("Chat Completions model must be non-empty")]
     EmptyModel,
     #[error("Chat Completions max_tokens must be greater than zero")]
@@ -887,10 +909,7 @@ mod frame_profile_tests {
             Ok(_) => panic!("invalid Chat Frame constraints were accepted"),
             Err(error) => error,
         };
-        assert_eq!(
-            error,
-            super::super::AsyncOpenAiConfigError::InvalidChatCompletionsFrameProfile
-        );
+        assert_eq!(error, ChatCompletionsConfigError::InvalidFrameProfile);
     }
 
     #[test]
@@ -1006,7 +1025,7 @@ mod frame_profile_tests {
 
         assert_eq!(
             next_chat_target_identity(&exhausted),
-            Err(super::super::AsyncOpenAiConfigError::ChatCompletionsTargetIdentityExhausted)
+            Err(ChatCompletionsConfigError::TargetIdentityExhausted)
         );
     }
 

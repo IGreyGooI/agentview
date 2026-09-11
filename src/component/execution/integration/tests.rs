@@ -11,7 +11,6 @@ use super::{PluginControl, PluginPort, SkillControl, SkillPort};
 use crate::{
     component::{
         execution::{
-            RenderedProjection,
             application::Application,
             debug::DebugProviderPort,
             external::{
@@ -19,6 +18,7 @@ use crate::{
                 ExternalObservationKind,
             },
             reaction::{FrameBasis, ReactionPort},
+            RenderedProjection,
         },
         prelude::*,
     },
@@ -307,15 +307,13 @@ async fn plugin_registry_owns_one_session_per_parent_and_fences_late_messages() 
     assert!(second_a.content().contains("from-parent-a"));
     assert_eq!(second_a.frame().target(), first_a.frame().target());
     assert_eq!(registry.len(), 2);
-    assert!(
-        registry
-            .get("parent-b")
-            .unwrap()
-            .control
-            .next_observation()
-            .now_or_never()
-            .is_none()
-    );
+    assert!(registry
+        .get("parent-b")
+        .unwrap()
+        .control
+        .next_observation()
+        .now_or_never()
+        .is_none());
 
     for parent in registry.into_values() {
         parent.application.shutdown().await.unwrap();

@@ -34,6 +34,7 @@ use super::{
     native_function_call,
     output::{OpenAiOutputLedger, SealedOpenAiPrivateOutput},
     reaction_fault::{map_openai_fault, OpenAiFailureClass, OpenAiReactionFailure},
+    request_observation::{observe_request, OpenAiResponsesRequestSnapshot},
     responses_observation::{
         capture_error_response, observation_fault, observe_facts, CapturedResponse,
         OpenAiResponsesObservation,
@@ -100,6 +101,10 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         let stream_capture = capture.clone();
         let capture_enabled = observer.is_some();
 
+        let request_observer = self.request_observer.clone();
+        let request_snapshot = request_observer
+            .as_ref()
+            .map(|_| OpenAiResponsesRequestSnapshot::new(&frame, &prepared.request_body));
         let client = self.client.clone();
         let execution_mode = &mut self.execution_mode;
         let target = &mut self.reaction_target;
@@ -144,6 +149,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         .await?;
 
         let mut continuity = PostHandoffContinuity::new(target);
+        observe_request(&request_observer, request_snapshot);
         let pending = async move {
             let response = match first_response {
                 Poll::Ready(Ok(response)) => response,
@@ -701,15 +707,16 @@ impl<S> NativeOpenAiStreamState<'_, S> {
     }
 
     fn advance_sequence(&mut self, payload: &Map<String, Value>) -> Result<(), ReactionPortFault> {
-        let sequence = payload
-            .get("sequence_number")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                port_fault(
-                    OpenAiFailureClass::ResponseProtocolRetryable,
-                    "event is missing sequence_number",
-                )
-            })?;
+        // Some gateways omit event numbers; retain the last known number across gaps.
+        let Some(sequence) = payload.get("sequence_number") else {
+            return Ok(());
+        };
+        let sequence = sequence.as_u64().ok_or_else(|| {
+            port_fault(
+                OpenAiFailureClass::ResponseProtocolRetryable,
+                "event has invalid sequence_number",
+            )
+        })?;
         if self
             .last_sequence
             .is_some_and(|previous| sequence <= previous)
@@ -1574,6 +1581,26 @@ mod tests {
         ])
     }
 
+    fn unnumbered_tool_events() -> Vec<serde_json::Value> {
+        let added = json!({
+            "id": "call_item_1", "type": "function_call", "status": "in_progress",
+            "call_id": "call_1", "name": "read_next", "arguments": ""
+        });
+        let done = json!({
+            "id": "call_item_1", "type": "function_call", "status": "completed",
+            "call_id": "call_1", "name": "read_next", "arguments": "{}"
+        });
+        vec![
+            json!({"type":"response.created","response":{"id":"resp_tool","status":"in_progress","output":[]}}),
+            json!({"type":"response.in_progress","response":{"id":"resp_tool","status":"in_progress","output":[]}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":added}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"call_item_1","output_index":0,"delta":"{}"}),
+            json!({"type":"response.function_call_arguments.done","item_id":"call_item_1","output_index":0,"arguments":"{}"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":done.clone()}),
+            json!({"type":"response.completed","response":{"id":"resp_tool","status":"completed","output":[done]}}),
+        ]
+    }
+
     fn compacted_text_sse() -> String {
         let compaction = json!({
             "id": "cmp_1",
@@ -2267,6 +2294,149 @@ mod tests {
 
         let _ = shutdown.send(());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_stream_accepts_missing_sequence_numbers_and_preserves_continuity() {
+        for sequences in [
+            [None; 7],
+            [None, None, None, None, None, None, Some(0)],
+            [Some(0), None, Some(1), None, Some(10), None, Some(u64::MAX)],
+        ] {
+            let mut events = unnumbered_tool_events();
+            for (event, sequence) in events.iter_mut().zip(sequences) {
+                if let Some(sequence) = sequence {
+                    event["sequence_number"] = json!(sequence);
+                }
+            }
+            let (base, shutdown, server) = spawn_sse_server(encode_sse(events)).await;
+            let mut provider = provider(&base, None);
+            let declaration = ReactionPort::declare(&mut provider).unwrap();
+            let frame = full_frame(&declaration);
+            let revision = frame.revision();
+            let mut stream = ReactionPort::submit(&mut provider, frame).await.unwrap();
+            let mut facts = Vec::new();
+            while let Some(fact) = stream.next().await {
+                facts.push(fact.unwrap());
+            }
+            drop(stream);
+
+            assert_eq!(
+                facts,
+                vec![
+                    ProviderFact::ToolCall {
+                        output: ProviderOutputKey::new(0),
+                        ordinal: 0,
+                        call: ProviderToolCall::new("call_1", "read_next", "{}").unwrap(),
+                    },
+                    ProviderFact::ReactionCompleted { primary_text: None },
+                ],
+                "sequences: {sequences:?}"
+            );
+            assert!(matches!(
+                ReactionPort::declare(&mut provider).unwrap().continuity(),
+                TargetContinuity::Accepted { revision: accepted, .. } if *accepted == revision
+            ));
+
+            let _ = shutdown.send(());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_stream_rejects_invalid_present_sequence_numbers() {
+        for sequence in [
+            json!(null),
+            json!("1"),
+            json!(-1),
+            json!(1.5),
+            json!(true),
+            json!({}),
+            json!([]),
+            serde_json::from_str("18446744073709551616").unwrap(),
+        ] {
+            let mut events = unnumbered_tool_events();
+            events[0]["sequence_number"] = sequence.clone();
+            let (base, shutdown, server) = spawn_sse_server(encode_sse(events)).await;
+            let mut provider = provider(&base, None);
+            let declaration = ReactionPort::declare(&mut provider).unwrap();
+            let mut stream = ReactionPort::submit(&mut provider, full_frame(&declaration))
+                .await
+                .unwrap();
+            let fault = stream.next().await.unwrap().unwrap_err();
+            assert_eq!(fault.kind(), ReactionPortFaultKind::Retryable, "{sequence}");
+            assert_eq!(fault.code(), ReactionPortFaultCode::Protocol, "{sequence}");
+            assert_eq!(fault.reason(), ReactionPortFaultReason::ResponseProtocol);
+            assert!(stream.next().await.is_none());
+            drop(stream);
+            assert!(matches!(
+                ReactionPort::declare(&mut provider).unwrap().continuity(),
+                TargetContinuity::FullRequired { epoch }
+                    if *epoch > declaration.continuity().epoch()
+            ));
+
+            let _ = shutdown.send(());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_stream_rejects_non_increasing_sequences_across_unnumbered_events() {
+        for sequence in [9, 10] {
+            let mut events = unnumbered_tool_events();
+            events[0]["sequence_number"] = json!(10);
+            events[2]["sequence_number"] = json!(sequence);
+            let (base, shutdown, server) = spawn_sse_server(encode_sse(events)).await;
+            let mut provider = provider(&base, None);
+            let declaration = ReactionPort::declare(&mut provider).unwrap();
+            let mut stream = ReactionPort::submit(&mut provider, full_frame(&declaration))
+                .await
+                .unwrap();
+            let fault = stream.next().await.unwrap().unwrap_err();
+            assert_eq!(fault.kind(), ReactionPortFaultKind::Terminal);
+            assert_eq!(fault.code(), ReactionPortFaultCode::Protocol);
+            assert_eq!(fault.reason(), ReactionPortFaultReason::ResponseProtocol);
+            assert!(stream.next().await.is_none());
+            drop(stream);
+
+            let _ = shutdown.send(());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unnumbered_tool_stream_still_requires_matching_lifecycle_and_completion() {
+        let mut missing_arguments_done = unnumbered_tool_events();
+        missing_arguments_done.remove(4);
+        let mut mismatched_completion = unnumbered_tool_events();
+        mismatched_completion[6]["response"]["output"][0]["arguments"] = json!("{\"key\":1}");
+
+        for events in [missing_arguments_done, mismatched_completion] {
+            let (base, shutdown, server) = spawn_sse_server(encode_sse(events)).await;
+            let mut provider = provider(&base, None);
+            let declaration = ReactionPort::declare(&mut provider).unwrap();
+            let mut stream = ReactionPort::submit(&mut provider, full_frame(&declaration))
+                .await
+                .unwrap();
+            let fault = loop {
+                match stream
+                    .next()
+                    .await
+                    .expect("invalid tool stream ended without a fault")
+                {
+                    Ok(fact) => assert!(matches!(fact, ProviderFact::ToolCall { .. })),
+                    Err(fault) => break fault,
+                }
+            };
+            assert_eq!(fault.kind(), ReactionPortFaultKind::Terminal);
+            assert_eq!(fault.code(), ReactionPortFaultCode::Protocol);
+            assert_eq!(fault.reason(), ReactionPortFaultReason::ResponseProtocol);
+            assert!(stream.next().await.is_none());
+            drop(stream);
+
+            let _ = shutdown.send(());
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

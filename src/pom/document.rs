@@ -1,4 +1,5 @@
-use super::{BlockBuilder, BlockChildren, BlockContent, PomError, XmlNode};
+use super::{BlockBuilder, BlockChildren, BlockContent, PomError, RawTextNode, XmlNode};
+use crate::StorageString;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Document {
@@ -22,6 +23,12 @@ impl Document {
     pub fn from_xml(node: XmlNode) -> Self {
         let mut children = BlockChildren::new();
         children.push(BlockContent::xml(node));
+        Self::new(children)
+    }
+
+    pub fn from_raw_text(value: impl Into<StorageString>) -> Self {
+        let mut children = BlockChildren::new();
+        children.push(BlockContent::raw_text(RawTextNode::new(value)));
         Self::new(children)
     }
 

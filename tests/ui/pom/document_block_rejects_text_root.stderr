@@ -12,6 +12,7 @@ error[E0277]: the trait bound `TextNode: agentview::agent_view::IntoBlockChildre
             ListNode
             Option<T>
             ParagraphNode
+            RawTextNode
             XmlNode
 note: required by a bound in `agentview::agent_view::build_block_children`
  --> src/agent_view.rs

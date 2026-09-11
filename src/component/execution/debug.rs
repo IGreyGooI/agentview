@@ -1,8 +1,8 @@
 use std::{
-    num::{NonZeroU64, NonZeroU128},
+    num::{NonZeroU128, NonZeroU64},
     sync::{
-        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
     },
 };
 
@@ -14,8 +14,8 @@ use async_trait::async_trait;
     reason = "the debug provider retains its feature-gated ProviderPort compatibility implementation"
 )]
 use super::{
-    ProviderEventStream, ProviderFault, ProviderFaultCode, ProviderPort, RenderedProjection,
-    prompt_render::render_projection_prompt,
+    prompt_render::render_projection_prompt, ProviderEventStream, ProviderFault, ProviderFaultCode,
+    ProviderPort, RenderedProjection,
 };
 use crate::component::execution::reaction::{
     Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
@@ -249,12 +249,12 @@ mod tests {
     use agentview_derive::view;
 
     use super::*;
-    #[cfg(feature = "legacy-provider-port")]
-    use crate::component::execution::{RenderedProjection, RenderedProjectionNode};
     use crate::component::execution::{
         application::Application,
         reaction::{FrameSubmission, ProjectionSubmission, ToolCatalog},
     };
+    #[cfg(feature = "legacy-provider-port")]
+    use crate::component::execution::{RenderedProjection, RenderedProjectionNode};
 
     fn frame(declaration: &TargetDeclaration, sequence: u64) -> Frame {
         let epoch = declaration.continuity().epoch();

@@ -724,9 +724,11 @@ mod tests {
             ProviderIdentity,
         },
         provider::async_openai::{
-            AsyncOpenAiChatCompletionsProvider, AsyncOpenAiTransportConfig,
-            OpenAiChatCompletionsOptions, OpenAiChatObservation, OpenAiChatObservationError,
-            OpenAiChatObserver,
+            chat_completions::{
+                AsyncOpenAiChatCompletionsProvider, OpenAiChatCompletionsOptions,
+                OpenAiChatObservation, OpenAiChatObservationError, OpenAiChatObserver,
+            },
+            AsyncOpenAiTransportConfig,
         },
         transcript::CanonicalInputItem,
     };

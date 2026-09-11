@@ -565,6 +565,7 @@ fn mixed_children_preserve_text_markdown_xml_text_order() {
         .iter()
         .map(|edge| match edge {
             ContentRef::Node(ContentNode::Text(_)) => "text",
+            ContentRef::Node(ContentNode::RawText(_)) => "raw-text",
             ContentRef::Node(ContentNode::Markdown(_)) => "markdown",
             ContentRef::Node(ContentNode::Xml(_)) => "xml",
             ContentRef::DiffSlot(_) => "diff",

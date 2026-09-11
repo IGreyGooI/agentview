@@ -566,15 +566,27 @@ async fn preparation_and_contract_drive_the_model_and_stockfish_turns() {
         .text
         .contains("fen>rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2"));
     assert_eq!(
-            frames[1]
-                .text
-                .matches(
-                    "Respond with exactly two XML elements and no other text: first one nonempty &lt;thought&gt;...&lt;/thought&gt; with a concise move evaluation, then exactly one registered self-closing XML action element. The rule elements below are instructions, not valid output."
-                )
-                .count(),
-            1,
-            "a delta repeats the policy without relying on stable action examples"
-        );
+        frames[1].text.matches("<chess_action_policy>").count(),
+        1,
+        "developer(repeat) sends the current action policy once on every turn"
+    );
+    assert!(!frames[1].text.contains("<remove>"));
+    assert!(!frames[1].text.contains("<chess_player>"));
+    assert_eq!(
+        frames[1].replay,
+        [CanonicalInputItem::assistant_text(
+            thought_then_choose_move("e2e4"),
+            None,
+        )],
+        "the previous model reply is retained by the history path"
+    );
+    assert!(frames[1].projection.iter().all(|item| matches!(
+        item,
+        CanonicalInputItem::Instruction {
+            authority: agentview::transcript::InstructionAuthority::Developer,
+            ..
+        }
+    )));
     assert!(!frames[1].text.contains("shown after this policy"));
     assert!(frames[1].text.contains("d2d4"));
     for action_syntax in ["<choose_move uci=\"...\" />", "<resign />"] {

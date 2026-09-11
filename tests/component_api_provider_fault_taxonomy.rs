@@ -142,9 +142,10 @@ fn completed_reconciliation_snapshot_is_typed_structural_and_atomically_optional
     );
     assert_eq!(diagnostic.response_completed_reconciliation(), None);
 
-    const NULLABLE_KEYS: [&str; 13] = [
+    const NULLABLE_KEYS: [&str; 14] = [
         "response_created_sequence",
         "response_in_progress_sequence",
+        "response_completed_sequence",
         "terminal_output_index",
         "observed_lifecycle_index",
         "observed_lifecycle_state",

@@ -3,6 +3,10 @@
 mod scripted_provider;
 
 use agentview::component::execution::FrameBasis;
+use agentview::{
+    pom_renderer::render_pom_document,
+    transcript::{CanonicalInputItem, ConversationRole},
+};
 use scripted_provider::{ScriptedProvider, ScriptedReaction};
 
 use super::*;
@@ -21,7 +25,21 @@ async fn completed_review_is_published_in_the_next_frame() -> anyhow::Result<()>
     assert_eq!(frames[0].basis, FrameBasis::Full);
     assert!(matches!(frames[1].basis, FrameBasis::DeltaFrom(_)));
     assert!(frames[0].text.contains("<review_status>pending"));
-    assert!(frames[1].text.contains("<review_status>approved"));
+    assert!(frames[0].text.contains("<review_policy>"));
+    assert!(frames[0].text.contains("<document_request>"));
+    assert_eq!(frames[1].text, "<review_status>approved</review_status>");
+    assert!(matches!(
+        frames[1].projection.as_slice(),
+        [CanonicalInputItem::Message {
+            role: ConversationRole::User,
+            pom,
+        }] if render_pom_document(pom)? == "<review_status>approved</review_status>"
+    ));
+    assert_eq!(
+        frames[1].replay,
+        [CanonicalInputItem::assistant_text("approved", None)],
+        "the model reply belongs to history, separate from the current review state"
+    );
     Ok(())
 }
 

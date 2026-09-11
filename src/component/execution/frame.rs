@@ -347,6 +347,7 @@ impl FrameSession {
                 newly_unclaimed_outputs.as_slice()
             };
         let projection_plan = ReconciledProjectionPlan::prepare(
+            compatible_checkpoint.map(|checkpoint| &checkpoint.complete_projection),
             delta_checkpoint.map(|checkpoint| &checkpoint.diff_baseline),
             previous_reconciliation,
             current_scope_outputs,

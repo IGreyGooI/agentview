@@ -1350,7 +1350,7 @@ fn sanitize_staging_budget_fault(error: FrameBudgetFault) -> ToolOutputStagingFa
 mod tests {
     use std::{
         error::Error,
-        num::{NonZeroU64, NonZeroU128},
+        num::{NonZeroU128, NonZeroU64},
     };
 
     use crate::{
@@ -1362,8 +1362,8 @@ mod tests {
             },
         },
         transcript::{
-            AssistantTextStatus, CanonicalInputItem, reset_construction_work,
-            take_construction_work,
+            reset_construction_work, take_construction_work, AssistantTextStatus,
+            CanonicalInputItem,
         },
     };
 
@@ -2357,48 +2357,40 @@ mod tests {
             .stage_tool_output(ticket, call.output("too-large".repeat(512)))
             .unwrap_err();
         assert_eq!(fault.reason(), ToolOutputStagingReason::Budget);
-        assert!(
-            guard
-                .staging
-                .slots
-                .get(&retry.registration)
-                .unwrap()
-                .output
-                .is_none()
-        );
-        assert!(
-            guard
-                .staging
-                .slots
-                .get(&retry.registration)
-                .unwrap()
-                .cancellation_fallback
-                .is_some()
-        );
+        assert!(guard
+            .staging
+            .slots
+            .get(&retry.registration)
+            .unwrap()
+            .output
+            .is_none());
+        assert!(guard
+            .staging
+            .slots
+            .get(&retry.registration)
+            .unwrap()
+            .cancellation_fallback
+            .is_some());
 
         guard
             .stage_tool_output(retry, call.output("small"))
             .unwrap();
-        assert!(
-            guard
-                .staging
-                .slots
-                .values()
-                .next()
-                .unwrap()
-                .output
-                .is_some()
-        );
-        assert!(
-            guard
-                .staging
-                .slots
-                .values()
-                .next()
-                .unwrap()
-                .cancellation_fallback
-                .is_none()
-        );
+        assert!(guard
+            .staging
+            .slots
+            .values()
+            .next()
+            .unwrap()
+            .output
+            .is_some());
+        assert!(guard
+            .staging
+            .slots
+            .values()
+            .next()
+            .unwrap()
+            .cancellation_fallback
+            .is_none());
     }
 
     #[test]
