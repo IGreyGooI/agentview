@@ -41,11 +41,13 @@ fn calculator(answer: Arc<Mutex<String>>) -> Component {
         }
     });
 
+    let request = r#"## Request
+
+- Call `add` exactly once with `a=17` and `b=25`.
+- Do not answer before using the tool.
+- After receiving the tool result, reply with only the resulting number."#;
     view! {
-        request {
-            "Call add exactly once with a=17 and b=25. Do not answer before using the tool. \
-             After receiving the tool result, reply with only the resulting number."
-        }
+        { request }
         { NativeToolCall::new(add) }
     }
 }

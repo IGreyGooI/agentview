@@ -49,11 +49,11 @@ fn prompt_debug_test_application() -> Component {
     let context = context.with(Clone::clone).expect("mounted context");
     view! {
         #[system_once]
-        system_policy { "Return one short reply." }
+        { "# Assistant\n\nReturn one short reply." }
         #[developer]
         developer_context { "{context}" }
         #[user]
-        user_request { "Reply with done." }
+        { "## Request\n\nReply with done." }
         { NativeToolCall::new(crate::add) }
     }
 }
@@ -266,6 +266,7 @@ async fn prepared_projection_and_exact_requests_are_captured_separately() -> any
         );
     }
     let projection = std::fs::read_to_string(run_dir.join("0001/projection.txt"))?;
+    assert!(projection.contains("# Assistant\n\nReturn one short reply."));
     assert!(projection
         .contains("<developer_context>prepared &lt;context&gt; &amp; state</developer_context>"));
     assert!(!projection.contains("pending"));
@@ -290,6 +291,11 @@ async fn prepared_projection_and_exact_requests_are_captured_separately() -> any
 
     let request_path = run_dir.join("0001/request.json");
     assert_eq!(std::fs::read(&request_path)?, server_body);
+    let request: Value = serde_json::from_slice(&server_body)?;
+    assert_eq!(
+        request["instructions"],
+        "# Assistant\n\nReturn one short reply."
+    );
     assert_eq!(
         std::fs::read(run_dir.join("0002/request.json"))?,
         second_body

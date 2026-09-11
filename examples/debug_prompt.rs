@@ -54,17 +54,21 @@ fn debug_tool_agent(answer: Arc<Mutex<String>>) -> Component {
         }
     });
 
+    let system = r#"# Arithmetic assistant
+
+Use the available native tool before answering arithmetic requests."#;
+    let instructions = r#"## Tool use
+
+- Call `add` exactly once when asked for this sum.
+- After its result arrives, respond with only the number."#;
+    let request = "## Request\n\nWhat is 17 plus 25?";
     view! {
         #[system_once]
-        system_policy {
-            "Use the available native tool before answering arithmetic requests."
-        }
+        { system }
         #[developer]
-        developer_policy {
-            "Call add exactly once when asked for this sum. After its result arrives, respond with only the number."
-        }
+        { instructions }
         #[user]
-        user_request { "What is 17 plus 25?" }
+        { request }
         #[user]
         task_state { "{current_phase}" }
         { NativeToolCall::new(add) }

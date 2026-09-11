@@ -23,9 +23,8 @@ fn hello_agent() -> Component {
     let exit = use_application_exit();
     use_reaction_completion(move || async move { exit.request(ExitReason::Completed) });
 
-    view! {
-        greeting_request { "Say exactly: Hello World" }
-    }
+    let request = "## Request\n\nSay exactly: Hello World";
+    view! { { request } }
 }
 
 async fn run_agent(provider: impl ReactionPort) -> anyhow::Result<()> {

@@ -1,4 +1,5 @@
-//! Render an existing multiline prompt without parsing or escaping its contents.
+//! Markdown strings carry instructions; XML nodes carry structured state.
+//! Raw strings preserve literal XML examples, while XML node text is escaped.
 //!
 //! Run `cargo run --no-default-features --example raw_prompt`; no credentials are needed.
 
@@ -14,25 +15,32 @@ const SYSTEM_PROMPT: &str = r#"# Assistant
 
 Keep the user's original formatting.
 
-- Read the current context.
-- Respond using the following example:
+- Read the recipient from the current `greeting_context` state.
+- Say hello using the following response format:
 
 ```xml
-<say>Hello & welcome.</say>
+<say>Hello &amp; welcome.</say>
 ```
 
-The literal <say> tag is part of this prompt.
+Escape XML special characters in the response text.
 "#;
 
 #[component]
 fn existing_prompt(system: String) -> Component {
     let request = String::from("## Request\n\nSay hello.\n");
+    let recipient = "Mina <ops> & team";
     view! {
         #[system_once]
         { system }
 
         #[user]
         { request }
+
+        #[user]
+        greeting_context {
+            recipient { "{recipient}" }
+            language { "English" }
+        }
     }
 }
 
