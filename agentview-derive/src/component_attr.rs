@@ -211,6 +211,9 @@ impl VisitMut for HookCallRewriter {
             ComponentHookCall::Preparation => syn::parse_quote! {
                 __agentview_hooks.use_preparation_at(#site, #arguments)
             },
+            ComponentHookCall::CommandWait => syn::parse_quote! {
+                __agentview_hooks.use_wait_for_command_at(#site)
+            },
             ComponentHookCall::ProviderEventHandler => syn::parse_quote! {
                 __agentview_hooks.use_provider_event_handler_at(#site, #arguments)
             },
@@ -243,6 +246,7 @@ impl VisitMut for HookCallRewriter {
 enum ComponentHookCall {
     Signal,
     Preparation,
+    CommandWait,
     ProviderEventHandler,
     ReactionCompletion,
     ReactionRequest,
@@ -269,6 +273,7 @@ fn component_hook_call(path: &syn::Path, argument_count: usize) -> Option<Compon
     match (hook, argument_count) {
         ("use_signal", 1) => Some(ComponentHookCall::Signal),
         ("use_preparation", 1) => Some(ComponentHookCall::Preparation),
+        ("use_wait_for_command", 0) => Some(ComponentHookCall::CommandWait),
         ("use_provider_event_handler", 2) => Some(ComponentHookCall::ProviderEventHandler),
         ("use_reaction_completion", 1) => Some(ComponentHookCall::ReactionCompletion),
         ("use_reaction_request", 0) => Some(ComponentHookCall::ReactionRequest),

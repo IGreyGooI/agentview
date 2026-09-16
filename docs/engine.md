@@ -19,6 +19,26 @@ AgentView 把 LLM 应用组织成 retained Component tree：
 - `Application::run()` 是默认 fixed driver；需要手动调度的 external owner 可以显式调用
   `Application::react()` 开始一次 reaction。
 
+### 可交互性是核心设计目标
+
+AgentView 为 LLM 提供用户界面。应用通过 Component 声明当前状态、可用操作与反馈，使 LLM 能够
+观察、操作、看到真实结果，再根据变化后的界面继续行动。设计和评审应围绕这个连续的交互过程展开。
+
+界面需要让模型知道当前可以做什么、操作需要什么输入和约束。执行后，应呈现该操作的实际结果、
+进展或失败原因，以及更新后的状态和下一步可用操作。成功、进行中和失败都是模型做下一次选择所需的
+反馈；已提交、等待完成和已经生效的操作应当区分。业务状态由应用持有，模型的文字不能代替执行结果。
+
+例如搜索得到带可用标识的候选项，查看某个候选项后得到详情及相关操作，执行操作后看到实际结果。
+每一次观察都支持后续行动。只有输入被正确解析、回调成功或最终答案正确，尚不足以证明可交互性；
+验证还应覆盖模型操作得到的结果或状态变化、后续 Frame 中可见的反馈，以及基于该反馈继续操作的路径。
+
+反馈的内容和交付时机也是界面设计的一部分。Component 声明模型下一次应看到的状态，后续提交的
+Frame 才将更新交付给模型；Signal 写入或日志记录本身不产生新一轮观察。何时推进下一次 reaction
+沿用应用的 driver 与 preparation 规则。具体 authoring 方式见 [HELP.md](../HELP.md#the-llm-is-the-user)。
+
+错误反馈是可交互性的一个具体场景：普通模型输入错误被跳过并保留有用反馈，独立的合法操作继续处理。
+业务准入、操作依赖、明确的事务要求以及 runtime 的失败与恢复边界仍按各自规则执行。
+
 ### Component 输出契约
 
 Component 输出的是当前组件必须告诉 LLM 的完整状态声明：规则、环境、业务状态、记录或应用显式
@@ -371,6 +391,50 @@ poll claim，确定的pre-handoff local failure不claim，claim后另一入口ty
 
 ToolCall Component 声明 target 可调用的能力。它接收完整 ToolCall，执行、拒绝或报告失败，然后产生
 同一 `call_id` 的 typed ToolOutput。它不编码 Provider wire item，也不直接写 canonical history。
+
+`view!` 支持 `NativeToolCall { name, description, on_call }` 属性声明。`name` 和 `on_call`
+必填，属性顺序无关；输入 schema 从 callback 的 owned `Deserialize + JsonSchema` 参数类型生成。
+callback 可捕获当前 Component 的 Signal 或其他应用句柄，这些捕获值不属于模型输入。
+无参数 callback 可直接写 `||`，schema 为只接受空 object 的输入。
+同步 `Result<Output, Error>` 和返回该结果的 `Send` future 均可作为 callback 返回值；
+`Output` 必须可序列化。参数解码失败返回 `invalid_arguments`，不执行 callback；普通业务拒绝
+应作为 `Ok` 中的结果数据返回，callback `Err` 仍为 reaction fault。
+render 只绑定 callback，不执行动作；后续 render 更新捕获值，同一挂载保留原生调用记录。
+动作结果进入原有 ToolOutput staging，更新后的业务状态由 Component 声明，均需后续成功提交的
+Frame 才交付给模型。属性语法不改变调用调度、取消、记录归属或下一轮交付规则。
+
+普通流式 XML 写法为 `XmlStreamingToolCall { element, description, on_open, on_delta,
+on_complete, on_invalid }`。`element` 必填，至少提供一个 open/delta/complete callback；
+`text` draft 默认解码为 `String`，self-closing draft 默认解码为 `()`，显式 `.decode(...)`
+保留自己的 `Head` 和 `Value`。`on_open` 接收 `Arc<Head>`，`on_delta` 接收新增的 decoded
+`String`，`on_complete` 在元素有效关闭并完成解码后接收 `Value`。同步 Result 和异步 Result
+均可，成功返回值丢弃，应用把实际业务结果写入状态并在当前 POM 声明。
+
+这条执行路径的 scope 明确分成三层：Component mount 保存业务 Signal 和动作诊断，prepared
+render 绑定本轮 callbacks；单次 reaction 的 `RenderBindings` 持有所有普通 XML 动作共享的
+strict parser 及进行中的 callback；每个 occurrence 独立处理 open/delta/complete。
+简单动作标签全局唯一，按输入顺序完整 await callback 后再派发下一事件。
+普通动作 parser 跳过已注册的 managed contract 标签，其余未知标签保留诊断；两类声明的标签
+不得重名。混合使用时 managed contract 通过既有 `ignore_unknown_elements` 策略跳过兄弟动作。
+只在 canonical admission 后处理非 Commentary 主文本，normal EOF 才检查未闭合输入和最小次数要求。
+callback 的创建和 future polling 都带 action Component 的 mount/task context；显式 `spawn`
+仍为该挂载的任务能力，卸载时关闭并清理。
+
+执行直接借用 `react()` future，不创建后台 worker。取消会先丢弃当前 callback future，再丢弃
+后续未执行的输入；不合成完成回调、不重放、不回滚已经写入的 Signal 或外部效果。普通 callback
+错误为 runtime fault，panic 原样传播；模型 XML 错误是诊断，跳过无效 occurrence 后继续独立
+合法动作。诊断写入动作 Component 的 retained view，并可通过 `on_invalid` 额外处理；未知标签
+等无法归属的诊断由第一个简单动作声明接收。每个动作保留最近 32 条诊断及省略数量，新一轮输入
+开始后清空，下一 submitted Frame 才交付反馈。legacy `ApplicationHost` 在提交前拒绝新 callback
+声明，普通 callback 使用 `Application<P>`。
+
+需要 managed effects 的流式 XML 写法为 `XmlStreamingToolCall::<Channels> { ... }`，其中嵌套
+`XmlToolElement { contract, on_open, on_delta, on_complete }`；校验与完成分开的回调使用
+`on_complete_validated: (validate, reduce)`。宏按原有 typestate 顺序组织声明，属性书写顺序无关。
+每个元素仍须选择完成回调，根节点仍须声明 attempt state、最终决策及 live/publication 策略。
+这只是原有 streaming contract 的声明语法：reducer 的 attempt-local 状态、managed effects、
+publisher 的业务提交边界和 rejection feedback 规则均不变。详见
+[Streaming Tool API](streaming-tool-api-design.md)。
 
 `#[tool]` 从同步或异步 Rust 函数生成工具定义值、参数结构和 JSON Schema；
 工具名固定取 Rust 函数名，禁止 `name` 覆盖；`description` 仍可单独配置。
@@ -761,11 +825,12 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
      -> precompute the optional admitted root ProviderEvent
      -> commit canonical fact
      -> dispatch event
-     -> broadcast selected structured text to independent contract workers
+    -> dispatch selected structured text to direct XML callbacks in source order
+    -> broadcast selected structured text to independent managed contract workers
      -> committed ToolCall starts its lane immediately
      -> poll active lanes while awaiting raw handlers or streaming work
 9. valid terminal + normal EOF -> drain remaining lanes
-10. finalize streaming parsers, decide each contract, and settle managed effects
+10. finalize direct XML callbacks at normal EOF; decide managed contracts and settle their effects
     -> unresolved effects retain workers and return RecoveryRequired before step 11
 11. post-reconcile Component state
 12. release gate; return Continue, or Break if exit was requested
@@ -972,7 +1037,24 @@ lifecycle。
 
 ### Skill / CLI frontend
 
-Skill的普通frontend与reaction exchange分开：
+stdin/stdout binary 的默认入口是 `StdinApplication::run(root).await`，在 Tokio runtime 内运行并
+返回 `std::process::ExitCode`。例如 chess binary 只启动无参数的业务 root：
+
+```rust
+use agentview::component::execution::StdinApplication;
+
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    StdinApplication::run(app::chess_application).await
+}
+```
+
+框架 runner 持有 CLI 解析、stdin framing、stdout 交付、stderr diagnostics 和 Unix daemon lifecycle；
+daemon 内部的 Application owner 持有 ingress、自动 preparation loop、view rendering 和 cleanup。
+session/connection 元数据由 runner 提供，业务 root 不接收 transport props。业务 root 显式声明唯一
+`use_wait_for_command()`，root 与子 Component 在 `view!` 中声明动作。
+
+保留的 SkillPort frontend 与 reaction exchange 分开：
 
 ```text
 agentview                       -> latest committed projection
@@ -986,6 +1068,64 @@ ProviderFact，也不隐式开始reaction。只有明确的reaction invocation�
 
 Plugin message遵守同一reaction-local stale fence；correlation属于adapter protocol，不恢复public core
 `FrameId`。
+
+`Action { name, description, enabled, on_call }` 由 core 像 NativeToolCall 一样在 Component 树遍历时收集，
+并由根 Component 唯一的 `use_wait_for_command()` 显式声明消费边界；子 Component 只声明动作，
+嵌套 wait 在 render 时拒绝。成功 render 的命令绑定进入本轮 `RenderBindings`；
+未采用的节点不登记，失败候选树不发布，重名在等待输入前拒绝。Application 通过
+`CommandInput::channel` 和 `mount_with_commands` 持有每个实例自己的 ingress。prepare 的普通 hooks
+到达 fixed point 后，wait hook 接收一个保留请求；Runtime 用最新成功 render 的 callbacks dispatch，
+把 callback outcome 和 wait feedback 写入 Component state，再 reconciliation 后返回完整 projection。
+callback 的执行 scope 是当前 preparation operation，业务 Signal 与命令 task context 属于其 Component
+mount。callback 支持同步结果和 async future，创建与 polling 都进入其 mount task scope。取消
+preparation 会保留尚未执行的 pending request 和已完成的 outcome；正在执行的 async future 被丢弃，
+下一次准备将其报告为 `Interrupted`，不重放，已发生效果不回滚。显式 preparation 失败清理当前请求。
+`enabled: false` 在调用前返回 `command_disabled` 及当前 view，不执行 callback；其他业务合法性由
+callback 判断。回调返回值直接成为 stdout 结果，框架不解释其中的 bool 或业务成功字段。
+
+Action 的 callback 输入结构体以 `Deserialize + JsonSchema` 声明 JSON 解码和可发现的 input schema。
+无参数 callback 直接写 `||`，只接受空 object。stdin envelope 为
+`{"action":"move","input":{"uci":"e2e4"}}`；框架按本轮实际挂载的动作名路由并执行 typed 解码。
+未知动作、错误类型等普通输入错误返回 feedback 和当前 view，不阻止下一次有效动作。callback
+返回错误仍遵循运行时失败规则。业务作者不维护独立 descriptor 常量、parser catalog 或 NoInput 类型。
+保留的 action feedback 对名称、错误码和正文提供有大小上限的展示预览，预算包括 XML/Markdown
+转义和 JSON 编码后的膨胀；截短有明确标记。XML 禁止字符以可读转义展示，`CommandResponse`
+仍保留原始调用及完整 outcome。
+
+`CommandSender::observe()` 通过相同 preparation barrier 请求 prepared projection，不调用业务 callback，
+不增加 action feedback。观察和动作请求都受取消、关闭与队列规则管理。stdout 由前台 adapter 输出
+准备好的 view；stdin 结束只关闭前台输入，daemon 持有的 Application 和业务状态继续存在。
+`CommandSender::feedback()` 通过相同队列将输入诊断保存在根 wait 声明的反馈区域，返回 prepared view；
+观察保留诊断，下一动作清除它。
+
+自定义 transport 使用 `StdinApplication::mount(root)` 嵌入 Application owner：内部配置 ingress 和 port，
+持续驱动 `prepare()`，不提交 Provider Frame。必须在 Tokio runtime 内调用且根必须声明 wait。
+`submit` 返回 callback 的完整 JSON result 和渲染后的 view；`observe` 只返回 view；`feedback` 返回
+输入错误及 view。response 的 `ok` 表示 dispatch 是否成功，不解释业务 result。取消 submit waiter
+不取消 driver 中已接纳的动作。已完成 response 先于下一 preparation 的 fault 交付；输入通道关闭时
+join driver 仲裁原始 panic。`shutdown()` 在调用时请求退出，其独立 owner 完成 Application cleanup；
+取消或不 poll 返回 waiter 都不取消 cleanup，必须 await 后才能向外确认关闭。
+
+标准 runner 的 CLI 只管理 daemon：`start` 幂等启动或连接并返回当前 view；默认 stdin 动作隐式启动；
+`status` 返回运行中的 view 或 stopped 状态，不启动 daemon；`stop` 在 Application 清理和 socket
+释放之后返回最终 view 及停止确认；`restart` 返回新会话 view；`help` 描述使用方式。无输入也能观察
+当前 view。按行输入使一条无效 JSON 的反馈可以在下一条有效动作前送达，批次不会因普通输入错误中止。
+stdout 的动作响应包含直接 callback result 和完整 view，并在读取下一动作前 flush。默认 socket 为
+`$XDG_RUNTIME_DIR/agentview-<executable-name>/socket`，回退到
+`$HOME/.cache/agentview-<executable-name>/socket`；`--socket PATH` 覆盖该位置并选择独立会话。
+chess_cli 的目录名为 `agentview-chess_cli`。关闭前台 stdin 不终止 daemon。runner 只有在 Application
+cleanup 完成并释放 socket 后才确认 stop；已提交但响应失败的动作不自动重试。
+生命周期请求与动作串行处理；尚未结束的 async action 会阻塞后续 stop/restart，可能使其 transport
+超时而 daemon 仍然运行。当前 runner 不提供越过动作队列的取消通道。
+
+这些通用行为实现在 `src/component/execution/stdin.rs` 及其 `stdin/cli.rs`、`stdin/daemon.rs` 模块；
+`examples/chess_cli/main.rs` 只调用 runner，`app.rs` 与 `game.rs` 保留业务声明和棋局逻辑。
+
+保留的 `CliCommand { command, enabled, on_call }` 仍支持选择业务 subcommand 的 adapter。
+`Command::definition()` 导出同一 typed descriptor 的 CLI 元数据与输入校验；`CommandParser` 根据
+descriptor 列表提供 argv/stdin 解码、请求校验和 help。parser 不执行 callback，也不拥有 stdin、
+socket 或 Application。CLI catalog 描述 binary 能识别的命令，当前可用动作仍由成功挂载的 Component
+树决定。纯 stdin Action 不依赖该 descriptor catalog，也不需要 clap。
 
 ### Declarative provider event handler
 

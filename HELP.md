@@ -3,6 +3,40 @@
 Use this file when changing Rust Components in AgentView. [docs/engine.md](docs/engine.md)
 is the authoritative runtime contract; this file is its authoring guide.
 
+## The LLM Is the User
+
+AgentView builds a user interface for the LLM. Components present current state,
+available actions, action results, and feedback as declared by the application.
+Interactivity is a primary design requirement. Build the experience around the
+model's successive observations and actions:
+
+1. Present the relevant state and available actions, with the inputs and
+   constraints the model needs to use them.
+2. Handle the selected action against real application state.
+3. Expose what happened to that action: its result, progress, or failure, together
+   with the resulting state. Distinguish work that is pending from work completed.
+4. Present the updated view and next available actions so the model can continue,
+   inspect, choose a different action, or finish the task.
+
+For example, a search interaction presents matching items with usable identities
+and an action to inspect one. Inspecting an item reveals its current details and
+available operations. Performing an operation then exposes its actual outcome.
+Each observation gives the model enough information to take the next step.
+
+Feedback matters during successful work as well as after mistakes. Decide what
+the model needs to see next and when that information becomes useful. Store the
+result in application state and render it in the Component's current POM. The
+next submitted Frame delivers the updated view; a Signal write or log entry alone
+does not reach the model. Whether and when to drive a subsequent reaction follows
+the application's existing driver and preparation rules.
+
+Review and verify the whole observe -> act -> feedback -> next action flow. Check
+that handling an action records its result or resulting state, that a subsequent
+submitted Frame exposes its actual outcome, and that the model can use the view to
+continue. Parsing input or producing a correct final answer alone does not
+demonstrate interactivity. Error handling is one part of this experience; see
+[Streaming XML Feedback](#streaming-xml-feedback) for that specific case.
+
 ## Choose the API
 
 | Need | Use |
@@ -20,7 +54,10 @@ is the authoritative runtime contract; this file is its authoring guide.
 | End normal application work | `use_application_exit`, then owner calls `shutdown()` |
 | Drive a single model turn | `app.react().await` |
 | Receive ordinary provider output | `use_provider_event_handler` |
-| Declare a native model tool | `#[tool]` and `NativeToolCall::new(tool)` |
+| Declare a native model action with captured state | `NativeToolCall { name, description, on_call }` inside `view!` |
+| Declare a streaming XML action with captured state | `XmlStreamingToolCall { element, on_delta, on_complete, ... }` inside `view!` |
+| Run a stdin/stdout application | `StdinApplication::run(root).await` inside a Tokio main; the framework owns CLI, daemon, input, output, and cleanup |
+| Wait for application-owned CLI input | One `use_wait_for_command()` in the root Component; root and child Components declare inline `Action { name, description, on_call }` in `view!` |
 | Encode a provider request or retain remote state | a `ReactionPort`, outside the business Component |
 
 ## Business History
@@ -246,9 +283,260 @@ deletion patch.
 Parent content is grouped by node: source `before`, child, `after` produces parent `[before, after]`
 followed by the child node. Do not use parent/child source interleaving as a business-history primitive.
 
+## Streaming XML Feedback
+
+Declare ordinary streaming actions with callbacks directly in `view!`:
+
+```rust
+use agentview::component::prelude::*;
+
+#[component]
+fn notebook() -> Component {
+    let notes = use_signal(Vec::<String>::new);
+    let saved = notes.with(|notes| notes.join("\n")).expect("mounted notes");
+    view! {
+        notes { "{saved}" }
+        XmlStreamingToolCall {
+            element: XmlToolElement::text("note"),
+            description: "Save a text note; saved notes appear in the next view.",
+            on_complete: move |text: String| {
+                notes.update(|notes| notes.push(text))
+            },
+        }
+    }
+}
+```
+
+`element` and at least one of `on_open`, `on_delta`, or `on_complete` are required. A text
+draft defaults to a `String` value; a self-closing draft defaults to `()`. Use `.decode(...)`
+on an element for typed attributes and a custom completed value. `on_open` receives an
+`Arc<Head>`, `on_delta` receives decoded new text as `String`, and `on_complete` receives
+the decoded value once the element closes successfully. Properties can appear in any order.
+Callbacks return `Result<T, E>` or a `Send` future producing it; successful return values are
+discarded, so write actual outcomes to retained state and render them.
+
+The owning Component mount retains application state and the action's diagnostic view. Each
+reaction owns a fresh strict parser and callback bindings from its prepared render. Simple
+actions share that parser and execute in source order, awaiting one callback before the next.
+Rendering and preparation do not invoke callbacks. The execution runs directly inside
+`Application::react()`; cancellation drops its current callback future and remaining input.
+Earlier state writes and external effects remain, and callbacks are never replayed. An
+incomplete or invalid element does not receive completion. Callback `Err` is a runtime fault,
+not an ordinary model-input diagnostic. Callbacks may use `spawn`; explicitly spawned tasks
+belong to the action Component mount and are retired when that mount is removed.
+
+`on_invalid` optionally receives an `XmlCallbackDiagnostic`. Diagnostics are also retained in
+the action Component's next projection, even without that handler (up to 32, with a count of
+additional diagnostics). Errors without a registered target, such as unknown tags, belong to
+the first declared action; valid sibling tags route to their own callbacks. All simple action
+names in one application must be distinct. The next submitted Frame delivers updated state
+and feedback. Run [`streaming_callbacks`](examples/streaming_callbacks.rs) to see a model save
+notes, inspect the actual saved count, confirm it, and acknowledge the result.
+
+When combining ordinary callbacks with managed contracts in the same response, use distinct
+element names and `ignore_unknown_elements` on the managed contracts that should skip sibling
+actions. The ordinary callback parser skips registered managed tags but still reports typos.
+
+The advanced `XmlStreamingToolCall::<Channels> { ... }` form retains explicit attempt state,
+reducers, and managed live/publication adapters. Use it when accepted-batch publication or
+compensation is required; ordinary callbacks do not acquire those guarantees. See the
+[streaming authoring examples](docs/streaming-tool-api-design.md#1-decision).
+
+Ordinary model mistakes are expected interaction inputs. For a contract declaring
+independent `say` actions, consider:
+
+```xml
+<say>First sentence.</say>
+<saya>mistake</saya>
+<say>Continue speaking.</say>
+```
+
+Record an unknown-element diagnostic for `saya` and skip its subtree. The valid
+`say` elements still reach their normal validation and handlers, whether they
+arrive in the same delta or later ones. Show the model which actions succeeded,
+which were ignored, and what input is supported.
+
+With managed `XmlStreamingToolCall::<Channels>`, read `summary.diagnostics` in `finish` and preserve
+useful feedback in application state or publication. Accepted attempt reports
+also carry diagnostics; `on_rejected` only covers rejected attempts. Render useful
+feedback in the next view even when other actions were accepted.
+
+Choose acceptance from the business result. Do not use a nonempty diagnostics
+list as a universal reason to reject every action. Partial acceptance with
+feedback is valid. `react()` returning `Continue(())` describes runtime progress;
+the Component presents the actual business results.
+
+Business admission, dependencies, and explicit atomic operations still apply.
+Runtime/protocol faults, hard limits, cancellation, and uncertain external effects
+retain their existing failure and recovery semantics. See
+[streaming tool diagnostics](docs/streaming-tool-api-design.md#82-contract-diagnostics).
+
+## Stdin Actions
+
+Start a stdin/stdout application with one framework call:
+
+```rust
+use agentview::component::execution::StdinApplication;
+
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    StdinApplication::run(app).await
+}
+```
+
+The Unix runner handles CLI arguments, daemon discovery and lifetime, stdin JSON
+lines, stdout views, and stderr diagnostics. It adds session and connection
+metadata, so the root Component needs only its business state and actions.
+
+Declare the business interface once in `view!`. The input structure supplies
+JSON decoding and the schema used to advertise the action:
+
+```rust
+use agentview::component::prelude::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MoveInput {
+    /// One canonical lowercase UCI token from the current legal_moves.
+    uci: String,
+}
+
+// In the root or any child Component. Only the root declares use_wait_for_command().
+view! {
+    Action {
+        name: "move",
+        description: "Play one legal move",
+        on_call: move |input: MoveInput| game.update(|state| state.play(&input.uci)),
+    }
+    Action {
+        name: "undo",
+        on_call: move || undone_game.update(GameState::undo),
+    }
+}
+```
+
+The stdin envelope is `{"action":"move","input":{"uci":"e2e4"}}`. No-argument
+callbacks use `||` and require an empty input object. Metadata and callbacks belong
+to the same mounted declaration; there is no separate command catalog or `NoInput`
+structure. `enabled: false` returns `command_disabled` and the current view without
+invoking the callback. Enabled callbacks still validate current business state.
+Callbacks return either `Result<Output, Error>` or a `Send` future producing it.
+The serializable `Output` is the action's direct stdout result, including any
+business refusal; callback `Err` is a runtime fault. No special outcome wrapper
+or boolean return convention is required. The view also shows updated state.
+
+Declare the explicit barrier once in the root. Child Components contribute actions
+without their own wait hook:
+
+```rust
+#[component]
+fn app() -> Component {
+    use_wait_for_command();
+    view! { board() history_actions() }
+}
+```
+
+`run` also owns provider setup, the inbox, the preparation loop, view rendering,
+and shutdown. The CLI commands `start`, `status`, `stop`, and `restart` manage the
+daemon; business actions arrive on stdin. `start` returns the current view, and a
+default invocation automatically starts a missing daemon. The default socket is
+`$XDG_RUNTIME_DIR/agentview-<executable-name>/socket`, falling back to
+`$HOME/.cache/agentview-<executable-name>/socket`; `--socket PATH` selects another
+session. See the [complete chess interaction](examples/README.md#interactive-chess-cli).
+
+For embedding in a custom transport, `mount` exposes the same application owner
+without the CLI or daemon:
+
+```rust
+use agentview::component::execution::{CommandCall, StdinApplication};
+
+let mut app = StdinApplication::mount(app)?;
+let initial = app.observe().await?;
+let response = app.submit(CommandCall::new("undo", serde_json::json!({}))).await?;
+// response.result is the callback output; response.view is the complete view.
+// response.ok reports dispatch success, without interpreting the business output.
+app.shutdown().await?;
+```
+
+`feedback(code, message)` delivers input parsing errors through the root's view.
+Observations preserve feedback; the next action replaces the input diagnostic.
+Calling `shutdown()` starts cleanup immediately; cancelling its waiter does not
+cancel cleanup. A custom transport acknowledges shutdown only after awaiting it;
+the standard runner handles this itself.
+
+An async Action uses the same `on_call` property. Clone captured handles before
+returning `async move { ... }`, as for native callbacks. The returned future runs
+inside the current preparation and its Component task scope. Cancelling low-level
+preparation drops an unfinished callback and reports interruption on resumption;
+it never replays effects. Cancelling a `StdinApplication::submit` waiter merely
+stops waiting: the independently owned driver completes the accepted action.
+
+Lower-level integrations can still install `CommandInput` with
+`Application::mount_with_commands` and drive `prepare()` themselves. Component
+props need neither an inbox nor a provider.
+
+The standard runner returns each action's result and complete view, flushes stdout,
+and preserves daemon state when foreground stdin closes. Invalid input produces
+feedback and allows the next valid action to continue.
+
+The existing `CliCommand` / `CommandParser` descriptor API remains available for
+adapters that deliberately expose business subcommands. Stdin actions do not
+require that API or clap.
+
 ## Native Tools
 
-Declare a typed tool with `#[tool]`, then mount its definition with `NativeToolCall::new`.
+Declare a native action beside the state it operates on. `NativeToolCall` properties inside
+`view!` bind a typed callback; the callback captures Component state just like a UI event handler.
+Only its input type becomes the model's argument schema:
+
+```rust
+use agentview::component::prelude::*;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddInput {
+    /// Amount to add to the current total.
+    amount: i32,
+}
+
+#[component]
+fn counter() -> Component {
+    let total = use_signal(|| 0_i64);
+    let current = total.with(|value| *value).expect("mounted total");
+    view! {
+        counter { value: current, }
+        NativeToolCall {
+            name: "add",
+            description: "Add an amount to the current total and return the new total.",
+            on_call: move |input: AddInput| {
+                total.update(|value| {
+                    *value += i64::from(input.amount);
+                    *value
+                })
+            },
+        }
+    }
+}
+```
+
+`name` and `on_call` are required; `description` is optional but should explain the action.
+Properties may appear in any order. Callbacks accept an owned `Deserialize + JsonSchema` input
+or use `||` for an empty input object, and return either `Result<Output, Error>` or a `Send` future producing that result. Async
+callbacks can clone captured handles before returning `async move { ... }`. Input structs use
+`#[serde(deny_unknown_fields)]` when extra fields should be rejected. Captured state never becomes
+a model argument. Rendering binds the callback without executing it; updated captures are bound
+on subsequent renders while the mounted tool retains its call/result history.
+
+Keep actual outcomes and current business state in the Component view. A callback's result is
+associated with its native call automatically; the next submitted Frame delivers it together
+with the updated view. See the live [`native_tool`](examples/native_tool.rs) example for an
+increment followed by an undo using the same retained state.
+
+For a standalone function, `#[tool]` and `NativeToolCall::new(tool)` remain available.
 The macro exports a tool definition value under the original function name, generates an owned
 argument struct and JSON Schema, and supports synchronous and asynchronous handlers returning
 `Result<T, E>`. It does not preserve an ordinary callable function under that name.

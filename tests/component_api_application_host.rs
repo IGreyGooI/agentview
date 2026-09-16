@@ -32,6 +32,7 @@ use agentview::{
 };
 use async_trait::async_trait;
 use futures::{channel::mpsc, Stream, StreamExt};
+use serde::Deserialize;
 use tokio::sync::Notify;
 
 #[derive(Clone)]
@@ -55,6 +56,47 @@ fn legacy_preparation_application(
         Ok::<(), Infallible>(())
     });
     view! { preparation_state { "loading" } }
+}
+
+#[component]
+fn legacy_xml_callback_application(
+    callback_calls: Arc<AtomicUsize>,
+    _events: EventInput<ProviderEvent>,
+) -> Component {
+    view! {
+        XmlStreamingToolCall {
+            element: XmlToolElement::text("say"),
+            description: "Speak the supplied text.",
+            on_complete: move |_text: String| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), Infallible>(())
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyNoInput {}
+
+const LEGACY_CLI_COMMAND: Command<LegacyNoInput> =
+    Command::new("legacy_cli", "Legacy CLI guard", None);
+
+#[component]
+fn legacy_cli_application(
+    callback_calls: Arc<AtomicUsize>,
+    _events: EventInput<ProviderEvent>,
+) -> Component {
+    use_wait_for_command();
+    view! {
+        CliCommand {
+            command: LEGACY_CLI_COMMAND,
+            on_call: move |_: LegacyNoInput| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>(())
+            },
+        }
+    }
 }
 
 #[component]
@@ -522,6 +564,66 @@ async fn legacy_application_host_rejects_preparations_before_provider_execute() 
     ));
     assert_eq!(loader_calls.load(Ordering::SeqCst), 0);
     assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn legacy_application_host_rejects_xml_callbacks_before_provider_execute() {
+    let execute_calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = Arc::new(AtomicUsize::new(0));
+    let projections = Arc::new(Mutex::new(Vec::new()));
+    let port = ScriptedEventPort {
+        scripts: VecDeque::from([EventScript::Eof(Vec::new())]),
+        execute_calls: Arc::clone(&execute_calls),
+        projections: Arc::clone(&projections),
+        polls: None,
+    };
+    let mut components =
+        ComponentHost::new(legacy_xml_callback_application, Arc::clone(&callback_calls));
+    let mut host = ApplicationHost::new(port);
+
+    let fault = host
+        .dispatch_llm_reaction(&mut components)
+        .await
+        .expect_err("legacy ApplicationHost cannot dispatch direct XML callbacks");
+
+    assert!(matches!(
+        fault,
+        ApplicationHostFault::XmlCallbacksUnsupported
+    ));
+    assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        projections.lock().unwrap().is_empty(),
+        "unsupported actions must not be advertised to the provider"
+    );
+    assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn legacy_application_host_rejects_cli_commands_before_provider_execute() {
+    let execute_calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = Arc::new(AtomicUsize::new(0));
+    let projections = Arc::new(Mutex::new(Vec::new()));
+    let port = ScriptedEventPort {
+        scripts: VecDeque::from([EventScript::Eof(Vec::new())]),
+        execute_calls: Arc::clone(&execute_calls),
+        projections: Arc::clone(&projections),
+        polls: None,
+    };
+    let mut components = ComponentHost::new(legacy_cli_application, Arc::clone(&callback_calls));
+    let mut host = ApplicationHost::new(port);
+
+    let fault = host
+        .dispatch_llm_reaction(&mut components)
+        .await
+        .expect_err("legacy ApplicationHost cannot dispatch CLI commands");
+
+    assert!(matches!(
+        fault,
+        ApplicationHostFault::CliCommandsUnsupported
+    ));
+    assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+    assert!(projections.lock().unwrap().is_empty());
+    assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

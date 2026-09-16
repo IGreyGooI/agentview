@@ -15,23 +15,105 @@ source is [`streaming-tool-attempt.lifecycle.json`](streaming-tool-attempt.lifec
 
 ## 1. Decision
 
-Add one high-level, strict, multi-element contract API under the existing
-`XmlStreamingToolCall` entry point:
+For ordinary actions, declare callbacks directly beside Component state:
 
 ```rust,ignore
-XmlStreamingToolCall::new::<SelectorChannels>("forgotten-city.player-selector")
-    .version("v2") // optional; the default is "v1"
-    .state_with(...)
-    // XmlEnvelope::strict_fragment() is the default.
-    .element(...)
-    .finish(...)
-    .live_with(...)
-    .publish_with(...)
-    .on_rejected(...)
-    .build()
+view! {
+    XmlStreamingToolCall {
+        element: XmlToolElement::text("say"),
+        description: "Say a message; completed messages appear in the next view.",
+        on_delta: move |text: String| speaker.write(text),
+        on_complete: move |text: String| history.update(|items| items.push(text)),
+    }
+}
 ```
 
-`XmlStreamingToolCall::new::<C>(identity)` creates one strict contract declaration. The branch now
+No channel type or effect adapter is required for this form. Callbacks capture state
+and return synchronous or asynchronous `Result` values; only failures affect runtime
+control flow. The element supplies validation and decoding. Text drafts default to
+`String`; explicit decoded contracts retain custom types. `on_open` receives an
+`Arc<Head>`, `on_delta` newly decoded text, and `on_complete` the valid completed value.
+`on_invalid` optionally receives diagnostics, which the declared action also retains
+in its next projection. The application renders successful outcomes and current state.
+
+All ordinary XML actions in one prepared application share a strict parser and must
+have distinct names. They execute in source order directly in the current reaction,
+with each callback awaited before the next. Application state and diagnostics belong
+to Component mounts; parser/occurrence state and pending callback futures belong to
+the current reaction. Callback invocation and polling enter the action's task context.
+Explicitly spawned tasks belong to that mount and are retired on unmount.
+
+When composing these actions with managed contracts, use disjoint element names. The direct
+parser skips registered managed subtrees while retaining feedback for unknown names; managed
+contracts use their existing `ignore_unknown_elements` option when they should skip sibling
+actions. Managed contracts keep their independent acceptance and effect ordering.
+
+Dropping `react()` drops the current direct callback future and remaining input.
+Earlier effects remain; there is no automatic replay or compensation. Element completion
+is not delayed until reaction EOF, and invalid or incomplete elements never receive it.
+Ordinary model errors are retained as feedback while valid independent actions continue.
+Callback errors and panics keep their runtime failure semantics. This execution policy
+reuses strict decoding without claiming the managed-effect guarantees described below.
+
+Run `cargo run --no-default-features --example streaming_callbacks` for a model saving
+notes, observing the actual saved count, confirming it through another callback, and
+acknowledging the result. The example uses no channel types or publication adapters.
+
+For managed effects, declare a strict, multi-element contract in `view!`, with reducers beside
+the element grammar they handle:
+
+```rust,ignore
+view! {
+    XmlStreamingToolCall::<SelectorChannels> {
+        identity: "forgotten-city.player-selector",
+        version: "v2", // optional; the default is "v1"
+        state_with: create_attempt,
+        finish: decide_selection,
+        live_with: move |_| create_live_runtime(display.clone()),
+        publish_with: move |_| create_publisher(selection.clone()),
+        on_rejected: move |report| show_rejection(feedback.clone(), report),
+
+        XmlToolElement {
+            contract: speech_contract(),
+            on_open: begin_speech,
+            on_delta: stream_speech,
+            on_complete: complete_speech,
+        }
+        XmlToolElement {
+            contract: selection_contract(),
+            on_complete_validated: (validate_selection, complete_selection),
+        }
+    }
+}
+```
+
+Callbacks are ordinary Rust closures or function values. Closures can capture the
+owning Component's application state and services; these captures are not model
+inputs. The `contract` property supplies the typed grammar and decoders, and
+`on_open`, `on_delta`, and completion properties bind its typed events. Multiple
+`XmlToolElement` children may have different decoded types and share one attempt
+state. Property order does not change lifecycle order; element order remains its
+authored order.
+
+`identity`, `state_with`, `finish`, and at least one element are required. Every
+element supplies exactly one of `on_complete` or `on_complete_validated`; the latter
+takes a `(validator, reducer)` pair. Choose `live_with` or `without_live: ()`, and
+`publish_with` or `without_publication: ()`. The disabled choices still require
+uninhabited channel types. Optional contract properties are `version`, `envelope`,
+`allow_unclosed_text_at_eof: ()`, `ignore_unknown_elements: ()`, and `on_rejected`.
+
+This syntax lowers to the existing `XmlStreamingToolCall::new::<C>(identity)`
+typestate builder. Both authoring forms create the same contract; grammar checks,
+occurrence validation, diagnostics, publication, and recovery are unchanged.
+The lifecycle callbacks remain synchronous reducers: they declare updates rather
+than performing I/O or writing a Signal. The captured-state `publish_with` and
+`live_with` factories bind the application's managed effect adapters. Section 4.4
+defines that distinction and the state mutation rules.
+
+The [`Chess component`](../examples/chess_agentview/chess_action_component.rs) uses
+the declarative form for its heterogeneous thought, move, and resign elements.
+
+The branch now
 contains an incremental parser, typed element declarations, reducers, managed lanes, and a
 reaction-owned supervisor. Each selected structured text stream is broadcast to every mounted
 contract, which starts an isolated parser, state value, cardinality ledger, and effect ledger. This

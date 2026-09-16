@@ -1,7 +1,7 @@
 use std::{fmt, future::Future};
 
 use crate::component::{
-    execution::{DriverDemandHandle, ProviderEvent},
+    execution::{command::CommandFeedback, DriverDemandHandle, ProviderEvent},
     signal::{self as signal_kernel, HookKind},
     task::MountTaskHandle,
 };
@@ -9,9 +9,10 @@ use crate::component::{
 use super::{
     application_exit::ApplicationExitControl,
     async_task::{ComponentTaskContext, MountTaskStart},
+    declaration::Placement,
     event_input::{EventInputOrigin, EventSelector},
     event_listener::EventListenerDeclaration,
-    preparation::{PreparationDeclaration, PreparationSet},
+    preparation::{CommandWaitDeclaration, PreparationDeclaration, PreparationSet},
     ApplicationExitHandle, Coroutine, CoroutineInbox, ReactionCompletionDeclaration,
     ReactionRequest, Signal,
 };
@@ -135,6 +136,26 @@ impl<'render> HookRenderContext<'render> {
             .unwrap_or_else(|fault| panic!("{fault}"));
         self.preparations
             .push(PreparationDeclaration::new(loader, mount));
+    }
+
+    #[doc(hidden)]
+    pub fn use_wait_for_command_at(&mut self, site: u32) {
+        if !self.attempt_local_allowed {
+            panic!("System component declared generation-local command wait");
+        }
+        let mount = self
+            .signals
+            .use_marker_at(site, HookKind::CommandWait)
+            .unwrap_or_else(|fault| panic!("{fault}"));
+        let feedback = self
+            .signals
+            .use_signal_at(site, CommandFeedback::default)
+            .unwrap_or_else(|fault| panic!("{fault}"));
+        self.preparations.push_command_wait(CommandWaitDeclaration {
+            mount,
+            feedback,
+            placement: Placement::User,
+        });
     }
 
     #[doc(hidden)]

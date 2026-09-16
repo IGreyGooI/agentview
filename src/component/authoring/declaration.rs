@@ -43,7 +43,9 @@ pub(crate) enum ComponentNode {
     StreamingXmlTag(Box<StreamingXmlTagDeclaration>),
     XmlStreamingToolCall(Box<XmlStreamingToolCallDeclaration>),
     StreamingAttempt(Box<super::streaming_attempt::ContractDeclaration>),
+    XmlCallback(Box<super::streaming_attempt::XmlCallbackDeclaration>),
     NativeToolCall(Box<super::native_tool::NativeToolCallDeclaration>),
+    CliCommand(Box<super::cli_command::CliCommandDeclaration>),
 }
 
 pub(crate) type RepeatableRender =

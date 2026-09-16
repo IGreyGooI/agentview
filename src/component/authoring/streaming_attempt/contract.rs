@@ -58,6 +58,10 @@ impl ContractDeclaration {
         self.inner.implementation_version()
     }
 
+    pub(crate) fn element_names(&self) -> Vec<&'static str> {
+        self.inner.element_names()
+    }
+
     /// Validates the declaration before prompt generation, state construction,
     /// or provider submission.
     pub(crate) fn validate_and_prompt(&self) -> Result<Document, ComponentAttemptFault> {
@@ -76,7 +80,7 @@ impl ContractDeclaration {
     }
 }
 
-fn map_declaration_fault(fault: StreamingToolDeclarationFault) -> ComponentAttemptFault {
+pub(super) fn map_declaration_fault(fault: StreamingToolDeclarationFault) -> ComponentAttemptFault {
     match fault {
         StreamingToolDeclarationFault::InvalidElementName {
             contract,
@@ -119,6 +123,7 @@ fn map_declaration_fault(fault: StreamingToolDeclarationFault) -> ComponentAttem
 pub(crate) trait ErasedContractDeclaration: Send {
     fn identity(&self) -> &'static str;
     fn implementation_version(&self) -> &'static str;
+    fn element_names(&self) -> Vec<&'static str>;
     fn validate_and_prompt(&self) -> Result<Document, StreamingToolDeclarationFault>;
     fn start(
         self: Box<Self>,
@@ -261,14 +266,14 @@ pub(super) enum ElementCompleteDispatch<C: StreamingToolChannels> {
 
 #[derive(Debug)]
 pub(super) struct ElementInvariant {
-    message: &'static str,
+    pub(super) message: &'static str,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct ElementContractProblem {
-    attribute: Option<&'static str>,
-    kind: XmlContractViolationKind,
-    detail: &'static str,
+    pub(super) attribute: Option<&'static str>,
+    pub(super) kind: XmlContractViolationKind,
+    pub(super) detail: &'static str,
 }
 
 impl<C, State, Head, Value> ErasedElement<C, State> for TypedElement<C, State, Head, Value>
@@ -1381,7 +1386,7 @@ where
     Ok(Document::new(children))
 }
 
-fn map_parser_declaration_fault(
+pub(super) fn map_parser_declaration_fault(
     identity: &'static str,
     fault: ParserDeclarationFault,
 ) -> StreamingToolDeclarationFault {
@@ -1406,7 +1411,7 @@ fn map_parser_declaration_fault(
     }
 }
 
-fn map_invalid_kind(kind: InvalidKind) -> (XmlContractViolationKind, &'static str) {
+pub(super) fn map_invalid_kind(kind: InvalidKind) -> (XmlContractViolationKind, &'static str) {
     match kind {
         InvalidKind::MalformedMarkup
         | InvalidKind::MismatchedClose

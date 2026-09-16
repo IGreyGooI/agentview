@@ -174,7 +174,7 @@ fn prepared_render_transfers_scoped_projection_preparations_and_local_bindings()
     assert!(COMPONENT_HOST.contains("let committed = self.begin_managed_render()?;"));
     assert!(COMPONENT_HOST.contains("self.publish_managed_render(committed)"));
     assert!(COMPONENT_HOST
-        .contains("ComponentRenderStage::prepare_complete_root_candidate_with_capabilities("));
+        .contains("ComponentRenderStage::prepare_complete_root_candidate_with_command_prefix("));
     assert!(COMPONENT_HOST.contains(".with_execution_scope(ProjectionExecutionScope {"));
     assert!(COMPONENT_HOST.contains("candidate.stage_mut().set_projection(projection.clone());"));
     assert!(COMPONENT_HOST.contains("let (stage, _, mounts) = candidate.commit_deferred();"));

@@ -20,6 +20,7 @@ use super::{
         ReactionAdmissionFault, ReactionAdmissionGuard, ReactionAdmissionReason, ToolLaneTicket,
         ToolOutputStagingFault, ToolOutputStagingReason,
     },
+    command::{CommandInput, CommandInputError, CommandOutcome, PendingCommandState},
     driver_demand::{DriverDemand, DriverDemandFault},
     frame::{FrameSession, FrameSessionFault, InvalidFrameProfileFault, PreparedFrame},
     port::{ProviderEvent, RenderedProjection, ToolOutput},
@@ -252,6 +253,7 @@ pub struct Application<P: ReactionPort> {
     port: P,
     state: Arc<AtomicU8>,
     streaming: StreamingSupervisor,
+    command_input: Option<CommandInput>,
 }
 
 impl<P: ReactionPort> Drop for Application<P> {
@@ -317,7 +319,18 @@ impl<P: ReactionPort> Application<P> {
         root: impl Fn() -> Component + Send + Sync + 'static,
         port: P,
     ) -> Result<Self, ApplicationFault> {
-        Self::mount_with_event_root(move |_events| root(), port)
+        Self::mount_with_event_root(move |_events| root(), port, None)
+    }
+
+    /// Mount with an application-owned command inbox. Components declare when
+    /// to consume it with `use_wait_for_command()`; declarations and callbacks
+    /// are collected from the mounted tree, including ordinary child Components.
+    pub fn mount_with_commands(
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        port: P,
+        input: CommandInput,
+    ) -> Result<Self, ApplicationFault> {
+        Self::mount_with_event_root(move |_events| root(), port, Some(input))
     }
 
     /// Temporary bridge for integrations that still receive provider events
@@ -326,12 +339,13 @@ impl<P: ReactionPort> Application<P> {
         root: impl Fn(EventInput<ProviderEvent>) -> Component + Send + Sync + 'static,
         port: P,
     ) -> Result<Self, ApplicationFault> {
-        Self::mount_with_event_root(root, port)
+        Self::mount_with_event_root(root, port, None)
     }
 
     fn mount_with_event_root(
         root: impl Fn(EventInput<ProviderEvent>) -> Component + Send + Sync + 'static,
         mut port: P,
+        command_input: Option<CommandInput>,
     ) -> Result<Self, ApplicationFault> {
         let declaration = port.declare().map_err(|source| {
             ApplicationFault::from_port(ApplicationFaultStage::Declaration, source)
@@ -368,7 +382,13 @@ impl<P: ReactionPort> Application<P> {
             port,
             state: Arc::new(AtomicU8::new(APPLICATION_READY)),
             streaming: StreamingSupervisor::default(),
+            command_input,
         };
+        if let Some(input) = &application.command_input {
+            application
+                .components
+                .set_command_prefix(input.prefix().to_owned());
+        }
         let committed = application
             .components
             .begin_managed_render()
@@ -451,6 +471,9 @@ impl<P: ReactionPort> Application<P> {
     /// Fence the mounted tree, then abort and await every Component-owned task.
     pub async fn shutdown(mut self) -> Result<(), ApplicationFault> {
         self.application_exit.close();
+        if let Some(input) = &mut self.command_input {
+            input.close();
+        }
         if self.streaming.pending() {
             self.streaming
                 .abort(StreamingToolAbortCause::Cancelled)
@@ -528,6 +551,10 @@ impl<P: ReactionPort> Application<P> {
             dirty: self.components.is_dirty() || self.pending_render.is_some(),
             prepared: self.components.current_projection_is_prepared(),
         }
+    }
+
+    pub(crate) fn has_command_wait(&self) -> bool {
+        self.components.has_command_wait()
     }
 
     /// Resolve retained contract operations without starting a provider reaction.
@@ -816,14 +843,26 @@ impl<P: ReactionPort> Application<P> {
     > {
         let exit = self.application_exit.clone();
         if let Some(reason) = exit.reason() {
+            if let Some(input) = &mut self.command_input {
+                input.close();
+            }
             return Ok(ControlFlow::Break(reason));
         }
         let mut preparation = Box::pin(self.prepare_components());
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             result = &mut preparation => result,
             reason = exit.wait() => Ok(ControlFlow::Break(reason)),
+        };
+        drop(preparation);
+        if let Some(input) = &mut self.command_input {
+            match &result {
+                Err(_) => input.fail_command(CommandInputError::PreparationFailed),
+                Ok(ControlFlow::Break(_)) => input.close(),
+                Ok(ControlFlow::Continue(_)) => {}
+            }
         }
+        result
     }
 
     async fn prepare_components(
@@ -833,20 +872,34 @@ impl<P: ReactionPort> Application<P> {
         ApplicationFault,
     > {
         let mut run = PreparationRun::default();
-        for wave in 0..=MAX_PREPARATION_WAVES {
+        let mut waves = 0;
+        let mut command_done = false;
+        let mut command_reconcile = false;
+        loop {
             if let Some(reason) = self.application_exit.reason() {
                 return Ok(ControlFlow::Break(reason));
             }
             let rendered = self
                 .reconcile_components(ApplicationFaultStage::Reconcile)
                 .await?;
-            let (projection, preparations, bindings) = rendered.into_execution_parts();
-            if wave == MAX_PREPARATION_WAVES {
+            let (projection, preparations, mut bindings) = rendered.into_execution_parts();
+            let wait = preparations.command_wait().map_err(|fault| {
+                ApplicationFault::from_attempt(ApplicationFaultStage::Preparation, fault)
+            })?;
+            // Receiving and publishing a command add at most two reconciles.
+            // New ordinary preparations still use the original wave budget.
+            let command_only = command_reconcile && !preparations.has_pending(&run);
+            command_reconcile = false;
+            let final_reconcile = waves == MAX_PREPARATION_WAVES && !command_only;
+            if command_only {
+                drop(preparations);
+            } else if final_reconcile {
                 if preparations.has_pending(&run) {
                     return Err(ApplicationFault::preparation_graph_unstable());
                 }
                 drop(preparations);
             } else {
+                waves += 1;
                 preparations
                     .prepare(&mut run)
                     .await
@@ -855,12 +908,104 @@ impl<P: ReactionPort> Application<P> {
             if let Some(reason) = self.application_exit.reason() {
                 return Ok(ControlFlow::Break(reason));
             }
-            if !self.components.is_dirty() {
-                self.components.mark_current_projection_prepared();
-                return Ok(ControlFlow::Continue((projection, bindings)));
+            if self.components.is_dirty() {
+                if final_reconcile {
+                    return Err(ApplicationFault::preparation_graph_unstable());
+                }
+                continue;
             }
+
+            if !command_done {
+                let pending = self
+                    .command_input
+                    .as_ref()
+                    .is_some_and(CommandInput::has_pending);
+                if pending || wait.is_some() {
+                    let input = self
+                        .command_input
+                        .as_mut()
+                        .ok_or_else(ApplicationFault::command_input_unavailable)?;
+                    if !pending {
+                        if !input
+                            .receive(wait.as_ref().expect("command wait").mount.clone())
+                            .await
+                        {
+                            return Ok(ControlFlow::Break(ExitReason::Completed));
+                        }
+                        // Tasks may change state while receive is pending. Keep
+                        // the request, then reconcile before choosing a callback.
+                        command_reconcile = true;
+                        continue;
+                    }
+                    match input.state().expect("pending command") {
+                        PendingCommandState::Started => {
+                            input.fail_command(CommandInputError::Interrupted);
+                            return Err(ApplicationFault::command_handler());
+                        }
+                        PendingCommandState::Applied(_) | PendingCommandState::Observed => {}
+                        PendingCommandState::Received if input.call().is_none() => {
+                            // An observation shares preparation and ordering with
+                            // actions, but does not invoke a callback or advance
+                            // the Component's retained action feedback.
+                            if let (Some((code, message)), Some(wait)) = (input.feedback(), &wait) {
+                                wait.feedback
+                                    .update(|feedback| {
+                                        feedback.input_feedback(code.clone(), message.clone())
+                                    })
+                                    .map_err(|_| ApplicationFault::command_handler())?;
+                            }
+                            input.observed();
+                            command_done = true;
+                            if self.components.is_dirty() {
+                                command_reconcile = true;
+                                continue;
+                            }
+                        }
+                        PendingCommandState::Received => {
+                            let call = input.call().expect("pending command").clone();
+                            input.start();
+                            let outcome = match &wait {
+                                Some(wait) if input.belongs_to(&wait.mount) && wait.mount.authorize().is_some() => {
+                                    bindings
+                                        .dispatch_command(call.name(), call.input().clone())
+                                        .await
+                                }
+                                _ => Ok(CommandOutcome::Rejected {
+                                    code: "command_unavailable".to_owned(),
+                                    message: "The component waiting for this command is no longer mounted.".to_owned(),
+                                }),
+                            };
+                            let outcome = match outcome {
+                                Ok(outcome) => outcome,
+                                Err(message) => {
+                                    input.fail_command(CommandInputError::Handler(message));
+                                    return Err(ApplicationFault::command_handler());
+                                }
+                            };
+                            // Retain completion in the poll that produced it.
+                            // A cancelled pending callback stays Started, so
+                            // the next preparation reports it without replay.
+                            input.applied(outcome.clone());
+                            command_done = true;
+                            if let Some(wait) = &wait {
+                                wait.feedback
+                                    .update(|feedback| feedback.record(&call, outcome))
+                                    .map_err(|_| ApplicationFault::command_handler())?;
+                            }
+                            if self.components.is_dirty() {
+                                command_reconcile = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            self.components.mark_current_projection_prepared();
+            if let Some(input) = &mut self.command_input {
+                input.complete(&projection);
+            }
+            return Ok(ControlFlow::Continue((projection, bindings)));
         }
-        Err(ApplicationFault::preparation_graph_unstable())
     }
 
     async fn reconcile_components(
@@ -1168,6 +1313,32 @@ async fn pump_provider_facts(
                         }
                     }
                     if let Some(text) = structured_text {
+                        let (output, phase, content, sealed) = match &text {
+                            super::admission::AdmittedTextFact::Delta {
+                                output,
+                                phase,
+                                delta,
+                            } => (*output, *phase, delta.as_str(), false),
+                            super::admission::AdmittedTextFact::Sealed {
+                                output,
+                                phase,
+                                text,
+                            } => (*output, *phase, text.as_str(), true),
+                        };
+                        // Direct callbacks belong to this reaction future. Await
+                        // them in source order while native lanes keep progressing;
+                        // cancellation drops this callback before abandoning input.
+                        await_with_lanes(
+                            async {
+                                bindings
+                                    .dispatch_xml_callbacks(output, phase, content, sealed)
+                                    .await
+                                    .map_err(ApplicationFault::from_streaming)
+                            },
+                            &mut lanes,
+                            recovery.admission_mut(),
+                        )
+                        .await?;
                         await_with_lanes(
                             streaming.dispatch(text),
                             &mut lanes,
@@ -1187,6 +1358,10 @@ async fn pump_provider_facts(
             return Err(fault);
         }
         let summary = recovery.admission_mut().finish_normal()?;
+        bindings
+            .finish_xml_callbacks(summary.primary_text)
+            .await
+            .map_err(ApplicationFault::from_streaming)?;
         streaming.finish(summary).await?;
         bindings.finish_normal().await.map_err(|source| {
             ApplicationFault::from_attempt(ApplicationFaultStage::Binding, source)
@@ -1307,6 +1482,8 @@ pub enum ApplicationFaultReason {
     ComponentRuntime,
     Preparation,
     PreparationGraphUnstable,
+    CommandInput,
+    CommandHandler,
     ComponentContract,
     ComponentInvariant,
     BindingLifecycle,
@@ -1539,6 +1716,23 @@ impl ApplicationFault {
             kind: ApplicationFaultKind::Retryable,
             code: ApplicationFaultCode::Component,
             reason: ApplicationFaultReason::Preparation,
+        }
+    }
+
+    fn command_input_unavailable() -> Self {
+        Self::terminal(
+            ApplicationFaultStage::Preparation,
+            ApplicationFaultCode::Unavailable,
+            ApplicationFaultReason::CommandInput,
+        )
+    }
+
+    fn command_handler() -> Self {
+        Self {
+            stage: ApplicationFaultStage::Preparation,
+            kind: ApplicationFaultKind::Retryable,
+            code: ApplicationFaultCode::Component,
+            reason: ApplicationFaultReason::CommandHandler,
         }
     }
 

@@ -360,7 +360,10 @@ impl fmt::Display for HookSite {
 pub(crate) enum HookKind {
     Signal,
     Preparation,
+    CommandWait,
+    CliCommand,
     ProviderEventHandler,
+    XmlCallback,
     ReactionCompletion,
     ReactionRequest,
     ApplicationExit,
@@ -400,7 +403,10 @@ impl fmt::Display for HookKind {
         let name = match self {
             Self::Signal => "signal",
             Self::Preparation => "preparation",
+            Self::CommandWait => "command-wait",
+            Self::CliCommand => "cli-command",
             Self::ProviderEventHandler => "provider-event-handler",
+            Self::XmlCallback => "xml-callback",
             Self::ReactionCompletion => "reaction-completion",
             Self::ReactionRequest => "reaction-request",
             Self::ApplicationExit => "application-exit",

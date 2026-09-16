@@ -1,4 +1,4 @@
-//! A live model calls a Rust function, then answers using its tool result.
+//! A live model changes retained state, sees the result, then undoes its change.
 //!
 //! Run `cargo run --no-default-features --example native_tool` with the shared
 //! example credentials in `.env` or `OPENAI_API_KEY`.
@@ -11,25 +11,58 @@ use std::{
 
 use agentview::{
     component::{execution::Application, prelude::*},
+    pom_renderer::render_pom_document,
     transcript::CanonicalInputItem,
 };
 use anyhow::Context as _;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 #[path = "support/live_provider.rs"]
 mod live_provider;
 
-/// Add two integers.
-#[tool]
-fn add(a: i32, b: i32) -> Result<i32, ToolError> {
-    let result = a
-        .checked_add(b)
-        .ok_or_else(|| ToolError::new("integer overflow"))?;
-    println!("native: add({a}, {b}) = {result}");
-    Ok(result)
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Adjustment {
+    /// The amount to add, from -100 through 100.
+    amount: i32,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Undo {
+    /// The current value shown in the latest counter view.
+    expected_value: i32,
+}
+
+#[derive(Clone, Serialize)]
+struct Counter {
+    value: i32,
+    previous: Option<i32>,
+    operations: u8,
+    feedback: &'static str,
 }
 
 #[component]
-fn calculator(answer: Arc<Mutex<String>>) -> Component {
+fn counter(answer: Arc<Mutex<String>>) -> Component {
+    let state = use_signal(|| Counter {
+        value: 17,
+        previous: None,
+        operations: 0,
+        feedback: "Ready to adjust.",
+    });
+    let current = state.with(Clone::clone).expect("mounted counter");
+    let value = current.value;
+    let feedback = current.feedback;
+    let next_action = match current.operations {
+        0 => "Call adjust exactly once with amount=25.",
+        1 => "Call undo exactly once, passing the current counter value as expected_value.",
+        _ => {
+            "The undo is complete. Reply with only the current counter value, without using tools."
+        }
+    };
+    let adjust_state = state.clone();
+
     use_provider_event_handler(ProviderEvent::TEXT, move |event| {
         let answer = Arc::clone(&answer);
         async move {
@@ -41,100 +74,149 @@ fn calculator(answer: Arc<Mutex<String>>) -> Component {
         }
     });
 
-    let request = r#"## Request
-
-- Call `add` exactly once with `a=17` and `b=25`.
-- Do not answer before using the tool.
-- After receiving the tool result, reply with only the resulting number."#;
     view! {
-        { request }
-        { NativeToolCall::new(add) }
+        instructions {
+            "Follow the latest counter view. Make at most one tool call per response, then wait \
+             for its result and the updated view before choosing your next action."
+        }
+        counter_state {
+            value { "{value}" }
+            feedback { "{feedback}" }
+            next_action { "{next_action}" }
+        }
+        NativeToolCall {
+            name: "adjust",
+            description: "Add an amount from -100 through 100. Available before the first adjustment.",
+            on_call: move |input: Adjustment| {
+                adjust_state.update(|counter| {
+                    if counter.operations != 0 || !(-100..=100).contains(&input.amount) {
+                        counter.feedback = "Ignored: adjust requires a fresh counter and an amount from -100 through 100.";
+                    } else {
+                        counter.previous = Some(counter.value);
+                        counter.value += input.amount;
+                        counter.operations += 1;
+                        counter.feedback = "Adjustment applied. Undo is now available.";
+                    }
+                    counter.clone()
+                })
+            },
+        }
+        NativeToolCall {
+            name: "undo",
+            description: "Undo the adjustment. Pass the current counter value to confirm which state you observed.",
+            on_call: move |input: Undo| {
+                state.update(|counter| {
+                    if counter.operations != 1 || input.expected_value != counter.value {
+                        counter.feedback = "Ignored: undo requires an applied adjustment and the current counter value.";
+                    } else {
+                        counter.value = counter.previous.take().expect("applied adjustment");
+                        counter.operations += 1;
+                        counter.feedback = "Undo applied. The original value is restored.";
+                    }
+                    counter.clone()
+                })
+            },
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let provider = live_provider::from_env("native-tool")?.with_response_usage_observer(|usage| {
-        if let Some(tokens) = usage.input_tokens() {
-            println!("provider input tokens: {tokens}");
-        }
-    });
+    let provider = live_provider::from_env("native-tool")?;
     let answer = Arc::new(Mutex::new(String::new()));
     let component_answer = Arc::clone(&answer);
     let mut application =
-        Application::mount(move || calculator(Arc::clone(&component_answer)), provider)?;
+        Application::mount(move || counter(Arc::clone(&component_answer)), provider)?;
 
-    let operation = tokio::time::timeout(Duration::from_secs(120), async {
-        println!("reaction 1: request native tool call");
-        let _ = application.react().await?;
-        let records: Vec<_> = application
-            .current_projection()
-            .projection()
-            .nodes()
-            .iter()
-            .flat_map(|node| node.items())
-            .filter(|item| {
-                matches!(
-                    item,
-                    CanonicalInputItem::ToolCall { .. } | CanonicalInputItem::ToolResult { .. }
-                )
-            })
-            .cloned()
-            .collect();
-        let [CanonicalInputItem::ToolCall {
-            call_id,
-            name,
-            raw_arguments,
-        }, CanonicalInputItem::ToolResult {
-            call_id: result_id,
-            content,
-        }] = records.as_slice()
-        else {
-            anyhow::bail!("expected one native call and its result, got {records:?}");
-        };
-        anyhow::ensure!(
-            name == "add" && call_id == result_id && content == "42",
-            "unexpected native call/result"
-        );
-        anyhow::ensure!(
-            serde_json::from_str::<serde_json::Value>(raw_arguments)?
-                == serde_json::json!({"a": 17, "b": 25}),
-            "unexpected tool arguments"
-        );
-        println!("component: ToolCall + ToolResult, call_id={call_id}, result={content}");
+    let operation =
+        tokio::time::timeout(Duration::from_secs(120), async {
+            for (step, tool, expected_value, expected_arguments) in [
+                (1, "adjust", 42, serde_json::json!({"amount": 25})),
+                (2, "undo", 17, serde_json::json!({"expected_value": 42})),
+            ] {
+                println!("reaction {step}: observe the counter, then call {tool}");
+                let _ = application.react().await?;
+                let current_projection = application.current_projection();
+                let items: Vec<_> = current_projection
+                    .projection()
+                    .nodes()
+                    .iter()
+                    .flat_map(|node| node.items())
+                    .collect();
+                let calls: Vec<_> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        CanonicalInputItem::ToolCall {
+                            call_id,
+                            name,
+                            raw_arguments,
+                        } => Some((call_id, name, raw_arguments)),
+                        _ => None,
+                    })
+                    .collect();
+                anyhow::ensure!(calls.len() == step, "expected one action per reaction");
+                let (call_id, _, arguments) = calls
+                    .into_iter()
+                    .find(|(_, name, _)| *name == tool)
+                    .context("model did not select the advertised next action")?;
+                anyhow::ensure!(
+                    serde_json::from_str::<serde_json::Value>(arguments)? == expected_arguments,
+                    "model did not use the observed counter state"
+                );
+                let result = items
+                    .iter()
+                    .find_map(|item| match item {
+                        CanonicalInputItem::ToolResult {
+                            call_id: result_id,
+                            content,
+                        } if result_id == call_id => Some(content),
+                        _ => None,
+                    })
+                    .context("action result missing from the component")?;
+                let result: serde_json::Value = serde_json::from_str(result)?;
+                anyhow::ensure!(result["value"] == expected_value && result["operations"] == step);
+                let view = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        CanonicalInputItem::Instruction { pom, .. }
+                        | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom)),
+                        _ => None,
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("\n");
+                anyhow::ensure!(view.contains(&format!("<value>{expected_value}</value>")));
+                anyhow::ensure!(
+                    view.contains(result["feedback"].as_str().context("feedback missing")?)
+                );
+                println!("counter: {result}");
+            }
 
-        println!("reaction 2: submit tool result");
-        let _ = application.react().await?;
-        anyhow::ensure!(
-            answer.lock().expect("answer lock").trim() == "42",
-            "model did not answer with the tool result"
-        );
-        let current_records: Vec<_> = application
-            .current_projection()
-            .projection()
-            .nodes()
-            .iter()
-            .flat_map(|node| node.items())
-            .filter(|item| {
-                matches!(
-                    item,
-                    CanonicalInputItem::ToolCall { .. } | CanonicalInputItem::ToolResult { .. }
-                )
-            })
-            .cloned()
-            .collect();
-        anyhow::ensure!(
-            current_records == records,
-            "continuation unexpectedly added another tool call"
-        );
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("native tool example exceeded 120 seconds")
-    .and_then(|result| result);
+            println!("reaction 3: deliver the undo result and restored state");
+            let _ = application.react().await?;
+            let call_count = application
+                .current_projection()
+                .projection()
+                .nodes()
+                .iter()
+                .flat_map(|node| node.items())
+                .filter(|item| matches!(item, CanonicalInputItem::ToolCall { .. }))
+                .count();
+            anyhow::ensure!(
+                call_count == 2,
+                "model acted after completing the interaction"
+            );
+            anyhow::ensure!(
+                answer.lock().expect("answer lock").trim() == "17",
+                "model did not answer using the restored counter"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("native tool example exceeded 120 seconds")
+        .and_then(|result| result);
     let shutdown = application.shutdown().await;
     operation?;
     shutdown?;
-    println!("verified: native call, component records, result handoff, and model answer");
+    println!("verified: observe -> adjust -> feedback -> undo -> restored-state answer");
     Ok(())
 }

@@ -2,7 +2,13 @@ use std::{collections::HashSet, fmt, future::Future, pin::Pin};
 
 use futures::{stream::FuturesUnordered, StreamExt};
 
-use crate::component::signal::{HookMount, MountIdentity};
+use crate::component::{
+    execution::command::CommandFeedback,
+    signal::{HookMount, MountIdentity, Signal},
+    ComponentId,
+};
+
+use super::{declaration::Placement, ComponentAttemptFault};
 
 type PreparationFuture =
     Pin<Box<dyn Future<Output = Result<(), PreparationFault>> + Send + 'static>>;
@@ -22,6 +28,13 @@ pub(crate) struct PreparationDeclaration {
     identity: PreparationIdentity,
     mount: HookMount,
     prepare: Box<dyn FnOnce() -> PreparationFuture + Send + 'static>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandWaitDeclaration {
+    pub(crate) mount: HookMount,
+    pub(crate) feedback: Signal<CommandFeedback>,
+    pub(crate) placement: Placement,
 }
 
 impl PreparationDeclaration {
@@ -66,11 +79,54 @@ impl PreparationDeclaration {
 #[derive(Default)]
 pub(crate) struct PreparationSet {
     declarations: Vec<PreparationDeclaration>,
+    command_waits: Vec<CommandWaitDeclaration>,
 }
 
 impl PreparationSet {
+    pub(crate) fn has_command_wait(&self) -> bool {
+        !self.command_waits.is_empty()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.declarations.is_empty()
+        self.declarations.is_empty() && self.command_waits.is_empty()
+    }
+
+    pub(crate) fn command_wait(
+        &self,
+    ) -> Result<Option<CommandWaitDeclaration>, ComponentAttemptFault> {
+        match self.command_waits.as_slice() {
+            [] => Ok(None),
+            [declaration] => Ok(Some(declaration.clone())),
+            _ => Err(ComponentAttemptFault::RuntimeInvariant {
+                message: "an Application can declare only one active use_wait_for_command hook"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    pub(crate) fn push_command_wait(&mut self, declaration: CommandWaitDeclaration) {
+        self.command_waits.push(declaration);
+    }
+
+    pub(crate) fn set_wait_scope(
+        &mut self,
+        owner: &ComponentId,
+        forced: Option<Placement>,
+        is_root: bool,
+    ) -> Result<(), ComponentAttemptFault> {
+        for declaration in &mut self.command_waits {
+            if &declaration.mount.component == owner {
+                if !is_root {
+                    return Err(ComponentAttemptFault::RuntimeInvariant {
+                        message: format!(
+                            "use_wait_for_command must be declared by the root Component; `{owner}` is a child Component"
+                        ),
+                    });
+                }
+                declaration.placement = forced.unwrap_or(Placement::User);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn has_pending(&self, run: &PreparationRun) -> bool {
@@ -153,6 +209,23 @@ where
     Error: fmt::Display + Send + 'static,
 {
     panic!("use_preparation must be called directly inside a #[component] function")
+}
+
+/// Wait for one action or observation before completing application preparation.
+///
+/// Declare this hook once in the root Component. Child Components declare their
+/// [`Action`](super::Action) or [`CliCommand`](super::CliCommand) callbacks without
+/// another wait hook. All mounted actions share the root's preparation barrier,
+/// and the next prepared view includes the outcome alongside updated state.
+/// An observation returns that view without invoking a callback. A wait hook in
+/// a child Component, or multiple active wait hooks, rejects the render.
+///
+/// This hook must be called directly inside a `#[component]` function. Rendering
+/// only declares the barrier; the Application driver owns receiving and
+/// dispatching commands. The legacy `ApplicationHost` does not support it.
+#[track_caller]
+pub fn use_wait_for_command() {
+    panic!("use_wait_for_command must be called directly inside a #[component] function")
 }
 
 #[cfg(test)]

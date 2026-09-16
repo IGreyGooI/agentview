@@ -70,6 +70,9 @@ impl Default for ParserLimits {
 #[derive(Clone, Debug)]
 pub(crate) struct Contract {
     pub(crate) elements: Vec<ElementSpec>,
+    /// Other mounted actions whose complete top-level subtrees belong to a
+    /// separate parser. Unregistered names still follow `unknown_top_level`.
+    pub(crate) ignored_known_elements: HashSet<&'static str>,
     pub(crate) unknown_top_level: UnknownTopLevel,
     pub(crate) allow_implicit_text_eof: bool,
     pub(crate) limits: ParserLimits,
@@ -79,6 +82,7 @@ impl Contract {
     pub(crate) fn strict(elements: Vec<ElementSpec>) -> Self {
         Self {
             elements,
+            ignored_known_elements: HashSet::new(),
             unknown_top_level: UnknownTopLevel::Reject,
             allow_implicit_text_eof: false,
             limits: ParserLimits::default(),
@@ -250,7 +254,7 @@ impl Parser {
         if !self.pending.is_empty() {
             let span = self.pending_offset..self.raw_output.len();
             let element = lexical_element_name(&self.pending).map(str::to_owned);
-            if !self.is_suppressed() {
+            if !self.is_suppressed() && !self.ignore_foreign_lexical_start(element.as_deref()) {
                 let occurrence = match self.active_occurrence() {
                     Some(occurrence) => Some(occurrence),
                     None => self.occurrence_for_lexical_name(element.as_deref())?,
@@ -406,6 +410,9 @@ impl Parser {
 
         let span = (self.pending_offset + start)..(self.pending_offset + start + consumed);
         let raw = &raw[..consumed];
+        if self.is_suppressed() {
+            return Ok(consumed);
+        }
         let decoded = match decode_text(raw) {
             Ok(decoded) => decoded,
             Err(()) => {
@@ -534,6 +541,15 @@ impl Parser {
         }
 
         let declared = self.element_indexes.contains_key(parsed.name.as_str());
+        if !declared
+            && self
+                .contract
+                .ignored_known_elements
+                .contains(parsed.name.as_str())
+        {
+            self.push_ignored_frame(parsed.name, parsed.empty)?;
+            return Ok(());
+        }
         let has_namespace = parsed.name.contains(':')
             || parsed
                 .attributes
@@ -630,6 +646,14 @@ impl Parser {
     }
 
     fn process_end(&mut self, markup: &str, events: &mut Vec<ParserEvent>, span: Range<usize>) {
+        if self.is_suppressed() {
+            if let Ok(name) = parse_end_name(markup) {
+                if let Some(index) = self.stack.iter().rposition(|frame| frame.name == name) {
+                    self.stack.truncate(index);
+                }
+            }
+            return;
+        }
         let name = match parse_end_name(markup) {
             Ok(name) => name,
             Err(()) => {
@@ -824,9 +848,13 @@ impl Parser {
     }
 
     fn ignore_foreign_lexical_start(&self, name: Option<&str>) -> bool {
-        self.stack.is_empty()
-            && self.contract.unknown_top_level == UnknownTopLevel::IgnoreSubtree
-            && name.is_some_and(|name| !self.element_indexes.contains_key(name))
+        self.is_suppressed()
+            || (self.stack.is_empty()
+                && name.is_some_and(|name| {
+                    !self.element_indexes.contains_key(name)
+                        && (self.contract.unknown_top_level == UnknownTopLevel::IgnoreSubtree
+                            || self.contract.ignored_known_elements.contains(name))
+                }))
     }
 }
 
@@ -1266,6 +1294,23 @@ mod tests {
                 Some(0..8),
             )]
         );
+    }
+
+    #[test]
+    fn known_foreign_action_is_skipped_but_unknown_action_still_has_feedback() {
+        let mut contract = empty_contract();
+        contract.ignored_known_elements.insert("managed");
+        let mut parser = Parser::new(contract).unwrap();
+        let mut events = parser
+            .push("<managed><pick/>&not_an_entity;<nested broken></wrong></managed><typo/>")
+            .unwrap();
+        events.extend(parser.push("<pick/>").unwrap());
+        events.extend(parser.finish_normal().unwrap());
+        assert!(matches!(events.as_slice(), [
+            ParserEvent::Invalid { element: Some(name), kind: InvalidKind::UnknownElement, .. },
+            ParserEvent::Open { occurrence: 1, .. },
+            ParserEvent::Complete { occurrence: 1, .. },
+        ] if name == "typo"));
     }
 
     #[test]

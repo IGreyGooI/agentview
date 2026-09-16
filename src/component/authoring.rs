@@ -3,10 +3,12 @@
 //! This module does not convert to the legacy generic component compiler. Its
 //! private declaration tree is the permanent lowering target for `view!`.
 
+mod action;
 pub(crate) mod application_exit;
 mod async_task;
 mod attempt;
 mod capture;
+mod cli_command;
 mod declaration;
 mod event_input;
 mod event_listener;
@@ -22,6 +24,7 @@ pub mod streaming_attempt;
 mod streaming_xml;
 mod tool;
 
+pub use action::{Action, ActionProps};
 pub use application_exit::{
     use_application_exit, ApplicationExitError, ApplicationExitHandle, ExitReason,
 };
@@ -32,9 +35,10 @@ pub use async_task::{
 pub use attempt::ComponentAttemptFault;
 pub(crate) use attempt::{ComponentRenderStage, RenderBindings};
 pub use capture::ComponentCaptureError;
+pub use cli_command::{CliCommand, Command, CommandArgument, CommandDefinition};
 pub use declaration::Component;
 pub(crate) use event_input::EventInput as InternalEventInput;
-pub use preparation::use_preparation;
+pub use preparation::{use_preparation, use_wait_for_command};
 pub(crate) use preparation::{PreparationFault, PreparationRun, PreparationSet};
 #[cfg(feature = "legacy-provider-port")]
 #[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
@@ -44,7 +48,7 @@ pub(crate) use event_listener::EventListener as InternalEventListener;
 #[cfg(feature = "legacy-provider-port")]
 #[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
 pub type EventListener = event_listener::EventListener;
-pub use native_tool::NativeToolCall;
+pub use native_tool::{NativeToolCall, NativeToolCallProps};
 pub use provider_event_handler::{use_provider_event_handler, ProviderEventSelector};
 pub use reaction_completion::use_reaction_completion;
 pub(crate) use reaction_completion::ReactionCompletionDeclaration;

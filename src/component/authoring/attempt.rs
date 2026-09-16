@@ -5,24 +5,30 @@ use std::{
 
 use crate::{
     component::{
-        execution::{DriverDemandHandle, RenderedProjection, RenderedProjectionNode},
+        execution::{
+            CommandOutcome, DriverDemandHandle, ProviderOutputKey, RenderedProjection,
+            RenderedProjectionNode,
+        },
         signal::{
-            SignalMountTransition, SignalRenderError, SignalRenderTransaction, SignalRuntime,
+            HookKind, SignalMountTransition, SignalRenderError, SignalRenderTransaction,
+            SignalRuntime,
         },
         task::MountTaskHandle,
         ComponentId,
     },
     pom::{BlockChildren, Document, ResolvedDocument},
     pom_resolution::resolve_artifact_document,
+    transcript::AssistantPhase,
 };
 
 use super::{
     application_exit::ApplicationExitControl,
-    async_task::MountTaskStart,
+    async_task::{ComponentTaskContext, MountTaskStart},
     capture::{
         build_projection_items, ComponentCaptureError, ProjectionFragmentCapture,
         ProjectionRunCapture,
     },
+    cli_command::CliCommandDeclaration,
     declaration::{ComponentNode, Placement, RepeatableRender, ScopeRender},
     event_input::EventInputOrigin,
     event_listener::EventListenerDispatchFault,
@@ -33,7 +39,10 @@ use super::{
     preparation::PreparationSet,
     reaction_completion::{ReactionCompletionDeclaration, ReactionCompletionDispatchFault},
     render_context::HookRenderContext,
-    streaming_attempt::ContractDeclaration,
+    streaming_attempt::{
+        ContractDeclaration, StreamingToolDriverFault, XmlCallbackDeclaration, XmlCallbackFeedback,
+        XmlCallbackRuntime,
+    },
     streaming_xml::{
         MountedStreamingRoute, ParsedContractEvent, StreamingXmlDispatchFault,
         StreamingXmlMountFault,
@@ -159,6 +168,26 @@ where
         tasks: Option<&MountTaskHandle>,
         application_exit: Option<&ApplicationExitControl>,
     ) -> Result<ComponentRenderCandidate<'runtime, Root>, ComponentAttemptFault> {
+        Self::prepare_complete_root_candidate_with_command_prefix(
+            root,
+            event_origin,
+            signals,
+            driver_demand,
+            tasks,
+            application_exit,
+            "",
+        )
+    }
+
+    pub(crate) fn prepare_complete_root_candidate_with_command_prefix<'runtime>(
+        root: Component,
+        event_origin: EventInputOrigin,
+        signals: &'runtime SignalRuntime,
+        driver_demand: Option<&DriverDemandHandle>,
+        tasks: Option<&MountTaskHandle>,
+        application_exit: Option<&ApplicationExitControl>,
+        command_prefix: &str,
+    ) -> Result<ComponentRenderCandidate<'runtime, Root>, ComponentAttemptFault> {
         let mut signal_render = signals
             .begin_render()
             .map_err(ComponentAttemptFault::signal)?;
@@ -169,6 +198,7 @@ where
             driver_demand,
             tasks,
             application_exit,
+            command_prefix,
         )?;
         Ok(ComponentRenderCandidate {
             stage,
@@ -184,6 +214,7 @@ where
         driver_demand: Option<&DriverDemandHandle>,
         tasks: Option<&MountTaskHandle>,
         application_exit: Option<&ApplicationExitControl>,
+        command_prefix: &str,
     ) -> Result<(Self, Option<ResolvedDocument>), ComponentAttemptFault> {
         let mut listeners = Vec::new();
         let mut reaction_completions = Vec::new();
@@ -191,7 +222,7 @@ where
         let mut native_tools = Vec::new();
         let mut task_starts = Vec::new();
         let root_id = ComponentId::root();
-        let mut capture = RenderCapture::new(root_id.clone());
+        let mut capture = RenderCapture::new(root_id.clone(), command_prefix);
         let mut scope_cursor = 0;
         let mut system_scope_cursor = 0;
         let rendered = visit_render(
@@ -216,8 +247,48 @@ where
         );
         rendered?;
 
+        if let Some(wait) = preparations.command_wait()? {
+            let document = wait
+                .feedback
+                .with(|feedback| feedback.prompt_document())
+                .map_err(|error| ComponentAttemptFault::RuntimeInvariant {
+                    message: error.to_string(),
+                })?
+                .map_err(|message| ComponentAttemptFault::RuntimeInvariant { message })?;
+            capture.push(
+                &wait.mount.component,
+                wait.placement,
+                document.into_children(),
+                None,
+            )?;
+        }
+        let cli_commands = std::mem::take(&mut capture.cli_commands);
+        let mut command_names = HashSet::new();
+        for command in &cli_commands {
+            if !command_names.insert(command.name()) {
+                return Err(ComponentAttemptFault::RuntimeInvariant {
+                    message: format!("duplicate mounted CLI command `{}`", command.name()),
+                });
+            }
+        }
+
         let streaming_routes = build_streaming_routes(&listeners)?;
         let streaming_contracts = std::mem::take(&mut capture.streaming_contracts);
+        let xml_callbacks = match std::mem::take(&mut capture.xml_callbacks) {
+            declarations if declarations.is_empty() => None,
+            declarations => Some(
+                XmlCallbackRuntime::new(
+                    declarations,
+                    streaming_contracts
+                        .iter()
+                        .flat_map(ContractDeclaration::element_names)
+                        .collect(),
+                )
+                .map_err(|fault| ComponentAttemptFault::StreamingMount {
+                    message: fault.to_string(),
+                })?,
+            ),
+        };
         let system_candidate = capture.resolve_system_candidate()?;
         let projection = capture.into_projection(system_candidate.as_ref())?;
         let projection = RenderedProjection::with_native_tools(
@@ -242,8 +313,12 @@ where
                     listeners,
                     reaction_completions,
                     native_tools,
+                    cli_commands,
                     streaming_routes,
                     streaming_contracts,
+                    xml_callbacks,
+                    callback_output: None,
+                    callback_sealed: false,
                     finished: false,
                     faulted: false,
                     marker: std::marker::PhantomData,
@@ -256,6 +331,10 @@ where
 
     pub(crate) fn projection(&self) -> &RenderedProjection {
         &self.projection
+    }
+
+    pub(crate) fn has_command_wait(&self) -> bool {
+        self.preparations.has_command_wait()
     }
 
     pub(crate) fn set_projection(&mut self, projection: RenderedProjection) {
@@ -284,8 +363,12 @@ pub(crate) struct RenderBindings<Root> {
     listeners: Vec<MountedListener>,
     reaction_completions: Vec<ReactionCompletionDeclaration>,
     native_tools: Vec<NativeToolCallDeclaration>,
+    cli_commands: Vec<CliCommandDeclaration>,
     streaming_routes: Vec<MountedStreamingRoute>,
     streaming_contracts: Vec<ContractDeclaration>,
+    xml_callbacks: Option<XmlCallbackRuntime>,
+    callback_output: Option<ProviderOutputKey>,
+    callback_sealed: bool,
     finished: bool,
     faulted: bool,
     marker: std::marker::PhantomData<fn(Root)>,
@@ -297,6 +380,87 @@ where
 {
     pub(crate) fn take_streaming_contracts(&mut self) -> Vec<ContractDeclaration> {
         std::mem::take(&mut self.streaming_contracts)
+    }
+
+    #[cfg(feature = "legacy-provider-port")]
+    pub(crate) fn has_xml_callbacks(&self) -> bool {
+        self.xml_callbacks.is_some()
+    }
+
+    #[cfg(feature = "legacy-provider-port")]
+    pub(crate) fn has_cli_commands(&self) -> bool {
+        !self.cli_commands.is_empty()
+    }
+
+    pub(crate) async fn dispatch_command(
+        &mut self,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Result<CommandOutcome, String> {
+        let Some(command) = self
+            .cli_commands
+            .iter_mut()
+            .find(|command| command.name() == name)
+        else {
+            return Ok(CommandOutcome::Rejected {
+                code: "command_unavailable".to_owned(),
+                message: format!("Command `{name}` is not currently mounted."),
+            });
+        };
+        command.invoke(input).await
+    }
+
+    /// Ordinary XML callbacks run within the caller's reaction future. The
+    /// parser receives only canonically admitted, non-commentary text; neither
+    /// rendering nor provider text observers can invoke these callbacks.
+    pub(crate) async fn dispatch_xml_callbacks(
+        &mut self,
+        output: ProviderOutputKey,
+        phase: Option<AssistantPhase>,
+        text: &str,
+        sealed: bool,
+    ) -> Result<(), StreamingToolDriverFault> {
+        let Some(callbacks) = self.xml_callbacks.as_mut() else {
+            return Ok(());
+        };
+        if phase == Some(AssistantPhase::Commentary) {
+            return Ok(());
+        }
+        if self.callback_sealed
+            || self
+                .callback_output
+                .is_some_and(|selected| selected != output)
+        {
+            return Err(StreamingToolDriverFault::Input {
+                contract: "xml_callbacks",
+                message: "callback input changed output or continued after sealing".to_owned(),
+            });
+        }
+        self.callback_output = Some(output);
+        self.callback_sealed = sealed;
+        if sealed {
+            callbacks.seal(text).await
+        } else {
+            callbacks.push(text).await
+        }
+    }
+
+    pub(crate) async fn finish_xml_callbacks(
+        &mut self,
+        primary_text: Option<ProviderOutputKey>,
+    ) -> Result<(), StreamingToolDriverFault> {
+        let Some(callbacks) = self.xml_callbacks.as_mut() else {
+            return Ok(());
+        };
+        if primary_text != self.callback_output
+            || (self.callback_output.is_some() && !self.callback_sealed)
+        {
+            return Err(StreamingToolDriverFault::Input {
+                contract: "xml_callbacks",
+                message: "callback input did not match the completed primary output".to_owned(),
+            });
+        }
+        callbacks.finish().await
     }
 
     /// Dispatch one immutable root event without rendering.
@@ -551,6 +715,7 @@ fn visit_render(
                     },
                 )?,
             };
+            preparations.set_wait_scope(&component_id, forced, owner == &ComponentId::root())?;
             let mut child_cursor = 0;
             let mut child_system_scope_cursor = 0;
             visit_render(
@@ -694,6 +859,36 @@ fn visit_render(
             capture.push(owner, placement, document.into_children(), None)?;
             capture.streaming_contracts.push(*declaration);
         }
+        ComponentNode::XmlCallback(mut declaration) => {
+            let placement = forced.unwrap_or(Placement::User);
+            if placement == Placement::SystemOnce {
+                return Err(ComponentAttemptFault::SystemAttemptLocal {
+                    component: owner.to_string(),
+                    capability: "XmlStreamingToolCall/callback",
+                });
+            }
+            let position = *scope_cursor;
+            *scope_cursor = scope_cursor.saturating_add(1);
+            let component_id = owner.child(
+                &format!("agentview::XmlStreamingToolCall({})", declaration.name()),
+                position,
+            );
+            let (history, mount) = signal_render
+                .render_component(component_id.clone(), |scope| {
+                    let history = scope.use_signal_at(0, XmlCallbackFeedback::default)?;
+                    let mount = scope.use_marker_at(1, HookKind::XmlCallback)?;
+                    Ok((history, mount))
+                })
+                .map_err(ComponentAttemptFault::signal)?;
+            let task_context = tasks
+                .cloned()
+                .map(|tasks| ComponentTaskContext::new(mount.clone(), tasks));
+            declaration.mount(history, mount, task_context);
+            let document = declaration.prompt_document()?;
+            capture.register_component(component_id.clone())?;
+            capture.push(&component_id, placement, document.into_children(), None)?;
+            capture.xml_callbacks.push(*declaration);
+        }
         ComponentNode::NativeToolCall(mut declaration) => {
             if forced == Some(Placement::SystemOnce) {
                 return Err(ComponentAttemptFault::SystemAttemptLocal {
@@ -727,6 +922,34 @@ fn visit_render(
             capture.nodes[index].native_items = items;
             declaration.mount(history);
             native_tools.push(*declaration);
+        }
+        ComponentNode::CliCommand(mut declaration) => {
+            let placement = forced.unwrap_or(Placement::User);
+            if placement == Placement::SystemOnce {
+                return Err(ComponentAttemptFault::SystemAttemptLocal {
+                    component: owner.to_string(),
+                    capability: "CliCommand",
+                });
+            }
+            let position = *scope_cursor;
+            *scope_cursor = scope_cursor.saturating_add(1);
+            let component_id = owner.child(
+                &format!("agentview::CliCommand({})", declaration.name()),
+                position,
+            );
+            let mount = signal_render
+                .render_component(component_id.clone(), |scope| {
+                    scope.use_marker_at(0, HookKind::CliCommand)
+                })
+                .map_err(ComponentAttemptFault::signal)?;
+            let task_context = tasks
+                .cloned()
+                .map(|tasks| ComponentTaskContext::new(mount.clone(), tasks));
+            declaration.mount(mount, task_context);
+            let document = declaration.prompt_document(&capture.command_prefix)?;
+            capture.register_component(component_id.clone())?;
+            capture.push(&component_id, placement, document.into_children(), None)?;
+            capture.cli_commands.push(*declaration);
         }
     }
     Ok(())
@@ -815,7 +1038,10 @@ fn ensure_depth(depth: usize) -> Result<(), ComponentAttemptFault> {
 }
 
 struct RenderCapture {
+    command_prefix: String,
     streaming_contracts: Vec<ContractDeclaration>,
+    xml_callbacks: Vec<XmlCallbackDeclaration>,
+    cli_commands: Vec<CliCommandDeclaration>,
     system: BlockChildren,
     nodes: Vec<ProjectionNodeCapture>,
     last_run: Option<ProjectionRunAddress>,
@@ -824,11 +1050,14 @@ struct RenderCapture {
 }
 
 impl RenderCapture {
-    fn new(root: ComponentId) -> Self {
+    fn new(root: ComponentId, command_prefix: &str) -> Self {
         let mut node_indexes = HashMap::new();
         node_indexes.insert(root.clone(), 0);
         Self {
+            command_prefix: command_prefix.to_owned(),
             streaming_contracts: Vec::new(),
+            xml_callbacks: Vec::new(),
+            cli_commands: Vec::new(),
             system: BlockChildren::new(),
             nodes: vec![ProjectionNodeCapture {
                 identity: root,

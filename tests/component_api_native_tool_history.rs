@@ -1534,3 +1534,320 @@ async fn unicode_named_tool_executes_stages_results_and_continues_after_context_
         "macro-generated Unicode names retain both completed rounds across the reset"
     );
 }
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CounterAdjustment {
+    /// Amount to add to the current counter.
+    amount: i64,
+}
+
+#[derive(serde::Serialize)]
+struct CounterAdjustmentResult {
+    value: i64,
+    observed_value: i64,
+}
+
+#[derive(Clone, Default)]
+struct CallbackCounterProps {
+    sync_calls: Arc<AtomicUsize>,
+    async_calls: Arc<AtomicUsize>,
+}
+
+#[component]
+fn callback_counter_application(props: CallbackCounterProps) -> Component {
+    let counter = use_signal(|| 10_i64);
+    let observed_value = counter.with(|value| *value).expect("mounted counter");
+    let sync_counter = counter.clone();
+    let sync_calls = props.sync_calls;
+    let async_calls = props.async_calls;
+
+    view! {
+        counter_state {
+            value { "{observed_value}" }
+            next_action { "Adjust this counter with an integer amount." }
+        }
+        NativeToolCall {
+            name: "adjust",
+            description: "Adjust the mounted counter.",
+            on_call: move |input: CounterAdjustment| {
+                sync_calls.fetch_add(1, Ordering::SeqCst);
+                sync_counter.update(|value| {
+                    *value += input.amount;
+                    CounterAdjustmentResult { value: *value, observed_value }
+                })
+            },
+        }
+        NativeToolCall {
+            name: "adjust_async",
+            description: "Adjust the same counter asynchronously.",
+            on_call: move |input: CounterAdjustment| {
+                let counter = counter.clone();
+                let async_calls = Arc::clone(&async_calls);
+                async move {
+                    tokio::task::yield_now().await;
+                    async_calls.fetch_add(1, Ordering::SeqCst);
+                    counter.update(|value| {
+                        *value += input.amount;
+                        CounterAdjustmentResult { value: *value, observed_value }
+                    })
+                }
+            },
+        }
+    }
+}
+
+fn callback_frame_view(frame: &CapturedFrame) -> String {
+    frame
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            CanonicalInputItem::Instruction { pom, .. }
+            | CanonicalInputItem::Message { pom, .. } => {
+                Some(agentview::pom_renderer::render_pom_document(pom).expect("valid counter view"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn native_callback_infers_schema_and_rejects_invalid_arguments_before_invocation() {
+    let props = CallbackCounterProps::default();
+    let root_props = props.clone();
+    let (port, capture) = ScriptedPort::new([
+        Script::Finite(vec![
+            tool_fact_with_arguments(1, 1, "wrong-type", "adjust", r#"{"amount":"bad"}"#),
+            tool_fact_with_arguments(2, 2, "missing", "adjust_async", "{}"),
+            tool_fact_with_arguments(3, 3, "unknown-field", "adjust", r#"{"amount":2,"game":{}}"#),
+            tool_fact_with_arguments(4, 4, "valid-after-errors", "adjust", r#"{"amount":2}"#),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::completed(),
+    ]);
+    let mut application = Application::mount(
+        move || callback_counter_application(root_props.clone()),
+        port,
+    )
+    .expect("mount callback counter");
+
+    let _ = application
+        .react()
+        .await
+        .expect("invalid calls retain feedback");
+    let projection = application.current_projection();
+    let tools = projection.projection().native_tools();
+    assert_eq!(tools[0].description(), "Adjust the mounted counter.");
+    assert_eq!(tools[0].input_schema()["type"], "object");
+    assert_eq!(tools[0].input_schema()["additionalProperties"], false);
+    assert_eq!(
+        tools[0].input_schema()["required"],
+        serde_json::json!(["amount"])
+    );
+    assert_eq!(
+        tools[0].input_schema()["properties"]["amount"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        tools[0].input_schema()["properties"]["amount"]["description"],
+        "Amount to add to the current counter."
+    );
+    assert_eq!(tools[0].input_schema(), tools[1].input_schema());
+    drop(projection);
+    let _ = application
+        .react()
+        .await
+        .expect("deliver invalid argument results");
+
+    assert_eq!(props.sync_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(props.async_calls.load(Ordering::SeqCst), 0);
+    let frames = capture.frames();
+    assert!(callback_frame_view(&frames[0]).contains("<value>10</value>"));
+    let results = native_items(&frames[1].staged_inputs);
+    assert_eq!(results.len(), 4);
+    for (item, expected_call_id) in results
+        .iter()
+        .zip(["wrong-type", "missing", "unknown-field"])
+    {
+        let CanonicalInputItem::ToolResult { call_id, content } = item else {
+            panic!("invalid calls must produce tool results");
+        };
+        assert_eq!(call_id, expected_call_id);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(content).expect("JSON error result"),
+            serde_json::json!({
+                "error": {
+                    "code": "invalid_arguments",
+                    "message": "Arguments do not match this tool's input schema."
+                }
+            })
+        );
+    }
+    assert_eq!(
+        results[3],
+        tool_result("valid-after-errors", r#"{"value":12,"observed_value":10}"#),
+        "an independent valid call still executes after invalid model inputs"
+    );
+    assert!(callback_frame_view(&frames[1]).contains("<value>12</value>"));
+}
+
+#[tokio::test]
+async fn native_callbacks_deliver_state_and_results_and_refresh_captures_between_actions() {
+    let props = CallbackCounterProps::default();
+    let root_props = props.clone();
+    let (port, capture) = ScriptedPort::new([
+        Script::Finite(vec![
+            tool_fact_with_arguments(1, 1, "sync-first", "adjust", r#"{"amount":2}"#),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::Finite(vec![
+            tool_fact_with_arguments(2, 1, "async-next", "adjust_async", r#"{"amount":3}"#),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::Finite(vec![
+            tool_fact_with_arguments(3, 1, "sync-again", "adjust", r#"{"amount":-5}"#),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::completed(),
+    ]);
+    let mut application = Application::mount(
+        move || callback_counter_application(root_props.clone()),
+        port,
+    )
+    .expect("mount callback counter");
+
+    for _ in 0..4 {
+        let _ = application.react().await.expect("counter interaction");
+    }
+
+    let frames = capture.frames();
+    assert_eq!(frames[0].tools, ["adjust", "adjust_async"]);
+    assert!(callback_frame_view(&frames[0]).contains("<value>10</value>"));
+    for (frame, call_id, value, observed_value) in [
+        (&frames[1], "sync-first", 12, 10),
+        (&frames[2], "async-next", 15, 12),
+        (&frames[3], "sync-again", 10, 15),
+    ] {
+        assert_eq!(
+            native_items(&frame.staged_inputs),
+            vec![tool_result(
+                call_id,
+                &serde_json::to_string(&CounterAdjustmentResult {
+                    value,
+                    observed_value
+                })
+                .expect("serializable counter result")
+            )],
+            "the next Frame delivers the real result with the current callback capture"
+        );
+        assert!(
+            callback_frame_view(frame).contains(&format!("<value>{value}</value>")),
+            "the same Frame must expose the updated state for the next action"
+        );
+        assert_native_submission_has_no_duplicates(frame);
+    }
+    assert_eq!(props.sync_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(props.async_calls.load(Ordering::SeqCst), 1);
+}
+
+#[component]
+fn no_argument_callback_application(props: CallbackCounterProps) -> Component {
+    let counter = use_signal(|| 0_i64);
+    let current = counter.with(|value| *value).unwrap();
+    let sync_counter = counter.clone();
+    let sync_calls = props.sync_calls;
+    let async_calls = props.async_calls;
+    view! {
+        counter_state { value { "{current}" } }
+        NativeToolCall {
+            name: "increment",
+            on_call: move || {
+                sync_calls.fetch_add(1, Ordering::SeqCst);
+                sync_counter.update(|value| { *value += 1; *value })
+            },
+        }
+        NativeToolCall {
+            name: "increment_async",
+            on_call: move || {
+                let counter = counter.clone();
+                let calls = async_calls.clone();
+                async move {
+                    tokio::task::yield_now().await;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    counter.update(|value| { *value += 1; *value })
+                }
+            },
+        }
+    }
+}
+
+#[tokio::test]
+async fn zero_argument_native_callbacks_reject_input_fields_and_deliver_sync_and_async_results() {
+    let props = CallbackCounterProps::default();
+    let root_props = props.clone();
+    let (port, capture) = ScriptedPort::new([
+        Script::Finite(vec![
+            tool_fact_with_arguments(1, 1, "extra-sync", "increment", r#"{"unexpected":1}"#),
+            tool_fact_with_arguments(
+                2,
+                2,
+                "extra-async",
+                "increment_async",
+                r#"{"unexpected":1}"#,
+            ),
+            tool_fact(3, 3, "sync-valid", "increment"),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::Finite(vec![
+            tool_fact(4, 1, "async-valid", "increment_async"),
+            ProviderFact::ReactionCompleted { primary_text: None },
+        ]),
+        Script::completed(),
+    ]);
+    let mut app = Application::mount(
+        move || no_argument_callback_application(root_props.clone()),
+        port,
+    )
+    .unwrap();
+    let projection = app.current_projection();
+    for tool in projection.projection().native_tools() {
+        assert_eq!(
+            tool.input_schema(),
+            &serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            })
+        );
+    }
+    drop(projection);
+
+    for _ in 0..3 {
+        let _ = app.react().await.unwrap();
+    }
+
+    assert_eq!(props.sync_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(props.async_calls.load(Ordering::SeqCst), 1);
+    let frames = capture.frames();
+    let first_results = native_items(&frames[1].staged_inputs);
+    assert_eq!(first_results.len(), 3);
+    for (item, expected_id) in first_results.iter().zip(["extra-sync", "extra-async"]) {
+        let CanonicalInputItem::ToolResult { call_id, content } = item else {
+            panic!("invalid input must produce a result");
+        };
+        assert_eq!(call_id, expected_id);
+        let result: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_eq!(result["error"]["code"], "invalid_arguments");
+    }
+    assert_eq!(first_results[2], tool_result("sync-valid", "1"));
+    assert_eq!(
+        native_items(&frames[2].staged_inputs),
+        vec![tool_result("async-valid", "2")]
+    );
+    for (frame, current) in frames.iter().zip([0, 1, 2]) {
+        assert!(callback_frame_view(frame).contains(&format!("<value>{current}</value>")));
+        assert_native_submission_has_no_duplicates(frame);
+    }
+    app.shutdown().await.unwrap();
+}

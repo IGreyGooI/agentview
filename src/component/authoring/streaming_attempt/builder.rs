@@ -437,6 +437,10 @@ where
         self.implementation_version
     }
 
+    fn element_names(&self) -> Vec<&'static str> {
+        self.elements.iter().map(|element| element.name()).collect()
+    }
+
     fn validate_and_prompt(&self) -> Result<crate::pom::Document, StreamingToolDeclarationFault> {
         validate_elements(self.identity, &self.elements)
     }

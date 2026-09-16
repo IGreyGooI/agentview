@@ -182,6 +182,12 @@ impl From<StreamingXmlTag> for Component {
 pub struct XmlStreamingToolCall;
 
 impl XmlStreamingToolCall {
+    /// Declare an XML action with direct callbacks that capture Component state.
+    /// These ordinary callbacks run in source order and do not promise rollback.
+    pub fn props() -> super::streaming_attempt::XmlStreamingToolCallProps {
+        super::streaming_attempt::XmlStreamingToolCallProps::new()
+    }
+
     /// Declare an independent typed XML contract for each provider reaction.
     #[allow(clippy::new_ret_no_self)] // Namespace constructor returns the typed builder.
     pub fn new<C: super::streaming_attempt::StreamingToolChannels>(

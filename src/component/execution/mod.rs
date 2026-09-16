@@ -9,6 +9,8 @@ mod admission;
 mod application;
 #[cfg(feature = "legacy-provider-port")]
 mod application_host;
+pub(crate) mod command;
+mod command_parser;
 #[cfg(feature = "legacy-provider-port")]
 mod component_reaction;
 mod debug;
@@ -20,6 +22,7 @@ mod port;
 mod projection_diff;
 #[cfg(feature = "legacy-provider-port")]
 mod prompt_render;
+mod stdin;
 mod streaming;
 mod tool_definition;
 
@@ -46,6 +49,10 @@ pub use application::{
 pub use application_host::{
     ApplicationHost, ApplicationHostFault, EngineObservation, EngineObserver,
 };
+pub use command::{
+    CommandCall, CommandInput, CommandInputError, CommandOutcome, CommandResponse, CommandSender,
+};
+pub use command_parser::{CommandParseError, CommandParser};
 #[cfg(feature = "legacy-provider-port")]
 #[allow(
     deprecated,
@@ -111,5 +118,6 @@ pub use reaction::{
     ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason, ResettableReactionPort,
     SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
 };
+pub use stdin::{StdinApplication, StdinApplicationError, StdinResponse};
 pub use streaming::{StreamingToolRecoveryReport, StreamingToolRecoveryStatus};
 pub use tool_definition::{ToolDefinition, ToolDefinitionError};

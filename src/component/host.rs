@@ -56,11 +56,13 @@ pub struct ComponentHost<Props> {
     driver_demand: Option<DriverDemandHandle>,
     tasks: Option<MountTaskHandle>,
     application_exit: Option<ApplicationExitControl>,
+    command_prefix: String,
     next_render_generation: u64,
     next_projection_revision: Option<ProjectionRevision>,
     current_projection_revision: Option<ProjectionRevision>,
     current_projection: Option<RenderedProjection>,
     current_projection_prepared: bool,
+    current_has_command_wait: bool,
 }
 
 enum ComponentRoot<Props> {
@@ -133,11 +135,13 @@ impl<Props> ComponentHost<Props> {
             driver_demand,
             tasks,
             application_exit,
+            command_prefix: String::new(),
             next_render_generation: 1,
             next_projection_revision: Some(ProjectionRevision::FIRST),
             current_projection_revision: None,
             current_projection: None,
             current_projection_prepared: false,
+            current_has_command_wait: false,
         }
     }
 
@@ -147,6 +151,12 @@ impl<Props> ComponentHost<Props> {
 
     pub fn props(&self) -> &Props {
         &self.props
+    }
+
+    /// Configure the executable and transport arguments advertised by CLI actions.
+    pub(crate) fn set_command_prefix(&mut self, prefix: String) {
+        self.command_prefix = prefix;
+        self.signals.mark_dirty();
     }
 
     /// Replace root props without rendering or invoking a Provider.
@@ -169,6 +179,7 @@ impl<Props> ComponentHost<Props> {
         self.current_projection_revision = None;
         self.current_projection = None;
         self.current_projection_prepared = false;
+        self.current_has_command_wait = false;
         self.signals.mark_dirty();
         Ok(self.id)
     }
@@ -208,6 +219,10 @@ impl<Props> ComponentHost<Props> {
 
     pub(crate) const fn current_projection_is_prepared(&self) -> bool {
         self.current_projection_prepared
+    }
+
+    pub(crate) const fn has_command_wait(&self) -> bool {
+        self.current_has_command_wait
     }
 
     pub(crate) fn mark_current_projection_prepared(&mut self) {
@@ -256,13 +271,14 @@ where
             ComponentRoot::WithEvents(root) => root(props, input),
         };
         let mut candidate =
-            ComponentRenderStage::prepare_complete_root_candidate_with_capabilities(
+            ComponentRenderStage::prepare_complete_root_candidate_with_command_prefix(
                 root,
                 origin,
                 &self.signals,
                 self.driver_demand.as_ref(),
                 self.tasks.as_ref(),
                 self.application_exit.as_ref(),
+                &self.command_prefix,
             )?;
         if candidate.has_task_starts() {
             self.tasks
@@ -281,7 +297,9 @@ where
                     mount_generation: self.mount_generation,
                 });
         candidate.stage_mut().set_projection(projection.clone());
+        let has_command_wait = candidate.stage().has_command_wait();
         let (stage, _, mounts) = candidate.commit_deferred();
+        self.current_has_command_wait = has_command_wait;
         let (preparations, bindings, task_starts) = stage.into_execution_parts();
         self.next_projection_revision = projection_revision.checked_next();
 

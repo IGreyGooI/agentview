@@ -120,7 +120,8 @@ impl Drop for ReactionLifecycle<'_> {
 /// It returns [`ApplicationHostFault::ComponentPreparationsUnsupported`]
 /// before invoking [`ProviderPort::execute`] when a Component declares one.
 /// Use [`Application`](super::Application) with a [`ReactionPort`](super::ReactionPort)
-/// for preparation preparation.
+/// for Component preparation. CLI commands and `use_wait_for_command` likewise
+/// require that runtime and fail before invoking the compatibility Provider.
 #[deprecated(note = "use `Application<P>` as the mounted runtime owner")]
 pub struct ApplicationHost<P> {
     provider: P,
@@ -255,8 +256,14 @@ where
 {
     let prepared = components.render()?;
     let (projection, preparations, bindings) = prepared.into_execution_parts();
+    if preparations.command_wait()?.is_some() || bindings.has_cli_commands() {
+        return Err(ApplicationHostFault::CliCommandsUnsupported);
+    }
     if !preparations.is_empty() {
         return Err(ApplicationHostFault::ComponentPreparationsUnsupported);
+    }
+    if bindings.has_xml_callbacks() {
+        return Err(ApplicationHostFault::XmlCallbacksUnsupported);
     }
     Ok(PreparedComponentReaction {
         projection,
@@ -442,6 +449,10 @@ where
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ApplicationHostFault {
+    #[error("CLI commands and command waits require Application<P> and are unsupported by ApplicationHost")]
+    CliCommandsUnsupported,
+    #[error("XML action callbacks require Application<P> with ReactionPort and are unsupported by ApplicationHost")]
+    XmlCallbacksUnsupported,
     #[error("ApplicationHost is bound to {expected:?}, not {observed:?}")]
     ComponentHostMismatch {
         expected: ComponentHostId,

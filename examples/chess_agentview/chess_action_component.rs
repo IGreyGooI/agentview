@@ -192,25 +192,25 @@ fn thought_contract() -> XmlElementContract<(), String> {
         .decode(|_| Ok(()), |_, text| Ok(text.to_owned()))
 }
 
-fn configure_action<Head: Send + Sync + 'static>(
-    handlers: XmlElementHandlers<ChessActionAttempt, ChessActionChannels, Head, ChessAction>,
-) -> XmlElementHandlers<ChessActionAttempt, ChessActionChannels, Head, ChessAction, ReadyCompletion>
-{
-    handlers.on_complete_validated(
-        |state, _| {
-            if state.thought_completed {
-                XmlOccurrenceValidity::Valid
-            } else {
-                XmlOccurrenceValidity::Invalid(XmlOccurrenceRejection::diagnostic(
-                    InvalidActionReason::ThoughtAfterAction,
-                ))
-            }
-        },
-        |state, event| {
-            state.action = Some(event.value);
-            StreamingToolUpdate::none()
-        },
-    )
+fn validate_action<Head>(
+    state: &ChessActionAttempt,
+    _: &XmlComplete<Head, ChessAction>,
+) -> XmlOccurrenceValidity<InvalidActionReason> {
+    if state.thought_completed {
+        XmlOccurrenceValidity::Valid
+    } else {
+        XmlOccurrenceValidity::Invalid(XmlOccurrenceRejection::diagnostic(
+            InvalidActionReason::ThoughtAfterAction,
+        ))
+    }
+}
+
+fn complete_action<Head>(
+    state: &mut ChessActionAttempt,
+    event: XmlComplete<Head, ChessAction>,
+) -> StreamingToolUpdate<ChessActionChannels> {
+    state.action = Some(event.value);
+    StreamingToolUpdate::none()
 }
 
 fn choose_move_contract() -> XmlElementContract<StrictUciMove, ChessAction> {
@@ -358,45 +358,56 @@ pub(crate) fn chess_action_component(
 ) -> Component {
     let publisher_state = state.clone();
     let rejection_state = state;
-    XmlStreamingToolCall::new::<ChessActionChannels>(ACTION_CONTRACT_ID)
-        .version(ACTION_CONTRACT_VERSION)
-        .state_with(|_| Ok::<_, Infallible>(ChessActionAttempt::default()))
-        .element(thought_contract(), |handlers| {
-            handlers.on_complete_validated(
-                |_, event| {
-                    if event.value.trim().is_empty() {
-                        XmlOccurrenceValidity::Invalid(XmlOccurrenceRejection::diagnostic(
-                            InvalidActionReason::InvalidThought,
-                        ))
-                    } else {
-                        XmlOccurrenceValidity::Valid
-                    }
-                },
-                |state, _| {
-                    state.thought_completed = true;
-                    StreamingToolUpdate::none()
-                },
-            )
-        })
-        .element(choose_move_contract(), configure_action)
-        .element(resign_contract(), configure_action)
-        .finish(decide_action)
-        .without_live()
-        .publish_with(move |_| {
-            Ok::<_, Infallible>(ChessActionPublisher {
-                state: publisher_state.clone(),
-                attempt,
-            })
-        })
-        .on_rejected(move |report| {
-            let state = rejection_state.clone();
-            let reason = rejection_reason(&report);
-            async move {
-                let _ = apply_model_action(&state, attempt, Err(reason));
-                Ok::<_, Infallible>(StreamingToolRejectionAction::Complete)
+    view! {
+        XmlStreamingToolCall::<ChessActionChannels> {
+            identity: ACTION_CONTRACT_ID,
+            version: ACTION_CONTRACT_VERSION,
+            state_with: |_| Ok::<_, Infallible>(ChessActionAttempt::default()),
+            finish: decide_action,
+            without_live: (),
+            publish_with: move |_| {
+                Ok::<_, Infallible>(ChessActionPublisher {
+                    state: publisher_state.clone(),
+                    attempt,
+                })
+            },
+            on_rejected: move |report| {
+                let state = rejection_state.clone();
+                let reason = rejection_reason(&report);
+                async move {
+                    let _ = apply_model_action(&state, attempt, Err(reason));
+                    Ok::<_, Infallible>(StreamingToolRejectionAction::Complete)
+                }
+            },
+
+            XmlToolElement {
+                contract: thought_contract(),
+                on_complete_validated: (
+                    |_, event| {
+                        if event.value.trim().is_empty() {
+                            XmlOccurrenceValidity::Invalid(XmlOccurrenceRejection::diagnostic(
+                                InvalidActionReason::InvalidThought,
+                            ))
+                        } else {
+                            XmlOccurrenceValidity::Valid
+                        }
+                    },
+                    |state, _| {
+                        state.thought_completed = true;
+                        StreamingToolUpdate::none()
+                    },
+                ),
             }
-        })
-        .build()
+            XmlToolElement {
+                contract: choose_move_contract(),
+                on_complete_validated: (validate_action, complete_action),
+            }
+            XmlToolElement {
+                contract: resign_contract(),
+                on_complete_validated: (validate_action, complete_action),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

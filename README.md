@@ -1,11 +1,18 @@
 # agentview
 
-`agentview` is a Component runtime for rendering typed application state into
-provider-neutral Frames and admitting ordered model facts back into
-application-owned state.
+`agentview` builds user interfaces for LLMs. The model observes application state,
+attempts actions, receives feedback, and uses that feedback to act again. Its
+Component runtime renders typed application state into provider-neutral Frames
+and admits ordered model facts back into application-owned state.
 
-Coding agents: start with [HELP.md](HELP.md) for business POM and diff authoring,
-native tools, adjacent projection snapshots, and focused verification.
+Interactivity is a primary design requirement. The application makes current state
+and available actions discoverable, exposes what each action actually did, and
+presents the updated view so the model can choose its next step. Feedback covers
+successful actions, ongoing work, and mistakes throughout the interaction.
+
+Coding agents: start with [HELP.md](HELP.md) for the interaction model, business
+POM and diff authoring, native tools, adjacent projection snapshots, and focused
+verification.
 
 ## Runtime Boundary
 
@@ -185,6 +192,12 @@ cardinality, and one final decision; it owns an independent parser for each
 provider reaction. Separate contracts may independently parse the same selected
 provider text. The legacy `XmlStreamingToolCall::contract` and `StreamingXml`
 surfaces remain parser-hub compatibility APIs.
+
+Strict XML validation records model mistakes as diagnostics and permits later
+valid elements to be processed. A diagnostic does not automatically reject the
+whole attempt. The application owns acceptance and renders feedback, including
+for partially accepted output. See [HELP.md: Streaming XML Feedback](HELP.md#streaming-xml-feedback)
+for the unknown-tag example and feedback flow.
 
 ## Frame And Reaction Semantics
 
