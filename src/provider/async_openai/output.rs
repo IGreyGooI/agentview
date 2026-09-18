@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ::async_openai::types::responses::{
     MessagePhase as OpenAiMessagePhase, OutputContent, OutputItem, OutputMessageContent,
-    OutputStatus, OutputTextContent, ReasoningItem, ResponseOutputTextAnnotationAddedEvent,
-    SummaryPart,
+    OutputStatus, OutputTextContent, ReasoningItem, ReasoningItemContent,
+    ResponseOutputTextAnnotationAddedEvent, SummaryPart,
 };
 #[cfg(any(feature = "legacy-provider-port", test))]
 use serde_json::json;
@@ -69,10 +69,20 @@ struct OutputLifecycle {
     kind: OutputKind,
     phase: Option<AssistantPhase>,
     text: Option<TextLifecycle>,
+    reasoning_text: BTreeMap<u64, ReasoningTextLifecycle>,
     done: bool,
     sealed_private: Option<SealedOpenAiPrivateOutput>,
     added_sequence: Option<u64>,
     done_sequence: Option<u64>,
+}
+
+#[derive(Default)]
+struct ReasoningTextLifecycle {
+    delta: String,
+    delta_observed: bool,
+    completed: Option<String>,
+    part_added: bool,
+    part_done: bool,
 }
 
 #[derive(Default)]
@@ -523,6 +533,7 @@ impl OpenAiOutputLedger {
                 kind: parsed.kind,
                 phase: assistant_phase(&parsed.body),
                 text: (parsed.kind == OutputKind::Message).then(TextLifecycle::default),
+                reasoning_text: BTreeMap::new(),
                 done: false,
                 sealed_private: None,
                 added_sequence: optional_sequence(payload),
@@ -558,6 +569,37 @@ impl OpenAiOutputLedger {
             return Err(invalid_lifecycle(
                 "OpenAI output item emitted more than one done event",
             ));
+        }
+        if let ParsedOutputItemBody::Sdk(OutputItem::Reasoning(reasoning)) = &parsed.body {
+            for (index, text) in &lifecycle.reasoning_text {
+                if text.part_added && !text.part_done {
+                    return Err(invalid_lifecycle(
+                        "OpenAI reasoning content part was not completed",
+                    ));
+                }
+                // An encrypted artifact can replace plaintext in the sealed item.
+                // Otherwise the authoritative plaintext must match every observed part.
+                if let Some(content) = reasoning.content.as_ref().filter(|parts| !parts.is_empty())
+                {
+                    let part = usize::try_from(*index)
+                        .ok()
+                        .and_then(|index| content.get(index));
+                    let Some(ReasoningItemContent::ReasoningText(part)) = part else {
+                        return Err(invalid_lifecycle(
+                            "OpenAI reasoning content index is missing from output_item.done",
+                        ));
+                    };
+                    let observed = text
+                        .completed
+                        .as_deref()
+                        .or_else(|| text.delta_observed.then_some(text.delta.as_str()));
+                    if observed.is_some_and(|observed| observed != part.text) {
+                        return Err(invalid_lifecycle(
+                            "OpenAI reasoning content does not match its streamed text",
+                        ));
+                    }
+                }
+            }
         }
         if !self
             .output_identities
@@ -600,6 +642,21 @@ impl OpenAiOutputLedger {
         &mut self,
         payload: &Map<String, Value>,
     ) -> Result<(), ProviderFault> {
+        if is_reasoning_text_part(payload) {
+            let part = reasoning_text_part(payload)?;
+            let text = self.reasoning_text_mut(payload)?;
+            if !part.is_empty()
+                || text.part_added
+                || text.delta_observed
+                || text.completed.is_some()
+            {
+                return Err(invalid_lifecycle(
+                    "OpenAI reasoning content_part.added has an invalid lifecycle",
+                ));
+            }
+            text.part_added = true;
+            return Ok(());
+        }
         let part = output_text_part(payload)?;
         if !part.text.is_empty() {
             return Err(invalid_lifecycle(
@@ -622,6 +679,17 @@ impl OpenAiOutputLedger {
         &mut self,
         payload: &Map<String, Value>,
     ) -> Result<(), ProviderFault> {
+        if is_reasoning_text_part(payload) {
+            let part = reasoning_text_part(payload)?;
+            let text = self.reasoning_text_mut(payload)?;
+            if !text.part_added || text.part_done || text.completed.as_deref() != Some(part) {
+                return Err(invalid_lifecycle(
+                    "OpenAI reasoning content_part.done does not match its text lifecycle",
+                ));
+            }
+            text.part_done = true;
+            return Ok(());
+        }
         let part = output_text_part(payload)?;
         let lifecycle = self.message_lifecycle_mut(payload)?;
         let text = lifecycle.text.as_mut().expect("message text lifecycle");
@@ -643,6 +711,59 @@ impl OpenAiOutputLedger {
         text.content_part_done = Some(part);
         text.content_part_done_sequence = optional_sequence(payload);
         Ok(())
+    }
+
+    /// Reasoning stays private: only the sealed item is retained for wire replay.
+    pub(super) fn record_reasoning_text(
+        &mut self,
+        payload: &Map<String, Value>,
+        done: bool,
+    ) -> Result<(), ProviderFault> {
+        let value = payload
+            .get(if done { "text" } else { "delta" })
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                invalid_lifecycle("OpenAI reasoning text event has an invalid text field")
+            })?;
+        let text = self.reasoning_text_mut(payload)?;
+        if text.completed.is_some() {
+            return Err(invalid_lifecycle(
+                "OpenAI reasoning text followed reasoning_text.done",
+            ));
+        }
+        if done {
+            if text.delta_observed && text.delta != value {
+                return Err(invalid_lifecycle(
+                    "OpenAI reasoning_text.done does not equal accumulated deltas",
+                ));
+            }
+            text.completed = Some(value.to_owned());
+        } else {
+            text.delta.push_str(value);
+            text.delta_observed = true;
+        }
+        Ok(())
+    }
+
+    fn reasoning_text_mut(
+        &mut self,
+        payload: &Map<String, Value>,
+    ) -> Result<&mut ReasoningTextLifecycle, ProviderFault> {
+        let item_id = required_nonempty_string(payload, "item_id")?;
+        let output_index = required_u64(payload, "output_index")?;
+        let content_index = required_u64(payload, "content_index")?;
+        let lifecycle = self.items.get_mut(&output_index).ok_or_else(|| {
+            invalid_lifecycle("OpenAI reasoning text did not follow output_item.added")
+        })?;
+        if lifecycle.kind != OutputKind::Reasoning
+            || lifecycle.id.as_deref() != Some(item_id.as_str())
+            || lifecycle.done
+        {
+            return Err(invalid_lifecycle(
+                "OpenAI reasoning text does not match an open reasoning item",
+            ));
+        }
+        Ok(lifecycle.reasoning_text.entry(content_index).or_default())
     }
 
     pub(super) fn record_text_delta(
@@ -1745,6 +1866,22 @@ fn output_text_part(payload: &Map<String, Value>) -> Result<OutputTextContent, P
     }
 }
 
+fn is_reasoning_text_part(payload: &Map<String, Value>) -> bool {
+    payload
+        .get("part")
+        .and_then(|part| part.get("type"))
+        .and_then(Value::as_str)
+        == Some("reasoning_text")
+}
+
+fn reasoning_text_part(payload: &Map<String, Value>) -> Result<&str, ProviderFault> {
+    payload
+        .get("part")
+        .and_then(|part| part.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_lifecycle("OpenAI reasoning content part has an invalid shape"))
+}
+
 fn parse_lifecycle_item(
     payload: &Map<String, Value>,
     allow_omitted_in_progress_message_content: bool,
@@ -1976,7 +2113,7 @@ fn validate_observed_item(item: &ParsedOutputItem) -> Result<(), ResponseOutputI
     match &item.body {
         ParsedOutputItemBody::Sdk(OutputItem::Message(_)) => Ok(()),
         ParsedOutputItemBody::Sdk(OutputItem::Reasoning(reasoning))
-            if valid_empty_reasoning_content(&item.raw, reasoning)
+            if valid_reasoning_content(&item.raw, reasoning)
                 && valid_reasoning_summary(reasoning) =>
         {
             Ok(())
@@ -2001,11 +2138,15 @@ fn validate_terminal_item(item: &ParsedOutputItem) -> Result<(), ResponseOutputL
         ParsedOutputItemBody::TerminalMessage(_) => Ok(()),
         ParsedOutputItemBody::Sdk(OutputItem::Reasoning(reasoning))
             if reasoning.status != Some(OutputStatus::InProgress)
-                && valid_empty_reasoning_content(&item.raw, reasoning)
-                && reasoning
+                && valid_reasoning_content(&item.raw, reasoning)
+                && (reasoning
                     .encrypted_content
                     .as_deref()
                     .is_some_and(|content| !content.is_empty())
+                    || reasoning
+                        .content
+                        .as_ref()
+                        .is_some_and(|content| !content.is_empty()))
                 && valid_reasoning_summary(reasoning) =>
         {
             Ok(())
@@ -2033,7 +2174,12 @@ fn sealed_private_output(
             Ok(Some(SealedOpenAiPrivateOutput {
                 output_index: item.output_index,
                 #[cfg(feature = "legacy-provider-port")]
-                output_item: Some(reasoning_output(_reasoning)?),
+                output_item: _reasoning
+                    .encrypted_content
+                    .as_ref()
+                    .filter(|content| !content.is_empty())
+                    .map(|_| reasoning_output(_reasoning))
+                    .transpose()?,
                 wire_item: canonical_wire_item(item)?,
             }))
         }
@@ -2193,15 +2339,27 @@ fn canonical_wire_item(item: &ParsedOutputItem) -> Result<Value, ResponseOutputL
                 serde_json::to_value(&reasoning.summary)
                     .map_err(|_| ResponseOutputLedgerError::Canonicalization)?,
             );
-            wire.insert(
-                "encrypted_content".to_owned(),
-                Value::String(
-                    reasoning
-                        .encrypted_content
-                        .clone()
-                        .ok_or(ResponseOutputLedgerError::Canonicalization)?,
-                ),
-            );
+            if let Some(content) = &reasoning.encrypted_content {
+                wire.insert(
+                    "encrypted_content".to_owned(),
+                    Value::String(content.clone()),
+                );
+            }
+            if let Some(content) = reasoning
+                .content
+                .as_ref()
+                .filter(|content| !content.is_empty())
+            {
+                wire.insert(
+                    "content".to_owned(),
+                    serde_json::to_value(content)
+                        .map_err(|_| ResponseOutputLedgerError::Canonicalization)?,
+                );
+            }
+            // OpenRouter uses this to identify its provider reasoning encoding.
+            if let Some(format) = item.raw.get("format") {
+                wire.insert("format".to_owned(), format.clone());
+            }
         }
         ParsedOutputItemBody::Sdk(OutputItem::Compaction(compaction)) => {
             wire.insert("id".to_owned(), Value::String(compaction.id.clone()));
@@ -2218,12 +2376,13 @@ fn canonical_wire_item(item: &ParsedOutputItem) -> Result<Value, ResponseOutputL
     Ok(Value::Object(wire))
 }
 
-fn valid_empty_reasoning_content(raw: &Value, reasoning: &ReasoningItem) -> bool {
+fn valid_reasoning_content(raw: &Value, reasoning: &ReasoningItem) -> bool {
     match raw.get("content") {
         None => reasoning.content.is_none(),
-        Some(Value::Array(content)) => {
-            content.is_empty() && reasoning.content.as_ref().is_some_and(Vec::is_empty)
-        }
+        Some(Value::Array(content)) => reasoning
+            .content
+            .as_ref()
+            .is_some_and(|parsed| parsed.len() == content.len()),
         Some(_) => false,
     }
 }

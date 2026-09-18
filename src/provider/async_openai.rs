@@ -87,7 +87,6 @@ mod usage;
 #[cfg(feature = "legacy-provider-port")]
 use self::artifact_binding::OpenAiInlineArtifactBinding;
 use self::faults::{
-    has_plaintext_reasoning_completed_content, has_plaintext_reasoning_lifecycle_content,
     has_unsupported_completed_item, has_unsupported_content_part, has_unsupported_lifecycle_item,
     is_native_tool_event, OpenAiBodyStreamFault,
 };
@@ -98,7 +97,7 @@ use self::faults::{
     response_event_shape_fault, response_output_item_added_fault, response_stream_completion_fault,
     serialized_request_body_limit_fault, stream_error_code, stream_event_limit_fault,
     stream_transport_fault, unsupported_content_part_fault, unsupported_output_item_fault,
-    unsupported_reasoning_content_fault, OpenAiApi, ResponseEventReason,
+    OpenAiApi, ResponseEventReason,
 };
 pub use self::request_observation::OpenAiResponsesRequestSnapshot;
 pub use self::responses_observation::{
@@ -1133,8 +1132,13 @@ impl AsyncOpenAiResponsesProvider {
                             }
                         }
                         "response.reasoning_text.delta" | "response.reasoning_text.done" => {
-                            state.finished = true;
-                            return Some((Err(unsupported_reasoning_content_fault()), state));
+                            if let Err(error) = state.output_ledger.record_reasoning_text(
+                                &frame.payload,
+                                frame.event_type == "response.reasoning_text.done",
+                            ) {
+                                state.finished = true;
+                                return Some((Err(ledger_mismatch_fault(error)), state));
+                            }
                         }
                         // Terminal capability rejection takes precedence over reconciliation faults;
                         // the fixed message matches the ledger contract without reading error text.
@@ -1205,12 +1209,6 @@ impl AsyncOpenAiResponsesProvider {
                             state.finished = true;
                             return Some((Err(unsupported_output_item_fault()), state));
                         }
-                        "response.completed"
-                            if has_plaintext_reasoning_completed_content(&frame.payload) =>
-                        {
-                            state.finished = true;
-                            return Some((Err(unsupported_reasoning_content_fault()), state));
-                        }
                         "response.completed" => {
                             match state.output_ledger.complete(&frame.payload) {
                                 Ok(completed_output) => {
@@ -1252,10 +1250,6 @@ impl AsyncOpenAiResponsesProvider {
                         }
                         // Unsupported item types are capability rejections before lifecycle validation.
                         "response.output_item.added" => {
-                            if has_plaintext_reasoning_lifecycle_content(&frame.payload) {
-                                state.finished = true;
-                                return Some((Err(unsupported_reasoning_content_fault()), state));
-                            }
                             if has_unsupported_lifecycle_item(&frame.payload)
                                 && native_function_call(&frame.payload).is_none()
                             {
@@ -1294,10 +1288,6 @@ impl AsyncOpenAiResponsesProvider {
                             }
                         }
                         "response.output_item.done" => {
-                            if has_plaintext_reasoning_lifecycle_content(&frame.payload) {
-                                state.finished = true;
-                                return Some((Err(unsupported_reasoning_content_fault()), state));
-                            }
                             if has_unsupported_lifecycle_item(&frame.payload)
                                 && native_function_call(&frame.payload).is_none()
                             {

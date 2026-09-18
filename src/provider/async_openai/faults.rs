@@ -285,13 +285,6 @@ pub(super) fn unsupported_output_item_fault() -> ProviderFault {
     )
 }
 
-#[cfg(feature = "legacy-provider-port")]
-pub(super) fn unsupported_reasoning_content_fault() -> ProviderFault {
-    ProviderFault::model_rejected(
-        "plaintext OpenAI reasoning content is not supported by this adapter version",
-    )
-}
-
 pub(super) fn has_unsupported_lifecycle_item(payload: &Map<String, Value>) -> bool {
     payload
         .get("item")
@@ -304,7 +297,7 @@ pub(super) fn has_unsupported_content_part(payload: &Map<String, Value>) -> bool
         .and_then(Value::as_object)
         .and_then(|part| part.get("type"))
         .and_then(Value::as_str)
-        .is_some_and(|item_type| item_type != "output_text")
+        .is_some_and(|item_type| !matches!(item_type, "output_text" | "reasoning_text"))
 }
 
 pub(super) fn has_unsupported_completed_item(payload: &Map<String, Value>) -> bool {
@@ -314,39 +307,6 @@ pub(super) fn has_unsupported_completed_item(payload: &Map<String, Value>) -> bo
         .and_then(|response| response.get("output"))
         .and_then(Value::as_array)
         .is_some_and(|items| items.iter().any(has_explicitly_unsupported_item_type))
-}
-
-pub(super) fn has_plaintext_reasoning_lifecycle_content(payload: &Map<String, Value>) -> bool {
-    payload
-        .get("item")
-        .is_some_and(has_plaintext_reasoning_content)
-}
-
-pub(super) fn has_plaintext_reasoning_completed_content(payload: &Map<String, Value>) -> bool {
-    payload
-        .get("response")
-        .and_then(Value::as_object)
-        .and_then(|response| response.get("output"))
-        .and_then(Value::as_array)
-        .is_some_and(|items| items.iter().any(has_plaintext_reasoning_content))
-}
-
-fn has_plaintext_reasoning_content(item: &Value) -> bool {
-    let Some(item) = item.as_object() else {
-        return false;
-    };
-    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-        return false;
-    }
-    item.get("content")
-        .and_then(Value::as_array)
-        .is_some_and(|content| {
-            !content.is_empty()
-                && content.iter().all(|part| {
-                    part.get("type").and_then(Value::as_str) == Some("reasoning_text")
-                        && part.get("text").is_some_and(Value::is_string)
-                })
-        })
 }
 
 fn has_explicitly_unsupported_item_type(item: &Value) -> bool {

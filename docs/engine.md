@@ -932,9 +932,14 @@ assistant text加中断边界，或fail closed。
 
 ### Required port-private causal state
 
-encrypted reasoning、remote compaction和某些protocol correlation虽然不进入public fact或canonical
+reasoning（encrypted或plaintext）、remote compaction和某些protocol correlation虽然不进入public fact或canonical
 transcript，却可能是下一次合法wire continuation必需的因果artifact。port必须按provider output顺序
 seal/abort并保留它们。未sealprivate output可以丢弃；已经seal的artifact不因随后stream fault回滚。
+
+Responses-compatible provider的`reasoning_text` delta/done和content-part事件属于private reasoning
+lifecycle，不产生public assistant text或触发Component action。port校验item identity、streamed text和
+sealed content的一致性，在`output_item.done`保留plaintext content及provider format用于后续wire replay；
+`response.completed`只能reconcile已seal的内容，不能替换它。
 
 port只有在具备content-independent recovery strategy并仍保留其required private state时，才能推进epoch
 并声明FullRequired；declare阶段不证明某个canonical Full payload合法。收到exact Full后，port才在

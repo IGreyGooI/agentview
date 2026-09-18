@@ -28,8 +28,7 @@ use super::{
         PreparedResponsesFrameRequest, PrivateOutputKind, ResponsesFrameRequestFault,
         ResponsesFrameRequestState,
     },
-    has_native_function_call_completed, has_plaintext_reasoning_completed_content,
-    has_plaintext_reasoning_lifecycle_content, has_unsupported_completed_item,
+    has_native_function_call_completed, has_unsupported_completed_item,
     has_unsupported_content_part, has_unsupported_lifecycle_item, is_native_tool_event,
     native_function_call,
     output::{OpenAiOutputLedger, SealedOpenAiPrivateOutput},
@@ -671,7 +670,12 @@ impl<S> NativeOpenAiStreamState<'_, S> {
                 .map_err(protocol_fault)?,
             "response.output_text.done" => self.record_text_done(&frame.payload)?,
             "response.reasoning_text.delta" | "response.reasoning_text.done" => {
-                return Err(upstream_rejected("plaintext reasoning is unsupported"));
+                self.output_ledger
+                    .record_reasoning_text(
+                        &frame.payload,
+                        frame.event_type == "response.reasoning_text.done",
+                    )
+                    .map_err(protocol_fault)?;
             }
             "response.output_item.added" => self.record_output_added(&frame.payload)?,
             "response.function_call_arguments.delta" => self
@@ -786,9 +790,6 @@ impl<S> NativeOpenAiStreamState<'_, S> {
         &mut self,
         payload: &Map<String, Value>,
     ) -> Result<(), ReactionPortFault> {
-        if has_plaintext_reasoning_lifecycle_content(payload) {
-            return Err(upstream_rejected("plaintext reasoning is unsupported"));
-        }
         if has_unsupported_lifecycle_item(payload) && native_function_call(payload).is_none() {
             return Err(upstream_rejected("unsupported output item"));
         }
@@ -805,9 +806,6 @@ impl<S> NativeOpenAiStreamState<'_, S> {
         &mut self,
         payload: &Map<String, Value>,
     ) -> Result<(), ReactionPortFault> {
-        if has_plaintext_reasoning_lifecycle_content(payload) {
-            return Err(upstream_rejected("plaintext reasoning is unsupported"));
-        }
         if has_unsupported_lifecycle_item(payload) && native_function_call(payload).is_none() {
             return Err(upstream_rejected("unsupported output item"));
         }
@@ -921,9 +919,6 @@ impl<S> NativeOpenAiStreamState<'_, S> {
 
     fn record_completed(&mut self, payload: &Map<String, Value>) -> Result<(), ReactionPortFault> {
         validate_completed_envelope(payload)?;
-        if has_plaintext_reasoning_completed_content(payload) {
-            return Err(upstream_rejected("plaintext reasoning is unsupported"));
-        }
         let has_terminal_tool = has_native_function_call_completed(payload);
         if has_unsupported_completed_item(payload) && !has_terminal_tool {
             return Err(upstream_rejected("unsupported completed output item"));
@@ -1285,6 +1280,34 @@ mod tests {
         body: String,
     ) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         spawn_response_server(StatusCode::OK, "text/event-stream", body).await
+    }
+
+    async fn spawn_sse_sequence_server(
+        bodies: Vec<String>,
+    ) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        async fn respond(State(bodies): State<Arc<Mutex<VecDeque<String>>>>) -> impl IntoResponse {
+            let body = bodies.lock().unwrap().pop_front().expect("next response");
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let app = Router::new()
+            .route("/responses", post(respond))
+            .with_state(Arc::new(Mutex::new(VecDeque::from(bodies))));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), shutdown_tx, task)
     }
 
     async fn spawn_response_server(
@@ -1691,6 +1714,37 @@ mod tests {
             json!({"type":"response.output_item.done","sequence_number":6,"output_index":1,"item":tool_done.clone()}),
             json!({"type":"response.completed","sequence_number":7,"response":{"id":"resp_reasoning_tool","status":"completed","output":[reasoning,tool_done]}}),
         ])
+    }
+
+    fn plaintext_reasoning_and_tool_events() -> Vec<serde_json::Value> {
+        let reasoning = json!({
+            "id":"rs_plaintext",
+            "type":"reasoning",
+            "status":"completed",
+            "summary":[],
+            "format":"unknown",
+            "content":[{"type":"reasoning_text","text":"private-reasoning-sentinel"}]
+        });
+        let tool_done = json!({
+            "id":"call_item_1",
+            "type":"function_call",
+            "status":"completed",
+            "call_id":"call_1",
+            "name":"lookup",
+            "arguments":"{}"
+        });
+        vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":{"id":"rs_plaintext","type":"reasoning","status":"in_progress","summary":[],"content":[]}}),
+            json!({"type":"response.reasoning_text.delta","item_id":"rs_plaintext","output_index":0,"content_index":0,"delta":"private-reasoning-"}),
+            json!({"type":"response.reasoning_text.delta","item_id":"rs_plaintext","output_index":0,"content_index":0,"delta":"sentinel"}),
+            json!({"type":"response.reasoning_text.done","item_id":"rs_plaintext","output_index":0,"content_index":0,"text":"private-reasoning-sentinel"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":reasoning.clone()}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"id":"call_item_1","type":"function_call","status":"in_progress","call_id":"call_1","name":"lookup","arguments":""}}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"call_item_1","output_index":1,"delta":"{}"}),
+            json!({"type":"response.function_call_arguments.done","item_id":"call_item_1","output_index":1,"arguments":"{}"}),
+            json!({"type":"response.output_item.done","output_index":1,"item":tool_done.clone()}),
+            json!({"type":"response.completed","response":{"id":"resp_plaintext_tool","status":"completed","output":[reasoning,tool_done]}}),
+        ]
     }
 
     #[cfg(feature = "legacy-provider-port")]
@@ -2467,6 +2521,195 @@ mod tests {
 
         let _ = shutdown.send(());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plaintext_reasoning_remains_private_and_replays_before_tool_feedback() {
+        let (base, shutdown, server) = spawn_sse_sequence_server(vec![
+            encode_sse(plaintext_reasoning_and_tool_events()),
+            completed_text_sse(),
+        ])
+        .await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = provider(&base, None).with_observer(audit.clone());
+        let initial = ReactionPort::declare(&mut provider).unwrap();
+        let first: Vec<_> = ReactionPort::submit(&mut provider, full_frame(&initial))
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let first: Vec<_> = first.into_iter().map(Result::unwrap).collect();
+        assert_eq!(
+            first,
+            vec![
+                ProviderFact::ToolCall {
+                    output: ProviderOutputKey::new(1),
+                    ordinal: 1,
+                    call: ProviderToolCall::new("call_1", "lookup", "{}").unwrap(),
+                },
+                ProviderFact::ReactionCompleted { primary_text: None },
+            ]
+        );
+
+        let accepted = ReactionPort::declare(&mut provider).unwrap();
+        let feedback = full_frame_with_replay(
+            &accepted,
+            2,
+            vec![
+                crate::transcript::CanonicalInputItem::tool_call("call_1", "lookup", "{}").unwrap(),
+                crate::transcript::CanonicalInputItem::tool_result("call_1", "lookup succeeded")
+                    .unwrap(),
+            ],
+        );
+        let second: Vec<_> = ReactionPort::submit(&mut provider, feedback)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let second: Vec<_> = second.into_iter().map(Result::unwrap).collect();
+        assert!(second.iter().any(|fact| {
+            matches!(fact, ProviderFact::TextSealed { text, .. } if text == "hello")
+        }));
+        assert!(matches!(
+            second.last(),
+            Some(ProviderFact::ReactionCompleted {
+                primary_text: Some(_)
+            })
+        ));
+
+        let requests: Vec<serde_json::Value> = {
+            let observations = audit.events.lock().unwrap();
+            observations
+                .iter()
+                .filter_map(|event| match event {
+                    OpenAiResponsesObservation::Request { body, .. } => {
+                        Some(serde_json::from_slice(body).unwrap())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(requests.len(), 2);
+        let input = requests[1]["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["format"], "unknown");
+        assert_eq!(
+            input[0]["content"],
+            json!([{"type":"reasoning_text","text":"private-reasoning-sentinel"}])
+        );
+        assert!(input[0].get("encrypted_content").is_none());
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[2]["output"], "lookup succeeded");
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plaintext_reasoning_content_parts_require_a_matching_completed_lifecycle() {
+        let mut complete = plaintext_reasoning_and_tool_events();
+        complete.insert(
+            4,
+            json!({
+                "type":"response.content_part.done",
+                "item_id":"rs_plaintext","output_index":0,"content_index":0,
+                "part":{"type":"reasoning_text","text":"private-reasoning-sentinel"}
+            }),
+        );
+        complete.insert(
+            1,
+            json!({
+                "type":"response.content_part.added",
+                "item_id":"rs_plaintext","output_index":0,"content_index":0,
+                "part":{"type":"reasoning_text","text":""}
+            }),
+        );
+        let mut mismatch = complete.clone();
+        mismatch[5]["part"]["text"] = json!("different-private-reasoning");
+        let mut unfinished = complete.clone();
+        unfinished.remove(5);
+
+        for (events, accepted) in [(complete, true), (mismatch, false), (unfinished, false)] {
+            let (base, shutdown, server) = spawn_sse_server(encode_sse(events)).await;
+            let mut provider = provider(&base, None);
+            let declaration = ReactionPort::declare(&mut provider).unwrap();
+            let facts: Vec<_> = ReactionPort::submit(&mut provider, full_frame(&declaration))
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            if accepted {
+                assert!(matches!(
+                    facts.as_slice(),
+                    [
+                        Ok(ProviderFact::ToolCall { .. }),
+                        Ok(ProviderFact::ReactionCompleted { primary_text: None }),
+                    ]
+                ));
+            } else {
+                assert!(matches!(facts.as_slice(), [Err(fault)]
+                    if fault.kind() == ReactionPortFaultKind::Terminal
+                        && fault.code() == ReactionPortFaultCode::Protocol));
+            }
+            let _ = shutdown.send(());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_reasoning_rejects_stream_identity_and_body_mismatches() {
+        let mut wrong_item = plaintext_reasoning_and_tool_events();
+        wrong_item[1]["item_id"] = json!("different-reasoning-item");
+        let mut wrong_output = plaintext_reasoning_and_tool_events();
+        wrong_output[1]["output_index"] = json!(1);
+        let mut wrong_done = plaintext_reasoning_and_tool_events();
+        wrong_done[3]["text"] = json!("different-private-reasoning");
+        let mut wrong_seal = plaintext_reasoning_and_tool_events();
+        wrong_seal[4]["item"]["content"][0]["text"] = json!("different-private-reasoning");
+        let mut wrong_terminal = plaintext_reasoning_and_tool_events();
+        wrong_terminal[9]["response"]["output"][0]["content"][0]["text"] =
+            json!("different-private-reasoning");
+        let mut after_done = plaintext_reasoning_and_tool_events();
+        after_done.insert(4, after_done[1].clone());
+
+        for (name, events) in [
+            ("item identity", wrong_item),
+            ("output identity", wrong_output),
+            ("text done", wrong_done),
+            ("item seal", wrong_seal),
+            ("terminal body", wrong_terminal),
+            ("delta after text done", after_done),
+        ] {
+            let (base, shutdown, server) = spawn_sse_server(encode_sse(events)).await;
+            let mut provider = provider(&base, None);
+            let declaration = ReactionPort::declare(&mut provider).unwrap();
+            let facts: Vec<_> = ReactionPort::submit(&mut provider, full_frame(&declaration))
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            let fault = facts
+                .iter()
+                .find_map(|fact| fact.as_ref().err())
+                .unwrap_or_else(|| panic!("{name} was accepted"));
+            assert_eq!(fault.kind(), ReactionPortFaultKind::Terminal, "{name}");
+            assert_eq!(fault.code(), ReactionPortFaultCode::Protocol, "{name}");
+            assert_eq!(
+                fault.reason(),
+                ReactionPortFaultReason::ResponseProtocol,
+                "{name}"
+            );
+            assert!(facts
+                .iter()
+                .all(|fact| { matches!(fact, Ok(ProviderFact::ToolCall { .. }) | Err(_)) }));
+            assert!(!format!("{fault:?}").contains("private-reasoning"));
+
+            let _ = shutdown.send(());
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

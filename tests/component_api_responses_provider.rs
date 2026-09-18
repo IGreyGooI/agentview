@@ -196,6 +196,7 @@ enum ServerReply {
     ReasoningWithPlaintextCompletedContent,
     ReasoningTextDeltaWithOmittedTerminalContent,
     ReasoningTextDoneWithEmptyTerminalContent,
+    PlaintextReasoning(PlaintextReasoningCase),
     ReasoningWithMixedMalformedAddedContent,
     ReasoningWithMixedMalformedDoneContent,
     ReasoningWithMixedMalformedCompletedContent,
@@ -321,6 +322,21 @@ enum OutputItemAddedLifecycleFault {
 enum UnsealedPrivateKind {
     Reasoning,
     Compaction,
+}
+
+#[derive(Clone, Copy)]
+enum PlaintextReasoningCase {
+    Complete,
+    CompleteWithContentPartsAndFormat,
+    SealedThenEof,
+    WrongItemId,
+    WrongOutputIndex,
+    DeltaAfterDone,
+    StreamTextMismatch,
+    ItemTextMismatch,
+    TerminalTextMismatch,
+    OmittedDoneContent,
+    EmptyDoneContent,
 }
 
 #[derive(Clone, Copy)]
@@ -1666,6 +1682,104 @@ fn reasoning_text_stream_response(
     ])
 }
 
+const PLAINTEXT_REASONING_SENTINEL: &str = "plaintext-only-private-reasoning-sentinel";
+
+fn plaintext_only_reasoning_done() -> serde_json::Value {
+    serde_json::json!({
+        "id": "rs_plaintext",
+        "type": "reasoning",
+        "status": "completed",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": PLAINTEXT_REASONING_SENTINEL}],
+    })
+}
+
+fn plaintext_reasoning_response(case: PlaintextReasoningCase) -> Response {
+    let mut reasoning_done = plaintext_only_reasoning_done();
+    match case {
+        PlaintextReasoningCase::CompleteWithContentPartsAndFormat => {
+            reasoning_done["format"] = serde_json::json!("unknown");
+        }
+        PlaintextReasoningCase::ItemTextMismatch => {
+            reasoning_done["content"][0]["text"] =
+                serde_json::json!("mismatched-private-item-text-sentinel");
+        }
+        PlaintextReasoningCase::OmittedDoneContent => {
+            reasoning_done.as_object_mut().unwrap().remove("content");
+        }
+        PlaintextReasoningCase::EmptyDoneContent => {
+            reasoning_done["content"] = serde_json::json!([]);
+        }
+        _ => {}
+    }
+    let mut completed_reasoning = reasoning_done.clone();
+    if matches!(case, PlaintextReasoningCase::TerminalTextMismatch) {
+        completed_reasoning["content"][0]["text"] =
+            serde_json::json!("mismatched-private-terminal-text-sentinel");
+    }
+    let message_done = serde_json::json!({
+        "id": "msg_after_plaintext",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "<result value=\"alpha\" />", "annotations": []}],
+    });
+    let mut events = vec![
+        serde_json::json!({"type": "response.output_item.added", "output_index": 0, "item": {
+            "id": "rs_plaintext", "type": "reasoning", "status": "in_progress", "summary": [], "content": [],
+        }}),
+        serde_json::json!({"type": "response.reasoning_text.delta", "item_id": "rs_plaintext", "output_index": 0, "content_index": 0, "delta": "plaintext-only-private-"}),
+        serde_json::json!({"type": "response.reasoning_text.delta", "item_id": "rs_plaintext", "output_index": 0, "content_index": 0, "delta": "reasoning-sentinel"}),
+        serde_json::json!({"type": "response.reasoning_text.done", "item_id": "rs_plaintext", "output_index": 0, "content_index": 0, "text": PLAINTEXT_REASONING_SENTINEL}),
+        serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": reasoning_done}),
+        serde_json::json!({"type": "response.output_item.added", "output_index": 1, "item": {
+            "id": "msg_after_plaintext", "type": "message", "status": "in_progress", "role": "assistant", "content": [],
+        }}),
+        serde_json::json!({"type": "response.output_text.delta", "item_id": "msg_after_plaintext", "output_index": 1, "content_index": 0, "delta": "<result value=\"alpha\" />"}),
+        serde_json::json!({"type": "response.output_text.done", "item_id": "msg_after_plaintext", "output_index": 1, "content_index": 0, "text": "<result value=\"alpha\" />"}),
+        serde_json::json!({"type": "response.output_item.done", "output_index": 1, "item": message_done.clone()}),
+        serde_json::json!({"type": "response.completed", "response": {"id": "resp_plaintext", "status": "completed", "output": [completed_reasoning, message_done]}}),
+    ];
+    match case {
+        PlaintextReasoningCase::CompleteWithContentPartsAndFormat => {
+            events[0]["item"]["format"] = serde_json::json!("unknown");
+            events.insert(4, serde_json::json!({
+                "type": "response.content_part.done", "item_id": "rs_plaintext", "output_index": 0, "content_index": 0,
+                "part": {"type": "reasoning_text", "text": PLAINTEXT_REASONING_SENTINEL},
+            }));
+            events.insert(1, serde_json::json!({
+                "type": "response.content_part.added", "item_id": "rs_plaintext", "output_index": 0, "content_index": 0,
+                "part": {"type": "reasoning_text", "text": ""},
+            }));
+        }
+        PlaintextReasoningCase::SealedThenEof => events.truncate(5),
+        PlaintextReasoningCase::WrongItemId => {
+            events[1]["item_id"] = serde_json::json!("orphan-private-item-sentinel");
+        }
+        PlaintextReasoningCase::WrongOutputIndex => {
+            events[1]["output_index"] = serde_json::json!(1);
+        }
+        PlaintextReasoningCase::DeltaAfterDone => {
+            events.insert(4, events[1].clone());
+        }
+        PlaintextReasoningCase::StreamTextMismatch => {
+            events[3]["text"] = serde_json::json!("mismatched-private-stream-text-sentinel");
+        }
+        _ => {}
+    }
+    for (index, event) in events.iter_mut().enumerate() {
+        event["sequence_number"] = serde_json::json!(index + 1);
+        if matches!(
+            event["type"].as_str(),
+            Some("response.reasoning_text.delta" | "response.reasoning_text.done")
+        ) {
+            let _: ResponseStreamEvent = serde_json::from_value(event.clone())
+                .expect("plaintext reasoning stream fixture matches the pinned schema");
+        }
+    }
+    sse_response(events)
+}
+
 async fn responses_endpoint(State(state): State<ServerState>, body: Bytes) -> Response {
     let attempt = state.attempts.fetch_add(1, Ordering::SeqCst);
     state.bodies.send(body.to_vec()).unwrap();
@@ -1970,7 +2084,7 @@ async fn responses_endpoint(State(state): State<ServerState>, body: Bytes) -> Re
         ServerReply::ReasoningWithPlaintextDoneContent => reasoning_response(
             Some(serde_json::json!([])),
             Some(plaintext_reasoning_content()),
-            Some(serde_json::json!([])),
+            Some(plaintext_reasoning_content()),
         ),
         ServerReply::ReasoningWithPlaintextCompletedContent => reasoning_response(
             Some(serde_json::json!([])),
@@ -2001,6 +2115,7 @@ async fn responses_endpoint(State(state): State<ServerState>, body: Bytes) -> Re
             }),
             Some(serde_json::json!([])),
         ),
+        ServerReply::PlaintextReasoning(case) => plaintext_reasoning_response(case),
         ServerReply::ReasoningWithMixedMalformedAddedContent => reasoning_response(
             Some(mixed_malformed_reasoning_content()),
             Some(serde_json::json!([])),
@@ -4566,7 +4681,7 @@ async fn response_completed_rejects_added_unsealed_private_lifecycles() {
 }
 
 #[tokio::test]
-async fn reasoning_done_without_exact_encrypted_content_is_rejected_immediately() {
+async fn reasoning_done_without_replayable_content_is_rejected_immediately() {
     let (api_base, attempts, _bodies, shutdown, server) =
         spawn_server(ServerReply::ObservationalReasoning).await;
     let mut provider = provider(api_base);
@@ -5468,152 +5583,320 @@ async fn reasoning_null_content_is_rejected_at_each_lifecycle_boundary() {
 }
 
 #[tokio::test]
-async fn plaintext_reasoning_content_is_rejected_as_unsupported_without_leakage() {
+async fn plaintext_reasoning_with_encryption_stays_private_and_replays_done_content() {
     let cases = [
         (
-            "added",
+            "added-content",
             ServerReply::ReasoningWithPlaintextAddedContent,
+            "plaintext-reasoning-secret",
             false,
         ),
         (
-            "done",
+            "done-content",
             ServerReply::ReasoningWithPlaintextDoneContent,
+            "plaintext-reasoning-secret",
+            true,
+        ),
+        (
+            "delta-with-omitted-content",
+            ServerReply::ReasoningTextDeltaWithOmittedTerminalContent,
+            "plaintext-reasoning-delta-secret",
             false,
         ),
         (
-            "completed",
-            ServerReply::ReasoningWithPlaintextCompletedContent,
-            true,
+            "done-with-empty-content",
+            ServerReply::ReasoningTextDoneWithEmptyTerminalContent,
+            "plaintext-reasoning-done-secret",
+            false,
         ),
     ];
 
-    for (name, reply, retains_sealed_text) in cases {
+    for (name, reply, sentinel, retains_plaintext) in cases {
         let (api_base, attempts, mut bodies, shutdown, server) =
             spawn_sequence_server(vec![reply, ServerReply::Completed]).await;
         let mut provider = provider(api_base);
-        let projection = default_sample_projection();
-
-        let fault =
-            expect_provider_failure(execute_provider(&mut provider, projection.clone()).await);
-
-        assert_eq!(
-            fault.kind(),
-            ProviderFaultKind::ModelRejected,
-            "case {name}"
-        );
-        assert_eq!(
-            fault.code(),
-            ProviderFaultCode::ModelRejected,
-            "case {name}"
-        );
-        assert_eq!(
-            fault.message(),
-            "plaintext OpenAI reasoning content is not supported by this adapter version",
-            "case {name}"
-        );
-        assert!(
-            !format!("{fault:?}\n{fault}").contains("plaintext-reasoning-secret"),
-            "case {name}"
-        );
-        let rejected_request: serde_json::Value =
-            serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
-        execute_provider(&mut provider, projection)
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let events = execute_provider(&mut provider, default_sample_projection())
+            .with_subscriber(capture_subscriber(Arc::clone(&logs)))
             .await
-            .expect("plaintext rejection retains only the already handed-off input");
-        let retry_request: serde_json::Value =
-            serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
-        let rejected_input = rejected_request["input"].as_array().unwrap();
-        let retry_input = retry_request["input"].as_array().unwrap();
-        if retains_sealed_text {
-            assert_eq!(
-                &retry_input[..rejected_input.len()],
-                &rejected_input[..],
-                "case {name}"
-            );
-            let retained = &retry_input[rejected_input.len()..];
-            assert_eq!(retained.len(), 2, "case {name}");
-            assert_eq!(retained[0]["type"], "reasoning", "case {name}");
-            assert_eq!(
-                retained[0]["encrypted_content"], "encrypted-reasoning-1",
-                "case {name}"
-            );
-            assert_eq!(retained[1]["role"], "assistant", "case {name}");
-            assert!(retained[1]
-                .to_string()
-                .contains("<result value=\\\"alpha\\\" />"));
-        } else {
-            assert_eq!(retry_request, rejected_request, "case {name}");
-        }
-        assert!(
-            !retry_request
-                .to_string()
-                .contains("plaintext-reasoning-secret"),
+            .expect("plaintext reasoning metadata is accepted privately");
+        assert_eq!(
+            text_trace(events),
+            vec![
+                ("delta", String::from("<result value=\"alpha\" />")),
+                ("complete", String::from("<result value=\"alpha\" />")),
+            ],
             "case {name}"
         );
+        assert!(
+            !String::from_utf8(logs.lock().unwrap().clone())
+                .unwrap()
+                .contains(sentinel),
+            "case {name}"
+        );
+        execute_provider(
+            &mut provider,
+            sample_projection(
+                "Inspect the actual result and continue.",
+                "reasoning-turn-2",
+            ),
+        )
+        .await
+        .expect("accepted reasoning retains a valid continuation");
+
+        let _first = bodies.recv().await.unwrap();
+        let continued: serde_json::Value =
+            serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
+        let input = continued["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4, "case {name}");
+        assert_eq!(input[1]["type"], "reasoning", "case {name}");
+        assert_eq!(
+            input[1]["encrypted_content"], "encrypted-reasoning-1",
+            "case {name}"
+        );
+        assert_eq!(
+            input[1].to_string().contains(sentinel),
+            retains_plaintext,
+            "case {name}: only authoritative done content is replayed"
+        );
+        assert_eq!(input[2]["role"], "assistant", "case {name}");
+        assert!(input[3].to_string().contains("reasoning-turn-2"));
         assert_eq!(attempts.load(Ordering::SeqCst), 2, "case {name}");
         shutdown.send(()).unwrap();
         server.await.unwrap();
     }
 }
 
-async fn assert_reasoning_text_stream_rejection(reply: ServerReply, sentinel: &str) {
-    let (api_base, attempts, mut bodies, shutdown, server) =
-        spawn_sequence_server(vec![reply, ServerReply::Completed]).await;
+#[tokio::test]
+async fn plaintext_reasoning_only_in_completed_is_a_redacted_ledger_fault() {
+    let (api_base, attempts, mut bodies, shutdown, server) = spawn_sequence_server(vec![
+        ServerReply::ReasoningWithPlaintextCompletedContent,
+        ServerReply::Completed,
+    ])
+    .await;
     let mut provider = provider(api_base);
     let projection = default_sample_projection();
-
     let execution = trace_provider(&mut provider, projection.clone()).await;
-    assert!(
-        execution.events.is_empty(),
-        "plaintext reasoning must not publish partial or complete text"
+    assert_eq!(
+        text_trace(execution.events),
+        vec![("delta", String::from("<result value=\"alpha\" />"))]
     );
     let fault = execution
         .fault
-        .expect("plaintext reasoning stream metadata must be rejected");
-    assert_eq!(fault.kind(), ProviderFaultKind::ModelRejected);
-    assert_eq!(fault.code(), ProviderFaultCode::ModelRejected);
-    assert_eq!(
-        fault.message(),
-        "plaintext OpenAI reasoning content is not supported by this adapter version"
-    );
-    assert!(!format!("{fault:?}\n{fault}").contains(sentinel));
-    assert_eq!(
-        attempts.load(Ordering::SeqCst),
-        1,
-        "the adapter must not amplify a deterministic rejection"
-    );
-
-    let rejected_request: serde_json::Value =
-        serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
+        .expect("terminal reasoning cannot replace sealed content");
+    assert_eq!(fault.code(), ProviderFaultCode::ResponseEventShape);
+    assert!(!format!("{fault:?}\n{fault}").contains("plaintext-reasoning-secret"));
     execute_provider(&mut provider, projection)
         .await
-        .expect("reasoning stream rejection retains only the already handed-off input");
-    let retry_request: serde_json::Value =
-        serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
-    assert_eq!(retry_request, rejected_request);
-    assert!(!retry_request.to_string().contains(sentinel));
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        .expect("a terminal mismatch keeps the already sealed private item");
 
+    let _first = bodies.recv().await.unwrap();
+    let continued: serde_json::Value =
+        serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
+    let input = continued["input"].as_array().unwrap();
+    assert_eq!(input.len(), 3);
+    assert_eq!(input[1]["type"], "reasoning");
+    assert_eq!(input[1]["encrypted_content"], "encrypted-reasoning-1");
+    assert!(!continued.to_string().contains("plaintext-reasoning-secret"));
+    assert_eq!(input[2]["role"], "assistant");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
     shutdown.send(()).unwrap();
     server.await.unwrap();
 }
 
 #[tokio::test]
-async fn reasoning_text_delta_with_omitted_terminal_content_is_rejected_immediately() {
-    assert_reasoning_text_stream_rejection(
-        ServerReply::ReasoningTextDeltaWithOmittedTerminalContent,
-        "plaintext-reasoning-delta-secret",
-    )
-    .await;
+async fn plaintext_reasoning_without_encryption_replays_once_before_public_text() {
+    for case in [
+        PlaintextReasoningCase::Complete,
+        PlaintextReasoningCase::CompleteWithContentPartsAndFormat,
+    ] {
+        let (api_base, attempts, mut bodies, shutdown, server) = spawn_sequence_server(vec![
+            ServerReply::PlaintextReasoning(case),
+            ServerReply::Completed,
+        ])
+        .await;
+        let mut provider = provider(api_base);
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let first_events = execute_provider(&mut provider, default_sample_projection())
+            .with_subscriber(capture_subscriber(Arc::clone(&logs)))
+            .await
+            .expect("streamed plaintext reasoning needs no encrypted content");
+        assert_eq!(
+            text_trace(first_events),
+            vec![
+                ("delta", String::from("<result value=\"alpha\" />")),
+                ("complete", String::from("<result value=\"alpha\" />")),
+            ]
+        );
+        assert!(!String::from_utf8(logs.lock().unwrap().clone())
+            .unwrap()
+            .contains(PLAINTEXT_REASONING_SENTINEL));
+        execute_provider(
+            &mut provider,
+            sample_projection(
+                "Inspect the actual result and continue.",
+                "plaintext-turn-2",
+            ),
+        )
+        .await
+        .expect("plaintext private history supports the next reaction");
+
+        let _first = bodies.recv().await.unwrap();
+        let continued: serde_json::Value =
+            serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
+        assert!(continued.get("previous_response_id").is_none());
+        let input = continued["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+        let mut expected_reasoning = plaintext_only_reasoning_done();
+        if matches!(
+            case,
+            PlaintextReasoningCase::CompleteWithContentPartsAndFormat
+        ) {
+            expected_reasoning["format"] = serde_json::json!("unknown");
+        }
+        assert_eq!(input[1], expected_reasoning);
+        assert!(input[1].get("encrypted_content").is_none());
+        assert_eq!(input[2]["role"], "assistant");
+        assert!(input[3].to_string().contains("plaintext-turn-2"));
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            1
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]
-async fn reasoning_text_done_with_empty_terminal_content_is_rejected_immediately() {
-    assert_reasoning_text_stream_rejection(
-        ServerReply::ReasoningTextDoneWithEmptyTerminalContent,
-        "plaintext-reasoning-done-secret",
-    )
+async fn plaintext_reasoning_sealed_before_eof_stays_private_and_replayable() {
+    let (api_base, attempts, mut bodies, shutdown, server) = spawn_sequence_server(vec![
+        ServerReply::PlaintextReasoning(PlaintextReasoningCase::SealedThenEof),
+        ServerReply::Completed,
+    ])
     .await;
+    let mut provider = provider(api_base);
+    let projection = default_sample_projection();
+    let execution = trace_provider(&mut provider, projection.clone()).await;
+    assert!(execution.events.is_empty());
+    let fault = execution
+        .fault
+        .expect("EOF still requires response.completed");
+    assert!(fault.message().contains("without response.completed"));
+    assert!(!format!("{fault:?}\n{fault}").contains(PLAINTEXT_REASONING_SENTINEL));
+    execute_provider(&mut provider, projection)
+        .await
+        .expect("sealed plaintext reasoning survives a later stream failure");
+
+    let _first = bodies.recv().await.unwrap();
+    let continued: serde_json::Value =
+        serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
+    let input = continued["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2);
+    assert_eq!(input[1], plaintext_only_reasoning_done());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    shutdown.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_plaintext_reasoning_lifecycles_fail_without_private_text_leakage() {
+    let cases = [
+        ("wrong-item-id", PlaintextReasoningCase::WrongItemId),
+        (
+            "wrong-output-index",
+            PlaintextReasoningCase::WrongOutputIndex,
+        ),
+        ("delta-after-done", PlaintextReasoningCase::DeltaAfterDone),
+        (
+            "stream-text-mismatch",
+            PlaintextReasoningCase::StreamTextMismatch,
+        ),
+        (
+            "item-text-mismatch",
+            PlaintextReasoningCase::ItemTextMismatch,
+        ),
+        (
+            "terminal-text-mismatch",
+            PlaintextReasoningCase::TerminalTextMismatch,
+        ),
+        (
+            "omitted-done-content",
+            PlaintextReasoningCase::OmittedDoneContent,
+        ),
+        (
+            "empty-done-content",
+            PlaintextReasoningCase::EmptyDoneContent,
+        ),
+    ];
+    for (name, case) in cases {
+        let (api_base, attempts, mut bodies, shutdown, server) = spawn_sequence_server(vec![
+            ServerReply::PlaintextReasoning(case),
+            ServerReply::Completed,
+        ])
+        .await;
+        let mut provider = provider(api_base);
+        let projection = default_sample_projection();
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let execution = trace_provider(&mut provider, projection.clone())
+            .with_subscriber(capture_subscriber(Arc::clone(&logs)))
+            .await;
+        let public_text = text_trace(execution.events);
+        assert!(
+            public_text
+                .iter()
+                .all(|(kind, text)| *kind != "complete" && !text.contains("sentinel")),
+            "case {name}"
+        );
+        let fault = execution
+            .fault
+            .expect("invalid private lifecycle must fail closed");
+        assert_eq!(
+            fault.code(),
+            ProviderFaultCode::ResponseEventShape,
+            "case {name}"
+        );
+        assert!(
+            !format!("{fault:?}\n{fault}").contains("sentinel"),
+            "case {name}"
+        );
+        assert!(
+            !String::from_utf8(logs.lock().unwrap().clone())
+                .unwrap()
+                .contains("sentinel"),
+            "case {name}"
+        );
+        execute_provider(&mut provider, projection)
+            .await
+            .expect("a failed private lifecycle permits a valid independent continuation");
+        let _first = bodies.recv().await.unwrap();
+        let continued: serde_json::Value =
+            serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
+        let reasoning: Vec<_> = continued["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .collect();
+        if matches!(case, PlaintextReasoningCase::TerminalTextMismatch) {
+            assert_eq!(
+                reasoning,
+                vec![&plaintext_only_reasoning_done()],
+                "case {name}"
+            );
+        } else {
+            assert!(
+                reasoning.is_empty(),
+                "case {name}: unsealed reasoning is not retained"
+            );
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "case {name}");
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]
