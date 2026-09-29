@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
+    num::NonZeroU64,
     sync::{atomic::Ordering, Arc, Mutex},
     task::Poll,
 };
@@ -32,6 +33,7 @@ use super::{
     has_unsupported_content_part, has_unsupported_lifecycle_item, is_native_tool_event,
     native_function_call,
     output::{OpenAiOutputLedger, SealedOpenAiPrivateOutput},
+    parallel_compaction::{CompactionContext, CompactionTransport, ContextEstimate},
     reaction_fault::{map_openai_fault, OpenAiFailureClass, OpenAiReactionFailure},
     request_observation::{observe_request, OpenAiResponsesRequestSnapshot},
     responses_observation::{
@@ -55,13 +57,96 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             .frame_native_declaration()
             .map_err(SubmitFault::Rejected)?;
         frame.check_handoff_precondition(&declaration)?;
+        let context_window_tokens = frame
+            .prepared_profile()
+            .constraints
+            .context_window
+            .tokens()
+            .ok_or_else(|| {
+                rejected(
+                    OpenAiFailureClass::RequestPreparation,
+                    "model context window is missing",
+                )
+            })?;
+        let mut compacted_base = self
+            .parallel_compaction
+            .prepare_base(self.reaction_frame.as_ref(), &frame, &self.encoder)
+            .map_err(frame_submit_fault)?;
+        let base = compacted_base
+            .as_ref()
+            .map(|(_, state)| state)
+            .or(self.reaction_frame.as_ref());
         let prepared = ResponsesFrameRequestState::prepare(
-            self.reaction_frame.as_ref(),
+            base,
             &frame,
             &self.encoder,
             self.max_responses_serialized_request_body_bytes,
-        )
-        .map_err(frame_submit_fault)?;
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(ResponsesFrameRequestFault::ContextWindowLimit)
+                if self.forced_compaction_enabled && compacted_base.is_none() =>
+            {
+                if !self.parallel_compaction.has_attempt() {
+                    let source = self
+                        .reaction_frame
+                        .as_ref()
+                        .and_then(ResponsesFrameRequestState::compaction_source);
+                    if let Some(source) = self.parallel_compaction.select_forced_source(source) {
+                        let transport = self.compaction_transport(context_window_tokens);
+                        self.parallel_compaction.start(source, transport);
+                    }
+                }
+                if !self.parallel_compaction.wait_ready(self.read_timeout).await {
+                    return Err(frame_submit_fault(
+                        ResponsesFrameRequestFault::ContextWindowLimit,
+                    ));
+                }
+                compacted_base = self
+                    .parallel_compaction
+                    .prepare_base(self.reaction_frame.as_ref(), &frame, &self.encoder)
+                    .map_err(frame_submit_fault)?;
+                let Some((_, forced_base)) = compacted_base.as_ref() else {
+                    return Err(frame_submit_fault(
+                        ResponsesFrameRequestFault::ContextWindowLimit,
+                    ));
+                };
+                ResponsesFrameRequestState::prepare(
+                    Some(forced_base),
+                    &frame,
+                    &self.encoder,
+                    self.max_responses_serialized_request_body_bytes,
+                )
+                .map_err(frame_submit_fault)?
+            }
+            Err(error) => return Err(frame_submit_fault(error)),
+        };
+        let compaction_source = if compacted_base.is_none()
+            && self.parallel_compaction_enabled
+            && !self.parallel_compaction.has_attempt()
+        {
+            let source = self
+                .reaction_frame
+                .as_ref()
+                .and_then(ResponsesFrameRequestState::compaction_source);
+            let context = CompactionContext {
+                requested_context: frame
+                    .requested_context_bytes()
+                    .map(ContextEstimate::from_bytes),
+                provider_context: ContextEstimate::from_bytes(prepared.request_body.len()),
+                compactable_context: ContextEstimate::from_bytes(
+                    source.as_ref().map_or(0, |source| source.input_bytes),
+                ),
+                context_window_tokens,
+                reserved_output_tokens: frame.prepared_profile().constraints.reserved_output_tokens,
+            };
+            self.parallel_compaction.select_source(source, &context)
+        } else {
+            None
+        };
+        let compaction_transport = compaction_source
+            .as_ref()
+            .map(|_| self.compaction_transport(context_window_tokens));
         serde_json::from_slice::<Value>(&prepared.request_body).map_err(|_| {
             rejected(
                 OpenAiFailureClass::RequestPreparation,
@@ -147,6 +232,12 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         })
         .await?;
 
+        if let Some((id, _)) = compacted_base {
+            self.parallel_compaction.installed(id);
+        }
+        if let Some((source, transport)) = compaction_source.zip(compaction_transport) {
+            self.parallel_compaction.start(source, transport);
+        }
         let mut continuity = PostHandoffContinuity::new(target);
         observe_request(&request_observer, request_snapshot);
         let pending = async move {
@@ -290,6 +381,10 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             observation_failed,
         ))
     }
+
+    async fn shutdown(&mut self) {
+        self.parallel_compaction.shutdown().await;
+    }
 }
 
 impl ResettableReactionPort for AsyncOpenAiResponsesProvider {
@@ -310,11 +405,24 @@ impl ResettableReactionPort for AsyncOpenAiResponsesProvider {
         // A later Full must be rebuilt from its Frame, not reconciled against
         // the prior wire prefix or its provider output.
         self.reaction_frame = None;
+        self.parallel_compaction.reset();
         Ok(declaration)
     }
 }
 
 impl AsyncOpenAiResponsesProvider {
+    fn compaction_transport(&self, context_window_tokens: NonZeroU64) -> CompactionTransport {
+        CompactionTransport {
+            client: self.client.clone(),
+            config: self.config.clone(),
+            encoder: self.encoder.clone(),
+            request_limit: self.max_responses_serialized_request_body_bytes,
+            response_limit: self.max_response_body_bytes,
+            read_timeout: self.read_timeout,
+            context_window_tokens,
+        }
+    }
+
     fn frame_native_declaration(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
         if self.observation_failed.load(Ordering::Acquire) {
             return Err(observation_fault());
@@ -1099,7 +1207,13 @@ mod tests {
         };
         let identity =
             ProviderIdentity::new("openai", "native-responses", 1, "native-test").unwrap();
-        let options = CodexHttpV1Options::new("test-model", None, None, None::<String>).unwrap();
+        let options = CodexHttpV1Options::new(
+            crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+            None,
+            None,
+            None::<String>,
+        )
+        .unwrap();
         AsyncOpenAiResponsesProvider::try_new(config, identity, CodexHttpV1Encoder::new(options))
             .unwrap()
     }

@@ -9,6 +9,7 @@ use agentview::{
     provider::{
         async_openai::{AsyncOpenAiResponsesProvider, AsyncOpenAiTransportConfig},
         codex_http_v1::{CodexHttpV1Encoder, CodexHttpV1Options, CODEX_HTTP_V1_PROFILE},
+        ModelSpec,
     },
 };
 use chess::{Board, BoardStatus, Color, MoveGen};
@@ -46,7 +47,7 @@ const MAX_MODEL_BYTES: usize = 256;
 const MAX_API_KEY_BYTES: usize = 4 * 1024;
 
 pub(crate) struct LiveConfig {
-    model: String,
+    model: ModelSpec,
     api_key: String,
     api_base: String,
     effective_provider: EffectiveProviderConfig,
@@ -59,6 +60,8 @@ pub(crate) struct LiveConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LiveConfigError {
     InvalidModel,
+    MissingContextWindow,
+    InvalidContextWindow,
     MissingApiKey,
     InvalidApiKey,
     InvalidApiBase,
@@ -121,8 +124,9 @@ pub(crate) fn build_responses_provider(
         .map_err(|_| LiveSetupError::ProviderInitialization)?;
     let identity = ProviderIdentity::new("openai", CODEX_HTTP_V1_PROFILE, 1, LIVE_PROVIDER_BINDING)
         .map_err(|_| LiveSetupError::ProviderInitialization)?;
-    let options = CodexHttpV1Options::new(config.model(), None, None, Some(prompt_cache_key))
-        .map_err(|_| LiveSetupError::ProviderInitialization)?;
+    let options =
+        CodexHttpV1Options::new(config.model().clone(), None, None, Some(prompt_cache_key))
+            .map_err(|_| LiveSetupError::ProviderInitialization)?;
 
     AsyncOpenAiResponsesProvider::try_new(transport, identity, CodexHttpV1Encoder::new(options))
         .map(|provider| {
@@ -466,6 +470,12 @@ impl LiveConfig {
         mut read: impl FnMut(&str) -> Option<OsString>,
     ) -> Result<Self, LiveConfigError> {
         let model = optional_model(read("AGENTVIEW_MODEL"))?;
+        let context_window_tokens: std::num::NonZeroU64 = read("AGENTVIEW_CONTEXT_WINDOW_TOKENS")
+            .ok_or(LiveConfigError::MissingContextWindow)?
+            .into_string()
+            .map_err(|_| LiveConfigError::InvalidContextWindow)?
+            .parse()
+            .map_err(|_| LiveConfigError::InvalidContextWindow)?;
         let api_key = required_api_key(read("OPENAI_API_KEY"))?;
         let api_base = optional_unicode(read("OPENAI_BASE_URL"), DEFAULT_API_BASE)?;
         let stockfish_program = read("AGENTVIEW_STOCKFISH_BIN")
@@ -477,6 +487,8 @@ impl LiveConfig {
         AsyncOpenAiTransportConfig::new(&api_base, "validation-placeholder")
             .map_err(|_| LiveConfigError::InvalidApiBase)?;
         let effective_provider = effective_provider_config(&model, &parsed_api_base)?;
+        let model = ModelSpec::new(model, context_window_tokens.get())
+            .map_err(|_| LiveConfigError::InvalidModel)?;
         if !stockfish_program.is_absolute() || stockfish_program.as_os_str().is_empty() {
             return Err(LiveConfigError::InvalidStockfishProgram);
         }
@@ -499,7 +511,7 @@ impl LiveConfig {
         })
     }
 
-    pub(crate) fn model(&self) -> &str {
+    pub(crate) fn model(&self) -> &ModelSpec {
         &self.model
     }
 

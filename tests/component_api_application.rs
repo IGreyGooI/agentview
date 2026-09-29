@@ -9,9 +9,9 @@ use std::{
 
 use agentview::component::{
     execution::{
-        Application, Frame, FrameCapabilities, FrameConstraints, FrameProfile, ProviderFact,
-        ProviderFactStream, ReactionPort, ReactionPortFault, SubmitFault, TargetDeclaration,
-        TargetEpoch, TargetIdentity,
+        Application, ContextWindow, Frame, FrameCapabilities, FrameConstraints, FrameProfile,
+        ProviderFact, ProviderFactStream, ReactionPort, ReactionPortFault, SubmitFault,
+        TargetDeclaration, TargetEpoch, TargetIdentity,
     },
     prelude::{component, view, Component},
 };
@@ -74,7 +74,7 @@ async fn public_application_mounts_reacts_and_shuts_down_through_the_curated_own
         FrameConstraints {
             max_frame_bytes: 4_096,
             max_component_bytes: 1_024,
-            context_window_tokens: None,
+            context_window: ContextWindow::NotApplicable,
             reserved_output_tokens: None,
         },
         FrameCapabilities::NONE,

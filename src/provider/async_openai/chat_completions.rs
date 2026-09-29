@@ -37,6 +37,7 @@ use crate::{
         ProviderIdentity,
     },
     pom_renderer::PomRenderError,
+    provider::ModelSpec,
     transcript::CanonicalTranscriptError,
 };
 #[cfg(feature = "legacy-provider-port")]
@@ -95,24 +96,20 @@ pub(super) enum ChatCompletionsConfigError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct OpenAiChatCompletionsOptions {
-    model: String,
+    model: ModelSpec,
     max_tokens: Option<u64>,
     temperature: Option<serde_json::Number>,
     include_usage: bool,
 }
 
 impl OpenAiChatCompletionsOptions {
-    pub(super) fn new(model: impl Into<String>) -> Result<Self, OpenAiChatCompletionsError> {
-        let model = model.into();
-        if model.is_empty() {
-            return Err(OpenAiChatCompletionsError::EmptyModel);
-        }
-        Ok(Self {
+    pub(super) fn new(model: ModelSpec) -> Self {
+        Self {
             model,
             max_tokens: None,
             temperature: None,
             include_usage: false,
-        })
+        }
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u64) -> Result<Self, OpenAiChatCompletionsError> {
@@ -143,7 +140,7 @@ impl OpenAiChatCompletionsOptions {
         self
     }
 
-    fn model(&self) -> &str {
+    fn model(&self) -> &ModelSpec {
         &self.model
     }
 }
@@ -186,7 +183,11 @@ impl AsyncOpenAiChatCompletionsProvider {
         options: OpenAiChatCompletionsOptions,
     ) -> Result<Self, ChatCompletionsConfigError> {
         let chat_completions_frame_profile = super::chat_completions_frame_profile(
-            config.chat_completions_frame_constraints.clone(),
+            config.chat_completions_frame_limits.constraints(
+                crate::component::execution::ContextWindow::Tokens(
+                    options.model().context_window_tokens(),
+                ),
+            ),
         )?;
         let initialized = super::transport::initialize(config)?;
         let reaction_target = ChatReactionTarget::new(chat_completions_frame_profile)?;
@@ -833,8 +834,6 @@ struct ChatWireDelta {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub(super) enum OpenAiChatCompletionsError {
-    #[error("Chat Completions model must be non-empty")]
-    EmptyModel,
     #[error("Chat Completions max_tokens must be greater than zero")]
     ZeroMaxTokens,
     #[error("Chat Completions temperature must be finite and between zero and two")]
@@ -870,8 +869,8 @@ mod frame_profile_tests {
     use std::sync::atomic::AtomicU64;
 
     use crate::component::execution::reaction::{
-        FrameConstraints, FrameRevision, ReactionPortFaultKind, ReactionPortFaultReason,
-        TargetContinuity,
+        ContextWindow, FrameConstraints, FrameRevision, ReactionPortFaultKind,
+        ReactionPortFaultReason, TargetContinuity,
     };
 
     use super::*;
@@ -884,28 +883,43 @@ mod frame_profile_tests {
     fn temperature_rejects_nonfinite_or_out_of_range_values() {
         for temperature in [f64::NAN, f64::INFINITY, -0.1, 2.1] {
             assert!(matches!(
-                OpenAiChatCompletionsOptions::new("test-model")
-                    .unwrap()
-                    .with_temperature(temperature),
+                OpenAiChatCompletionsOptions::new(
+                    crate::provider::ModelSpec::new("test-model", 272_000).unwrap()
+                )
+                .with_temperature(temperature),
                 Err(OpenAiChatCompletionsError::InvalidTemperature)
             ));
         }
         for temperature in [0.0, 0.2, 2.0] {
-            assert!(OpenAiChatCompletionsOptions::new("test-model")
-                .unwrap()
-                .with_temperature(temperature)
-                .is_ok());
+            assert!(OpenAiChatCompletionsOptions::new(
+                crate::provider::ModelSpec::new("test-model", 272_000).unwrap()
+            )
+            .with_temperature(temperature)
+            .is_ok());
         }
     }
 
     fn provider(config: AsyncOpenAiTransportConfig) -> AsyncOpenAiChatCompletionsProvider {
+        provider_with_window(config, 272_000)
+    }
+
+    fn provider_with_window(
+        config: AsyncOpenAiTransportConfig,
+        context_window_tokens: u64,
+    ) -> AsyncOpenAiChatCompletionsProvider {
         let identity = ProviderIdentity::new("openai", "chat-frame-profile", 1, "test").unwrap();
-        let options = OpenAiChatCompletionsOptions::new("test-model").unwrap();
+        let options = OpenAiChatCompletionsOptions::new(
+            crate::provider::ModelSpec::new("gpt-5.4", context_window_tokens).unwrap(),
+        );
         AsyncOpenAiChatCompletionsProvider::try_new(config, identity, options).unwrap()
     }
 
     fn assert_invalid(constraints: FrameConstraints) {
-        let error = match config().with_chat_completions_frame_constraints(constraints) {
+        let error = match config().with_chat_completions_frame_limits(
+            constraints.max_frame_bytes,
+            constraints.max_component_bytes,
+            constraints.reserved_output_tokens,
+        ) {
             Ok(_) => panic!("invalid Chat Frame constraints were accepted"),
             Err(error) => error,
         };
@@ -922,7 +936,7 @@ mod frame_profile_tests {
             FrameConstraints {
                 max_frame_bytes: 16 * 1024 * 1024,
                 max_component_bytes: 4 * 1024 * 1024,
-                context_window_tokens: None,
+                context_window: ContextWindow::Tokens(NonZeroU64::new(272_000).unwrap()),
                 reserved_output_tokens: None,
             }
         );
@@ -939,13 +953,18 @@ mod frame_profile_tests {
         let constraints = FrameConstraints {
             max_frame_bytes: 32 * 1024,
             max_component_bytes: 8 * 1024,
-            context_window_tokens: Some(128_000),
+            context_window: ContextWindow::Tokens(std::num::NonZeroU64::new(128_000).unwrap()),
             reserved_output_tokens: Some(8_192),
         };
-        let provider = provider(
+        let provider = provider_with_window(
             config()
-                .with_chat_completions_frame_constraints(constraints.clone())
+                .with_chat_completions_frame_limits(
+                    constraints.max_frame_bytes,
+                    constraints.max_component_bytes,
+                    constraints.reserved_output_tokens,
+                )
                 .unwrap(),
+            128_000,
         );
 
         assert_eq!(
@@ -964,7 +983,7 @@ mod frame_profile_tests {
         let valid = FrameConstraints {
             max_frame_bytes: 1_024,
             max_component_bytes: 256,
-            context_window_tokens: Some(4_096),
+            context_window: ContextWindow::Tokens(std::num::NonZeroU64::new(4_096).unwrap()),
             reserved_output_tokens: Some(512),
         };
         assert_invalid(FrameConstraints {
@@ -973,10 +992,6 @@ mod frame_profile_tests {
         });
         assert_invalid(FrameConstraints {
             max_component_bytes: 0,
-            ..valid.clone()
-        });
-        assert_invalid(FrameConstraints {
-            context_window_tokens: Some(0),
             ..valid.clone()
         });
         assert_invalid(FrameConstraints {

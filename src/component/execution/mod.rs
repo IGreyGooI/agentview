@@ -112,9 +112,9 @@ pub(crate) use projection_diff::{
     ProjectionDiffState, ProjectionReconciliationState, ReconciledProjectionPlan,
 };
 pub use reaction::{
-    Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
-    FrameSubmission, ProjectionSubmission, ProviderFact, ProviderFactStream, ProviderOutputKey,
-    ProviderToolCall, ProviderToolCallError, ReactionPort, ReactionPortFault,
+    ContextWindow, Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile,
+    FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact, ProviderFactStream,
+    ProviderOutputKey, ProviderToolCall, ProviderToolCallError, ReactionPort, ReactionPortFault,
     ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason, ResettableReactionPort,
     SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
 };

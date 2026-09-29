@@ -8,7 +8,7 @@ use agentview::{
             CodexHttpV1Options, CodexReasoning, CODEX_HTTP_V1_CODEX_REVISION,
             CODEX_HTTP_V1_PROFILE,
         },
-        HistoryPolicy, ProviderRequestEncoder,
+        HistoryPolicy, ModelSpec, ModelSpecError, ProviderRequestEncoder,
     },
     record_store::{
         reconstruct_transcript, MemoryRecordStore, NewRecord, ProviderArtifactMode, RecordBatch,
@@ -107,7 +107,7 @@ fn oracle_encoder() -> CodexHttpV1Encoder {
     )
     .unwrap();
     let options = CodexHttpV1Options::new(
-        "gpt-5.6-codex",
+        ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
         Some(vec![tool]),
         Some(CodexReasoning::max_detailed()),
         Some("agentview-session-7"),
@@ -130,7 +130,7 @@ fn fixture_metadata_pins_the_profile_revision_and_body_digest() {
 }
 
 #[test]
-fn codex_http_v1_matches_the_real_request_body_byte_for_byte() {
+fn codex_http_v1_matches_the_profile_fixture_byte_for_byte() {
     let encoded = oracle_encoder()
         .encode_request(&oracle_transcript())
         .unwrap();
@@ -144,7 +144,13 @@ fn raw_tool_arguments_keep_whitespace_key_order_and_escaping() {
     let transcript = CanonicalTranscript::new()
         .appended(CanonicalInputItem::tool_call("call_raw", "inspect", raw_arguments).unwrap())
         .unwrap();
-    let options = CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap();
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )
+    .unwrap();
 
     let encoded = CodexHttpV1Encoder::new(options)
         .encode_request(&transcript)
@@ -164,7 +170,13 @@ fn raw_tool_arguments_keep_whitespace_key_order_and_escaping() {
 
 #[test]
 fn request_dto_locks_field_order_and_absent_field_omission() {
-    let options = CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap();
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )
+    .unwrap();
     let encoded = CodexHttpV1Encoder::new(options)
         .encode_request(&CanonicalTranscript::new())
         .unwrap();
@@ -174,7 +186,7 @@ fn request_dto_locks_field_order_and_absent_field_omission() {
 
     assert_eq!(
         String::from_utf8(encoded).unwrap(),
-        r#"{"model":"gpt-5.6-codex","input":[],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"context_management":[{"type":"compaction","compact_threshold":200000}],"store":false,"stream":true,"include":["reasoning.encrypted_content"]}"#
+        r#"{"model":"gpt-5.6-codex","input":[],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"store":false,"stream":true,"include":["reasoning.encrypted_content"]}"#
     );
 }
 
@@ -186,7 +198,13 @@ fn history_policy_maps_assistant_text_to_output_text() {
             xml_document("move", &[], "e2e4"),
         ))
         .unwrap();
-    let options = CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap();
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )
+    .unwrap();
 
     let encoded = CodexHttpV1Encoder::new(options)
         .encode_request(&transcript)
@@ -228,8 +246,13 @@ fn function_names_are_preserved_in_tools_and_call_history_without_a_length_limit
     ] {
         let tool =
             CodexFunctionTool::new(&name, "lookup", json!({"type": "object"}), false).unwrap();
-        let options =
-            CodexHttpV1Options::new("model", Some(vec![tool]), None, None::<String>).unwrap();
+        let options = CodexHttpV1Options::new(
+            ModelSpec::new("model", 272_000).unwrap(),
+            Some(vec![tool]),
+            None,
+            None::<String>,
+        )
+        .unwrap();
         let transcript = CanonicalTranscript::new()
             .appended(CanonicalInputItem::tool_call("call_1", &name, "{}").unwrap())
             .unwrap()
@@ -280,11 +303,12 @@ fn codex_function_names_fail_before_an_invalid_request_is_encoded() {
 #[test]
 fn request_options_and_tool_schemas_validate_their_boundaries() {
     assert!(matches!(
-        CodexHttpV1Options::new("", None, None, None::<String>),
-        Err(CodexHttpV1Error::EmptyModel)
-    ));
-    assert!(matches!(
-        CodexHttpV1Options::new("model", None, None, Some("")),
+        CodexHttpV1Options::new(
+            ModelSpec::new("model", 272_000).unwrap(),
+            None,
+            None,
+            Some("")
+        ),
         Err(CodexHttpV1Error::EmptyPromptCacheKey)
     ));
     assert!(matches!(
@@ -294,14 +318,18 @@ fn request_options_and_tool_schemas_validate_their_boundaries() {
 
     let tool = CodexFunctionTool::new("tool", "valid", json!({}), false).unwrap();
     assert!(matches!(
-        CodexHttpV1Options::new(
-            "model",
-            Some(vec![tool.clone(), tool]),
-            None,
-            None::<String>,
-        ),
+        CodexHttpV1Options::new(ModelSpec::new("model", 272_000).unwrap(), Some(vec![tool.clone(), tool]), None, None::<String>),
         Err(CodexHttpV1Error::DuplicateToolName { ref name }) if name == "tool"
     ));
+}
+
+#[test]
+fn model_spec_requires_an_identifier_and_positive_context_capacity() {
+    assert_eq!(ModelSpec::new("", 128_000), Err(ModelSpecError::EmptyId));
+    assert_eq!(
+        ModelSpec::new("custom-model", 0),
+        Err(ModelSpecError::ZeroContextWindowTokens)
+    );
 }
 
 #[test]

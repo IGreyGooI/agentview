@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/component_target/fail_openai_model_spec_missing.rs:4:37
+  |
+4 |     let _ = CodexHttpV1Options::new("test-model", None, None, None::<String>);
+  |             ----------------------- ^^^^^^^^^^^^ expected `ModelSpec`, found `&str`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> src/provider/codex_http_v1.rs
+  |
+  |     pub fn new(
+  |            ^^^

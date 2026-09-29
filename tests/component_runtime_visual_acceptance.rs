@@ -1,5 +1,6 @@
 //! Component runtime regression coverage for complete DOM and private provider history.
 
+use agentview::provider::ModelSpec;
 use std::{
     fmt::Write as _,
     panic::{resume_unwind, AssertUnwindSafe},
@@ -159,7 +160,12 @@ fn responses_provider(
 ) -> anyhow::Result<(AsyncOpenAiResponsesProvider, TargetIdentity)> {
     let config = AsyncOpenAiTransportConfig::new(api_base, "visual-acceptance-token")?;
     let identity = ProviderIdentity::new("openai", CODEX_HTTP_V1_PROFILE, 1, BINDING)?;
-    let options = CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)?;
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )?;
     let mut provider =
         AsyncOpenAiResponsesProvider::new(config, identity, CodexHttpV1Encoder::new(options));
     let target = ReactionPort::declare(&mut provider)?.identity();

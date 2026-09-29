@@ -453,10 +453,11 @@ mod tests {
     use agentview::{
         component::execution::{
             Application, ApplicationFaultCode, ApplicationFaultKind, ApplicationFaultReason,
-            ApplicationFaultStage, Frame, FrameBasis, FrameCapabilities, FrameConstraints,
-            FrameProfile, FrameRevision, ProviderFact, ProviderFactStream, ProviderOutputKey,
-            ReactionPort, ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultReason,
-            SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity,
+            ApplicationFaultStage, ContextWindow, Frame, FrameBasis, FrameCapabilities,
+            FrameConstraints, FrameProfile, FrameRevision, ProviderFact, ProviderFactStream,
+            ProviderOutputKey, ReactionPort, ReactionPortFault, ReactionPortFaultCode,
+            ReactionPortFaultReason, SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch,
+            TargetIdentity,
         },
         pom_renderer::render_pom_document,
         transcript::CanonicalInputItem,
@@ -639,7 +640,7 @@ mod tests {
             FrameConstraints {
                 max_frame_bytes: 1024 * 1024,
                 max_component_bytes: 256 * 1024,
-                context_window_tokens: None,
+                context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
             FrameCapabilities::new(true),

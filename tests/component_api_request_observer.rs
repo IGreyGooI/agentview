@@ -1,5 +1,6 @@
 //! Regression coverage for Responses request observation at transport handoff.
 
+use agentview::provider::ModelSpec;
 use std::{
     ops::ControlFlow,
     sync::{
@@ -79,7 +80,12 @@ fn responses_provider(
         None => config,
     };
     let identity = ProviderIdentity::new("openai", CODEX_HTTP_V1_PROFILE, 1, BINDING)?;
-    let options = CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)?;
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )?;
     Ok(AsyncOpenAiResponsesProvider::new(
         config,
         identity,

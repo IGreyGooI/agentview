@@ -47,9 +47,6 @@ impl FrameProfile {
         if constraints.max_component_bytes == 0 {
             return Err(InvalidFrameProfileFault::ZeroMaxComponentBytes);
         }
-        if constraints.context_window_tokens == Some(0) {
-            return Err(InvalidFrameProfileFault::ZeroContextWindowTokens);
-        }
         if constraints.reserved_output_tokens == Some(0) {
             return Err(InvalidFrameProfileFault::ZeroReservedOutputTokens);
         }
@@ -85,8 +82,6 @@ pub(crate) enum InvalidFrameProfileFault {
     ZeroMaxFrameBytes,
     #[error("max_component_bytes must be greater than zero")]
     ZeroMaxComponentBytes,
-    #[error("context_window_tokens must be greater than zero when present")]
-    ZeroContextWindowTokens,
     #[error("reserved_output_tokens must be greater than zero when present")]
     ZeroReservedOutputTokens,
     #[error(
@@ -366,11 +361,13 @@ impl FrameSession {
 
         // The authoring envelope is always measured from the complete
         // projection, even when this exact submission is a much smaller Delta.
-        FrameMeter::compile_component(
+        let requested_context_bytes = FrameMeter::compile_component(
             complete_component_items,
             complete_projection.native_tools().to_vec(),
             constraints,
-        )?;
+        )?
+        .canonical_bytes
+        .len();
         let component = FrameMeter::compile_component(
             projection_items.clone(),
             complete_projection.native_tools().to_vec(),
@@ -398,7 +395,8 @@ impl FrameSession {
             declaration.profile().clone(),
             basis,
             submission,
-        )?;
+        )?
+        .with_requested_context_bytes(requested_context_bytes);
 
         let replay_basis = committed_transcript.items().to_vec();
         let checkpoint = FrameCheckpoint {
@@ -1063,8 +1061,8 @@ mod tests {
             admission::ReactionAdmissionGuard,
             port::ProjectionExecutionScope,
             reaction::{
-                FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
-                ProviderFact, ProviderOutputKey, ProviderToolCall, TargetContinuity,
+                ContextWindow, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile,
+                FrameRevision, ProviderFact, ProviderOutputKey, ProviderToolCall, TargetContinuity,
                 TargetDeclaration, TargetEpoch, TargetIdentity,
             },
             ProviderEvent, RenderedProjection, RenderedProjectionNode, ToolDefinition,
@@ -1086,7 +1084,7 @@ mod tests {
         FrameConstraints {
             max_frame_bytes,
             max_component_bytes,
-            context_window_tokens: None,
+            context_window: ContextWindow::NotApplicable,
             reserved_output_tokens: None,
         }
     }
@@ -1857,6 +1855,24 @@ mod tests {
         assert_eq!(prepared.frame.basis(), FrameBasis::DeltaFrom(head));
         assert!(prepared.frame.submission().replay().is_empty());
         assert!(prepared.frame.submission().projection().items().is_empty());
+    }
+
+    #[test]
+    fn requested_context_measures_the_complete_projection_even_for_an_empty_delta() {
+        let profile = profile(true);
+        let declaration = full(profile.clone(), 1);
+        let mut session = FrameSession::new(&declaration).unwrap();
+        let complete =
+            projection_with_system(&[("policy", "stable instructions")], &["complete state"]);
+        let first = session.prepare(&declaration, &complete).unwrap();
+        let requested = first.frame.requested_context_bytes().unwrap();
+        assert!(requested > "stable instructionscomplete state".len());
+        let (frame, commit) = first.into_parts();
+        session.commit(commit);
+        let resume = TargetDeclaration::resume(frame.revision(), profile);
+        let next = session.prepare(&resume, &complete).unwrap();
+        assert!(next.frame.submission().projection().items().is_empty());
+        assert_eq!(next.frame.requested_context_bytes(), Some(requested));
     }
 
     #[test]

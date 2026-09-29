@@ -13,9 +13,10 @@ use std::{
 use agentview::{
     component::{
         execution::{
-            Application, Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile,
-            ProviderFact, ProviderFactStream, ProviderOutputKey, ReactionPort, ReactionPortFault,
-            SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity, ToolDefinition,
+            Application, ContextWindow, Frame, FrameBasis, FrameCapabilities, FrameConstraints,
+            FrameProfile, ProviderFact, ProviderFactStream, ProviderOutputKey, ReactionPort,
+            ReactionPortFault, SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity,
+            ToolDefinition,
         },
         prelude::*,
     },
@@ -104,7 +105,7 @@ impl CapturingPort {
             FrameConstraints {
                 max_frame_bytes: 1_048_576,
                 max_component_bytes: 262_144,
-                context_window_tokens: None,
+                context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
             FrameCapabilities::new(true),

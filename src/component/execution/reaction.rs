@@ -108,6 +108,27 @@ pub enum FrameBasis {
     DeltaFrom(FrameRevision),
 }
 
+/// Explicit context capacity of a reaction target.
+///
+/// Model providers must require callers to configure a finite token window. There
+/// is no unknown or inferred capacity at the runtime boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextWindow {
+    /// The effective capacity of the configured model and deployment.
+    Tokens(NonZeroU64),
+    /// This target does not invoke a model (for example Debug or External).
+    NotApplicable,
+}
+
+impl ContextWindow {
+    pub const fn tokens(self) -> Option<NonZeroU64> {
+        match self {
+            Self::Tokens(tokens) => Some(tokens),
+            Self::NotApplicable => None,
+        }
+    }
+}
+
 /// Stable canonical and target-estimated limits for one mounted application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameConstraints {
@@ -115,8 +136,8 @@ pub struct FrameConstraints {
     pub max_frame_bytes: usize,
     /// Guaranteed envelope for the complete Component projection and tools.
     pub max_component_bytes: usize,
-    /// Target-provided estimate; it is not part of the canonical byte meter.
-    pub context_window_tokens: Option<u64>,
+    /// Required capacity declaration; separate from the canonical byte meter.
+    pub context_window: ContextWindow,
     /// Target-provided estimate; it is not part of the canonical byte meter.
     pub reserved_output_tokens: Option<u64>,
 }
@@ -388,6 +409,7 @@ pub struct Frame {
     prepared_profile: FrameProfile,
     basis: FrameBasis,
     submission: FrameSubmission,
+    requested_context_bytes: Option<usize>,
 }
 
 impl Frame {
@@ -436,7 +458,20 @@ impl Frame {
             prepared_profile,
             basis,
             submission,
+            requested_context_bytes: None,
         })
+    }
+
+    /// Size of the complete current Component envelope (including System and
+    /// tools), measured before diff/omission. This is advisory metadata, not
+    /// the Delta payload size or a copy of the private complete projection.
+    pub const fn requested_context_bytes(&self) -> Option<usize> {
+        self.requested_context_bytes
+    }
+
+    pub(crate) fn with_requested_context_bytes(mut self, bytes: usize) -> Self {
+        self.requested_context_bytes = Some(bytes);
+        self
     }
 
     pub const fn revision(&self) -> FrameRevision {
@@ -698,6 +733,9 @@ pub type ProviderFactStream<'a> =
 #[async_trait]
 pub trait ReactionPort: Send {
     /// Returns an idempotent snapshot without advancing delivery state.
+    /// Model ports must declare ContextWindow::Tokens with the caller's explicit
+    /// capacity. ContextWindow::NotApplicable is reserved for non-model targets.
+    /// Require capacity configuration before mounting; the profile stays stable.
     fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault>;
 
     /// Hands one exact Frame to this target and returns its ordered fact stream.
@@ -715,6 +753,11 @@ pub trait ReactionPort: Send {
     /// invalidates continuity, or a terminal declaration fault. Stale
     /// `Accepted` continuity is forbidden.
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault>;
+
+    /// Stop and join port-owned background work. Called by Application shutdown
+    /// after active reactions have ended. Ports without background work need
+    /// no implementation; Drop alone only provides best-effort cancellation.
+    async fn shutdown(&mut self) {}
 }
 
 /// Optional port capability for starting a new model-context lineage without
@@ -750,9 +793,9 @@ mod tests {
     use futures::stream;
 
     use super::{
-        Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameInvariantFault, FrameProfile,
-        FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact, ProviderFactStream,
-        ProviderOutputKey, ProviderToolCall, ReactionPort, ReactionPortFault,
+        ContextWindow, Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameInvariantFault,
+        FrameProfile, FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact,
+        ProviderFactStream, ProviderOutputKey, ProviderToolCall, ReactionPort, ReactionPortFault,
         ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason, SubmitFault,
         TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
         ToolCatalogFault,
@@ -782,7 +825,7 @@ mod tests {
             FrameConstraints {
                 max_frame_bytes: 4_096,
                 max_component_bytes: 1_024,
-                context_window_tokens: Some(8_192),
+                context_window: ContextWindow::Tokens(std::num::NonZeroU64::new(8_192).unwrap()),
                 reserved_output_tokens: Some(1_024),
             },
             FrameCapabilities::new(true),

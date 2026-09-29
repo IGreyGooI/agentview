@@ -323,7 +323,9 @@ fn provider(api_base: String) -> AsyncOpenAiChatCompletionsProvider {
 fn provider_with_config(config: AsyncOpenAiTransportConfig) -> AsyncOpenAiChatCompletionsProvider {
     let identity =
         ProviderIdentity::new("openai", OPENAI_CHAT_COMPLETIONS_PROFILE, 1, BINDING).unwrap();
-    let options = OpenAiChatCompletionsOptions::new("test-chat-model").unwrap();
+    let options = OpenAiChatCompletionsOptions::new(
+        crate::provider::ModelSpec::new("test-chat-model", 272_000).unwrap(),
+    );
     AsyncOpenAiChatCompletionsProvider::new(config, identity, options)
 }
 
@@ -1192,12 +1194,6 @@ async fn output_limit_fails_before_emitting_the_overflowing_delta() {
 
     let _ = shutdown.send(());
     server.await.unwrap();
-}
-
-#[test]
-fn chat_model_must_be_nonempty() {
-    let error = OpenAiChatCompletionsOptions::new("").unwrap_err();
-    assert!(error.to_string().contains("must be non-empty"));
 }
 
 #[tokio::test]

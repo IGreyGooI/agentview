@@ -10,7 +10,9 @@ cargo run --locked --no-default-features --example native_tool
 cargo run --locked --no-default-features --example streaming_callbacks
 ```
 
-Both use the shared live provider configuration (`.env` or `OPENAI_API_KEY`). The native
+Both use the shared live provider configuration: `OPENAI_API_KEY` and a positive
+`AGENTVIEW_CONTEXT_WINDOW_TOKENS` are required in the environment or `.env`. The window
+is bound to `AGENTVIEW_MODEL` in a `ModelSpec`, which the request options retain. The native
 example adjusts a counter, receives the actual updated value, then undoes the change.
 The XML example streams and saves notes, exposes the saved count, and lets the model
 confirm it before acknowledging the result. Only the action available in the current

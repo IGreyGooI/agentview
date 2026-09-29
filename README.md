@@ -221,6 +221,33 @@ pub trait ReactionPort: Send {
 }
 ```
 
+Every port explicitly declares `FrameConstraints.context_window`. Model providers
+use `ContextWindow::Tokens(NonZeroU64)`; targets such as Debug and External use
+`ContextWindow::NotApplicable`. The capacity remains stable for the mount.
+`agentview::provider::ModelSpec` binds a model identifier to its required effective
+context window. Request options take that validated description:
+
+```rust,ignore
+let transport = AsyncOpenAiTransportConfig::new(api_base, api_key)?;
+let model = ModelSpec::new(model_id, 128_000)?;
+let options = CodexHttpV1Options::new(model, None, None, None::<String>)?;
+let provider = AsyncOpenAiResponsesProvider::try_new(
+    transport,
+    identity,
+    CodexHttpV1Encoder::new(options),
+)?;
+```
+
+Omitting the window or passing a bare name to request options is a compile error.
+An empty identifier or zero capacity is a `ModelSpecError`. Model
+names never fill in a default capacity. Use the actual capacity of your deployment.
+`options.model()` exposes the same immutable model description; temperature,
+reasoning and request output limits remain request options.
+Transport configuration is independent of the model and cannot override its window.
+The window is local metadata and is not sent in the HTTP body.
+Requests and background compaction use that same declared window for their byte/4
+token estimates. See [compaction configuration](docs/parallel-compaction-design.md).
+
 The port checks the Frame handoff precondition at the crossing poll. A
 successful submit handoff commits the Application's outbound canonical input,
 Frame revision, and diff baseline synchronously before any returned fact is
@@ -241,6 +268,8 @@ Runnable examples use the OpenAI Responses API, so `cargo run` makes
 token-bearing requests. Set `OPENAI_API_KEY` in the environment or `.env`.
 `AGENTVIEW_MODEL` defaults to `gpt-5.6-terra`; `OPENAI_BASE_URL` defaults to
 `https://api.openai.com/v1`.
+`AGENTVIEW_CONTEXT_WINDOW_TOKENS` is required for every model, including the
+default model. Set it to the effective token capacity of your deployment.
 
 When present, `.env` entries override existing values with the same name,
 including Cargo-injected certificate defaults. Without `.env`, the examples use

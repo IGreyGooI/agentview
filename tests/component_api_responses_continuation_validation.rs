@@ -4,6 +4,7 @@
     reason = "this compatibility test intentionally exercises legacy Responses continuation"
 )]
 
+use agentview::provider::ModelSpec;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -69,7 +70,13 @@ async fn spawn_server() -> (
 fn provider(api_base: String) -> AsyncOpenAiResponsesProvider {
     let config = AsyncOpenAiTransportConfig::new(api_base, "test-token").unwrap();
     let identity = ProviderIdentity::new("openai", CODEX_HTTP_V1_PROFILE, 1, BINDING).unwrap();
-    let options = CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap();
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )
+    .unwrap();
     AsyncOpenAiResponsesProvider::new(config, identity, CodexHttpV1Encoder::new(options))
 }
 

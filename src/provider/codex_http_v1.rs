@@ -20,7 +20,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{HistoryPolicy, ProviderRequestEncoder};
+use super::{HistoryPolicy, ModelSpec, ProviderRequestEncoder};
 
 pub const CODEX_HTTP_V1_PROFILE: &str = "codex-http-v1";
 pub const CODEX_HTTP_V1_CODEX_REVISION: &str = "4f1992732c832fe125608980a03ec2b66710c4e4";
@@ -28,7 +28,6 @@ pub const CODEX_HTTP_V1_CODEX_REVISION: &str = "4f1992732c832fe125608980a03ec2b6
 const OPENAI_PROVIDER: &str = "openai";
 const REASONING_CAPABILITY: &str = "reasoning.encrypted_content";
 const REASONING_SCHEMA_VERSION: u32 = 1;
-const DEFAULT_COMPACTION_THRESHOLD: u32 = 200_000;
 
 /// One function tool in the Codex Responses request schema.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -100,28 +99,24 @@ enum ReasoningSummary {
 /// Immutable inputs that vary between `codex-http-v1` operations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexHttpV1Options {
-    model: String,
+    model: ModelSpec,
     tools: Option<Vec<CodexFunctionTool>>,
     reasoning: Option<CodexReasoning>,
     prompt_cache_key: Option<String>,
     max_output_tokens: Option<u32>,
     temperature: Option<f64>,
-    context_management: bool,
     explicit_assistant_status: bool,
 }
 
 impl CodexHttpV1Options {
+    /// Configures requests for a model with an explicit context capacity.
+    /// Model identity and capacity are validated together by [`ModelSpec::new`].
     pub fn new(
-        model: impl Into<String>,
+        model: ModelSpec,
         tools: Option<Vec<CodexFunctionTool>>,
         reasoning: Option<CodexReasoning>,
         prompt_cache_key: Option<impl Into<String>>,
     ) -> Result<Self, CodexHttpV1Error> {
-        let model = model.into();
-        if model.is_empty() {
-            return Err(CodexHttpV1Error::EmptyModel);
-        }
-
         if let Some(duplicate) = duplicate_tool_name(tools.as_deref().unwrap_or_default()) {
             return Err(CodexHttpV1Error::DuplicateToolName { name: duplicate });
         }
@@ -138,9 +133,13 @@ impl CodexHttpV1Options {
             prompt_cache_key,
             max_output_tokens: None,
             temperature: None,
-            context_management: true,
             explicit_assistant_status: false,
         })
+    }
+
+    /// The model identity and capacity shared by all requests using these options.
+    pub const fn model(&self) -> &ModelSpec {
+        &self.model
     }
 
     /// Limits model-generated output tokens for this request profile.
@@ -163,16 +162,6 @@ impl CodexHttpV1Options {
         }
         self.temperature = Some(temperature);
         Ok(self)
-    }
-
-    /// Omits the optional Responses `context_management` field.
-    ///
-    /// The default retains the Codex server-side compaction configuration.
-    /// Call this only for Responses-compatible endpoints that reject that
-    /// Codex-specific request extension.
-    pub fn without_context_management(mut self) -> Self {
-        self.context_management = false;
-        self
     }
 
     /// Includes a terminal status on canonical assistant messages.
@@ -202,8 +191,6 @@ pub struct CodexHttpV1Request {
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
     reasoning: Option<CodexReasoning>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context_management: Option<Vec<ContextManagement>>,
     store: bool,
     stream: bool,
     include: Vec<IncludedField>,
@@ -226,8 +213,6 @@ struct CodexHttpV1WireRequest<'a> {
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
     reasoning: Option<&'a CodexReasoning>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context_management: Option<&'a [ContextManagement]>,
     store: bool,
     stream: bool,
     include: &'a [IncludedField],
@@ -251,7 +236,6 @@ impl<'a> CodexHttpV1WireRequest<'a> {
             tool_choice: request.tool_choice,
             parallel_tool_calls: request.parallel_tool_calls,
             reasoning: request.reasoning.as_ref(),
-            context_management: request.context_management.as_deref(),
             store: request.store,
             stream: request.stream,
             include: &request.include,
@@ -291,28 +275,6 @@ impl CodexHttpV1Request {
             limit,
         )
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-struct ContextManagement {
-    #[serde(rename = "type")]
-    kind: ContextManagementType,
-    compact_threshold: u32,
-}
-
-impl ContextManagement {
-    const fn server_side_compaction() -> Self {
-        Self {
-            kind: ContextManagementType::Compaction,
-            compact_threshold: DEFAULT_COMPACTION_THRESHOLD,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ContextManagementType {
-    Compaction,
 }
 
 /// Provider history after `codex-http-v1` capability checks and POM rendering.
@@ -514,6 +476,32 @@ impl CodexHttpV1Encoder {
         Self { options }
     }
 
+    pub(crate) const fn model(&self) -> &ModelSpec {
+        self.options.model()
+    }
+
+    pub(crate) fn encode_compaction_request_bounded(
+        &self,
+        input: &[Value],
+        instructions: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>, CodexHttpV1Error> {
+        #[derive(Serialize)]
+        struct Request<'a> {
+            model: &'a str,
+            input: &'a [Value],
+            instructions: &'a str,
+        }
+        serialize_json_bounded(
+            &Request {
+                model: self.model().id(),
+                input,
+                instructions,
+            },
+            limit,
+        )
+    }
+
     pub fn request(
         &self,
         transcript: &CanonicalTranscript,
@@ -621,7 +609,7 @@ impl CodexHttpV1Encoder {
         tools: Option<Vec<CodexFunctionTool>>,
     ) -> CodexHttpV1Request {
         CodexHttpV1Request {
-            model: self.options.model.clone(),
+            model: self.model().id().to_owned(),
             max_output_tokens: self.options.max_output_tokens,
             temperature: self.options.temperature,
             instructions: history.instructions,
@@ -630,10 +618,6 @@ impl CodexHttpV1Encoder {
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: false,
             reasoning: self.options.reasoning,
-            context_management: self
-                .options
-                .context_management
-                .then(|| vec![ContextManagement::server_side_compaction()]),
             store: false,
             stream: true,
             include: vec![IncludedField::ReasoningEncryptedContent],
@@ -925,8 +909,6 @@ fn validate_function_name(name: &str) -> Result<(), CodexHttpV1Error> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CodexHttpV1Error {
-    #[error("Codex model must be non-empty")]
-    EmptyModel,
     #[error(
         "invalid Codex function tool name `{name}`; expected a non-empty name using Unicode identifier characters or hyphens"
     )]
@@ -985,7 +967,7 @@ mod tests {
     #[test]
     fn retained_input_encoder_preserves_wire_order_and_non_input_options() {
         let options = CodexHttpV1Options::new(
-            "gpt-5.6-codex",
+            crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
             None,
             Some(CodexReasoning::max_detailed()),
             Some("retained-session"),
@@ -1022,14 +1004,20 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"model":"gpt-5.6-codex","instructions":"<system>Retain these instructions.</system>","input":[{"encrypted_content":"opaque","id":"cmp_7","type":"compaction"}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":{"effort":"max","summary":"detailed"},"context_management":[{"type":"compaction","compact_threshold":200000}],"store":false,"stream":true,"include":["reasoning.encrypted_content"],"prompt_cache_key":"retained-session"}"#
+            r#"{"model":"gpt-5.6-codex","instructions":"<system>Retain these instructions.</system>","input":[{"encrypted_content":"opaque","id":"cmp_7","type":"compaction"}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":{"effort":"max","summary":"detailed"},"store":false,"stream":true,"include":["reasoning.encrypted_content"],"prompt_cache_key":"retained-session"}"#
         );
     }
 
     #[test]
     fn max_output_tokens_is_optional_in_public_and_native_requests() {
         let default_encoder = CodexHttpV1Encoder::new(
-            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap(),
         );
         let default_public = default_encoder
             .request(&CanonicalTranscript::new())
@@ -1045,12 +1033,17 @@ mod tests {
         assert!(default_native.get("temperature").is_none());
 
         let configured_encoder = CodexHttpV1Encoder::new(
-            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)
-                .unwrap()
-                .with_max_output_tokens(1_024)
-                .unwrap()
-                .with_temperature(0.2)
-                .unwrap(),
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap()
+            .with_max_output_tokens(1_024)
+            .unwrap()
+            .with_temperature(0.2)
+            .unwrap(),
         );
         let configured_public = configured_encoder
             .request(&CanonicalTranscript::new())
@@ -1069,9 +1062,14 @@ mod tests {
     #[test]
     fn max_output_tokens_rejects_zero() {
         assert!(matches!(
-            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)
-                .unwrap()
-                .with_max_output_tokens(0),
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>
+            )
+            .unwrap()
+            .with_max_output_tokens(0),
             Err(CodexHttpV1Error::ZeroMaxOutputTokens)
         ));
     }
@@ -1080,55 +1078,38 @@ mod tests {
     fn temperature_rejects_nonfinite_and_out_of_range_values() {
         for temperature in [f64::NAN, f64::INFINITY, -0.1, 2.1] {
             assert!(matches!(
-                CodexHttpV1Options::new("test-model", None, None, None::<String>)
-                    .unwrap()
-                    .with_temperature(temperature),
+                CodexHttpV1Options::new(
+                    crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+                    None,
+                    None,
+                    None::<String>
+                )
+                .unwrap()
+                .with_temperature(temperature),
                 Err(CodexHttpV1Error::InvalidTemperature)
             ));
         }
     }
 
     #[test]
-    fn context_management_defaults_to_compaction_and_can_be_omitted() {
-        let default_encoder = CodexHttpV1Encoder::new(
-            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+    fn ordinary_requests_never_ask_the_server_to_manage_context() {
+        let encoder = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap(),
         );
-        let default_public: Value = serde_json::to_value(
-            default_encoder
-                .request(&CanonicalTranscript::new())
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            default_public["context_management"],
-            json!([{"type": "compaction", "compact_threshold": 200_000}])
-        );
-        let default_native = default_encoder
+        let public =
+            serde_json::to_value(encoder.request(&CanonicalTranscript::new()).unwrap()).unwrap();
+        assert!(public.get("context_management").is_none());
+        let native = encoder
             .encode_frame_request_bounded(&[], "", &[], usize::MAX)
             .unwrap();
-        let default_native: Value = serde_json::from_slice(&default_native).unwrap();
-        assert_eq!(
-            default_native["context_management"],
-            json!([{"type": "compaction", "compact_threshold": 200_000}])
-        );
-
-        let disabled_encoder = CodexHttpV1Encoder::new(
-            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)
-                .unwrap()
-                .without_context_management(),
-        );
-        let disabled_public: Value = serde_json::to_value(
-            disabled_encoder
-                .request(&CanonicalTranscript::new())
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(disabled_public.get("context_management").is_none());
-        let disabled_native = disabled_encoder
-            .encode_frame_request_bounded(&[], "", &[], usize::MAX)
-            .unwrap();
-        let disabled_native: Value = serde_json::from_slice(&disabled_native).unwrap();
-        assert!(disabled_native.get("context_management").is_none());
+        let native: Value = serde_json::from_slice(&native).unwrap();
+        assert!(native.get("context_management").is_none());
     }
 
     #[test]
@@ -1140,16 +1121,27 @@ mod tests {
             ))
             .unwrap();
         let default = CodexHttpV1Encoder::new(
-            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap(),
         );
         let default_body: Value =
             serde_json::to_value(default.request(&assistant_history).unwrap()).unwrap();
         assert!(default_body["input"][0].get("status").is_none());
 
         let explicit = CodexHttpV1Encoder::new(
-            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>)
-                .unwrap()
-                .with_explicit_assistant_status(),
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap()
+            .with_explicit_assistant_status(),
         );
         let explicit_body: Value =
             serde_json::to_value(explicit.request(&assistant_history).unwrap()).unwrap();
@@ -1173,7 +1165,7 @@ mod tests {
     fn native_frame_items_expand_interrupted_text_and_accept_delta_tool_result() {
         let encoder = CodexHttpV1Encoder::new(
             CodexHttpV1Options::new(
-                "gpt-5.6-codex",
+                crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
                 Some(vec![CodexFunctionTool::new(
                     "configured_tool",
                     "old",
@@ -1228,7 +1220,13 @@ mod tests {
     #[test]
     fn native_frame_request_uses_the_complete_tool_definition() {
         let encoder = CodexHttpV1Encoder::new(
-            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap(),
         );
         let tool = ToolDefinition::new(
             "lookup_status",
@@ -1282,7 +1280,13 @@ mod tests {
     #[test]
     fn native_frame_request_uses_system_lane_and_inclusive_wire_limit() {
         let encoder = CodexHttpV1Encoder::new(
-            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap(),
         );
         let system = CanonicalInputItem::instruction(
             InstructionAuthority::System,

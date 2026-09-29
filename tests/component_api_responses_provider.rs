@@ -4,6 +4,7 @@
     reason = "this compatibility test intentionally exercises the Responses ProviderPort adapter"
 )]
 
+use agentview::provider::ModelSpec;
 use std::{
     convert::Infallible,
     io::{self, Write},
@@ -54,7 +55,7 @@ use tracing::instrument::WithSubscriber;
 const BINDING: &str = "responses-provider-test-binding";
 const LOOPBACK_PROXY_CHILD_ENV: &str = "AGENTVIEW_LOOPBACK_PROXY_TEST_CHILD";
 const AMBIENT_HEADERS_CHILD_ENV: &str = "AGENTVIEW_RESPONSES_AMBIENT_HEADERS_TEST_CHILD";
-const SAMPLE_CODEX_ORACLE_BODY: &[u8] = br#"{"model":"gpt-5.6-codex","instructions":"<sample_policy>Follow the response protocol.</sample_policy>","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"<sample_request>Return one result.&#10;turn\\_id: turn-1</sample_request>"}]}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"context_management":[{"type":"compaction","compact_threshold":200000}],"store":false,"stream":true,"include":["reasoning.encrypted_content"]}"#;
+const SAMPLE_CODEX_ORACLE_BODY: &[u8] = br#"{"model":"gpt-5.6-codex","instructions":"<sample_policy>Follow the response protocol.</sample_policy>","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"<sample_request>Return one result.&#10;turn\\_id: turn-1</sample_request>"}]}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"store":false,"stream":true,"include":["reasoning.encrypted_content"]}"#;
 
 #[test]
 fn serialized_responses_request_body_limit_must_be_nonzero() {
@@ -2866,7 +2867,13 @@ fn provider(api_base: String) -> AsyncOpenAiResponsesProvider {
 fn provider_with_config(config: AsyncOpenAiTransportConfig) -> AsyncOpenAiResponsesProvider {
     provider_with_options(
         config,
-        CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+        CodexHttpV1Options::new(
+            ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+            None,
+            None,
+            None::<String>,
+        )
+        .unwrap(),
     )
 }
 
@@ -2913,7 +2920,13 @@ impl EngineObserver for SubmissionAfterExecuteObserver {
 fn dispatch_probe_provider(api_base: String) -> AsyncOpenAiResponsesProvider {
     let config = AsyncOpenAiTransportConfig::new(api_base, "test-token").unwrap();
     let identity = ProviderIdentity::new("openai", CODEX_HTTP_V1_PROFILE, 1, BINDING).unwrap();
-    let options = CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap();
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )
+    .unwrap();
     AsyncOpenAiResponsesProvider::new(config, identity, CodexHttpV1Encoder::new(options))
 }
 
@@ -3730,9 +3743,13 @@ async fn replayed_request_preserves_prompt_cache_key_with_validated_history() {
     ])
     .await;
     let config = AsyncOpenAiTransportConfig::new(api_base, "test-token").unwrap();
-    let options =
-        CodexHttpV1Options::new("gpt-5.6-codex", None, None, Some("stable-prompt-cache-key"))
-            .unwrap();
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+        None,
+        None,
+        Some("stable-prompt-cache-key"),
+    )
+    .unwrap();
     let mut provider = provider_with_options(config, options);
 
     execute_provider(&mut provider, diff_projection("input-a"))
@@ -3928,10 +3945,7 @@ async fn compaction_prunes_the_private_wire_window_and_replays_canonical_input()
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     let first: serde_json::Value = serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
     let second: serde_json::Value = serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
-    assert_eq!(
-        first["context_management"],
-        serde_json::json!([{"type": "compaction", "compact_threshold": 200000}])
-    );
+    assert!(first.get("context_management").is_none());
     assert_eq!(first["store"], false);
     assert!(first.get("previous_response_id").is_none());
     assert!(second.get("previous_response_id").is_none());

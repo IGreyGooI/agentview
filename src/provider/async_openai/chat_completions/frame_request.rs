@@ -13,6 +13,7 @@ use super::{
     history::{encode_request, lower_item, ChatMessage},
     OpenAiChatCompletionsError, OpenAiChatCompletionsOptions,
 };
+use crate::provider::async_openai::parallel_compaction::ContextEstimate;
 use crate::provider::async_openai::reaction_fault::OpenAiFailureClass;
 
 #[derive(Clone)]
@@ -54,6 +55,17 @@ impl ChatFrameRequestState {
         let request_body =
             encode_request(options, &wire_messages, max_serialized_request_body_bytes)
                 .map_err(ChatFrameRequestFault::Lowering)?;
+        let constraints = &frame.prepared_profile().constraints;
+        let limit = constraints
+            .context_window
+            .tokens()
+            .ok_or(ChatFrameRequestFault::MissingContextWindow)?;
+        if u128::from(ContextEstimate::from_bytes(request_body.len()).tokens)
+            + u128::from(constraints.reserved_output_tokens.unwrap_or(0))
+            > u128::from(limit.get())
+        {
+            return Err(ChatFrameRequestFault::ContextWindowLimit);
+        }
         Ok(PreparedChatFrameRequest {
             request_body,
             state: Self {
@@ -75,6 +87,10 @@ pub(super) struct PreparedChatFrameRequest {
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ChatFrameRequestFault {
+    #[error("Chat Completions requires a model context window")]
+    MissingContextWindow,
+    #[error("Chat Completions request exceeds the model context window")]
+    ContextWindowLimit,
     #[error("Delta Frame has no accepted Chat Completions wire baseline")]
     MissingDeltaBaseline,
     #[error("Delta Frame base does not match the Chat Completions wire baseline")]
@@ -92,10 +108,10 @@ pub(super) enum ChatFrameRequestFault {
 impl ChatFrameRequestFault {
     pub(super) fn failure_class(&self) -> OpenAiFailureClass {
         match self {
-            Self::Lowering(OpenAiChatCompletionsError::SerializedRequestBodyLimit) => {
-                OpenAiFailureClass::RequestBodyLimit
-            }
-            Self::MissingDeltaBaseline
+            Self::Lowering(OpenAiChatCompletionsError::SerializedRequestBodyLimit)
+            | Self::ContextWindowLimit => OpenAiFailureClass::RequestBodyLimit,
+            Self::MissingContextWindow
+            | Self::MissingDeltaBaseline
             | Self::DeltaBaselineMismatch
             | Self::UnexpectedSystemItem
             | Self::MultipleSystemItems
@@ -162,9 +178,9 @@ mod tests {
 
     use crate::{
         component::execution::reaction::{
-            Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
-            FrameSubmission, ProjectionSubmission, TargetContinuity, TargetEpoch, TargetIdentity,
-            ToolCatalog,
+            ContextWindow, Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile,
+            FrameRevision, FrameSubmission, ProjectionSubmission, TargetContinuity, TargetEpoch,
+            TargetIdentity, ToolCatalog,
         },
         pom::{Document, TextNode, XmlNode},
         pom_resolution::resolve_system_document,
@@ -175,7 +191,9 @@ mod tests {
     use crate::provider::async_openai::chat_completions::OpenAiChatCompletionsOptions;
 
     fn options() -> OpenAiChatCompletionsOptions {
-        OpenAiChatCompletionsOptions::new("test-model").unwrap()
+        OpenAiChatCompletionsOptions::new(
+            crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+        )
     }
 
     fn target() -> TargetIdentity {
@@ -191,7 +209,7 @@ mod tests {
             FrameConstraints {
                 max_frame_bytes: 64 * 1024,
                 max_component_bytes: 16 * 1024,
-                context_window_tokens: None,
+                context_window: ContextWindow::Tokens(NonZeroU64::new(272_000).unwrap()),
                 reserved_output_tokens: None,
             },
             FrameCapabilities::new(true),

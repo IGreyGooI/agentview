@@ -18,9 +18,10 @@ use super::{
     ProviderPort, RenderedProjection,
 };
 use crate::component::execution::reaction::{
-    Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
-    ProviderFact, ProviderFactStream, ReactionPort, ReactionPortFault, ReactionPortFaultCode,
-    ReactionPortFaultReason, SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity,
+    ContextWindow, Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile,
+    FrameRevision, ProviderFact, ProviderFactStream, ReactionPort, ReactionPortFault,
+    ReactionPortFaultCode, ReactionPortFaultReason, SubmitFault, TargetDeclaration, TargetEpoch,
+    TargetIdentity,
 };
 
 static NEXT_DEBUG_TARGET_ID: AtomicU64 = AtomicU64::new(1);
@@ -45,7 +46,7 @@ fn debug_frame_profile() -> FrameProfile {
         FrameConstraints {
             max_frame_bytes: DEBUG_MAX_FRAME_BYTES,
             max_component_bytes: DEBUG_MAX_COMPONENT_BYTES,
-            context_window_tokens: None,
+            context_window: ContextWindow::NotApplicable,
             reserved_output_tokens: None,
         },
         FrameCapabilities::new(true),
@@ -328,7 +329,7 @@ mod tests {
             FrameConstraints {
                 max_frame_bytes: DEBUG_MAX_FRAME_BYTES,
                 max_component_bytes: DEBUG_MAX_COMPONENT_BYTES,
-                context_window_tokens: None,
+                context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             }
         );

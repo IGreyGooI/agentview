@@ -830,7 +830,9 @@ mod tests {
             None => config,
         };
         let identity = ProviderIdentity::new("openai", "native-chat", 1, "native-test").unwrap();
-        let options = OpenAiChatCompletionsOptions::new("test-model").unwrap();
+        let options = OpenAiChatCompletionsOptions::new(
+            crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+        );
         AsyncOpenAiChatCompletionsProvider::try_new(config, identity, options).unwrap()
     }
 
@@ -1024,13 +1026,14 @@ mod tests {
             spawn_server(StatusCode::OK, "text/event-stream", response.clone()).await;
         let audit = Arc::new(Audit::default());
         let mut provider = provider(&base, None).with_observer(audit.clone());
-        provider.options = OpenAiChatCompletionsOptions::new("test-model")
-            .unwrap()
-            .with_max_tokens(321)
-            .unwrap()
-            .with_temperature(0.2)
-            .unwrap()
-            .with_usage(true);
+        provider.options = OpenAiChatCompletionsOptions::new(
+            crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+        )
+        .with_max_tokens(321)
+        .unwrap()
+        .with_temperature(0.2)
+        .unwrap()
+        .with_usage(true);
         let frame = full_frame(&provider.declare().unwrap());
         let mut facts = provider.submit(frame).await.unwrap();
         while let Some(fact) = facts.next().await {
@@ -1360,6 +1363,24 @@ mod tests {
 
         let _ = shutdown.send(());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn declared_context_window_is_enforced_before_handoff() {
+        let mut provider = provider("http://127.0.0.1:1", None);
+        provider.reaction_target.profile.constraints.context_window =
+            crate::component::execution::ContextWindow::Tokens(NonZeroU64::MIN);
+        let initial = ReactionPort::declare(&mut provider).unwrap();
+        let error = match ReactionPort::submit(&mut provider, full_frame(&initial)).await {
+            Err(error) => error,
+            Ok(_) => panic!("request exceeding the declared window was accepted"),
+        };
+        let SubmitFault::Rejected(fault) = error else {
+            panic!("unexpected pre-handoff fault: {error:?}");
+        };
+        assert_eq!(fault.code(), ReactionPortFaultCode::Limit);
+        assert_eq!(fault.reason(), ReactionPortFaultReason::RequestPreparation);
+        assert_eq!(ReactionPort::declare(&mut provider).unwrap(), initial);
     }
 
     #[tokio::test]

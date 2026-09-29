@@ -4,7 +4,7 @@
 //! coverage proofs. It never retains a Component projection, shared canonical
 //! history, semantic diff baseline, or ToolOutput staging.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -15,6 +15,7 @@ use crate::{
     transcript::{CanonicalInputItem, InstructionAuthority},
 };
 
+use super::parallel_compaction::{CompactionSource, ContextEstimate};
 use super::reaction_fault::OpenAiFailureClass;
 
 const PREFIX_PROOF_DOMAIN: &[u8] = b"agentview:openai-responses:canonical-prefix:v1";
@@ -106,6 +107,65 @@ struct PendingWireCall {
 }
 
 impl ResponsesFrameRequestState {
+    /// The source is from the previous accepted window. Keep the newest item
+    /// and any unresolved call/partial tail outside the closed prefix.
+    pub(super) fn compaction_source(&self) -> Option<CompactionSource> {
+        let limit = self.wire_input.len().checked_sub(1)?;
+        let mut pending = HashSet::new();
+        let mut cut = 0;
+        for (index, item) in self.wire_input.iter().take(limit).enumerate() {
+            if item
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status == "in_progress" || status == "incomplete")
+            {
+                break;
+            }
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    pending.insert(item.get("call_id")?.as_str()?);
+                }
+                Some("function_call_output") if !pending.remove(item.get("call_id")?.as_str()?) => {
+                    return None;
+                }
+                _ => {}
+            }
+            if pending.is_empty() {
+                cut = index + 1;
+            }
+        }
+        if cut == 0 {
+            return None;
+        }
+        CompactionSource::new(self.wire_input[..cut].to_vec(), self.instructions.clone())
+    }
+
+    pub(super) fn with_parallel_compaction(
+        &self,
+        source: &CompactionSource,
+        output: &[Value],
+        frame: &Frame,
+        encoder: &CodexHttpV1Encoder,
+    ) -> Result<Option<Self>, ResponsesFrameRequestFault> {
+        if self.instructions != source.instructions
+            || !self.wire_input.starts_with(&source.input)
+            || matches!(frame.basis(), FrameBasis::Full)
+                && frame_system_instructions(frame, encoder)? != source.instructions
+        {
+            return Ok(None);
+        }
+        let mut state = self.clone();
+        state.wire_input = output
+            .iter()
+            .cloned()
+            .chain(self.wire_input[source.input.len()..].iter().cloned())
+            .collect();
+        state.compaction_instructions = Some(
+            CompactionInstructionsProof::for_normalized_instructions(&self.instructions),
+        );
+        Ok(Some(state))
+    }
+
     pub(super) fn prepare(
         previous: Option<&Self>,
         frame: &Frame,
@@ -144,6 +204,18 @@ impl ResponsesFrameRequestState {
                 max_serialized_request_body_bytes,
             )
             .map_err(ResponsesFrameRequestFault::Encoding)?;
+
+        let constraints = &frame.prepared_profile().constraints;
+        let limit = constraints
+            .context_window
+            .tokens()
+            .ok_or(ResponsesFrameRequestFault::MissingContextWindow)?;
+        if u128::from(ContextEstimate::from_bytes(request_body.len()).tokens)
+            + u128::from(constraints.reserved_output_tokens.unwrap_or(0))
+            > u128::from(limit.get())
+        {
+            return Err(ResponsesFrameRequestFault::ContextWindowLimit);
+        }
 
         Ok(PreparedResponsesFrameRequest {
             request_body,
@@ -360,6 +432,10 @@ pub(super) enum PrivateOutputKind {
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ResponsesFrameRequestFault {
+    #[error("Responses requires a model context window")]
+    MissingContextWindow,
+    #[error("estimated Responses request context exceeds the configured window")]
+    ContextWindowLimit,
     #[error("Delta Frame has no accepted Responses wire baseline")]
     MissingDeltaBaseline,
     #[error("Delta Frame base does not match the Responses wire baseline")]
@@ -383,10 +459,12 @@ pub(super) enum ResponsesFrameRequestFault {
 impl ResponsesFrameRequestFault {
     pub(super) fn failure_class(&self) -> OpenAiFailureClass {
         match self {
+            Self::ContextWindowLimit => OpenAiFailureClass::RequestBodyLimit,
             Self::Encoding(CodexHttpV1Error::SerializedRequestBodyLimit) => {
                 OpenAiFailureClass::RequestBodyLimit
             }
-            Self::MissingDeltaBaseline
+            Self::MissingContextWindow
+            | Self::MissingDeltaBaseline
             | Self::DeltaBaselineMismatch
             | Self::CoverageMismatch
             | Self::CompactionInstructionsMismatch
@@ -471,9 +549,9 @@ mod tests {
 
     use crate::{
         component::execution::reaction::{
-            Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
-            FrameSubmission, ProjectionSubmission, TargetContinuity, TargetEpoch, TargetIdentity,
-            ToolCatalog,
+            ContextWindow, Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile,
+            FrameRevision, FrameSubmission, ProjectionSubmission, TargetContinuity, TargetEpoch,
+            TargetIdentity, ToolCatalog,
         },
         component::execution::ToolDefinition,
         pom::{Document, TextNode, XmlNode},
@@ -491,14 +569,20 @@ mod tests {
 
     fn encoder() -> CodexHttpV1Encoder {
         CodexHttpV1Encoder::new(
-            CodexHttpV1Options::new("test-model", None, None, None::<String>).unwrap(),
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap(),
         )
     }
 
     fn encoder_with_configured_tool() -> CodexHttpV1Encoder {
         CodexHttpV1Encoder::new(
             CodexHttpV1Options::new(
-                "test-model",
+                crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
                 Some(vec![CodexFunctionTool::new(
                     "configured_only",
                     "must not leak into a Frame request",
@@ -526,7 +610,7 @@ mod tests {
             FrameConstraints {
                 max_frame_bytes: 64 * 1024,
                 max_component_bytes: 16 * 1024,
-                context_window_tokens: None,
+                context_window: ContextWindow::Tokens(NonZeroU64::new(272_000).unwrap()),
                 reserved_output_tokens: None,
             },
             FrameCapabilities::new(true),
@@ -1262,6 +1346,251 @@ mod tests {
                 CodexHttpV1Error::SerializedRequestBodyLimit
             ))
         ));
+    }
+
+    #[test]
+    fn estimated_context_window_includes_output_reserve_and_is_inclusive() {
+        let make_frame = |window, reserve| {
+            let mut profile = profile();
+            profile.constraints.context_window =
+                ContextWindow::Tokens(NonZeroU64::new(window).unwrap());
+            profile.constraints.reserved_output_tokens = reserve;
+            Frame::from_compiled(
+                revision(1),
+                target(),
+                epoch(),
+                TargetContinuity::FullRequired { epoch: epoch() },
+                profile,
+                FrameBasis::Full,
+                FrameSubmission::from_compiled(
+                    Vec::new(),
+                    Vec::new(),
+                    ProjectionSubmission::new(vec![CanonicalInputItem::assistant_text(
+                        "bounded", None,
+                    )]),
+                    ToolCatalog::new(Vec::new()).unwrap(),
+                    Vec::new(),
+                ),
+            )
+            .unwrap()
+        };
+        let prepared = ResponsesFrameRequestState::prepare(
+            None,
+            &make_frame(272_000, None),
+            &encoder(),
+            64 * 1024,
+        )
+        .unwrap();
+        let tokens = prepared.request_body.len().div_ceil(4) as u64;
+        assert!(ResponsesFrameRequestState::prepare(
+            None,
+            &make_frame(tokens + 64, Some(64)),
+            &encoder(),
+            64 * 1024,
+        )
+        .is_ok());
+        assert!(matches!(
+            ResponsesFrameRequestState::prepare(
+                None,
+                &make_frame(tokens + 63, Some(64)),
+                &encoder(),
+                64 * 1024,
+            ),
+            Err(ResponsesFrameRequestFault::ContextWindowLimit)
+        ));
+        assert!(matches!(
+            ResponsesFrameRequestState::prepare(
+                None,
+                &make_frame(u64::MAX, Some(u64::MAX - 1)),
+                &encoder(),
+                64 * 1024,
+            ),
+            Err(ResponsesFrameRequestFault::ContextWindowLimit)
+        ));
+    }
+
+    #[test]
+    fn parallel_compaction_preserves_latest_tail_and_full_then_delta_coverage() {
+        let old = CanonicalInputItem::assistant_text("old context ".repeat(100), None);
+        let tail = CanonicalInputItem::assistant_text("tail", None);
+        let initial = full(
+            1,
+            Vec::new(),
+            vec![system("stable"), old.clone(), tail.clone()],
+            Vec::new(),
+        );
+        let mut state = ResponsesFrameRequestState::prepare(None, &initial, &encoder(), 64 * 1024)
+            .unwrap()
+            .state;
+        let source = state.compaction_source().unwrap();
+        assert_eq!(source.input, state.wire_input[..1]);
+
+        let arriving = CanonicalInputItem::assistant_text("arrived during compaction", None);
+        state.append_public_output(0, &arriving, json!({
+            "type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"arrived during compaction"}],
+        })).unwrap();
+        let next_item = CanonicalInputItem::assistant_text("next", None);
+        let next = delta(
+            2,
+            revision(1),
+            vec![arriving.clone()],
+            Vec::new(),
+            vec![next_item.clone()],
+        );
+        let output = vec![
+            json!({"type":"message", "role":"user", "content":"retained"}),
+            json!({"type":"compaction", "encrypted_content":"opaque"}),
+        ];
+        let candidate = state
+            .with_parallel_compaction(&source, &output, &next, &encoder())
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.accepted_prefix, state.accepted_prefix);
+        assert_eq!(candidate.wire_coverage, state.wire_coverage);
+        assert_eq!(
+            &candidate.wire_input[output.len()..],
+            &state.wire_input[source.input.len()..]
+        );
+        let prepared =
+            ResponsesFrameRequestState::prepare(Some(&candidate), &next, &encoder(), 64 * 1024)
+                .unwrap();
+        let wire = input(&prepared.request_body);
+        assert!(wire.starts_with(&output));
+        assert_eq!(wire.len(), output.len() + 3);
+        assert_eq!(prepared.state.accepted_prefix.item_count(), 4);
+        assert_eq!(prepared.state.accepted_prefix, prepared.state.wire_coverage);
+
+        let recovery = full(
+            3,
+            vec![old, tail, arriving, next_item],
+            vec![system("stable")],
+            Vec::new(),
+        );
+        let recovered = ResponsesFrameRequestState::prepare(
+            Some(&prepared.state),
+            &recovery,
+            &encoder(),
+            64 * 1024,
+        )
+        .unwrap();
+        assert_eq!(input(&recovered.request_body), wire);
+        let subsequent = delta(
+            4,
+            revision(3),
+            Vec::new(),
+            Vec::new(),
+            vec![CanonicalInputItem::assistant_text("after recovery", None)],
+        );
+        let continued = ResponsesFrameRequestState::prepare(
+            Some(&recovered.state),
+            &subsequent,
+            &encoder(),
+            64 * 1024,
+        )
+        .unwrap();
+        assert!(input(&continued.request_body).starts_with(&wire));
+        assert_eq!(continued.state.wire_coverage.item_count(), 5);
+
+        // A later compaction can cover the previous artifact while preserving
+        // the same canonical coverage and the now-newest tail.
+        let second_source = continued.state.compaction_source().unwrap();
+        let final_frame = delta(5, revision(4), Vec::new(), Vec::new(), Vec::new());
+        let second_output = vec![json!({"type":"compaction", "encrypted_content":"opaque-2"})];
+        let second_base = continued
+            .state
+            .with_parallel_compaction(&second_source, &second_output, &final_frame, &encoder())
+            .unwrap()
+            .unwrap();
+        let final_request = ResponsesFrameRequestState::prepare(
+            Some(&second_base),
+            &final_frame,
+            &encoder(),
+            64 * 1024,
+        )
+        .unwrap();
+        assert_eq!(
+            input(&final_request.request_body),
+            vec![
+                second_output[0].clone(),
+                continued.state.wire_input.last().unwrap().clone()
+            ]
+        );
+        assert_eq!(
+            final_request.state.wire_coverage,
+            continued.state.wire_coverage
+        );
+    }
+
+    #[test]
+    fn parallel_compaction_refuses_changed_system_or_replaced_prefix() {
+        let items = vec![
+            CanonicalInputItem::assistant_text("old", None),
+            CanonicalInputItem::assistant_text("tail", None),
+        ];
+        let mut projection = vec![system("stable")];
+        projection.extend(items.clone());
+        let initial = full(1, Vec::new(), projection, Vec::new());
+        let mut state = ResponsesFrameRequestState::prepare(None, &initial, &encoder(), 64 * 1024)
+            .unwrap()
+            .state;
+        let source = state.compaction_source().unwrap();
+        let output = vec![json!({"type":"compaction", "encrypted_content":"opaque"})];
+        for next_system in [vec![system("changed")], Vec::new()] {
+            let next = full(2, items.clone(), next_system, Vec::new());
+            assert!(state
+                .with_parallel_compaction(&source, &output, &next, &encoder())
+                .unwrap()
+                .is_none());
+            // Discarding a candidate leaves the ordinary System replacement valid.
+            assert!(ResponsesFrameRequestState::prepare(
+                Some(&state),
+                &next,
+                &encoder(),
+                64 * 1024
+            )
+            .is_ok());
+        }
+        let next = delta(2, revision(1), Vec::new(), Vec::new(), Vec::new());
+        state.wire_input[0] = json!({"type":"compaction", "encrypted_content":"other-lineage"});
+        assert!(state
+            .with_parallel_compaction(&source, &output, &next, &encoder())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn parallel_compaction_cuts_only_before_a_closed_tail() {
+        let initial = full(1, Vec::new(), Vec::new(), Vec::new());
+        let mut state = ResponsesFrameRequestState::prepare(None, &initial, &encoder(), 64 * 1024)
+            .unwrap()
+            .state;
+        let text = json!({"type":"message", "role":"user", "content":"past"});
+        let call = json!({"type":"function_call", "call_id":"one", "name":"lookup", "arguments":"{}", "status":"completed"});
+        let result = json!({"type":"function_call_output", "call_id":"one", "output":"done"});
+        let reasoning = json!({"type":"reasoning", "encrypted_content":"opaque"});
+        state.wire_input = vec![text.clone(), call.clone(), reasoning.clone()];
+        assert_eq!(state.compaction_source().unwrap().input, vec![text.clone()]);
+        state.wire_input = vec![
+            text.clone(),
+            call.clone(),
+            result.clone(),
+            reasoning.clone(),
+        ];
+        assert_eq!(
+            state.compaction_source().unwrap().input,
+            vec![text.clone(), call.clone(), result.clone()]
+        );
+        state.wire_input = vec![call, result];
+        assert!(
+            state.compaction_source().is_none(),
+            "keeping the last item must not split a call/result pair"
+        );
+        state.wire_input = vec![
+            text.clone(),
+            json!({"type":"message", "status":"incomplete"}),
+            reasoning,
+        ];
+        assert_eq!(state.compaction_source().unwrap().input, vec![text]);
     }
 
     #[test]

@@ -241,6 +241,8 @@ pub trait ReactionPort: Send {
         &'a mut self,
         frame: Frame,
     ) -> Result<ProviderFactStream<'a>, SubmitFault>;
+
+    async fn shutdown(&mut self) {}
 }
 
 #[non_exhaustive]
@@ -373,6 +375,10 @@ port 只拥有 integration-specific protocol state：
 
 port 不拥有 shared canonical history、Component checkpoint、semantic `#[diff]` baseline或 ToolOutput
 staging。它也不能在 `declare()` 中读取这些 private FrameSession 内容。
+
+port 可以拥有只计算 provider-private 候选的后台任务。正常 `Application::shutdown()` 在
+Component tasks 清理后调用 `ReactionPort::shutdown()`，port 必须取消并 join 自己的后台任务后返回；
+没有后台工作的 port 使用默认空实现。转发型 port 应转发此方法。普通 Drop 只保证 best-effort abort。
 
 `declare()` 中的 `FullRequired` 只证明 port 具有不依赖具体 canonical payload 的 recovery strategy，且
 当前仍保留该 strategy 所需的 required private causal state。它不声称已经验证某个 exact Full request；
@@ -550,6 +556,7 @@ pub struct Frame {
     prepared_profile: FrameProfile,
     basis: FrameBasis, // Full | DeltaFrom(FrameRevision)
     submission: FrameSubmission,
+    requested_context_bytes: Option<usize>,
 }
 ```
 
@@ -566,6 +573,12 @@ Frame只能由crate-private validated constructor创建，并同时满足以下�
 
 因此port接到的Frame不会在这些重复control字段之间自相矛盾；port只需把完整precondition同自己的当前
 snapshot比较，而不需要猜测哪个字段优先。
+
+`Frame::requested_context_bytes()` 是完整当前 Component envelope（normalized System、完整
+ordinary projection 和 ToolCatalog）在 diff/omission 前的 JCS UTF-8 byte length。生产 compiler
+始终提供此 advisory metadata；合成的内部 Frame 可以缺省。它不是本次 Delta payload size，
+不包含 canonical replay 或 provider-private history，也不赋予 port 读取完整 projection 的能力。
+这个派生计量值不进入 semantic payload meter 或 continuity proof。
 
 `FrameSubmission` 包含本次 Full或Delta的 ordered canonical items和ToolCatalog。`replay`与
 `staged_inputs`永不包含System；Full的`projection.items`至多有一个位于首位的normalized System snapshot，
@@ -658,18 +671,104 @@ Provider-private remote compaction是另一类状态。它只有在对应private
 不进入public Frame或canonical transcript，也不因后续stream fault回滚。只要port仍能合法承认head，
 private compaction本身不强制Full。
 
+### Parallel provider compaction
+
+Native `AsyncOpenAiResponsesProvider` 默认使用 `DefaultCompactionPolicy` 在后台调用独立的
+`/responses/compact`。`with_parallel_compaction(policy)` 替换默认策略，
+`without_parallel_compaction()` 可为不支持该接口的 endpoint 关闭后台压缩；这些配置不影响
+独立的请求上限检查。编码器始终省略 server-side `context_management`，压缩触发由 AgentView
+决定。此功能不影响 Application 内 reaction 的 single-flight 契约，也不适用于 legacy port。
+
+Forced compaction 是同一 native provider 的独立 opt-in：`with_forced_compaction()` 默认关闭，
+且不受 `without_parallel_compaction()` 影响。它只在一个本来可编码的前台 Frame 因
+`ContextWindowLimit` 被拒绝时介入；低于上限、其他准备错误和 legacy port 均不触发。forced
+路径不会发送已知超窗的 foreground request。
+
+`CompactionPolicy`（也可传 `Fn(&CompactionContext) -> bool + Send + Sync` 闭包）在 handoff 前
+同步判断是否允许尝试，必须快速、有界；policy panic 原样传播。默认策略包含两项 OR 条件：
+
+- `TokenThresholdPolicy`：`provider_tokens >= threshold`。threshold 默认为
+  `floor((context_window_tokens - reserved_output_tokens) * 0.9)`，减法饱和到零。可用非零
+  `token_limit` 显式覆盖，但仍限制在上述 90% 阈值以内。模型窗口必须已解析，没有未知容量的兜底阈值。
+- `ContextRatioPolicy`：`requested_tokens * 10 < provider_tokens`，倍数可配置为非零整数。
+
+自定义策略替换上述两项；也可只使用其中一个 policy。两项 token estimate 均为
+`ceil(bytes / 4)`：requested 使用完整 Component envelope；provider 使用本次准备后的完整 Responses
+JSON body，包括历史、私有 artifact、instructions 和工具定义。两种编码的开销不同，不能当精确 tokenizer。
+策略还可读取可压缩前缀大小、必填的非零 context window 和 output reserve。缺少 requested 计量时，
+比例条件不触发，token 阈值仍可触发。提前压缩不能保证一定赶在上下文增长前完成；绝对上限仍由
+独立的预算检查执行。token 阈值是启动后台计算的条件，不是等待压缩完成的阻塞屏障。
+
+模型描述使用 `agentview::provider::ModelSpec`。用户必须通过
+`ModelSpec::new(model_id, context_window_tokens)` 同时提供非空模型 ID 和当前部署的非零容量；
+省略窗口无法编译，空 ID 和零容量分别返回 `ModelSpecError::EmptyId` 和
+`ModelSpecError::ZeroContextWindowTokens`。已知和未知型号都没有自动默认窗口。
+`ModelSpec` 的字段私有，只提供 `id()` 和 `context_window_tokens()` 只读访问；克隆时完整保留两者。
+
+`CodexHttpV1Options::new(model_spec, tools, reasoning, prompt_cache_key)` 持有这份模型描述，
+不接受裸模型名或独立的窗口覆盖值；`model()` 返回其只读引用。temperature、reasoning、
+`max_output_tokens` 等请求控制仍属于 options，其中输出请求上限不表示模型的最大输出能力。
+`AsyncOpenAiTransportConfig::new(api_base, api_key)` 只接收连接参数，transport 不持有或覆盖窗口。
+provider 从 encoder 的 `ModelSpec` 派生稳定的 FrameProfile，同时用于 compaction 阈值和请求预算检查。
+只有 ID 编码为 HTTP body 的 `model` 字段，窗口是本地 metadata。
+运行示例时 `AGENTVIEW_CONTEXT_WINDOW_TOKENS` 必填，与 `AGENTVIEW_MODEL` 一起构造 `ModelSpec`。
+
+一次至多一个 attempt。source 取自前一 accepted wire window 的因果闭合前缀，保留至少最后一项，
+不能切开 call/result 或覆盖未完成输出。policy-triggered background attempt 只在普通 Frame 真实
+handoff 后启动，不阻塞该前台反应。forced attempt 在超窗 Frame handoff 前启动并等待；若已有
+background worker，则等待同一个 worker，不复制 source 或启动第二个 worker。两种路径共用 source
+fingerprint 去重，同一 accepted source 至多尝试一次。worker 不拥有 Component、canonical history、
+receipt 或前台 continuation 的写能力。
+
+forced 等待以 provider 的 `read_timeout` 为上限。没有闭合 source、worker 失败或超时、候选失效时，
+返回原 `ContextWindowLimit`；不发送 foreground request，也不推进 provider accepted state 或
+FrameSession commit。候选成功后只重新准备并检查预算一次。若候选仍超窗，同样返回原 limit，候选和
+monitor 保持 `Ready`，同一 source 不再 compact。只有压缩后 foreground request 的首次 transport poll
+才把候选标为 `Installed` 并进入既有同步 commit。等待中的 submit future 被取消时，worker handle
+仍由 provider 持有；reset、shutdown 和 Drop 沿用统一的取消与收取规则。
+
+完整 `response.compaction.output` 数组及顺序作为候选保留，不能只抽取 encrypted artifact，也不能
+派发为 ProviderFact 或 Component action。结果须协议合法、因果闭合且严格缩小输入前缀的 JSON bytes。
+worker 完成仅生成候选；后续 `submit()` 非阻塞收取已结束的 worker，以候选替换仍匹配的前缀，
+再拼接**当前**最新 tail。前缀替换、reset 或 System binding 变化使旧候选无效。原 canonical coverage
+proof、pending calls 和 receipt 保持原有语义，Full recovery 仍须验证精确 coverage 与 instructions。
+
+准备候选不修改 accepted state。前台真实 handoff 才安装，随后正常同步 Frame commit；pre-handoff
+失败或取消保留兼容候选供重试，post-handoff fault 不回滚已安装窗口。同一来源不重复尝试；普通压缩
+失败通过 monitor 报告并保留原前台窗口。后台 HTTP 有独立请求/响应字节限制与超时，不能绕过预算。
+
+`parallel_compaction_monitor()` 返回无 payload/credentials 的状态观察句柄，区分 Running、Ready、
+Installed、Discarded、Failed 和 Cancelled。通知可能合并，Ready 不表示已经交付给模型，也不主动驱动
+reaction。reset 立即撤销旧任务安装资格并 abort；后台句柄保留至收取或 shutdown join。worker panic 在
+下次 submit 或 shutdown 收取时保留原 payload 传播；Drop 只提供 best-effort abort。
+
+配置示例和完整说明见 [parallel-compaction-design.md](parallel-compaction-design.md)。这一功能只压缩
+provider wire window，仍不改变 `CompleteTranscript`、canonical hard budget 或 runtime replay policy。
+
 ### Budget closure
 
 `FrameProfile` 在一个Application mount期间稳定：
 
 ```rust
+pub enum ContextWindow {
+    Tokens(NonZeroU64),
+    NotApplicable,
+}
+
 pub struct FrameConstraints {
     pub max_frame_bytes: usize,
     pub max_component_bytes: usize,
-    pub context_window_tokens: Option<u64>,
+    pub context_window: ContextWindow,
     pub reserved_output_tokens: Option<u64>,
 }
 ```
+
+每个 `ReactionPort` 必须在 `declare().profile().constraints.context_window` 明确声明容量。
+模型 provider 使用 `Tokens(NonZeroU64)`，表示当前模型和部署的有效窗口；`NotApplicable` 仅用于
+Debug、External、Skill/Plugin 等不直接调用模型的 target，不能表示未知模型容量。
+模型 provider 必须要求调用方随 model 显式配置容量，不通过 model name 或内置表自动补值；
+port 声明由模型配置派生，transport 不拥有或覆盖窗口。
+声明的容量在 mount 期间稳定，修改容量和修改其他 profile 字段一样必须重新 mount。
 
 `max_component_bytes` 是complete Component projection加Component-declared ToolCatalog的authoring
 envelope；`max_frame_bytes` 是整个stable canonical `FrameSubmission` payload的hard limit。二者使用同一
@@ -727,7 +826,11 @@ mount先对空transcript/staging验证；每次TextDelta、ToolCall和ToolOutput
 Delta也必须证明hypothetical next-Full成立。prepare最后验证actual JCS bytes。checked arithmetic失败、零值、
 Component limit大于Frame limit或初始reserve失败都是typed invalid-profile fault。
 
-port随后独立校验private artifact、真实wire bytes和tokenizer。任何一层超限都是typed pre-handoff fault，
+port随后独立校验private artifact、真实wire bytes和context预算。Native OpenAI ports 对完整 JSON body
+按 `ceil(bytes / 4)` 估算，再加 `reserved_output_tokens`；必须不超过声明的 context window，
+相等合法。这不是精确 tokenizer 保证。独立 compact 请求也检查
+其 request bytes/4 是否超过同一 window，并遵守 transport request/response byte limits。
+任何一层超限都是typed pre-handoff fault（后台 compact 超限只使该 attempt 失败），
 任何一层都不能静默truncate。
 
 ## 4. Target declaration 与 handoff
@@ -1286,6 +1389,7 @@ long-lived tasks属于mount，正常reaction结束不取消；unmount或Applicat
 每个持有Application的production integration必须提供consuming async shutdown；普通Rust `Drop`只允许作为
 emergency best-effort abort，不能证明cleanup完成。External shutdown在API调用时立即把唯一owner移入专用cleanup
 task：先cancel并join active reaction、取回Application，再fence mounts并abort + await全部Component tasks。
+正常路径还须 await port 的后台任务清理。
 丢弃shutdown waiter不取消这个cleanup owner。CLI/daemon只能在该cleanup完成后回复shutdown成功；typed cleanup
 failure回复错误，不能先ACK再Drop state。Agent、Skill或Plugin在形成production Application owner时必须复用同一
 lifecycle contract，crate-private port role本身不是Application owner。

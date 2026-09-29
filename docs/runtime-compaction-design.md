@@ -3,6 +3,10 @@
 本文记录运行时主动管理 compact 的设计方向，尚未实现，不改变
 [`engine.md`](engine.md) 中当前 `CompleteTranscript` 契约。
 
+Provider port 下方的并行压缩另见
+[`parallel-compaction-design.md`](parallel-compaction-design.md)。它并行生成并安装
+provider-private wire window，不改变本文讨论的 runtime replay/checkpoint 所有权。
+
 ## 1. 所有权
 
 自动 compact 属于 `Application` 的 reaction 生命周期。运行时负责触发、选择覆盖范围、
@@ -39,10 +43,10 @@ native Frame continuation 和 SSE 解析器，向配置的 base 下的 `/respons
 沿用现有 Responses HTTP 通道、API base 和 API key 配置，普通采样与 compact 都请求
 `/responses`。Chat Completions 的私有可见性与 HTTP 端点、认证方式无关。
 
-启用运行时自动 compact 时，使用现有 `CodexHttpV1Options::without_context_management()`
-省略请求中的服务端自动 compact 配置，避免两套触发策略并行。当前默认配置会请求服务端在
-200,000 tokens 阈值自动 compact；这类 provider-private 产物本身不保证运行时全量重建 Frame。
-省略该字段只控制客户端下发的配置，不能替未知服务端承诺额外行为。
+编码器已移除 server-side `context_management` 配置，普通请求不下发服务端自动 compact 策略。
+当前已实现的 provider-private parallel compaction 由 AgentView 的默认或用户策略触发，具体阈值见
+[parallel-compaction-design.md](parallel-compaction-design.md)。它本身不保证运行时全量重建 Frame；
+本文的 runtime-owned 摘要与 checkpoint 仍属于后续设计。
 
 ### Session 复用
 
@@ -107,7 +111,7 @@ stream 和工具执行已结算，尚未提交本轮 Frame。计算预算时包�
 - 输出预留和安全余量。
 
 provider usage 用于校准当前窗口估算，不把累计账单或压缩请求的 output_tokens 当成压缩后大小。
-token 估算和 canonical JCS 字节预算分别检查；未知模型窗口需要显式配置。
+token 估算和 canonical JCS 字节预算分别检查；所有模型窗口都需要用户显式配置。
 
 默认触发规则为：
 
@@ -123,8 +127,12 @@ should_compact = estimated_next_input_tokens >= trigger_limit
 压缩后重新估算摘要、保留 tail、当前完整 projection 与工具声明，确认有足够余量再提交。
 接近 next-Full 字节预算时也需提前处理，token 余量不能替代字节预算保证。
 
-当前 `FrameConstraints` 已有窗口和输出预留字段，但默认 Responses 配置未填写；usage 目前
-仅通过 observer 暴露 input/cached tokens。provider 内的用量记录、估算与运行时触发尚需实现。
+当前模型 provider 必须在 `FrameConstraints.context_window` 声明 `ModelSpec` 中的非零容量；
+`ModelSpec::new(model_id, context_window_tokens)` 要求同时提供 ID 和窗口，不根据型号补默认值。
+OpenAI 的 `CodexHttpV1Options` 持有该模型描述，并单独配置请求参数。
+transport 配置不持有或覆盖窗口。provider-private parallel compaction
+已使用完整请求 bytes/4 估算和独立预算检查；usage 仍通过 observer 暴露 input/cached tokens。
+本节所述 runtime replay 压缩的用量校准与触发仍待实现。
 
 只压缩已结算的历史前缀。最早未闭合 ToolCall 起的 tail、近期保留项和所有 staged ToolOutput
 受保护；覆盖边界不能拆开 call/result 配对。持续调用工具的会话仍应能压缩较早的已结算前缀，

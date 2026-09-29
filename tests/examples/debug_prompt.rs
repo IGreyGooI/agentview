@@ -1,3 +1,4 @@
+use agentview::provider::ModelSpec;
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -114,7 +115,12 @@ fn test_provider(api_base: &str) -> anyhow::Result<AsyncOpenAiResponsesProvider>
         1,
         "debug-prompt-example-test",
     )?;
-    let options = CodexHttpV1Options::new("test-model", None, None, None::<String>)?;
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("test-model", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )?;
     Ok(AsyncOpenAiResponsesProvider::new(
         transport,
         identity,

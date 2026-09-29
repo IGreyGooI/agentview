@@ -1357,8 +1357,8 @@ mod tests {
         component::execution::{
             frame::{FrameMeter, FrameSession},
             reaction::{
-                FrameCapabilities, FrameConstraints, FrameProfile, TargetDeclaration, TargetEpoch,
-                TargetIdentity,
+                ContextWindow, FrameCapabilities, FrameConstraints, FrameProfile,
+                TargetDeclaration, TargetEpoch, TargetIdentity,
             },
         },
         transcript::{
@@ -1419,7 +1419,7 @@ mod tests {
                 FrameConstraints {
                     max_frame_bytes,
                     max_component_bytes,
-                    context_window_tokens: None,
+                    context_window: ContextWindow::NotApplicable,
                     reserved_output_tokens: None,
                 },
                 FrameCapabilities::NONE,
@@ -2297,7 +2297,7 @@ mod tests {
             &FrameConstraints {
                 max_frame_bytes: 0,
                 max_component_bytes: 128,
-                context_window_tokens: None,
+                context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
         ) {

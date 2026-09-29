@@ -468,7 +468,8 @@ impl<P: ReactionPort> Application<P> {
         result
     }
 
-    /// Fence the mounted tree, then abort and await every Component-owned task.
+    /// Fence the mounted tree, abort and await every Component-owned task, then
+    /// stop and join port-owned background work.
     pub async fn shutdown(mut self) -> Result<(), ApplicationFault> {
         self.application_exit.close();
         if let Some(input) = &mut self.command_input {
@@ -504,6 +505,7 @@ impl<P: ReactionPort> Application<P> {
 
         if panic_already_consumed {
             let _ = self.tasks.shutdown().await;
+            self.port.shutdown().await;
             mount_fence?;
             return Err(task_panic_terminal_fault(ApplicationFaultStage::Reaction));
         }
@@ -524,6 +526,7 @@ impl<P: ReactionPort> Application<P> {
             result = &mut shutdown => result,
         };
         drop(shutdown);
+        self.port.shutdown().await;
         if monitor.status() == TaskSupervisorStatus::Panicked {
             consume_supervised_task_panic(&application_state, &monitor);
             return Err(task_panic_terminal_fault(ApplicationFaultStage::Reaction));
@@ -1882,8 +1885,8 @@ mod tests {
 
     use super::*;
     use crate::component::execution::reaction::{
-        Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
-        ProviderFact, ProviderOutputKey, ProviderToolCall, ReactionPortFault,
+        ContextWindow, Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile,
+        FrameRevision, ProviderFact, ProviderOutputKey, ProviderToolCall, ReactionPortFault,
         ReactionPortFaultCode, ReactionPortFaultReason, TargetContinuity, TargetDeclaration,
         TargetDeclarationInvariantFault, TargetEpoch, TargetIdentity,
     };
@@ -2794,7 +2797,7 @@ mod tests {
             FrameConstraints {
                 max_frame_bytes: 4_096,
                 max_component_bytes: 1_024,
-                context_window_tokens: Some(8_192),
+                context_window: ContextWindow::Tokens(std::num::NonZeroU64::new(8_192).unwrap()),
                 reserved_output_tokens: Some(1_024),
             },
             FrameCapabilities::NONE,
@@ -3021,7 +3024,7 @@ mod tests {
             FrameConstraints {
                 max_frame_bytes: 128,
                 max_component_bytes: 100,
-                context_window_tokens: None,
+                context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
             FrameCapabilities::NONE,
@@ -3335,7 +3338,8 @@ mod tests {
         let mut application = Application::mount(|| __private::fragment(Vec::new()), port).unwrap();
         let prepared = prepared_frame(&mut application);
         let mut changed_profile = valid_profile();
-        changed_profile.constraints.context_window_tokens = Some(16_384);
+        changed_profile.constraints.context_window =
+            ContextWindow::Tokens(NonZeroU64::new(16_384).unwrap());
         application.port.declaration = Ok(target_declaration(changed_profile));
         let mut submit = Box::pin(submit_prepared_frame(
             &mut application.port,

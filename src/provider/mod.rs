@@ -1,4 +1,4 @@
-//! Provider-owned history projection and deterministic request encoding.
+//! Model descriptions, provider-owned history projection, and request encoding.
 //!
 //! Transport clients and third-party SDK types belong in adapter modules built
 //! on top of these AgentView-owned contracts.
@@ -9,6 +9,9 @@ use crate::transcript::CanonicalTranscript;
 
 pub mod async_openai;
 pub mod codex_http_v1;
+mod model;
+
+pub use model::{ModelSpec, ModelSpecError};
 
 /// Projects canonical history into one provider profile's accepted window.
 pub trait HistoryPolicy {

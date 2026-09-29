@@ -12,9 +12,9 @@ use std::{
 use agentview::{
     component::{
         execution::{
-            Application, ExitReason, Frame, FrameCapabilities, FrameConstraints, FrameProfile,
-            ProviderFact, ProviderFactStream, ProviderOutputKey, ReactionPort, ReactionPortFault,
-            SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity,
+            Application, ContextWindow, ExitReason, Frame, FrameCapabilities, FrameConstraints,
+            FrameProfile, ProviderFact, ProviderFactStream, ProviderOutputKey, ReactionPort,
+            ReactionPortFault, SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity,
         },
         prelude::*,
     },
@@ -182,7 +182,7 @@ impl Port {
                     FrameConstraints {
                         max_frame_bytes: 64 * 1024,
                         max_component_bytes: 16 * 1024,
-                        context_window_tokens: None,
+                        context_window: ContextWindow::NotApplicable,
                         reserved_output_tokens: None,
                     },
                     FrameCapabilities::new(true),

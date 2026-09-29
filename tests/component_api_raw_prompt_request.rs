@@ -1,3 +1,4 @@
+use agentview::provider::ModelSpec;
 use std::time::Duration;
 
 use agentview::{
@@ -50,7 +51,12 @@ async fn multiline_prompt_strings_reach_the_provider_request_unchanged() -> anyh
     let mut server = ResponsesAcceptanceServer::start(&["received"]).await?;
     let config = AsyncOpenAiTransportConfig::new(server.api_base(), "test-token")?;
     let identity = ProviderIdentity::new("openai", CODEX_HTTP_V1_PROFILE, 1, "raw-prompt")?;
-    let options = CodexHttpV1Options::new("test-model", None, None, None::<String>)?;
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("test-model", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )?;
     let provider =
         AsyncOpenAiResponsesProvider::new(config, identity, CodexHttpV1Encoder::new(options));
     let mut application = Application::mount(raw_prompt_application, provider)?;

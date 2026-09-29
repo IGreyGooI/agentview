@@ -419,7 +419,7 @@ pub(super) fn encode_request(
     max_serialized_request_body_bytes: usize,
 ) -> Result<Vec<u8>, OpenAiChatCompletionsError> {
     let request_body = serde_json::to_vec(&ChatRequest {
-        model: options.model(),
+        model: options.model().id(),
         messages,
         stream: true,
         tool_choice: ToolChoice::None,

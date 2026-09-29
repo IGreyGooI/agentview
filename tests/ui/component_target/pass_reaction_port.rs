@@ -1,9 +1,9 @@
 use std::num::{NonZeroU128, NonZeroU64};
 
 use agentview::component::execution::reaction::{
-    Frame, FrameCapabilities, FrameConstraints, FrameProfile, ProviderFact, ProviderFactStream,
-    ReactionPort, ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultReason, SubmitFault,
-    TargetDeclaration, TargetEpoch, TargetIdentity,
+    ContextWindow, Frame, FrameCapabilities, FrameConstraints, FrameProfile, ProviderFact,
+    ProviderFactStream, ReactionPort, ReactionPortFault, ReactionPortFaultCode,
+    ReactionPortFaultReason, SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity,
 };
 use async_trait::async_trait;
 
@@ -46,7 +46,7 @@ fn main() {
             FrameConstraints {
                 max_frame_bytes: 4_096,
                 max_component_bytes: 1_024,
-                context_window_tokens: None,
+                context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
             FrameCapabilities::NONE,

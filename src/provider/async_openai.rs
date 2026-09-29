@@ -40,8 +40,9 @@ use crate::component::execution::{ProviderPort, RenderedProjection};
 use crate::{
     component::execution::{
         reaction::{
-            FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision, ReactionPortFault,
-            ReactionPortFaultKind, TargetDeclaration, TargetEpoch, TargetIdentity,
+            ContextWindow, FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision,
+            ReactionPortFault, ReactionPortFaultKind, TargetDeclaration, TargetEpoch,
+            TargetIdentity,
         },
         ProviderFault, ProviderIdentity, ToolCall,
     },
@@ -78,6 +79,7 @@ mod faults;
 mod frame_request;
 mod native_reaction;
 mod output;
+mod parallel_compaction;
 mod reaction_fault;
 mod request_observation;
 mod responses_observation;
@@ -98,6 +100,11 @@ use self::faults::{
     serialized_request_body_limit_fault, stream_error_code, stream_event_limit_fault,
     stream_transport_fault, unsupported_content_part_fault, unsupported_output_item_fault,
     OpenAiApi, ResponseEventReason,
+};
+pub use self::parallel_compaction::{
+    CompactionContext, CompactionPolicy, ContextEstimate, ContextRatioPolicy,
+    DefaultCompactionPolicy, ParallelCompactionFault, ParallelCompactionMonitor,
+    ParallelCompactionPhase, ParallelCompactionStatus, TokenThresholdPolicy,
 };
 pub use self::request_observation::OpenAiResponsesRequestSnapshot;
 pub use self::responses_observation::{
@@ -132,11 +139,31 @@ pub struct AsyncOpenAiTransportConfig {
     max_output_text_bytes: usize,
     max_responses_serialized_request_body_bytes: usize,
     max_chat_completions_serialized_request_body_bytes: usize,
-    responses_frame_constraints: FrameConstraints,
-    chat_completions_frame_constraints: FrameConstraints,
+    responses_frame_limits: OpenAiFrameLimits,
+    chat_completions_frame_limits: OpenAiFrameLimits,
+}
+
+/// Canonical delivery budgets, independent of the model's context capacity.
+struct OpenAiFrameLimits {
+    max_frame_bytes: usize,
+    max_component_bytes: usize,
+    reserved_output_tokens: Option<u64>,
+}
+
+impl OpenAiFrameLimits {
+    fn constraints(&self, context_window: ContextWindow) -> FrameConstraints {
+        FrameConstraints {
+            max_frame_bytes: self.max_frame_bytes,
+            max_component_bytes: self.max_component_bytes,
+            context_window,
+            reserved_output_tokens: self.reserved_output_tokens,
+        }
+    }
 }
 
 impl AsyncOpenAiTransportConfig {
+    /// Builds model-independent HTTP connection and delivery configuration.
+    /// Model identity and context capacity are supplied together in model options.
     pub fn new(
         api_base: impl Into<String>,
         api_key: impl Into<String>,
@@ -190,16 +217,14 @@ impl AsyncOpenAiTransportConfig {
                 DEFAULT_MAX_RESPONSES_SERIALIZED_REQUEST_BODY_BYTES,
             max_chat_completions_serialized_request_body_bytes:
                 DEFAULT_MAX_CHAT_COMPLETIONS_SERIALIZED_REQUEST_BODY_BYTES,
-            responses_frame_constraints: FrameConstraints {
+            responses_frame_limits: OpenAiFrameLimits {
                 max_frame_bytes: DEFAULT_MAX_RESPONSES_FRAME_BYTES,
                 max_component_bytes: DEFAULT_MAX_RESPONSES_COMPONENT_BYTES,
-                context_window_tokens: None,
                 reserved_output_tokens: None,
             },
-            chat_completions_frame_constraints: FrameConstraints {
+            chat_completions_frame_limits: OpenAiFrameLimits {
                 max_frame_bytes: DEFAULT_MAX_CHAT_COMPLETIONS_FRAME_BYTES,
                 max_component_bytes: DEFAULT_MAX_CHAT_COMPLETIONS_COMPONENT_BYTES,
-                context_window_tokens: None,
                 reserved_output_tokens: None,
             },
         })
@@ -258,18 +283,30 @@ impl AsyncOpenAiTransportConfig {
         })
     }
 
-    /// Replaces the mount-stable canonical Frame constraints declared by the
-    /// OpenAI Responses reaction target.
+    /// Replaces canonical Frame byte budgets and the reserved output budget.
     ///
-    /// These limits apply to AgentView's canonical Frame encoding. The exact
-    /// serialized OpenAI request body retains its independent transport limit.
-    pub fn with_responses_frame_constraints(
+    /// Byte limits apply to AgentView's canonical Frame encoding. The native
+    /// Responses port also checks ceil(serialized request bytes / 4) plus the
+    /// output reserve against the declared context window. This is an estimate,
+    /// not tokenizer accounting. The exact wire body has its own byte limit.
+    /// Context capacity always comes from the [`ModelSpec`](super::ModelSpec)
+    /// supplied to the encoder's request options.
+    pub fn with_responses_frame_limits(
         self,
-        constraints: FrameConstraints,
+        max_frame_bytes: usize,
+        max_component_bytes: usize,
+        reserved_output_tokens: Option<u64>,
     ) -> Result<Self, AsyncOpenAiConfigError> {
-        responses_frame_profile(constraints.clone())?;
+        let limits = OpenAiFrameLimits {
+            max_frame_bytes,
+            max_component_bytes,
+            reserved_output_tokens,
+        };
+        // Only canonical budgets are validated here; model metadata arrives
+        // when the provider is constructed.
+        responses_frame_profile(limits.constraints(ContextWindow::NotApplicable))?;
         Ok(Self {
-            responses_frame_constraints: constraints,
+            responses_frame_limits: limits,
             ..self
         })
     }
@@ -294,19 +331,27 @@ impl AsyncOpenAiTransportConfig {
         })
     }
 
-    /// Replaces the mount-stable canonical Frame constraints declared by the
-    /// OpenAI Chat Completions reaction target.
+    /// Replaces canonical Frame byte budgets and the reserved output budget for
+    /// the OpenAI Chat Completions reaction target.
     ///
     /// These limits apply to AgentView's canonical Frame encoding. The exact
-    /// serialized Chat request retains its independent transport limit.
+    /// serialized Chat request retains its independent transport limit. Model
+    /// context capacity comes from OpenAiChatCompletionsOptions.
     #[allow(dead_code, reason = "used by the private Chat Completions tests")]
-    fn with_chat_completions_frame_constraints(
+    fn with_chat_completions_frame_limits(
         self,
-        constraints: FrameConstraints,
+        max_frame_bytes: usize,
+        max_component_bytes: usize,
+        reserved_output_tokens: Option<u64>,
     ) -> Result<Self, chat_completions::ChatCompletionsConfigError> {
-        chat_completions_frame_profile(constraints.clone())?;
+        let limits = OpenAiFrameLimits {
+            max_frame_bytes,
+            max_component_bytes,
+            reserved_output_tokens,
+        };
+        chat_completions_frame_profile(limits.constraints(ContextWindow::NotApplicable))?;
         Ok(Self {
-            chat_completions_frame_constraints: constraints,
+            chat_completions_frame_limits: limits,
             ..self
         })
     }
@@ -393,6 +438,9 @@ pub struct AsyncOpenAiResponsesProvider {
     execution_mode: ResponsesExecutionMode,
     reaction_target: ResponsesReactionTarget,
     reaction_frame: Option<frame_request::ResponsesFrameRequestState>,
+    parallel_compaction: parallel_compaction::ParallelCompaction,
+    parallel_compaction_enabled: bool,
+    forced_compaction_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -560,14 +608,18 @@ impl AsyncOpenAiResponsesProvider {
             .unwrap_or_else(|_| panic!("OpenAI transport initialization failed"))
     }
 
-    /// Builds a Responses provider without exposing HTTP-client source errors.
+    /// Builds a Responses provider using the encoder's model context window.
+    /// HTTP-client source errors remain private.
     pub fn try_new(
         config: AsyncOpenAiTransportConfig,
         identity: ProviderIdentity,
         encoder: CodexHttpV1Encoder,
     ) -> Result<Self, AsyncOpenAiConfigError> {
+        let profile = responses_frame_profile(config.responses_frame_limits.constraints(
+            ContextWindow::Tokens(encoder.model().context_window_tokens()),
+        ))?;
         let initialized = transport::initialize(config)?;
-        let reaction_target = ResponsesReactionTarget::new(initialized.responses_frame_profile)?;
+        let reaction_target = ResponsesReactionTarget::new(profile)?;
         Ok(Self {
             client: initialized.client,
             config: initialized.config,
@@ -592,11 +644,72 @@ impl AsyncOpenAiResponsesProvider {
             execution_mode: ResponsesExecutionMode::Unclaimed,
             reaction_target,
             reaction_frame: None,
+            parallel_compaction: parallel_compaction::ParallelCompaction::new(
+                DefaultCompactionPolicy::default(),
+            ),
+            parallel_compaction_enabled: true,
+            forced_compaction_enabled: false,
         })
     }
 
     pub fn identity(&self) -> &ProviderIdentity {
         &self.identity
+    }
+
+    /// Replace the default background `/responses/compact` admission policy.
+    /// Native Responses enables DefaultCompactionPolicy automatically: a token
+    /// threshold plus requested context < provider / 10. Custom policies replace
+    /// both triggers. Requires endpoint support; ordinary requests never send
+    /// server-side context_management. Does not apply to the legacy port.
+    ///
+    /// ```
+    /// use agentview::provider::async_openai::{
+    ///     AsyncOpenAiResponsesProvider, CompactionContext, DefaultCompactionPolicy,
+    ///     TokenThresholdPolicy,
+    /// };
+    /// # fn built_in(provider: AsyncOpenAiResponsesProvider) {
+    /// let policy = DefaultCompactionPolicy {
+    ///     token_threshold: TokenThresholdPolicy {
+    ///         token_limit: std::num::NonZeroU64::new(120_000),
+    ///     },
+    ///     ..Default::default()
+    /// };
+    /// let provider = provider.with_parallel_compaction(policy);
+    /// let monitor = provider.parallel_compaction_monitor().unwrap();
+    /// # }
+    /// # fn custom(provider: AsyncOpenAiResponsesProvider) {
+    /// let provider = provider.with_parallel_compaction(|context: &CompactionContext| {
+    ///     context.requested_context.is_some_and(|requested| {
+    ///         u128::from(requested.tokens) * 11 < u128::from(context.provider_context.tokens)
+    ///     })
+    /// });
+    /// # }
+    /// ```
+    pub fn with_parallel_compaction(mut self, policy: impl CompactionPolicy + 'static) -> Self {
+        self.parallel_compaction.replace_policy(policy);
+        self.parallel_compaction_enabled = true;
+        self
+    }
+
+    /// Disable background compaction, for example for an endpoint without
+    /// `/responses/compact`. Independent request limits still apply.
+    pub fn without_parallel_compaction(mut self) -> Self {
+        self.parallel_compaction_enabled = false;
+        self
+    }
+
+    /// Enable one bounded `/responses/compact` attempt when an otherwise valid
+    /// Frame exceeds the configured context window. The attempt shares the
+    /// background worker and source deduplication, but remains enabled when
+    /// `without_parallel_compaction()` disables policy-triggered work.
+    pub fn with_forced_compaction(mut self) -> Self {
+        self.forced_compaction_enabled = true;
+        self
+    }
+
+    pub fn parallel_compaction_monitor(&self) -> Option<ParallelCompactionMonitor> {
+        (self.parallel_compaction_enabled || self.forced_compaction_enabled)
+            .then(|| self.parallel_compaction.monitor())
     }
 
     /// Observes exact bodies on the native ReactionPort path without exposing
@@ -1926,7 +2039,13 @@ mod terminal_precedence_tests {
     fn terminal_output_limit_precedes_malformed_usage() {
         let mut continuation = None;
         let mut artifact_binding = None;
-        let options = CodexHttpV1Options::new("test-model", None, None, None::<String>).unwrap();
+        let options = CodexHttpV1Options::new(
+            crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+            None,
+            None,
+            None::<String>,
+        )
+        .unwrap();
         let tool_output_sink: Arc<dyn ToolOutputSink> =
             Arc::new(Mutex::new(ToolOutputStaging::default()));
         let mut state = OpenAiStreamState {
@@ -2154,15 +2273,33 @@ mod responses_frame_profile_tests {
     }
 
     fn provider(config: AsyncOpenAiTransportConfig) -> AsyncOpenAiResponsesProvider {
+        provider_for_model(config, "gpt-5.4", 272_000)
+    }
+
+    fn provider_for_model(
+        config: AsyncOpenAiTransportConfig,
+        model: &str,
+        context_window_tokens: u64,
+    ) -> AsyncOpenAiResponsesProvider {
         let identity =
             ProviderIdentity::new("openai", "codex-http-v1", 1, "frame-profile-test").unwrap();
-        let options = CodexHttpV1Options::new("test-model", None, None, None::<String>).unwrap();
+        let options = CodexHttpV1Options::new(
+            crate::provider::ModelSpec::new(model, context_window_tokens).unwrap(),
+            None,
+            None,
+            None::<String>,
+        )
+        .unwrap();
         AsyncOpenAiResponsesProvider::try_new(config, identity, CodexHttpV1Encoder::new(options))
             .unwrap()
     }
 
     fn assert_invalid(constraints: FrameConstraints) {
-        let error = match config().with_responses_frame_constraints(constraints) {
+        let error = match config().with_responses_frame_limits(
+            constraints.max_frame_bytes,
+            constraints.max_component_bytes,
+            constraints.reserved_output_tokens,
+        ) {
             Ok(_) => panic!("invalid Responses Frame constraints were accepted"),
             Err(error) => error,
         };
@@ -2170,7 +2307,7 @@ mod responses_frame_profile_tests {
     }
 
     #[test]
-    fn responses_target_declares_exact_production_defaults() {
+    fn responses_target_declares_explicit_capacity_and_default_byte_limits() {
         let provider = provider(config());
         let declaration = provider.reaction_target.declaration().unwrap();
 
@@ -2179,7 +2316,7 @@ mod responses_frame_profile_tests {
             FrameConstraints {
                 max_frame_bytes: 16 * 1024 * 1024,
                 max_component_bytes: 4 * 1024 * 1024,
-                context_window_tokens: None,
+                context_window: ContextWindow::Tokens(NonZeroU64::new(272_000).unwrap()),
                 reserved_output_tokens: None,
             }
         );
@@ -2196,13 +2333,19 @@ mod responses_frame_profile_tests {
         let constraints = FrameConstraints {
             max_frame_bytes: 32 * 1024,
             max_component_bytes: 8 * 1024,
-            context_window_tokens: Some(128_000),
+            context_window: ContextWindow::Tokens(std::num::NonZeroU64::new(128_000).unwrap()),
             reserved_output_tokens: Some(8_192),
         };
-        let provider = provider(
+        let provider = provider_for_model(
             config()
-                .with_responses_frame_constraints(constraints.clone())
+                .with_responses_frame_limits(
+                    constraints.max_frame_bytes,
+                    constraints.max_component_bytes,
+                    constraints.reserved_output_tokens,
+                )
                 .unwrap(),
+            "test-model",
+            128_000,
         );
 
         assert_eq!(
@@ -2217,11 +2360,38 @@ mod responses_frame_profile_tests {
     }
 
     #[test]
-    fn responses_frame_constraints_reject_every_invalid_profile_shape() {
+    fn every_model_uses_the_explicit_window_for_declaration_and_compaction() {
+        for model in ["gpt-6-astra", "gpt-daybreak-red-latest", "custom-model"] {
+            for (window, threshold) in [(64_000, 57_600), (128_000, 115_200), (1_000_000, 900_000)]
+            {
+                let config =
+                    AsyncOpenAiTransportConfig::new("http://127.0.0.1:1/v1", "test-token").unwrap();
+                let provider = provider_for_model(config, model, window);
+                let declaration = provider.reaction_target.declaration().unwrap();
+                let constraints = &declaration.profile().constraints;
+                assert_eq!(constraints.context_window.tokens().unwrap().get(), window);
+                let context = CompactionContext {
+                    requested_context: None,
+                    provider_context: ContextEstimate::from_bytes(0),
+                    compactable_context: ContextEstimate::from_bytes(0),
+                    context_window_tokens: constraints.context_window.tokens().unwrap(),
+                    reserved_output_tokens: constraints.reserved_output_tokens,
+                };
+                assert_eq!(
+                    TokenThresholdPolicy::default().threshold_tokens(&context),
+                    threshold
+                );
+                assert!(provider.parallel_compaction_monitor().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn responses_frame_limits_reject_invalid_delivery_budgets() {
         let valid = FrameConstraints {
             max_frame_bytes: 1_024,
             max_component_bytes: 256,
-            context_window_tokens: Some(4_096),
+            context_window: ContextWindow::Tokens(std::num::NonZeroU64::new(4_096).unwrap()),
             reserved_output_tokens: Some(512),
         };
 
@@ -2231,10 +2401,6 @@ mod responses_frame_profile_tests {
         });
         assert_invalid(FrameConstraints {
             max_component_bytes: 0,
-            ..valid.clone()
-        });
-        assert_invalid(FrameConstraints {
-            context_window_tokens: Some(0),
             ..valid.clone()
         });
         assert_invalid(FrameConstraints {

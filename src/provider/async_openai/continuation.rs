@@ -1418,7 +1418,13 @@ mod tests {
 
     fn encoder() -> CodexHttpV1Encoder {
         CodexHttpV1Encoder::new(
-            CodexHttpV1Options::new("gpt-5.6-codex", None, None, None::<String>).unwrap(),
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("gpt-5.6-codex", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap(),
         )
     }
 
@@ -2302,7 +2308,7 @@ mod tests {
     fn retained_snapshot_preserves_encoder_binding_and_pruned_wire_without_future_projection() {
         let encoder = CodexHttpV1Encoder::new(
             CodexHttpV1Options::new(
-                "snapshot-model",
+                crate::provider::ModelSpec::new("snapshot-model", 272_000).unwrap(),
                 Some(vec![CodexFunctionTool::new(
                     "snapshot_tool",
                     "Snapshot tool description",

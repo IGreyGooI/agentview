@@ -6,9 +6,9 @@ use std::{
 use agentview::component::{
     execution::{
         Application, ApplicationFault, ApplicationFaultCode, ApplicationFaultKind,
-        ApplicationFaultReason, ApplicationFaultStage, Frame, FrameCapabilities, FrameConstraints,
-        FrameProfile, ProviderFact, ProviderFactStream, ReactionPort, ReactionPortFault,
-        SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity,
+        ApplicationFaultReason, ApplicationFaultStage, ContextWindow, Frame, FrameCapabilities,
+        FrameConstraints, FrameProfile, ProviderFact, ProviderFactStream, ReactionPort,
+        ReactionPortFault, SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity,
     },
     prelude::{component, view, Component},
 };
@@ -44,7 +44,7 @@ fn main() {
             FrameConstraints {
                 max_frame_bytes: 4_096,
                 max_component_bytes: 1_024,
-                context_window_tokens: None,
+                context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
             FrameCapabilities::NONE,

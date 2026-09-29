@@ -1,0 +1,15 @@
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+ --> tests/ui/component_target/fail_openai_context_window_missing.rs:4:13
+  |
+4 |     let _ = ModelSpec::new("test-model");
+  |             ^^^^^^^^^^^^^^-------------- argument #2 of type `u64` is missing
+  |
+note: associated function defined here
+ --> src/provider/model.rs
+  |
+  |     pub fn new(id: impl Into<String>, context_window_tokens: u64) -> Result<Self, ModelSpecError> {
+  |            ^^^
+help: provide the argument
+  |
+4 |     let _ = ModelSpec::new("test-model", /* u64 */);
+  |                                        +++++++++++

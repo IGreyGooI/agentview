@@ -5,6 +5,7 @@ use agentview::{
     provider::{
         async_openai::{AsyncOpenAiResponsesProvider, AsyncOpenAiTransportConfig},
         codex_http_v1::{CodexHttpV1Encoder, CodexHttpV1Options, CODEX_HTTP_V1_PROFILE},
+        ModelSpec,
     },
 };
 use anyhow::Context as _;
@@ -21,7 +22,7 @@ const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(110);
 const PROVIDER_BINDING: &str = "chess-agentview-example";
 
 pub(crate) struct LiveConfig {
-    model: String,
+    model: ModelSpec,
     api_key: String,
     api_base: String,
     stockfish_program: PathBuf,
@@ -39,6 +40,12 @@ impl LiveConfig {
         anyhow::ensure!(!api_key.is_empty(), "OPENAI_API_KEY must not be empty");
 
         let model = unicode(read("AGENTVIEW_MODEL")).unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+        let context_window_tokens = unicode(read("AGENTVIEW_CONTEXT_WINDOW_TOKENS"))
+            .context("AGENTVIEW_CONTEXT_WINDOW_TOKENS is required")?
+            .parse()
+            .context("AGENTVIEW_CONTEXT_WINDOW_TOKENS must be a positive integer")?;
+        let model = ModelSpec::new(model, context_window_tokens)
+            .context("OpenAI model description is invalid")?;
         let api_base =
             unicode(read("OPENAI_BASE_URL")).unwrap_or_else(|| DEFAULT_API_BASE.to_owned());
         let stockfish_program = read("AGENTVIEW_STOCKFISH_BIN")
@@ -93,8 +100,8 @@ impl LiveConfig {
         let identity = ProviderIdentity::new("openai", CODEX_HTTP_V1_PROFILE, 1, PROVIDER_BINDING)
             .context("provider identity is invalid")?;
         let cache_key = format!("chess-agentview-{}", std::process::id());
-        let options = CodexHttpV1Options::new(&self.model, None, None, Some(&cache_key))
-            .context("OpenAI model options are invalid")?;
+        let options = CodexHttpV1Options::new(self.model.clone(), None, None, Some(&cache_key))
+            .context("OpenAI request options are invalid")?;
 
         AsyncOpenAiResponsesProvider::try_new(transport, identity, CodexHttpV1Encoder::new(options))
             .context("OpenAI Responses provider initialization failed")

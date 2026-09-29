@@ -1,3 +1,4 @@
+use agentview::provider::ModelSpec;
 use std::error::Error;
 
 #[cfg(all(
@@ -32,7 +33,13 @@ const URL_PASSWORD_SENTINEL: &str = "url-password-sentinel";
 fn responses_provider_exposes_fallible_initialization() {
     let config = AsyncOpenAiTransportConfig::new("http://127.0.0.1:1/v1", "test-token").unwrap();
     let identity = ProviderIdentity::new("openai", CODEX_HTTP_V1_PROFILE, 1, BINDING).unwrap();
-    let options = CodexHttpV1Options::new("test-model", None, None, None::<String>).unwrap();
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("test-model", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )
+    .unwrap();
 
     let result: Result<AsyncOpenAiResponsesProvider, AsyncOpenAiConfigError> =
         AsyncOpenAiResponsesProvider::try_new(config, identity, CodexHttpV1Encoder::new(options));
@@ -57,7 +64,13 @@ fn responses_try_new_returns_a_sanitized_initialization_error_without_requesting
     let api_base = std::env::var(BASE_URL_ENV).expect("parent supplies a synthetic base URL");
     let config = AsyncOpenAiTransportConfig::new(&api_base, API_KEY_SENTINEL).unwrap();
     let identity = ProviderIdentity::new("openai", CODEX_HTTP_V1_PROFILE, 1, BINDING).unwrap();
-    let options = CodexHttpV1Options::new("test-model", None, None, None::<String>).unwrap();
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("test-model", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )
+    .unwrap();
 
     let error = match AsyncOpenAiResponsesProvider::try_new(
         config,
@@ -144,7 +157,13 @@ fn responses_legacy_new_panics_with_only_a_fixed_sanitized_message() {
     let api_base = std::env::var(BASE_URL_ENV).expect("parent supplies a synthetic base URL");
     let config = AsyncOpenAiTransportConfig::new(api_base, API_KEY_SENTINEL).unwrap();
     let identity = ProviderIdentity::new("openai", CODEX_HTTP_V1_PROFILE, 1, BINDING).unwrap();
-    let options = CodexHttpV1Options::new("test-model", None, None, None::<String>).unwrap();
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("test-model", 272_000).unwrap(),
+        None,
+        None,
+        None::<String>,
+    )
+    .unwrap();
     let _provider =
         AsyncOpenAiResponsesProvider::new(config, identity, CodexHttpV1Encoder::new(options));
     panic!("legacy Responses constructor unexpectedly returned");

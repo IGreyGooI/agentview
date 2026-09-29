@@ -37,7 +37,9 @@ fn chat_try_new_returns_a_sanitized_initialization_error_without_requesting() {
     let config = AsyncOpenAiTransportConfig::new(&api_base, API_KEY_SENTINEL).unwrap();
     let identity =
         ProviderIdentity::new("openai", OPENAI_CHAT_COMPLETIONS_PROFILE, 1, BINDING).unwrap();
-    let options = OpenAiChatCompletionsOptions::new("test-chat-model").unwrap();
+    let options = OpenAiChatCompletionsOptions::new(
+        crate::provider::ModelSpec::new("test-chat-model", 272_000).unwrap(),
+    );
 
     let error = match AsyncOpenAiChatCompletionsProvider::try_new(config, identity, options) {
         Ok(_) => panic!("missing CA configuration unexpectedly initialized Chat Completions"),
@@ -63,7 +65,9 @@ fn chat_legacy_new_panics_with_only_a_fixed_sanitized_message() {
     let config = AsyncOpenAiTransportConfig::new(api_base, API_KEY_SENTINEL).unwrap();
     let identity =
         ProviderIdentity::new("openai", OPENAI_CHAT_COMPLETIONS_PROFILE, 1, BINDING).unwrap();
-    let options = OpenAiChatCompletionsOptions::new("test-chat-model").unwrap();
+    let options = OpenAiChatCompletionsOptions::new(
+        crate::provider::ModelSpec::new("test-chat-model", 272_000).unwrap(),
+    );
     let _provider = AsyncOpenAiChatCompletionsProvider::new(config, identity, options);
     panic!("legacy Chat Completions constructor unexpectedly returned");
 }
