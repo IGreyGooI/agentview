@@ -10,13 +10,6 @@
 上下文替换，不表示模型必须运行在本机。摘要通过当前 provider 的普通推理接口执行，使用与
 前台 reaction 相同的 `ModelSpec`、reasoning 配置、连接配置和认证；不另选或硬编码摘要模型。
 
-local 路径迁移自 Codex：原样使用摘要提示词和 summary prefix，保留原 System instructions，
-在历史末尾追加 user 摘要请求，通过普通流式推理取得最后一条 assistant 摘要。重建为
-「近期 user 文本 + user 角色的摘要 + 最新 tail」。近期 user 文本采用 Codex 的逆序选取、
-恢复原顺序规则，上限为 20,000 tokens，并限制在当前模型窗口的十分之一以内；旧摘要不作为
-真实用户消息重复保留。输出沿用当前模型的请求参数；发送前校验输入估算与配置的输出预留总量。
-来源、许可证和 AgentView 适配说明见 [third_party/codex](third_party/codex/README.md)。
-
 - 后台 parallel compaction 和显式启用的 forced compaction 共用这一条本地摘要路径。
 - 不调用 `/responses/compact` 或任何 provider 专用压缩接口。
 - 不发送 `context_management`、`compaction_trigger` 或其他服务端压缩配置。

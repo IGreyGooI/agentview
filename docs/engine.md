@@ -731,17 +731,12 @@ monitor 保持 `Ready`，同一 source 不再 compact。只有压缩后 foregrou
 才把候选标为 `Installed` 并进入既有同步 commit。等待中的 submit future 被取消时，worker handle
 仍由 provider 持有；reset、shutdown 和 Drop 沿用统一的取消与收取规则。
 
-摘要执行迁移自 Codex local compaction。保留来源的 System instructions，在闭合历史前缀末尾追加
-原样复制的 Codex 摘要提示词（user 消息），工具列表为空，`store: false`、`stream: true`，
-不复用前台 `previous_response_id`。沿用当前模型的 reasoning、temperature、prompt cache key 和
-输出限制（未配置则继续省略，不新增上限）。摘要请求的 bytes/4 estimate 加上配置的 output reserve
-与显式 `max_output_tokens` 二者较大值必须在窗口内，并至少留有输出空间；不满足则失败。
-流通过既有 output ledger 校验，收到合法 `response.completed` 后才使用最后一条已 seal 的非空
-assistant 文本；reasoning 不进入候选，拒绝工具调用、refusal、服务端压缩产物、不完整或不一致结果。
-重建时按 Codex 规则优先保留最新 user 文本，恢复原顺序后追加带 Codex summary prefix 的 user
-摘要。保留文本预算最多 20,000 tokens 且不超过当前模型窗口的十分之一，以 bytes/4 估计；边界
-文本保留首尾并标明截断，之前的摘要不重复当作用户输入保留。这些是 provider-private 上下文，
-不成为 canonical 事实、不派发为 ProviderFact 或 Component action。
+摘要请求使用专门的摘要 instructions、闭合历史前缀及空工具列表，`store: false`、`stream: false`，
+不复用前台 `previous_response_id`。请求的输出预留为输入估算 token 数的四分之一（向上取整），
+最多 4096，并按当前窗口扣除实际请求估算占用后的剩余容量进一步缩小；无剩余容量则失败。
+只有 completed response 的非空 assistant 文本可以形成候选；reasoning 不进入候选，拒绝工具调用、
+refusal、服务端 compaction 产物和不完整结果。客户端把文本标记为历史摘要，包装成普通 assistant
+上下文项；它不成为 canonical 事实、不派发为 ProviderFact 或 Component action。
 候选必须严格缩小输入前缀的 JSON bytes。摘要是有损推理结果，不能承诺逐字保留全部历史事实。
 worker 完成仅生成候选；后续 `submit()` 非阻塞收取已结束的 worker，以候选替换仍匹配的前缀，
 再拼接**当前**最新 tail。前缀替换、reset 或 System binding 变化使旧候选无效。原 canonical coverage

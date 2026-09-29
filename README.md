@@ -250,9 +250,6 @@ token estimates. See [compaction configuration](docs/parallel-compaction-design.
 All compaction is local: AgentView manages history replacement, and summaries use
 ordinary inference with the current model and reasoning configuration. No server
 compaction API or extension is enabled. See [design constraints](design.md).
-The local compaction prompts and history reconstruction are adapted from Codex;
-the copied resources and adapted module retain their Apache-2.0 license, with
-[source and notices](third_party/codex/README.md). Other AgentView code remains MIT.
 
 The port checks the Frame handoff precondition at the crossing poll. A
 successful submit handoff commits the Application's outbound canonical input,

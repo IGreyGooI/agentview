@@ -75,9 +75,7 @@ generic `ContextCompactor` 默认复用 Codex 的
 
 摘要恢复时附加引导：随后会提供完整的当前状态；摘要用于延续历史，涉及当前状态时以最新
 projection 为准。这样摘要保留历史进展，Component projection 重新提供当前状态与规则。
-provider-private 实现已原样复制 Codex 提示词并迁移 local summary 路径，附带上游 Apache-2.0
-许可证、NOTICE、固定 revision 和修改说明；见 [third_party/codex](../third_party/codex/README.md)。
-本文的 runtime checkpoint、完整 projection 重放仍是另一个待实现层次。
+实际复制提示词资源入库时，附带上游 Apache-2.0 许可证与适用的来源署名；修改时标明修改。
 
 ## 2. 完整会话历史与有效回放
 

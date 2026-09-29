@@ -206,27 +206,17 @@ reserve 后再计算 90%。所有型号都由用户显式配置容量，没有�
 下次交付的窗口：   compacted(A B C) | D E F G
 ```
 
-`compacted(A B C)` 使用 Codex local compaction 的文本摘要及近期 user 文本。提示词和 summary prefix
-原样复制自 `eab107fed0811144b6fcb161a3f50a5865ca4c37`；来源、Apache-2.0 许可证和适配说明见
-[third_party/codex](../third_party/codex/README.md)。摘要提示词要求保留当前进展、关键决策、约束、
-偏好、下一步及关键资料。它作为最后一条 user 消息追加到稳定历史快照，原 System instructions
-保持不变；使用普通流式请求、空工具列表、`store: false`，不使用前台 `previous_response_id`。
+`compacted(A B C)` 是当前模型通过普通推理生成的文本摘要。后台请求使用专门的摘要 instructions，
+把闭合前缀作为历史输入，不提供业务工具，不使用前台 `previous_response_id`，并设置
+`store: false` 和 `stream: false`。摘要提示词要求保留目标、约束、决定、最新状态、动作实际结果、
+待办与必要标识，区分过时信息、失败与不确定性；原 System instructions 在前台单独保留。
 
-摘要与前台共用编码器及当前模型的 reasoning、temperature、prompt cache key 和输出限制；
-未配置输出上限则继续省略。请求 bytes/4 estimate 加上配置的 output reserve 与显式
-`max_output_tokens` 二者较大值必须在窗口内；没有输出空间则失败，不强行修改当前模型参数。
-通过既有 output ledger 检查流的顺序、消息身份、文本及 terminal 一致性；完成前不安装候选。
-收到合法 `response.completed` 后取最后一条已 seal 的非空 assistant 文本。reasoning 不进入候选，
-工具调用、refusal、不完整响应、不一致输出和服务端压缩产物均被拒绝。
-
-重建沿用 Codex 的近期 user 文本选择规则：从后向前选，恢复原顺序，最后追加带 summary prefix
-的 user 摘要。预算以 bytes/4 估计，最多 20,000 tokens，并限制在模型窗口的十分之一内，给摘要
-和前台 tail 留空间；边界文本保留首尾并标明截断。旧摘要不作为真实 user 文本再次保留。
-完整候选必须严格小于原前缀；摘要是有损模型推理，不能保证所有历史事实逐字保留。这些输出不作为
-canonical 事实、ProviderFact 或 Component 工具调用派发。
-
-Codex 会在摘要超窗失败后丢弃最旧历史并重试；这里保留 AgentView 的失败契约：返回明确故障、
-保留原前台窗口，不通过隐式丢弃 source 或重复同源请求伪造压缩成功。
+输出预留为前缀 bytes/4 estimate 的四分之一（向上取整），最多 4096 tokens；必要时缩小到当前
+模型窗口减去实际摘要请求 estimate 后的剩余容量。没有输出容量则失败，不发送超窗摘要请求。
+只接受 completed response 的非空 assistant 文本；reasoning 不进入候选，工具调用、refusal、
+不完整响应和服务端压缩产物均被拒绝。AgentView 为摘要加历史标识并构造普通 assistant 上下文项，
+其序列化大小必须严格小于原前缀。摘要是有损模型推理，不能保证所有历史事实逐字保留。
+这些输出不作为 canonical assistant 事实、ProviderFact 或 Component 工具调用派发。
 
 来源之后仅追加 tail 不应使候选过期。安装时检查实际被覆盖前缀仍匹配、context generation
 和 authority binding 仍有效；从当前窗口取得最新 tail，不能覆盖成启动时的旧 tail。
@@ -279,7 +269,6 @@ Running / Ready -> Cancelled
 
 1. [`parallel_compaction.rs`](../src/provider/async_openai/parallel_compaction.rs)：策略、计量、controller、
    不可变 source、owned worker、普通文本摘要校验与状态观察。
-   [`local_compaction.rs`](../src/provider/async_openai/local_compaction.rs) 迁移 Codex 摘要输入、流收取及历史重建。
 2. [`codex_http_v1.rs`](../src/provider/codex_http_v1.rs)：使用当前模型和 reasoning、受 byte limit 限制的普通摘要请求编码。
 3. [`frame_request.rs`](../src/provider/async_openai/frame_request.rs)：闭合前缀选择、来源验证、
    候选加最新 tail、canonical proofs 和请求窗口 estimate 检查。
