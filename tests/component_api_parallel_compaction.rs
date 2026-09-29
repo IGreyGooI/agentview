@@ -43,6 +43,7 @@ struct ServerState {
     release: Arc<Semaphore>,
     compact_reply: Value,
     compact_status: StatusCode,
+    unsupported_requests: Arc<AtomicUsize>,
 }
 
 struct Server {
@@ -52,6 +53,7 @@ struct Server {
     release: Arc<Semaphore>,
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
+    unsupported_requests: Arc<AtomicUsize>,
 }
 
 impl Server {
@@ -63,6 +65,7 @@ impl Server {
         let (requests, request_rx) = mpsc::unbounded_channel();
         let (compactions, compaction_rx) = mpsc::unbounded_channel();
         let release = Arc::new(Semaphore::new(0));
+        let unsupported_requests = Arc::new(AtomicUsize::new(0));
         let state = ServerState {
             calls: Arc::new(AtomicUsize::new(0)),
             requests,
@@ -70,10 +73,11 @@ impl Server {
             release: release.clone(),
             compact_reply,
             compact_status,
+            unsupported_requests: unsupported_requests.clone(),
         };
         let router = Router::new()
-            .route("/responses", post(foreground))
-            .route("/responses/compact", post(compact))
+            .route("/responses", post(responses))
+            .fallback(unsupported)
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -93,6 +97,7 @@ impl Server {
             release,
             stop,
             task,
+            unsupported_requests,
         }
     }
 
@@ -103,6 +108,38 @@ impl Server {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            self.unsupported_requests.load(Ordering::SeqCst),
+            0,
+            "only the ordinary /responses endpoint is supported"
+        );
+    }
+}
+
+async fn unsupported(State(state): State<ServerState>) -> StatusCode {
+    state.unsupported_requests.fetch_add(1, Ordering::SeqCst);
+    StatusCode::NOT_FOUND
+}
+
+async fn responses(
+    state: State<ServerState>,
+    Json(request): Json<Value>,
+) -> axum::response::Response {
+    assert!(request.get("context_management").is_none());
+    assert!(!request["input"].as_array().unwrap().iter().any(|item| {
+        matches!(
+            item["type"].as_str(),
+            Some("compaction" | "compaction_trigger")
+        )
+    }));
+    if request["stream"] == false {
+        assert_eq!(request["tools"], json!([]));
+        assert_eq!(request["store"], false);
+        assert!(request.get("previous_response_id").is_none());
+        assert!(request["max_output_tokens"].as_u64().unwrap() > 0);
+        compact(state, Json(request)).await.into_response()
+    } else {
+        foreground(state, Json(request)).await.into_response()
     }
 }
 
@@ -244,10 +281,23 @@ fn assert_context_limit(fault: ApplicationFault) {
     );
 }
 
+const SUMMARY_TEXT: &str = "Earlier context: the counter application is running.";
+const SUMMARY_PREFIX: &str = "Summary of earlier context (historical data; current instructions \
+and later messages take precedence):\n\n";
+
+fn summary_reply(text: &str) -> Value {
+    json!({
+        "object": "response", "status": "completed", "id": "summary_response",
+        "output": [{
+            "type": "message", "role": "assistant", "status": "completed", "id": "summary_message",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }],
+    })
+}
+
 fn compacted_output() -> Vec<Value> {
     vec![
-        json!({"type":"message", "role":"assistant", "content":[{"type":"output_text","text":"retained compact output","annotations":[]}],"id":"retained","status":"completed"}),
-        json!({"type":"compaction","id":"cmp_1","encrypted_content":"opaque-context"}),
+        json!({"type":"message", "role":"assistant", "content":[{"type":"output_text","text":format!("{SUMMARY_PREFIX}{SUMMARY_TEXT}"),"annotations":[]}],"status":"completed"}),
     ]
 }
 
@@ -296,7 +346,7 @@ fn replacing_large_context() -> Component {
 #[tokio::test]
 async fn default_threshold_starts_compaction_without_a_small_requested_context() {
     let output = compacted_output();
-    let mut server = Server::start(json!({"object":"response.compaction","output":output})).await;
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let provider = default_provider(&server.base);
     let mut monitor = provider.parallel_compaction_monitor().unwrap();
     let mut app = Application::mount(large_current_context, provider).unwrap();
@@ -334,7 +384,7 @@ async fn default_threshold_starts_compaction_without_a_small_requested_context()
 }
 
 #[tokio::test]
-async fn compaction_can_be_disabled_for_endpoints_without_compact_support() {
+async fn background_summarization_can_be_disabled_independently_of_request_limits() {
     let mut server = Server::start(json!({})).await;
     let provider = default_provider(&server.base).without_parallel_compaction();
     assert!(provider.parallel_compaction_monitor().is_none());
@@ -372,7 +422,7 @@ async fn declared_window_rejects_oversized_requests_even_with_compaction_disable
 #[tokio::test]
 async fn forced_only_compaction_waits_before_sending_the_oversized_foreground() {
     let output = compacted_output();
-    let mut server = Server::start(json!({"object":"response.compaction","output":output})).await;
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let provider = forced_provider(&server.base, 20_000, Duration::from_secs(5));
     let monitor = provider.parallel_compaction_monitor().unwrap();
     let mut app = Application::mount(replacing_large_context, provider).unwrap();
@@ -416,7 +466,7 @@ async fn forced_only_compaction_waits_before_sending_the_oversized_foreground() 
 #[tokio::test]
 async fn cancelling_a_forced_wait_keeps_the_same_candidate_for_retry() {
     let output = compacted_output();
-    let mut server = Server::start(json!({"object":"response.compaction","output":output})).await;
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let provider = forced_provider(&server.base, 20_000, Duration::from_secs(5));
     let mut monitor = provider.parallel_compaction_monitor().unwrap();
     let mut app = Application::mount(replacing_large_context, provider).unwrap();
@@ -487,11 +537,7 @@ async fn forced_compaction_does_not_block_or_compact_an_under_limit_frame() {
 
 #[tokio::test]
 async fn forced_compaction_timeout_rejects_before_handoff_and_does_not_retry_the_source() {
-    let mut server = Server::start(json!({
-        "object":"response.compaction",
-        "output":compacted_output(),
-    }))
-    .await;
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let provider = forced_provider(&server.base, 20_000, Duration::from_millis(100));
     let monitor = provider.parallel_compaction_monitor().unwrap();
     let mut app = Application::mount(replacing_large_context, provider).unwrap();
@@ -540,12 +586,7 @@ async fn forced_compaction_timeout_rejects_before_handoff_and_does_not_retry_the
 
 #[tokio::test]
 async fn forced_candidate_that_is_still_oversized_stays_ready_without_retry_or_handoff() {
-    let output = vec![json!({
-        "type":"compaction",
-        "id":"cmp_large",
-        "encrypted_content":"x".repeat(30_000),
-    })];
-    let mut server = Server::start(json!({"object":"response.compaction","output":output})).await;
+    let mut server = Server::start(summary_reply(&"x".repeat(30_000))).await;
     let provider = forced_provider(&server.base, 20_000, Duration::from_secs(5));
     let monitor = provider.parallel_compaction_monitor().unwrap();
     let mut app = Application::mount(replacing_large_context, provider).unwrap();
@@ -592,7 +633,7 @@ async fn forced_candidate_that_is_still_oversized_stays_ready_without_retry_or_h
 #[tokio::test]
 async fn forced_limit_waits_for_the_existing_background_worker() {
     let output = compacted_output();
-    let mut server = Server::start(json!({"object":"response.compaction","output":output})).await;
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let config = AsyncOpenAiTransportConfig::new(&server.base, "test-key")
         .unwrap()
         .with_timeouts(
@@ -637,7 +678,7 @@ async fn forced_limit_waits_for_the_existing_background_worker() {
 #[tokio::test]
 async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_new_tail() {
     let output = compacted_output();
-    let mut server = Server::start(json!({"object":"response.compaction","output":output})).await;
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let provider = default_provider(&server.base);
     let mut monitor = provider.parallel_compaction_monitor().unwrap();
     let events = Arc::new(AtomicUsize::new(0));
@@ -662,8 +703,12 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
         .unwrap()
         .unwrap();
     assert_eq!(compact_request["model"], "test-model");
-    assert!(compact_request.get("tools").is_none());
-    assert!(compact_request.get("stream").is_none());
+    assert_eq!(compact_request["tools"], json!([]));
+    assert_eq!(compact_request["stream"], false);
+    assert!(compact_request["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("Summarize"));
     let prefix = compact_request["input"].as_array().unwrap();
     assert!(!prefix.iter().any(|item| item["type"] == "function_call"));
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Running);
@@ -730,8 +775,7 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
 
 #[tokio::test]
 async fn custom_policy_sees_complete_requested_context_even_when_delta_is_small() {
-    let mut server =
-        Server::start(json!({"object":"response.compaction","output":compacted_output()})).await;
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let seen = Arc::new(Mutex::new(Vec::<CompactionContext>::new()));
     let capture = seen.clone();
     let provider = provider(&server.base, move |context: &CompactionContext| {
@@ -768,7 +812,8 @@ async fn custom_policy_sees_complete_requested_context_even_when_delta_is_small(
 
 #[tokio::test]
 async fn failed_compaction_keeps_foreground_context_and_reports_failure() {
-    let mut server = Server::start(json!({"object":"response.compaction","output":[]})).await;
+    let mut server =
+        Server::start(json!({"object":"response","status":"completed","output":[]})).await;
     let provider = provider(&server.base, ContextRatioPolicy::default());
     let mut monitor = provider.parallel_compaction_monitor().unwrap();
     let events = Arc::new(AtomicUsize::new(0));
@@ -793,8 +838,7 @@ async fn failed_compaction_keeps_foreground_context_and_reports_failure() {
 
 #[tokio::test]
 async fn shutdown_cancels_and_joins_a_pending_compaction() {
-    let mut server =
-        Server::start(json!({"object":"response.compaction","output":compacted_output()})).await;
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let provider = provider(&server.base, ContextRatioPolicy::default());
     let mut monitor = provider.parallel_compaction_monitor().unwrap();
     let events = Arc::new(AtomicUsize::new(0));
@@ -818,9 +862,7 @@ async fn background_http_limits_and_timeouts_report_sanitized_faults_without_bre
         ParallelCompactionFault::Limit,
         ParallelCompactionFault::Timeout,
     ] {
-        let reply = json!({"object":"response.compaction", "output":[{
-            "type":"compaction", "encrypted_content":"large result ".repeat(1024),
-        }]});
+        let reply = summary_reply(&"large result ".repeat(1024));
         let status = if expected == ParallelCompactionFault::HttpStatus(429) {
             StatusCode::TOO_MANY_REQUESTS
         } else {
@@ -866,8 +908,7 @@ async fn background_http_limits_and_timeouts_report_sanitized_faults_without_bre
 
 #[tokio::test]
 async fn reset_invalidates_a_pending_compaction_before_its_late_response() {
-    let mut server =
-        Server::start(json!({"object":"response.compaction","output":compacted_output()})).await;
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let provider = provider(&server.base, ContextRatioPolicy::default());
     let monitor = provider.parallel_compaction_monitor().unwrap();
     let events = Arc::new(AtomicUsize::new(0));
@@ -883,7 +924,7 @@ async fn reset_invalidates_a_pending_compaction_before_its_late_response() {
     server.release.add_permits(1);
     assert!(app.react().await.unwrap().is_continue());
     let next = server.requests.recv().await.unwrap();
-    assert!(!next.to_string().contains("opaque-context"));
+    assert!(!next.to_string().contains(SUMMARY_TEXT));
     assert!(!next.to_string().contains("old context old context"));
     assert!(next.to_string().contains("value=\\\"3\\\""));
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Cancelled);
@@ -904,12 +945,11 @@ impl OpenAiResponsesObserver for BlockFirstCompactedRequest {
     ) -> Result<(), OpenAiResponsesObservationError> {
         if let OpenAiResponsesObservation::Request { body, .. } = event {
             let request: Value = serde_json::from_slice(&body).unwrap();
-            if request["input"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| item["type"] == "compaction")
-                && self.block.swap(false, Ordering::SeqCst)
+            if request["input"].as_array().unwrap().iter().any(|item| {
+                item["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(SUMMARY_PREFIX))
+            }) && self.block.swap(false, Ordering::SeqCst)
             {
                 self.entered.notify_one();
                 std::future::pending::<()>().await;
@@ -922,7 +962,7 @@ impl OpenAiResponsesObserver for BlockFirstCompactedRequest {
 #[tokio::test]
 async fn cancelling_before_handoff_keeps_the_candidate_and_tool_receipts_for_retry() {
     let output = compacted_output();
-    let mut server = Server::start(json!({"object":"response.compaction","output":output})).await;
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let observer = Arc::new(BlockFirstCompactedRequest {
         block: AtomicBool::new(true),
         entered: Notify::new(),

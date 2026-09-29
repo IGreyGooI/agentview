@@ -673,11 +673,15 @@ private compaction本身不强制Full。
 
 ### Parallel provider compaction
 
-Native `AsyncOpenAiResponsesProvider` 默认使用 `DefaultCompactionPolicy` 在后台调用独立的
-`/responses/compact`。`with_parallel_compaction(policy)` 替换默认策略，
-`without_parallel_compaction()` 可为不支持该接口的 endpoint 关闭后台压缩；这些配置不影响
-独立的请求上限检查。编码器始终省略 server-side `context_management`，压缩触发由 AgentView
-决定。此功能不影响 Application 内 reaction 的 single-flight 契约，也不适用于 legacy port。
+**所有 compaction 都是 local compaction，摘要必须使用当前模型进行普通推理。**
+local 指客户端管理触发、候选校验和上下文替换；不表示模型必须运行在本机。
+Native `AsyncOpenAiResponsesProvider` 默认使用 `DefaultCompactionPolicy` 在后台向普通
+`/responses` 发摘要请求，沿用当前 `ModelSpec`、reasoning、transport 和认证配置。
+禁止使用 `/responses/compact`、`context_management`、`compaction_trigger` 或其他服务端压缩能力；
+也不提供 server compaction 分支或 fallback。此约束同样适用于 forced compaction 和未来 runtime
+checkpoint；见 [design.md](../design.md)。`with_parallel_compaction(policy)` 替换默认策略，
+`without_parallel_compaction()` 关闭后台摘要；这些配置不影响独立的请求上限检查。
+此功能不影响 Application 内 reaction 的 single-flight 契约，也不适用于 legacy port。
 
 Forced compaction 是同一 native provider 的独立 opt-in：`with_forced_compaction()` 默认关闭，
 且不受 `without_parallel_compaction()` 影响。它只在一个本来可编码的前台 Frame 因
@@ -727,15 +731,21 @@ monitor 保持 `Ready`，同一 source 不再 compact。只有压缩后 foregrou
 才把候选标为 `Installed` 并进入既有同步 commit。等待中的 submit future 被取消时，worker handle
 仍由 provider 持有；reset、shutdown 和 Drop 沿用统一的取消与收取规则。
 
-完整 `response.compaction.output` 数组及顺序作为候选保留，不能只抽取 encrypted artifact，也不能
-派发为 ProviderFact 或 Component action。结果须协议合法、因果闭合且严格缩小输入前缀的 JSON bytes。
+摘要请求使用专门的摘要 instructions、闭合历史前缀及空工具列表，`store: false`、`stream: false`，
+不复用前台 `previous_response_id`。请求的输出预留为输入估算 token 数的四分之一（向上取整），
+最多 4096，并按当前窗口扣除实际请求估算占用后的剩余容量进一步缩小；无剩余容量则失败。
+只有 completed response 的非空 assistant 文本可以形成候选；reasoning 不进入候选，拒绝工具调用、
+refusal、服务端 compaction 产物和不完整结果。客户端把文本标记为历史摘要，包装成普通 assistant
+上下文项；它不成为 canonical 事实、不派发为 ProviderFact 或 Component action。
+候选必须严格缩小输入前缀的 JSON bytes。摘要是有损推理结果，不能承诺逐字保留全部历史事实。
 worker 完成仅生成候选；后续 `submit()` 非阻塞收取已结束的 worker，以候选替换仍匹配的前缀，
 再拼接**当前**最新 tail。前缀替换、reset 或 System binding 变化使旧候选无效。原 canonical coverage
 proof、pending calls 和 receipt 保持原有语义，Full recovery 仍须验证精确 coverage 与 instructions。
 
 准备候选不修改 accepted state。前台真实 handoff 才安装，随后正常同步 Frame commit；pre-handoff
 失败或取消保留兼容候选供重试，post-handoff fault 不回滚已安装窗口。同一来源不重复尝试；普通压缩
-失败通过 monitor 报告并保留原前台窗口。后台 HTTP 有独立请求/响应字节限制与超时，不能绕过预算。
+失败通过 monitor 报告并保留原前台窗口。后台 HTTP 有独立请求/响应字节限制与超时，
+请求 bytes/4 加摘要输出预留不得超过当前模型窗口。
 
 `parallel_compaction_monitor()` 返回无 payload/credentials 的状态观察句柄，区分 Running、Ready、
 Installed、Discarded、Failed 和 Cancelled。通知可能合并，Ready 不表示已经交付给模型，也不主动驱动

@@ -22,8 +22,8 @@ const PREFIX_PROOF_DOMAIN: &[u8] = b"agentview:openai-responses:canonical-prefix
 const COMPACTION_INSTRUCTIONS_PROOF_DOMAIN: &[u8] =
     b"agentview:openai-responses:compaction-instructions:v1";
 
-/// Versioned binding between an opaque compaction artifact and the normalized
-/// System instructions under which the provider produced it.
+/// Versioned binding between a compacted window and the normalized System
+/// instructions in effect when it was produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CompactionInstructionsProof([u8; 32]);
 
@@ -1438,8 +1438,7 @@ mod tests {
             vec![next_item.clone()],
         );
         let output = vec![
-            json!({"type":"message", "role":"user", "content":"retained"}),
-            json!({"type":"compaction", "encrypted_content":"opaque"}),
+            json!({"type":"message", "role":"assistant", "content":"Summary of earlier context"}),
         ];
         let candidate = state
             .with_parallel_compaction(&source, &output, &next, &encoder())
@@ -1491,11 +1490,12 @@ mod tests {
         assert!(input(&continued.request_body).starts_with(&wire));
         assert_eq!(continued.state.wire_coverage.item_count(), 5);
 
-        // A later compaction can cover the previous artifact while preserving
+        // A later compaction can cover the previous summary while preserving
         // the same canonical coverage and the now-newest tail.
         let second_source = continued.state.compaction_source().unwrap();
         let final_frame = delta(5, revision(4), Vec::new(), Vec::new(), Vec::new());
-        let second_output = vec![json!({"type":"compaction", "encrypted_content":"opaque-2"})];
+        let second_output =
+            vec![json!({"type":"message", "role":"assistant", "content":"Updated summary"})];
         let second_base = continued
             .state
             .with_parallel_compaction(&second_source, &second_output, &final_frame, &encoder())
@@ -1534,7 +1534,7 @@ mod tests {
             .unwrap()
             .state;
         let source = state.compaction_source().unwrap();
-        let output = vec![json!({"type":"compaction", "encrypted_content":"opaque"})];
+        let output = vec![json!({"type":"message", "role":"assistant", "content":"Summary"})];
         for next_system in [vec![system("changed")], Vec::new()] {
             let next = full(2, items.clone(), next_system, Vec::new());
             assert!(state
@@ -1551,7 +1551,8 @@ mod tests {
             .is_ok());
         }
         let next = delta(2, revision(1), Vec::new(), Vec::new(), Vec::new());
-        state.wire_input[0] = json!({"type":"compaction", "encrypted_content":"other-lineage"});
+        state.wire_input[0] =
+            json!({"type":"message", "role":"assistant", "content":"Other lineage"});
         assert!(state
             .with_parallel_compaction(&source, &output, &next, &encoder())
             .unwrap()

@@ -247,6 +247,9 @@ Transport configuration is independent of the model and cannot override its wind
 The window is local metadata and is not sent in the HTTP body.
 Requests and background compaction use that same declared window for their byte/4
 token estimates. See [compaction configuration](docs/parallel-compaction-design.md).
+All compaction is local: AgentView manages history replacement, and summaries use
+ordinary inference with the current model and reasoning configuration. No server
+compaction API or extension is enabled. See [design constraints](design.md).
 
 The port checks the Frame handoff precondition at the crossing poll. A
 successful submit handoff commits the Application's outbound canonical input,

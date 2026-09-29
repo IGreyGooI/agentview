@@ -4,6 +4,11 @@
 可覆盖策略或关闭；forced compaction 默认关闭，须独立显式启用。
 [engine.md](engine.md) 是运行时的权威契约。
 
+**所有 compaction 都是 local compaction，摘要必须使用当前配置的模型进行普通推理。**
+local 表示由客户端管理压缩策略与上下文替换，不要求模型运行在本机。后台与 forced compaction
+共用这一条路径；禁止使用专用 compact API、`context_management`、`compaction_trigger`，
+也不提供服务端压缩分支或 fallback。参见 [design.md](../design.md)。
+
 ## 1. 两层并发
 
 两个独立功能以 `ReactionPort` 为边界：
@@ -19,8 +24,9 @@
 
 ## 2. 范围与所有权
 
-采用 Responses 的独立 `/responses/compact` 接口压缩 provider-private wire window。
-复用当前 provider 的客户端、认证、API base 和模型配置，请求拥有独立的输入快照、
+通过普通 `/responses` 模型推理生成历史摘要，由 AgentView 在本地替换 provider-private wire window。
+复用当前 provider 的客户端、认证、API base、`ModelSpec` 和 reasoning 配置，不另选摘要模型。
+请求拥有独立的输入快照、
 HTTP 生命周期与结果。前台请求和压缩请求可以实际重叠，压缩输出走专用候选通道。
 
 Provider 持有一个受监督的压缩操作，以及至多一个待安装候选。worker 不持有修改
@@ -143,10 +149,10 @@ max_component_bytes, reserved_output_tokens)` 配置。前台会检查完整 req
 请求 bytes/4、transport request/response byte limits 和超时；不会超限后静默截断或阻塞等待压缩。
 若要对某模型的实际 token 数给出精确保证，仍需对应 tokenizer；bytes/4 是此处约定的估算。
 
-编码器始终省略 server-side `context_management`，普通请求不依赖这一扩展。独立
-`/responses/compact` 仍要求 endpoint 支持；不支持时可使用 `provider.without_parallel_compaction()`，
-monitor 返回 `None`，请求上限继续生效。本实现尚无普通 `/responses` 文本摘要 fallback。
-来自服务端的合法私有输出仍按现有协议处理；若它改写了候选依赖的前缀，旧候选失效。
+普通请求和摘要请求均不发送 `context_management` 或 `compaction_trigger`，也不调用
+`/responses/compact`。只需 endpoint 支持当前模型的普通 Responses 推理。
+`provider.without_parallel_compaction()` 关闭策略触发的后台摘要；同时未启用 forced 时 monitor
+返回 `None`，请求上限继续生效。摘要失败保留原窗口，不改用服务端压缩。
 
 ### Forced compaction
 
@@ -163,7 +169,8 @@ let monitor = provider.parallel_compaction_monitor().unwrap();
 它只处理 `ResponsesFrameRequestFault::ContextWindowLimit`。正常 under-limit Frame 沿用原 nonblocking
 路径；编码、coverage、System binding 等其他错误原样返回。检测到超窗时，provider 不构造或发送该
 foreground request：已有 worker 就等待它，没有 worker 才从当前 accepted wire window 的闭合前缀
-启动一次 `/responses/compact`。background 和 forced 始终合计至多一个 worker，并共享同源去重。
+启动一次使用当前模型的普通 `/responses` 摘要请求。background 和 forced 始终合计至多一个 worker，
+并共享同源去重。
 
 等待上限是 transport `read_timeout`。失败、超时、没有闭合 source 或候选失效都返回原
 `ContextWindowLimit`。成功候选只重新准备和预算一次；若仍然超窗，返回原 limit，monitor 保持
@@ -199,9 +206,17 @@ reserve 后再计算 90%。所有型号都由用户显式配置容量，没有�
 下次交付的窗口：   compacted(A B C) | D E F G
 ```
 
-`compacted(A B C)` 是接口返回的完整 `output` 数组，包括 retained items 和 opaque
-compaction item。必须原样保留数组内容与顺序，不能只抽取其中的 compaction item。
-这些输出不作为普通 assistant reply、ProviderFact 或 Component 工具调用派发。
+`compacted(A B C)` 是当前模型通过普通推理生成的文本摘要。后台请求使用专门的摘要 instructions，
+把闭合前缀作为历史输入，不提供业务工具，不使用前台 `previous_response_id`，并设置
+`store: false` 和 `stream: false`。摘要提示词要求保留目标、约束、决定、最新状态、动作实际结果、
+待办与必要标识，区分过时信息、失败与不确定性；原 System instructions 在前台单独保留。
+
+输出预留为前缀 bytes/4 estimate 的四分之一（向上取整），最多 4096 tokens；必要时缩小到当前
+模型窗口减去实际摘要请求 estimate 后的剩余容量。没有输出容量则失败，不发送超窗摘要请求。
+只接受 completed response 的非空 assistant 文本；reasoning 不进入候选，工具调用、refusal、
+不完整响应和服务端压缩产物均被拒绝。AgentView 为摘要加历史标识并构造普通 assistant 上下文项，
+其序列化大小必须严格小于原前缀。摘要是有损模型推理，不能保证所有历史事实逐字保留。
+这些输出不作为 canonical assistant 事实、ProviderFact 或 Component 工具调用派发。
 
 来源之后仅追加 tail 不应使候选过期。安装时检查实际被覆盖前缀仍匹配、context generation
 和 authority binding 仍有效；从当前窗口取得最新 tail，不能覆盖成启动时的旧 tail。
@@ -253,8 +268,8 @@ Running / Ready -> Cancelled
 ## 6. 实现落点
 
 1. [`parallel_compaction.rs`](../src/provider/async_openai/parallel_compaction.rs)：策略、计量、controller、
-   不可变 source、owned worker、完整 output 校验与状态观察。
-2. [`codex_http_v1.rs`](../src/provider/codex_http_v1.rs)：独立、受 byte limit 限制的 compact 请求编码。
+   不可变 source、owned worker、普通文本摘要校验与状态观察。
+2. [`codex_http_v1.rs`](../src/provider/codex_http_v1.rs)：使用当前模型和 reasoning、受 byte limit 限制的普通摘要请求编码。
 3. [`frame_request.rs`](../src/provider/async_openai/frame_request.rs)：闭合前缀选择、来源验证、
    候选加最新 tail、canonical proofs 和请求窗口 estimate 检查。
 4. [`native_reaction.rs`](../src/provider/async_openai/native_reaction.rs)：handoff 时启动或安装候选，
@@ -276,7 +291,8 @@ Running / Ready -> Cancelled
 - forced 与 background 共享一个 worker；等待取消后同一候选可重试，timeout/reset/shutdown 仍能收取任务。
 - forced 候选仍超窗时保持 Ready、不安装、不重复 compact，accepted revision 和 receipt 不提前推进。
 - compact 完成前后，前台均可追加新输入；安装结果精确保留最新 tail。
-- compact `output` 中 retained items 的内容与顺序完整保留，且不会触发 Component handler。
+- 测试服务器只支持普通 `/responses`；任何其他端点请求都失败，全部请求均不含服务端压缩配置。
+- 摘要使用当前模型及 reasoning，不继承业务工具或前台 continuation；摘要文本不触发 Component handler。
 - 完整 observe -> action -> feedback -> next action 在压缩前后继续成立。
 - tool call/result 配对完整，pending calls 受保护，ToolOutput receipt 只交付一次。
 - System change、context reset、前缀替换、过期候选均无法安装错误窗口。
@@ -284,12 +300,7 @@ Running / Ready -> Cancelled
 - 超时、HTTP 错误、格式错误、超限、无缩减、取消、panic 与 shutdown 的状态和清理可验证。
 - 连续 compaction 基于有效 wire window 工作；Full recovery 与后续 Delta 均保持合法。
 
-## 8. 接口依据
+## 8. 接口边界
 
-已核对官方文档：
-
-- [Compaction guide](https://developers.openai.com/api/docs/guides/compaction)
-- [Compact a response](https://developers.openai.com/api/reference/resources/responses/methods/compact)
-
-独立 compact 接口是 stateless 操作，返回完整的压缩窗口；官方要求后续请求原样使用
-完整返回窗口。具体部署的模型及 API endpoint 仍需支持该能力；不支持时显式关闭后台 compaction。
+AgentView 只使用普通 Responses 推理生成摘要。专用 compact API、自动 context management 和
+remote compaction trigger 均不属于这一实现，也不是可选扩展或 fallback。

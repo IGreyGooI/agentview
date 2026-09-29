@@ -3,6 +3,10 @@
 本文记录运行时主动管理 compact 的设计方向，尚未实现，不改变
 [`engine.md`](engine.md) 中当前 `CompleteTranscript` 契约。
 
+**所有 compaction 均为 local compaction，摘要使用当前配置的模型进行普通推理。**
+本设计同样遵守 [design.md](../design.md)：不得调用专用 compact 接口、下发
+`context_management` / `compaction_trigger`，也不接入服务端压缩分支或 fallback。
+
 Provider port 下方的并行压缩另见
 [`parallel-compaction-design.md`](parallel-compaction-design.md)。它并行生成并安装
 provider-private wire window，不改变本文讨论的 runtime replay/checkpoint 所有权。
@@ -15,9 +19,8 @@ provider-private wire window，不改变本文讨论的 runtime replay/checkpoin
 摘要执行与 checkpoint 管理解耦。`ContextCompactor` 作为具体 `Provider<C>` 的泛型策略，
 定义与实现放在 provider 层；Application 仍只持有一个 P，通过统一的 compact 能力接口调用它。
 `C` 借用 provider 管理的 session 执行压缩，不另行拥有一份主会话或强制创建独立摘要会话。
-第一版采用 Codex 提示词生成文本摘要。原生压缩可以作为后续执行能力接入，但
-provider-private opaque artifact 不能冒充可移植的 canonical 摘要；运行时仍管理覆盖范围和
-checkpoint。
+摘要使用当前 `ModelSpec` 和 reasoning 配置，通过普通推理生成文本；不另选摘要模型。
+运行时仍管理覆盖范围和 checkpoint，不依赖 provider-private opaque compaction artifact。
 
 | Owner | 职责 |
 | --- | --- |
@@ -67,7 +70,7 @@ session 中的连接、routing 和 request/response 游标由 provider 继续管
 generic `ContextCompactor` 默认复用 Codex 的
 [本地摘要提示词](https://github.com/openai/codex/blob/02a8f038b87ad34d4a1dc5058eda26972ed7aa6c/codex-rs/prompts/templates/compact/prompt.md)。
 它要求保留当前进展、关键决策、约束和用户偏好、待完成事项，以及继续任务所需的关键资料。
-这是普通模型生成文本摘要的路径；Remote V2 的 `compaction_trigger` 是另一种协议能力。
+这是普通模型生成文本摘要的路径；AgentView 不采用 Remote V2 的 `compaction_trigger`。
 提示词里的 `another LLM` 是交接表述，不要求创建新的 provider session。
 
 摘要恢复时附加引导：随后会提供完整的当前状态；摘要用于延续历史，涉及当前状态时以最新

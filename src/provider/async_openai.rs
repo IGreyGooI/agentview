@@ -656,7 +656,9 @@ impl AsyncOpenAiResponsesProvider {
         &self.identity
     }
 
-    /// Replace the default background `/responses/compact` admission policy.
+    /// Replace the default local background compaction admission policy.
+    /// Summaries use ordinary inference with the current model; no server
+    /// compaction endpoint or extension is enabled.
     /// Native Responses enables DefaultCompactionPolicy automatically: a token
     /// threshold plus requested context < provider / 10. Custom policies replace
     /// both triggers. Requires endpoint support; ordinary requests never send
@@ -691,14 +693,13 @@ impl AsyncOpenAiResponsesProvider {
         self
     }
 
-    /// Disable background compaction, for example for an endpoint without
-    /// `/responses/compact`. Independent request limits still apply.
+    /// Disable background summarization. Independent request limits still apply.
     pub fn without_parallel_compaction(mut self) -> Self {
         self.parallel_compaction_enabled = false;
         self
     }
 
-    /// Enable one bounded `/responses/compact` attempt when an otherwise valid
+    /// Enable one bounded local summary attempt with the current model when an otherwise valid
     /// Frame exceeds the configured context window. The attempt shares the
     /// background worker and source deduplication, but remains enabled when
     /// `without_parallel_compaction()` disables policy-triggered work.
