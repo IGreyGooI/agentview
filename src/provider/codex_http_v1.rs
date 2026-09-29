@@ -480,40 +480,8 @@ impl CodexHttpV1Encoder {
         self.options.model()
     }
 
-    /// An ordinary, isolated model request. Summarization never enables API
-    /// compaction, inherits business tools, or continues the foreground response.
-    pub(crate) fn encode_summary_request_bounded(
-        &self,
-        input: &[Value],
-        instructions: &str,
-        max_output_tokens: u64,
-        limit: usize,
-    ) -> Result<Vec<u8>, CodexHttpV1Error> {
-        #[derive(Serialize)]
-        struct Request<'a> {
-            model: &'a str,
-            input: &'a [Value],
-            instructions: &'a str,
-            tools: [(); 0],
-            stream: bool,
-            store: bool,
-            max_output_tokens: u64,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            reasoning: Option<CodexReasoning>,
-        }
-        serialize_json_bounded(
-            &Request {
-                model: self.model().id(),
-                input,
-                instructions,
-                tools: [],
-                stream: false,
-                store: false,
-                max_output_tokens,
-                reasoning: self.options.reasoning,
-            },
-            limit,
-        )
+    pub(crate) const fn max_output_tokens(&self) -> Option<u32> {
+        self.options.max_output_tokens
     }
 
     pub fn request(

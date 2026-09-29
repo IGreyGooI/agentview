@@ -93,7 +93,10 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                         .as_ref()
                         .and_then(ResponsesFrameRequestState::compaction_source);
                     if let Some(source) = self.parallel_compaction.select_forced_source(source) {
-                        let transport = self.compaction_transport(context_window_tokens);
+                        let transport = self.compaction_transport(
+                            context_window_tokens,
+                            frame.prepared_profile().constraints.reserved_output_tokens,
+                        );
                         self.parallel_compaction.start(source, transport);
                     }
                 }
@@ -144,9 +147,12 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         } else {
             None
         };
-        let compaction_transport = compaction_source
-            .as_ref()
-            .map(|_| self.compaction_transport(context_window_tokens));
+        let compaction_transport = compaction_source.as_ref().map(|_| {
+            self.compaction_transport(
+                context_window_tokens,
+                frame.prepared_profile().constraints.reserved_output_tokens,
+            )
+        });
         serde_json::from_slice::<Value>(&prepared.request_body).map_err(|_| {
             rejected(
                 OpenAiFailureClass::RequestPreparation,
@@ -411,15 +417,22 @@ impl ResettableReactionPort for AsyncOpenAiResponsesProvider {
 }
 
 impl AsyncOpenAiResponsesProvider {
-    fn compaction_transport(&self, context_window_tokens: NonZeroU64) -> CompactionTransport {
+    fn compaction_transport(
+        &self,
+        context_window_tokens: NonZeroU64,
+        reserved_output_tokens: Option<u64>,
+    ) -> CompactionTransport {
         CompactionTransport {
             client: self.client.clone(),
             config: self.config.clone(),
             encoder: self.encoder.clone(),
             request_limit: self.max_responses_serialized_request_body_bytes,
             response_limit: self.max_response_body_bytes,
+            event_limit: self.max_sse_event_bytes,
+            text_limit: self.max_output_text_bytes,
             read_timeout: self.read_timeout,
             context_window_tokens,
+            reserved_output_tokens: reserved_output_tokens.unwrap_or(0),
         }
     }
 

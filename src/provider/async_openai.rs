@@ -77,6 +77,7 @@ mod chat_completions;
 mod continuation;
 mod faults;
 mod frame_request;
+mod local_compaction;
 mod native_reaction;
 mod output;
 mod parallel_compaction;

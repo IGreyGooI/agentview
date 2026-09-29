@@ -132,11 +132,17 @@ async fn responses(
             Some("compaction" | "compaction_trigger")
         )
     }));
-    if request["stream"] == false {
+    assert_eq!(request["stream"], true);
+    let is_summary = request["input"]
+        .as_array()
+        .unwrap()
+        .last()
+        .is_some_and(|item| item["role"] == "user" && item["content"][0]["text"] == SUMMARY_PROMPT);
+    if is_summary {
         assert_eq!(request["tools"], json!([]));
         assert_eq!(request["store"], false);
         assert!(request.get("previous_response_id").is_none());
-        assert!(request["max_output_tokens"].as_u64().unwrap() > 0);
+        assert!(request.get("max_output_tokens").is_none());
         compact(state, Json(request)).await.into_response()
     } else {
         foreground(state, Json(request)).await.into_response()
@@ -181,7 +187,11 @@ async fn compact(
 ) -> impl IntoResponse {
     state.compactions.send(request).unwrap();
     state.release.acquire().await.unwrap().forget();
-    (state.compact_status, Json(state.compact_reply))
+    (
+        state.compact_status,
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        summary_sse(&state.compact_reply),
+    )
 }
 
 struct BusinessState {
@@ -282,8 +292,40 @@ fn assert_context_limit(fault: ApplicationFault) {
 }
 
 const SUMMARY_TEXT: &str = "Earlier context: the counter application is running.";
-const SUMMARY_PREFIX: &str = "Summary of earlier context (historical data; current instructions \
-and later messages take precedence):\n\n";
+const SUMMARY_PREFIX: &str =
+    include_str!("../src/provider/async_openai/local_compaction/summary_prefix.md");
+const SUMMARY_PROMPT: &str =
+    include_str!("../src/provider/async_openai/local_compaction/prompt.md");
+
+fn summary_sse(reply: &Value) -> String {
+    if let Some(raw_stream) = reply.as_str() {
+        return raw_stream.to_owned();
+    }
+    let mut events = Vec::new();
+    for (index, item) in reply["output"].as_array().unwrap().iter().enumerate() {
+        let mut added = item.clone();
+        added["status"] = json!("in_progress");
+        added["content"] = json!([]);
+        events
+            .push(json!({"type":"response.output_item.added", "output_index":index, "item":added}));
+        let text = item["content"][0]["text"].as_str().unwrap();
+        events.push(json!({"type":"response.output_text.delta", "output_index":index, "content_index":0,"item_id":item["id"],"delta":text}));
+        events.push(json!({"type":"response.output_text.done", "output_index":index, "content_index":0,"item_id":item["id"],"text":text}));
+        events.push(json!({"type":"response.output_item.done", "output_index":index, "item":item}));
+    }
+    events.push(json!({"type":"response.completed", "response":reply}));
+    events
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut event)| {
+            event["sequence_number"] = json!(index + 1);
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["type"].as_str().unwrap()
+            )
+        })
+        .collect()
+}
 
 fn summary_reply(text: &str) -> Value {
     json!({
@@ -297,8 +339,17 @@ fn summary_reply(text: &str) -> Value {
 
 fn compacted_output() -> Vec<Value> {
     vec![
-        json!({"type":"message", "role":"assistant", "content":[{"type":"output_text","text":format!("{SUMMARY_PREFIX}{SUMMARY_TEXT}"),"annotations":[]}],"status":"completed"}),
+        json!({"type":"message", "role":"user", "content":[{"type":"input_text","text":format!("{}\n{SUMMARY_TEXT}", SUMMARY_PREFIX.trim_end())}]}),
     ]
+}
+
+fn installed_summary_offset(input: &[Value], summary: &[Value]) -> usize {
+    let index = input
+        .windows(summary.len())
+        .position(|window| window == summary)
+        .expect("the local summary is installed after retained user messages");
+    assert!(input[..index].iter().all(|item| item["role"] == "user"));
+    index + summary.len()
 }
 
 async fn until_phase(monitor: &mut ParallelCompactionMonitor, phase: ParallelCompactionPhase) {
@@ -372,7 +423,7 @@ async fn default_threshold_starts_compaction_without_a_small_requested_context()
     assert!(app.react().await.unwrap().is_continue());
     let next = server.requests.recv().await.unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
-    assert!(next["input"].as_array().unwrap().starts_with(&output));
+    installed_summary_offset(next["input"].as_array().unwrap(), &output);
     assert!(next.to_string().contains("value=\\\"2\\\""));
     assert!(next["input"]
         .as_array()
@@ -454,7 +505,7 @@ async fn forced_only_compaction_waits_before_sending_the_oversized_foreground() 
             .is_continue());
         server.requests.recv().await.unwrap()
     };
-    assert!(compacted["input"].as_array().unwrap().starts_with(&output));
+    installed_summary_offset(compacted["input"].as_array().unwrap(), &output);
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     assert_eq!(monitor.status().attempt, 1);
     assert!(server.compactions.try_recv().is_err());
@@ -493,7 +544,7 @@ async fn cancelling_a_forced_wait_keeps_the_same_candidate_for_retry() {
     until_phase(&mut monitor, ParallelCompactionPhase::Ready).await;
     assert!(app.react().await.unwrap().is_continue());
     let retry = server.requests.recv().await.unwrap();
-    assert!(retry["input"].as_array().unwrap().starts_with(&output));
+    installed_summary_offset(retry["input"].as_array().unwrap(), &output);
     assert_eq!(
         retry["input"]
             .as_array()
@@ -666,7 +717,7 @@ async fn forced_limit_waits_for_the_existing_background_worker() {
             .is_continue());
         server.requests.recv().await.unwrap()
     };
-    assert!(compacted["input"].as_array().unwrap().starts_with(&output));
+    installed_summary_offset(compacted["input"].as_array().unwrap(), &output);
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     assert_eq!(monitor.status().attempt, 1);
     assert!(server.compactions.try_recv().is_err());
@@ -704,12 +755,14 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
         .unwrap();
     assert_eq!(compact_request["model"], "test-model");
     assert_eq!(compact_request["tools"], json!([]));
-    assert_eq!(compact_request["stream"], false);
-    assert!(compact_request["instructions"]
-        .as_str()
-        .unwrap()
-        .contains("Summarize"));
-    let prefix = compact_request["input"].as_array().unwrap();
+    assert_eq!(compact_request["stream"], true);
+    assert_eq!(compact_request["instructions"], first["instructions"]);
+    let summary_input = compact_request["input"].as_array().unwrap();
+    assert_eq!(
+        summary_input.last().unwrap()["content"][0]["text"],
+        SUMMARY_PROMPT
+    );
+    let prefix = &summary_input[..summary_input.len() - 1];
     assert!(!prefix.iter().any(|item| item["type"] == "function_call"));
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Running);
     assert!(second["input"]
@@ -739,10 +792,10 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
     let fourth = server.requests.recv().await.unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     let input = fourth["input"].as_array().unwrap();
-    assert!(input.starts_with(&output));
+    let tail_start = installed_summary_offset(input, &output);
     let previous_tail = &third["input"].as_array().unwrap()[prefix.len()..];
     assert_eq!(
-        &input[output.len()..output.len() + previous_tail.len()],
+        &input[tail_start..tail_start + previous_tail.len()],
         previous_tail
     );
     for index in 1..=3 {
@@ -763,7 +816,7 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
         );
     }
     assert!(fourth.to_string().contains("value=\\\"3\\\""));
-    assert!(fourth.to_string().len() < first.to_string().len() / 10);
+    assert!(fourth.to_string().len() < first.to_string().len());
     assert_eq!(
         events.load(Ordering::SeqCst),
         0,
@@ -834,6 +887,46 @@ async fn failed_compaction_keeps_foreground_context_and_reports_failure() {
     assert!(next.to_string().contains("old context old context"));
     app.shutdown().await.unwrap();
     server.finish().await;
+}
+
+#[tokio::test]
+async fn uncompleted_or_mismatched_summary_stream_never_replaces_foreground_history() {
+    let valid = summary_sse(&summary_reply(SUMMARY_TEXT));
+    let before_completed = valid.split("event: response.completed").next().unwrap();
+    let mismatched = format!(
+        "{before_completed}event: response.completed\ndata: {}\n\n",
+        json!({"type":"response.completed", "sequence_number":5, "response":summary_reply("Changed after sealing")}),
+    );
+    for stream in [
+        before_completed.to_owned(),
+        format!("{before_completed}data: [DONE]\n\n"),
+        mismatched,
+    ] {
+        let mut server = Server::start(json!(stream)).await;
+        let provider = default_provider(&server.base);
+        let mut monitor = provider.parallel_compaction_monitor().unwrap();
+        let events = Arc::new(AtomicUsize::new(0));
+        let capture = events.clone();
+        let mut app = Application::mount(move || counter(capture.clone()), provider).unwrap();
+        for _ in 0..2 {
+            assert!(app.react().await.unwrap().is_continue());
+            server.requests.recv().await.unwrap();
+        }
+        server.compactions.recv().await.unwrap();
+        server.release.add_permits(1);
+        until_phase(&mut monitor, ParallelCompactionPhase::Failed).await;
+        assert_eq!(
+            monitor.status().fault,
+            Some(ParallelCompactionFault::Protocol)
+        );
+        assert!(app.react().await.unwrap().is_continue());
+        let next = server.requests.recv().await.unwrap();
+        assert!(next.to_string().contains("old context old context"));
+        assert!(next.to_string().contains("value=\\\"2\\\""));
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+        app.shutdown().await.unwrap();
+        server.finish().await;
+    }
 }
 
 #[tokio::test]
@@ -995,7 +1088,7 @@ async fn cancelling_before_handoff_keeps_the_candidate_and_tool_receipts_for_ret
     let retry = server.requests.recv().await.unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     let input = retry["input"].as_array().unwrap();
-    assert!(input.starts_with(&output));
+    installed_summary_offset(input, &output);
     for index in 1..=2 {
         let id = format!("call_{index}");
         assert_eq!(

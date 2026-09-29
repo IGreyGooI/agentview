@@ -3,7 +3,7 @@ name = "agentview"
 version = "0.1.0"
 edition = "2021"
 description = "AI/AX runtime: Agent Interface plus Agent Experience for language agents"
-license = "MIT"
+license = "MIT AND Apache-2.0"
 exclude = [
     "/.claude/**",
     "/CHATROOM.md",
