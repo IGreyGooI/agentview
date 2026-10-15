@@ -331,7 +331,7 @@ fn system_view() -> ShowcaseSystemDocument {
             RuleItemView {
                 before: "Dynamic values remain ",
                 term: "TextNode",
-                after: " data and are escaped once.",
+                after: " data and retain their original XML text.",
             },
             RuleItemView {
                 before: "System and user stay separate ",

@@ -397,7 +397,7 @@ impl ExternalCliState {
     ) -> anyhow::Result<ExternalCliEvent> {
         self.record_entry_meter(kind.prefix().len() + text.len());
         // Exact equality reuses an already validated serializer contribution;
-        // distinct text still passes through the structured JSON/XML meter.
+        // distinct text still passes through the structured JSON meter.
         let text_content_bytes = match self.events.back() {
             Some(ExternalCliEvent {
                 rendered:
@@ -571,7 +571,6 @@ impl ExternalCliComponentState {
 }
 
 fn canonical_external_state_item(rendered: &str) -> anyhow::Result<CanonicalInputItem> {
-    ensure_xml_renderable_text(rendered)?;
     let node = XmlNode::try_build("external_state", |children| {
         if !rendered.is_empty() {
             children.text(TextNode::new(rendered));
@@ -623,7 +622,6 @@ impl std::io::Write for CanonicalJsonStringCounter {
 }
 
 fn canonical_external_state_content_bytes(rendered: &str) -> anyhow::Result<usize> {
-    ensure_xml_renderable_text(rendered)?;
     let mut encoded = CanonicalJsonStringCounter::default();
     {
         let mut buffered =
@@ -761,22 +759,6 @@ fn char_boundary_between(value: &str, failing: usize, fitting: usize) -> Option<
         }
     }
     (middle < fitting).then_some(middle)
-}
-
-fn ensure_xml_renderable_text(value: &str) -> anyhow::Result<()> {
-    if let Some(invalid) = value.chars().find(|character| {
-        let code_point = u32::from(*character);
-        !matches!(code_point, 0x9 | 0xA | 0xD)
-            && !(0x20..=0xD7FF).contains(&code_point)
-            && !(0xE000..=0xFFFD).contains(&code_point)
-            && !(0x10000..=0x10FFFF).contains(&code_point)
-    }) {
-        anyhow::bail!(
-            "external text character U+{:04X} is not allowed in XML content",
-            u32::from(invalid)
-        );
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -3147,13 +3129,9 @@ fn external_protocol_diagnostic(protocol: &str) -> Option<&'static str> {
     for line in protocol.lines() {
         match serde_json::from_str::<ExternalCliProtocolFrame>(line) {
             Ok(
-                ExternalCliProtocolFrame::TextDelta { text }
-                | ExternalCliProtocolFrame::TextComplete { text },
-            ) => {
-                if ensure_xml_renderable_text(&text).is_err() {
-                    return Some("external text is not allowed in XML content");
-                }
-            }
+                ExternalCliProtocolFrame::TextDelta { .. }
+                | ExternalCliProtocolFrame::TextComplete { .. },
+            ) => {}
             Ok(ExternalCliProtocolFrame::Disconnect) => {
                 return Some("external text protocol disconnected abnormally");
             }
@@ -4009,6 +3987,8 @@ mod tests {
             "quotes-\"\"\"",
             "backslashes-\\\\\\",
             "controls-\t-\n-\r",
+            "json-controls-\0-\u{8}-\u{b}-\u{c}-\u{1f}",
+            "unicode-noncharacters-\u{fffe}-\u{ffff}",
             "xml-<tag attr='value'>&\"text\"</tag>",
             "unicode-\u{4e2d}\u{6587}-\u{1f642}-\u{e000}-\u{2028}-\u{2029}",
         ] {
@@ -4053,7 +4033,10 @@ mod tests {
             assert_matches_prefixed_item(kind, &value);
         }
 
-        assert!(canonical_external_state_content_bytes("invalid-\0").is_err());
+        let controls: String = ('\0'..='\u{1f}').collect();
+        assert_matches_full_item(&controls);
+        assert_matches_prefixed_item(ExternalCliTextKind::Delta, &controls);
+        assert_matches_prefixed_item(ExternalCliTextKind::Complete, &controls);
     }
 
     #[test]
@@ -4080,7 +4063,6 @@ mod tests {
             canonical_external_state_item_bytes(&complete[omitted - 1..]).unwrap()
                 > max_external_cli_snapshot_item_bytes()
         );
-        ensure_xml_renderable_text(&rendered).unwrap();
 
         let mut worst_xml = ExternalCliState::default();
         let worst_xml_event = format!("complete:{}", "&".repeat(EXTERNAL_CLI_MAX_TEXT_BYTES));
@@ -4135,11 +4117,19 @@ mod tests {
         assert!(state.events.len() < 10);
         assert!(state.canonical_item_bytes() <= canonical_cap);
 
-        let before_invalid = state.clone();
+        let before_rejected = state.clone();
         assert!(state
-            .push_with_limits("invalid-\0".to_owned(), usize::MAX, canonical_cap)
+            .push_with_limits(
+                "json-control-\0".to_owned(),
+                usize::MAX,
+                external_state_empty_item_bytes() - 1,
+            )
             .is_err());
-        assert_eq!(state, before_invalid);
+        assert_eq!(state, before_rejected);
+        state
+            .push_with_limits("json-control-\0".to_owned(), usize::MAX, canonical_cap)
+            .unwrap();
+        assert!(state.rendered().ends_with("json-control-\0"));
         assert_eq!(
             state.canonical_item_bytes(),
             canonical_external_state_item_bytes(&state.rendered()).unwrap()

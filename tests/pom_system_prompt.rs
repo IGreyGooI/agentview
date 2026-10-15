@@ -454,7 +454,7 @@ async fn resolved_system_document_reaches_the_real_agent_request_path() {
             "# System policy\n\n",
             "Use **grounded** actions.\n\n",
             "<reply_contract format=\"xml\">",
-            "Return &lt;action&gt;.",
+            "Return <action>.",
             "</reply_contract>"
         )
     );

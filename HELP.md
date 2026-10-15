@@ -141,8 +141,17 @@ XML-looking text. `#[diff]` retains whole-value comparison; `repeat` still sends
 System strings use the existing System snapshot rules.
 
 Quoted `"{system}"` remains a formatted paragraph with inline validation. Use `{ system }` or
-`{ format!("{system}") }` for a complete multiline prompt. Text inside explicit Markdown/XML nodes
-retains its existing validation and escaping. Low-level callers can use `Document::from_raw_text(...)`.
+`{ format!("{system}") }` for a complete multiline prompt. Explicit Markdown nodes retain their
+Markdown validation and escaping. Low-level callers can use `Document::from_raw_text(...)`.
+
+XML in the rendered prompt organizes content for the LLM; it is not parsed as XML. XML text,
+raw text, and attribute values receive no entity escaping, including `<`, `>`, `&`, quotes,
+and backslashes. XML retains its structural indentation, including nested multiline content;
+the source text's relative indentation and line endings remain. Pure data fields receive no
+Markdown escaping.
+Code spans and code blocks inside XML likewise preserve their bodies. Explicit Markdown nodes
+still supply their declared formatting. JSON values and provider requests retain the escaping
+required by JSON, without an additional XML or Markdown escaping layer.
 
 Run `cargo run --no-default-features --example raw_prompt` for a credential-free example.
 

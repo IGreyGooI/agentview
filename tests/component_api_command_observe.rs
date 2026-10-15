@@ -144,7 +144,7 @@ async fn large_retained_feedback_leaves_views_deliverable_for_following_actions_
 
     let assert_deliverable = |view: &str, ok: bool| {
         // The adapter wraps the rendered view in JSON. Test actual encoded
-        // bytes: a character count misses XML entities and JSON backslashes.
+        // bytes: a character count misses JSON escapes and multibyte text.
         let wire = serde_json::to_vec(&json!({"ok": ok, "output": view})).unwrap();
         assert!(wire.len() < 128 * 1024, "view needs {} bytes", wire.len());
     };
@@ -215,7 +215,7 @@ async fn large_retained_feedback_leaves_views_deliverable_for_following_actions_
 }
 
 #[tokio::test]
-async fn malformed_action_characters_remain_visible_without_poisoning_following_views() {
+async fn action_feedback_preserves_all_json_characters_and_allows_following_actions() {
     let probe = Probe::default();
     let root_probe = probe.clone();
     let (port, _control) = ExternalProviderPort::new().unwrap();
@@ -249,9 +249,10 @@ async fn malformed_action_characters_remain_visible_without_poisoning_following_
         );
         let view = text(&response.projection);
         assert!(view.contains(expected_code));
-        assert!(view.contains("\\u{ffff}"));
-        assert!(!view.contains('\u{ffff}'));
-        assert!(!view.contains('\0'));
+        assert!(view.contains(message));
+        assert!(view.contains('\u{ffff}'));
+        let wire = serde_json::to_vec(&view).unwrap();
+        assert_eq!(serde_json::from_slice::<String>(&wire).unwrap(), view);
         assert!(view.contains("<count>0</count>"));
     }
 
@@ -274,9 +275,10 @@ async fn malformed_action_characters_remain_visible_without_poisoning_following_
     let view = text(&observed.unwrap());
     assert!(view.contains("<count>1</count>"));
     assert_eq!(view.matches("<command_result ").count(), 3);
-    assert!(view.contains("\\u{0}"));
-    assert!(view.contains("\\u{fffe}"));
-    assert!(view.contains("\\u{ffff}"));
+    assert!(view.contains(unknown));
+    assert!(view.contains('\0'));
+    assert!(view.contains('\u{fffe}'));
+    assert!(view.contains('\u{ffff}'));
     app.shutdown().await.unwrap();
 }
 

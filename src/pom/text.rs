@@ -29,8 +29,9 @@ impl TextNode {
 /// One opaque source-text block.
 ///
 /// Unlike [`TextNode`], raw text is not Markdown content. At a document root
-/// it is rendered exactly as supplied; when embedded in XML it is escaped as
-/// XML character data.
+/// it is rendered exactly as supplied. Inside XML it receives no escaping and
+/// participates in the surrounding XML layout. Prompt XML organizes content
+/// for the model; it is not input to an XML parser.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RawTextNode {
     value: StorageString,

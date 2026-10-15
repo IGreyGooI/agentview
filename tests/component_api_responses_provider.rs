@@ -55,7 +55,7 @@ use tracing::instrument::WithSubscriber;
 const BINDING: &str = "responses-provider-test-binding";
 const LOOPBACK_PROXY_CHILD_ENV: &str = "AGENTVIEW_LOOPBACK_PROXY_TEST_CHILD";
 const AMBIENT_HEADERS_CHILD_ENV: &str = "AGENTVIEW_RESPONSES_AMBIENT_HEADERS_TEST_CHILD";
-const SAMPLE_CODEX_ORACLE_BODY: &[u8] = br#"{"model":"gpt-5.6-codex","instructions":"<sample_policy>Follow the response protocol.</sample_policy>","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"<sample_request>Return one result.&#10;turn\\_id: turn-1</sample_request>"}]}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"store":false,"stream":true,"include":["reasoning.encrypted_content"]}"#;
+const SAMPLE_CODEX_ORACLE_BODY: &[u8] = br#"{"model":"gpt-5.6-codex","instructions":"<sample_policy>Follow the response protocol.</sample_policy>","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"<sample_request>\nReturn one result.\nturn_id: turn-1\n</sample_request>"}]}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"store":false,"stream":true,"include":["reasoning.encrypted_content"]}"#;
 
 #[test]
 fn serialized_responses_request_body_limit_must_be_nonzero() {

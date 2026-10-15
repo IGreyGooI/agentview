@@ -818,8 +818,8 @@ Legacy-compatible XML and display derives also generate an implementation of
 `semantic_view::AgentView`. That compatibility tree retains:
 
 - `Node(SemanticNode)`: an element with attributes and children.
-- `Text(String)`: raw text escaped later by the legacy serializer.
-- `Comment(String)`: raw comment content normalized/escaped by the legacy
+- `Text(String)`: raw text preserved by the legacy serializer.
+- `Comment(String)`: raw comment content preserved by the legacy
   serializer.
 
 For a derived XML record, ordinary fields become ordinary POM content and each
@@ -915,9 +915,12 @@ effects, so a later snapshot failure cannot replay the same action.
 
 Both resolvers return opaque, slot-free `ResolvedDocument`; only that type can
 be passed to `render_pom_document`. The renderer emits canonical Markdown plus
-XML and owns escaping, list syntax, code fences/spans, XML mixed content, and
-error reporting. Empty paragraphs, zero-item lists, empty code spans, and
-invalid XML characters fail rather than falling back to raw markup.
+XML-shaped prompt text and owns Markdown escaping, list syntax, code fences/spans,
+mixed content layout, and error reporting. Prompt XML is read by the LLM, not an
+XML parser: data text and attributes receive no XML entities or Markdown escaping.
+XML retains its structural indentation. JSON retains its required escaping. Explicit Markdown nodes
+retain their formatting rules; empty paragraphs, zero-item lists, and empty code
+spans fail rather than falling back to raw markup.
 
 The streaming demo authors workflow prose with paragraph views that contain
 the actual typed tool value as `#[view(xml)]`:

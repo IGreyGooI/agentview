@@ -94,9 +94,20 @@ user/developer XML 删除规则处理；assistant 和 System placement 不支持
 原文中的 `<tag>` 不构成 POM XML，不能被 XML diff 或 slot 扫描解释。显式 `#[diff]` 不会将原文
 拆成字符或行级 patch；`repeat` 仍完整发送当前值。System 保持独立的 replace/clear 路径。
 
-quoted 文本模板和显式 Markdown/XML 内的文本仍按既有 inline / XML 上下文校验与转义。
+quoted 文本模板和显式 Markdown 节点仍按 Markdown inline 上下文校验与转义。
 根级字符串适配不改变 `String` 的字段编码，也不放宽 `TextNode` 的 block 转换约束。底层 API
 通过 `Document::from_raw_text(...)` 构造同样的原文内容。
+
+### 提示词 XML 的原文保留
+
+渲染给 LLM 的 XML 只用于组织提示词，不会交给 XML parser。XML 正文、原文 block 和属性值
+保留原始内容，不添加 XML 实体转义，也不因 XML 字符合法性拒绝正文。纯数据字段不添加 Markdown
+转义；`<`、`>`、`&`、引号、反斜杠和已有实体文本均直接保留。XML 继续按既有规则作层级缩进，
+包括嵌套的多行内容；正文自身的相对缩进和 CR/LF 保留。XML 内显式 code span / code block 的正文
+同样不做实体转义。
+显式 Markdown 节点继续提供其声明的格式及必要的 Markdown 转义。JSON 数据及 Provider request
+仍使用 JSON 自身必要的转义，不再叠加 XML 或纯数据 Markdown 转义。
+该规则只适用于发给模型的提示词；模型输出中的 XML 动作仍按既有 parser 和校验规则处理。
 
 ```text
 application owner
@@ -1206,9 +1217,8 @@ Action 的 callback 输入结构体以 `Deserialize + JsonSchema` 声明 JSON �
 `{"action":"move","input":{"uci":"e2e4"}}`；框架按本轮实际挂载的动作名路由并执行 typed 解码。
 未知动作、错误类型等普通输入错误返回 feedback 和当前 view，不阻止下一次有效动作。callback
 返回错误仍遵循运行时失败规则。业务作者不维护独立 descriptor 常量、parser catalog 或 NoInput 类型。
-保留的 action feedback 对名称、错误码和正文提供有大小上限的展示预览，预算包括 XML/Markdown
-转义和 JSON 编码后的膨胀；截短有明确标记。XML 禁止字符以可读转义展示，`CommandResponse`
-仍保留原始调用及完整 outcome。
+保留的 action feedback 对名称、错误码和正文提供有大小上限的展示预览，预算包括 JSON 编码后的
+膨胀；预览保留正文原文，截短有明确标记。`CommandResponse` 仍保留原始调用及完整 outcome。
 
 `CommandSender::observe()` 通过相同 preparation barrier 请求 prepared projection，不调用业务 callback，
 不增加 action feedback。观察和动作请求都受取消、关闭与队列规则管理。stdout 由前台 adapter 输出

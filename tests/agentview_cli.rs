@@ -1407,23 +1407,40 @@ fn malformed_protocol_frame_is_redacted_and_the_daemon_recovers() {
 }
 
 #[test]
-fn xml_invalid_protocol_text_is_rejected_without_poisoning_the_daemon() {
+fn protocol_text_preserves_json_legal_characters_without_xml_validation() {
     let mut daemon = DaemonGuard::new(unused_loopback_addr());
     json_output(&daemon.start());
-    let invalid = run_cli_with_input(
+    let accepted = run_cli_with_input(
         daemon.addr(),
         &["act", "--protocol"],
-        "{\"type\":\"text_delta\",\"text\":\"\\u0000\"}\n",
+        "{\"type\":\"text_delta\",\"text\":\"\\u0000<&> `*_[]#`\\r\\n\"}\n",
     );
 
-    assert!(!invalid.status.success(), "{invalid:?}");
-    assert!(
-        String::from_utf8_lossy(&invalid.stderr).contains("not allowed in XML content"),
-        "{invalid:?}"
-    );
+    assert!(String::from_utf8_lossy(&accepted.stdout).contains("\\u0000"));
+    let accepted = json_output(&accepted);
+    assert_eq!(accepted["kind"], "observation");
 
-    let recovered = json_output(&run_cli(daemon.addr(), &["observe"]));
-    assert_eq!(recovered["mode"], "full");
-    assert!(recovered["base_generation"].is_null());
-    assert!(!recovered["content"].as_str().unwrap().contains("\\u{0}"));
+    let observed = json_output(&run_cli(daemon.addr(), &["observe", "--full-re-render"]));
+    assert_eq!(observed["kind"], "observation");
+    for observation in [&accepted, &observed] {
+        let frame: Value = serde_json::from_str(observation["content"].as_str().unwrap())
+            .expect("observation content is a canonical JSON frame");
+        let state = frame["component"]["projection"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(frame["replay"].as_array().unwrap())
+            .chain(frame["staged_inputs"].as_array().unwrap())
+            .find(|item| item["payload"]["role"] == "user")
+            .unwrap_or_else(|| {
+                panic!("the CLI delivers its current state as a user message: {frame:#}")
+            });
+        let document: agentview::pom::ResolvedDocument =
+            serde_json::from_value(state["payload"]["pom"].clone()).unwrap();
+        let rendered = agentview::pom_renderer::render_pom_document(&document).unwrap();
+        assert!(
+            rendered.contains("delta:\0<&> `*_[]#`\r\n"),
+            "rendered state: {rendered:?}; observation: {observation:#}"
+        );
+    }
 }

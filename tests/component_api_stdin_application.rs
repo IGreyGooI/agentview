@@ -75,7 +75,7 @@ async fn owner_drives_root_wait_and_returns_outputs_feedback_and_next_view() {
         assert!(!invalid.ok);
         assert!(invalid.view.contains("<input_feedback"));
         assert!(invalid.view.contains("truncated"));
-        assert!(!invalid.view.contains('\0'));
+        assert!(invalid.view.contains('\0'));
         assert!(serde_json::to_vec(&invalid).unwrap().len() < 128 * 1024);
         assert_eq!(app.observe().await.unwrap().view, invalid.view);
 

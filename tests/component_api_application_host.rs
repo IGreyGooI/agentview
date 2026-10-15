@@ -654,11 +654,11 @@ async fn successful_reaction_post_reconciles_handler_state_before_return() {
     assert!(!components.is_dirty());
     let submitted = projections.lock().unwrap();
     assert_eq!(submitted.len(), 1);
-    assert!(projection_text(&submitted[0]).contains("<state>\\[\\]</state>"));
+    assert!(projection_text(&submitted[0]).contains("<state>[]</state>"));
     let committed = components
         .current_projection()
         .expect("post-reconciled projection is committed");
-    assert!(projection_text(committed).contains("<state>\\[7\\]</state>"));
+    assert!(projection_text(committed).contains("<state>[7]</state>"));
 }
 
 #[tokio::test]
@@ -1029,7 +1029,7 @@ async fn provider_stream_fault_is_reported_and_the_provider_remains_reusable() {
     let committed = components
         .current_projection()
         .expect("pre-reaction projection remains committed after stream fault");
-    assert!(projection_text(committed).contains("<state>\\[\\]</state>"));
+    assert!(projection_text(committed).contains("<state>[]</state>"));
 
     host.dispatch_llm_reaction(&mut components)
         .await
@@ -1037,7 +1037,7 @@ async fn provider_stream_fault_is_reported_and_the_provider_remains_reusable() {
     assert!(!components.is_dirty());
     assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
     let second_projection = projection_text(&projections.lock().unwrap()[1]);
-    assert!(second_projection.contains("<state>\\[7\\]</state>"));
+    assert!(second_projection.contains("<state>[7]</state>"));
 }
 
 #[tokio::test]

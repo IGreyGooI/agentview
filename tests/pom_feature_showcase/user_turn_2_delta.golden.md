@@ -70,7 +70,7 @@
   </transient_hint>
 </agent_context>
 
-<parser_error code="missing_owner">The first streamed call omitted edge\_id="edge.ownership".</parser_error>
+<parser_error code="missing_owner">The first streamed call omitted edge_id="edge.ownership".</parser_error>
 
 ### Resolver feedback
 

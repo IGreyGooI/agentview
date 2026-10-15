@@ -43,19 +43,19 @@ fn turn_artifact_renders_canonical_pom_and_exposes_its_kind() {
     assert_eq!(artifact.kind(), "parser_error");
     assert_eq!(
         render_pom_document(artifact.document()).unwrap(),
-        "<parser_error>&lt;select&gt;&amp;</parser_error>"
+        "<parser_error><select>&</parser_error>"
     );
 }
 
 #[test]
-fn turn_artifact_propagates_canonical_renderer_errors() {
+fn turn_artifact_preserves_original_text_without_xml_validation() {
     let artifact =
         TurnArtifact::try_from_document("parser_error", xml_document("parser_error", "\u{0}"))
             .unwrap();
 
-    assert!(
-        render_pom_document(artifact.document()).is_err(),
-        "an invalid XML character must not fall back to trusted raw markup"
+    assert_eq!(
+        render_pom_document(artifact.document()).unwrap(),
+        "<parser_error>\u{0}</parser_error>"
     );
 }
 

@@ -109,7 +109,7 @@ async fn component_host_lowers_system_developer_and_default_user_to_canonical_it
     );
     assert_eq!(
         rendered(&input.items()[2]),
-        "<chess_task turn_id=\"turn-7\">Choose a move &amp; explain.</chess_task>"
+        "<chess_task turn_id=\"turn-7\">Choose a move & explain.</chess_task>"
     );
 }
 
@@ -166,7 +166,7 @@ fn escaping_application(_props: TurnProps, _events: EventInput<ProviderEvent>) -
 }
 
 #[tokio::test]
-async fn static_xml_text_and_attributes_are_escaped_by_the_canonical_renderer() {
+async fn canonical_renderer_preserves_xml_text_and_attributes() {
     let input = render_application(escaping_application, TurnProps);
 
     assert_eq!(input.items().len(), 2);
@@ -174,8 +174,8 @@ async fn static_xml_text_and_attributes_are_escaped_by_the_canonical_renderer() 
         rendered(&input.items()[1]),
         concat!(
             "root \\* \\< \\&\n\n",
-            "<escaped data=\"&quot;&amp;&lt;&gt;\">\n",
-            "  <nested>&lt;&amp;&gt;</nested>\n",
+            "<escaped data=\"\"&<>\">\n",
+            "  <nested><&></nested>\n",
             "</escaped>"
         )
     );
@@ -213,7 +213,7 @@ fn dynamic_pom_application(_props: TurnProps, _events: EventInput<ProviderEvent>
 }
 
 #[tokio::test]
-async fn formatted_text_and_dynamic_attributes_materialize_as_escaped_pom() {
+async fn formatted_xml_text_and_dynamic_attributes_preserve_their_values() {
     ATTRIBUTE_EVALUATIONS.store(0, Ordering::SeqCst);
     let input = render_application(dynamic_pom_application, TurnProps);
 
@@ -226,7 +226,7 @@ async fn formatted_text_and_dynamic_attributes_materialize_as_escaped_pom() {
             "Literal {slot} for turn-7\n\n",
             "Clock: `4.2s`\n\n",
             "<chess_task priority=\"3\" label=\"clock 4.2s\">\n",
-            "  <instruction>Choose e2e4 &amp; hold &lt;center&gt;</instruction>\n",
+            "  <instruction>Choose e2e4 & hold <center></instruction>\n",
             "  <clock>4.2s</clock>\n",
             "</chess_task>"
         )
@@ -265,7 +265,7 @@ async fn dynamic_root_expressions_preserve_component_and_pom_structure() {
         rendered(&input.items()[1]),
         concat!(
             "<inline>component</inline>\n\n",
-            "<dynamic_note>typed &amp; structured</dynamic_note>\n\n",
+            "<dynamic_note>typed & structured</dynamic_note>\n\n",
             "<dynamic_note>optional</dynamic_note>"
         )
     );

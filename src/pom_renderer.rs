@@ -30,9 +30,6 @@ pub enum PomRenderError {
     #[error("code span body must be non-empty and cannot contain a newline: {value:?}")]
     InvalidCodeSpanBody { value: StorageString },
 
-    #[error("character U+{code_point:04X} is not allowed in XML content")]
-    InvalidXmlCharacter { code_point: u32 },
-
     #[error(
         "ordered list marker {marker} has more than nine digits (item {item_index}); \
          CommonMark cannot represent it as a list item"
@@ -40,7 +37,12 @@ pub enum PomRenderError {
     OrderedListMarkerTooLong { marker: u64, item_index: usize },
 }
 
-/// Renders a slot-free POM document to canonical Markdown + XML prompt text.
+/// Renders a slot-free POM document to Markdown + XML-shaped prompt text.
+///
+/// XML organizes the prompt for the model; it is not a serialization format for
+/// an XML parser. Data text and attribute values receive no escaping. XML keeps
+/// its structural indentation; explicitly authored Markdown nodes apply their
+/// own formatting and escaping.
 pub fn render_pom_document(document: &ResolvedDocument) -> Result<String, PomRenderError> {
     Renderer.render_block_children(document.children(), false)
 }
@@ -77,13 +79,7 @@ impl Renderer {
                 };
                 self.render_xml(node, placement)
             }
-            ContentRef::Node(ContentNode::RawText(node)) => {
-                if xml_context {
-                    self.escape_xml_text(node.value())
-                } else {
-                    Ok(node.value().to_owned())
-                }
-            }
+            ContentRef::Node(ContentNode::RawText(node)) => Ok(node.value().to_owned()),
             ContentRef::Node(ContentNode::Text(_)) => {
                 unreachable!("resolved block children cannot contain direct text")
             }
@@ -99,10 +95,10 @@ impl Renderer {
         xml_context: bool,
     ) -> Result<String, PomRenderError> {
         match node {
-            MarkdownNode::Heading(node) => self.render_heading(node, xml_context),
-            MarkdownNode::Paragraph(node) => self.render_paragraph(node, xml_context),
+            MarkdownNode::Heading(node) => self.render_heading(node),
+            MarkdownNode::Paragraph(node) => self.render_paragraph(node),
             MarkdownNode::List(node) => self.render_list(node, xml_context),
-            MarkdownNode::CodeBlock(node) => self.render_code_block(node, xml_context),
+            MarkdownNode::CodeBlock(node) => self.render_code_block(node),
             MarkdownNode::ThematicBreak => Ok("---".to_owned()),
             MarkdownNode::Strong(_) | MarkdownNode::CodeSpan(_) => {
                 unreachable!("block children cannot contain inline Markdown")
@@ -110,32 +106,23 @@ impl Renderer {
         }
     }
 
-    fn render_heading(
-        &self,
-        node: &HeadingNode,
-        xml_context: bool,
-    ) -> Result<String, PomRenderError> {
+    fn render_heading(&self, node: &HeadingNode) -> Result<String, PomRenderError> {
         let marker = "#".repeat(usize::from(node.level().number()));
-        let body = self.render_inline_children(node.children(), xml_context, false)?;
+        let body = self.render_inline_children(node.children(), false)?;
         Ok(format!("{marker} {body}"))
     }
 
-    fn render_paragraph(
-        &self,
-        node: &ParagraphNode,
-        xml_context: bool,
-    ) -> Result<String, PomRenderError> {
+    fn render_paragraph(&self, node: &ParagraphNode) -> Result<String, PomRenderError> {
         if node.children().is_empty() {
             return Err(PomRenderError::InvalidEmptyParagraph);
         }
-        self.render_inline_children(node.children(), xml_context, true)
+        self.render_inline_children(node.children(), true)
             .map(|rendered| encode_rendered_indentation(&rendered))
     }
 
     fn render_inline_children(
         &self,
         children: &InlineChildren,
-        xml_context: bool,
         starts_block: bool,
     ) -> Result<String, PomRenderError> {
         let mut rendered = String::new();
@@ -144,13 +131,13 @@ impl Renderer {
         for content in children.iter() {
             let next = match content {
                 ContentRef::Node(ContentNode::Text(node)) => {
-                    self.escape_markdown_text(node.value(), xml_context, at_block_start)?
+                    self.escape_markdown_text(node.value(), at_block_start)
                 }
                 ContentRef::Node(ContentNode::Markdown(MarkdownNode::Strong(node))) => {
-                    self.render_strong(node, xml_context)?
+                    self.render_strong(node)?
                 }
                 ContentRef::Node(ContentNode::Markdown(MarkdownNode::CodeSpan(node))) => {
-                    self.render_code_span(node, xml_context)?
+                    self.render_code_span(node)?
                 }
                 ContentRef::Node(ContentNode::Xml(node)) => {
                     self.render_xml(node, XmlPlacement::Embedded)?
@@ -177,12 +164,8 @@ impl Renderer {
         Ok(rendered)
     }
 
-    fn render_strong(
-        &self,
-        node: &StrongNode,
-        xml_context: bool,
-    ) -> Result<String, PomRenderError> {
-        let body = self.render_inline_children(node.children(), xml_context, false)?;
+    fn render_strong(&self, node: &StrongNode) -> Result<String, PomRenderError> {
+        let body = self.render_inline_children(node.children(), false)?;
         let Some(core_start) = body.find(|ch: char| !ch.is_whitespace()) else {
             return Err(PomRenderError::InvalidStrongContent);
         };
@@ -204,21 +187,13 @@ impl Renderer {
         Ok(format!("{leading}**{core}**{trailing}"))
     }
 
-    fn render_code_span(
-        &self,
-        node: &CodeSpanNode,
-        xml_context: bool,
-    ) -> Result<String, PomRenderError> {
+    fn render_code_span(&self, node: &CodeSpanNode) -> Result<String, PomRenderError> {
         let raw = node.body().value();
         if raw.is_empty() || raw.contains(['\r', '\n']) {
             return Err(PomRenderError::InvalidCodeSpanBody { value: raw.into() });
         }
         let delimiter = "`".repeat(longest_run(raw, '`').saturating_add(1).max(1));
-        let body = if xml_context {
-            self.escape_xml_text(raw)?
-        } else {
-            raw.to_owned()
-        };
+        let body = raw;
         let needs_padding = raw.starts_with('`')
             || raw.ends_with('`')
             || (raw.starts_with(' ') && raw.ends_with(' ') && raw.chars().any(|ch| ch != ' '));
@@ -295,11 +270,7 @@ impl Renderer {
         Ok(rendered_items.join("\n"))
     }
 
-    fn render_code_block(
-        &self,
-        node: &CodeBlockNode,
-        xml_context: bool,
-    ) -> Result<String, PomRenderError> {
+    fn render_code_block(&self, node: &CodeBlockNode) -> Result<String, PomRenderError> {
         let language = match node.language() {
             Some(language) if language.is_empty() || language.chars().any(char::is_whitespace) => {
                 return Err(PomRenderError::InvalidCodeBlockLanguage {
@@ -311,26 +282,11 @@ impl Renderer {
 
         let raw_body = node.body().value();
         let fence = "~".repeat(longest_run(raw_body, '~').saturating_add(1).max(3));
-        let rendered_language = language
-            .map(|language| {
-                if xml_context {
-                    self.escape_xml_text(language)
-                } else {
-                    Ok(language.to_owned())
-                }
-            })
-            .transpose()?;
-        let rendered_body = if xml_context {
-            self.escape_xml_text(raw_body)?
-        } else {
-            raw_body.to_owned()
+        let mut rendered = match language {
+            Some(language) => format!("{fence} {language}\n{raw_body}"),
+            None => format!("{fence}\n{raw_body}"),
         };
-
-        let mut rendered = match rendered_language {
-            Some(language) => format!("{fence} {language}\n{rendered_body}"),
-            None => format!("{fence}\n{rendered_body}"),
-        };
-        if !rendered_body.is_empty() && !rendered_body.ends_with('\n') {
+        if !raw_body.is_empty() && !raw_body.ends_with('\n') {
             rendered.push('\n');
         }
         rendered.push_str(&fence);
@@ -347,7 +303,7 @@ impl Renderer {
             opening.push(' ');
             opening.push_str(attribute.name().as_str());
             opening.push_str("=\"");
-            opening.push_str(&self.escape_xml_attribute(attribute.value())?);
+            opening.push_str(attribute.value());
             opening.push('"');
         }
 
@@ -400,29 +356,22 @@ impl Renderer {
     ) -> Result<RenderedMixed, PomRenderError> {
         let mut units = Vec::new();
         let mut flow = String::new();
-        let mut flow_starts_raw = false;
         let mut has_block = false;
 
         for content in children.iter() {
             match content {
                 ContentRef::Node(ContentNode::Markdown(node)) if node.is_block() => {
                     if !flow.is_empty() {
-                        let flow = std::mem::take(&mut flow);
-                        units.push(if flow_starts_raw {
-                            flow
-                        } else {
-                            encode_rendered_indentation(&flow)
-                        });
-                        flow_starts_raw = false;
+                        units.push(std::mem::take(&mut flow));
                     }
                     units.push(self.render_block_markdown(node, true)?);
                     has_block = true;
                 }
                 ContentRef::Node(ContentNode::Markdown(MarkdownNode::Strong(node))) => {
-                    flow.push_str(&self.render_strong(node, true)?);
+                    flow.push_str(&self.render_strong(node)?);
                 }
                 ContentRef::Node(ContentNode::Markdown(MarkdownNode::CodeSpan(node))) => {
-                    flow.push_str(&self.render_code_span(node, true)?);
+                    flow.push_str(&self.render_code_span(node)?);
                 }
                 ContentRef::Node(ContentNode::Markdown(
                     MarkdownNode::Heading(_)
@@ -432,18 +381,10 @@ impl Renderer {
                     | MarkdownNode::ThematicBreak,
                 )) => unreachable!("block Markdown was handled by the preceding match arm"),
                 ContentRef::Node(ContentNode::Text(node)) => {
-                    flow.push_str(&self.escape_markdown_text(
-                        node.value(),
-                        true,
-                        flow.is_empty(),
-                    )?);
+                    flow.push_str(node.value());
                 }
                 ContentRef::Node(ContentNode::RawText(node)) => {
-                    let raw = self.escape_xml_text(node.value())?;
-                    if flow.is_empty() && !raw.is_empty() {
-                        flow_starts_raw = true;
-                    }
-                    flow.push_str(&raw);
+                    flow.push_str(node.value());
                 }
                 ContentRef::Node(ContentNode::Xml(node)) => {
                     flow.push_str(&self.render_xml(node, XmlPlacement::Embedded)?);
@@ -454,11 +395,7 @@ impl Renderer {
             }
         }
         if !flow.is_empty() {
-            units.push(if flow_starts_raw {
-                flow
-            } else {
-                encode_rendered_indentation(&flow)
-            });
+            units.push(flow);
         }
 
         Ok(RenderedMixed {
@@ -467,12 +404,7 @@ impl Renderer {
         })
     }
 
-    fn escape_markdown_text(
-        &self,
-        raw: &str,
-        xml_context: bool,
-        block_start: bool,
-    ) -> Result<String, PomRenderError> {
+    fn escape_markdown_text(&self, raw: &str, block_start: bool) -> String {
         let ordered_delimiter = block_start.then(|| ordered_list_delimiter(raw)).flatten();
         let block_marker = block_start.then(|| block_marker(raw)).flatten();
         let encoded_indent = block_start.then(|| encoded_indentation(raw)).flatten();
@@ -488,76 +420,17 @@ impl Renderer {
                 continue;
             }
 
-            if xml_context {
-                ensure_xml_character(ch)?;
-                match ch {
-                    '&' => {
-                        rendered.push_str("&amp;");
-                        continue;
-                    }
-                    '<' => {
-                        rendered.push_str("&lt;");
-                        continue;
-                    }
-                    '>' => {
-                        rendered.push_str("&gt;");
-                        continue;
-                    }
-                    '\r' => {
-                        rendered.push_str("&#13;");
-                        continue;
-                    }
-                    '\n' => {
-                        rendered.push_str("&#10;");
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-
-            let markdown_control = matches!(ch, '\\' | '`' | '*' | '_' | '[' | ']' | '#')
-                || (!xml_context && matches!(ch, '<' | '>' | '&'));
+            let markdown_control = matches!(
+                ch,
+                '\\' | '`' | '*' | '_' | '[' | ']' | '#' | '<' | '>' | '&'
+            );
             if markdown_control || block_marker == Some(index) || ordered_delimiter == Some(index) {
                 rendered.push('\\');
             }
             rendered.push(ch);
         }
 
-        Ok(rendered)
-    }
-
-    fn escape_xml_text(&self, raw: &str) -> Result<String, PomRenderError> {
-        let mut rendered = String::with_capacity(raw.len());
-        for ch in raw.chars() {
-            ensure_xml_character(ch)?;
-            match ch {
-                '&' => rendered.push_str("&amp;"),
-                '<' => rendered.push_str("&lt;"),
-                '>' => rendered.push_str("&gt;"),
-                '\r' => rendered.push_str("&#13;"),
-                _ => rendered.push(ch),
-            }
-        }
-        Ok(rendered)
-    }
-
-    fn escape_xml_attribute(&self, raw: &str) -> Result<String, PomRenderError> {
-        let mut rendered = String::with_capacity(raw.len());
-        for ch in raw.chars() {
-            ensure_xml_character(ch)?;
-            match ch {
-                '&' => rendered.push_str("&amp;"),
-                '<' => rendered.push_str("&lt;"),
-                '>' => rendered.push_str("&gt;"),
-                '"' => rendered.push_str("&quot;"),
-                '\'' => rendered.push_str("&apos;"),
-                '\t' => rendered.push_str("&#9;"),
-                '\n' => rendered.push_str("&#10;"),
-                '\r' => rendered.push_str("&#13;"),
-                _ => rendered.push(ch),
-            }
-        }
-        Ok(rendered)
+        rendered
     }
 }
 
@@ -692,18 +565,5 @@ fn encode_rendered_indentation(rendered: &str) -> String {
         Some(b' ') => format!("&#32;{}", &rendered[1..]),
         Some(b'\t') => format!("&#9;{}", &rendered[1..]),
         _ => rendered.to_owned(),
-    }
-}
-
-fn ensure_xml_character(ch: char) -> Result<(), PomRenderError> {
-    let code_point = u32::from(ch);
-    if matches!(code_point, 0x9 | 0xA | 0xD)
-        || (0x20..=0xD7FF).contains(&code_point)
-        || (0xE000..=0xFFFD).contains(&code_point)
-        || (0x10000..=0x10FFFF).contains(&code_point)
-    {
-        Ok(())
-    } else {
-        Err(PomRenderError::InvalidXmlCharacter { code_point })
     }
 }

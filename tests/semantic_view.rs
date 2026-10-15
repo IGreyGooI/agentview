@@ -15,23 +15,41 @@ struct HelloView {
 }
 
 #[test]
-fn string_renders_as_root_text_and_field_attr() {
-    let text = "hello <agent>".to_owned();
-    assert_eq!(render_agent_view_xml(&text), "hello &lt;agent&gt;");
+fn string_renders_verbatim_as_root_text_and_field_attr() {
+    let text = r#"hello <agent> & "raw" 'text' &gt; C:\memory\graph `*_[]#`"#.to_owned();
+    assert_eq!(render_agent_view_xml(&text), text);
 
     let mut node = SemanticNode::new("actor");
     node.push_field(LegacyAgentView::render_field(&text, "name"));
     assert_eq!(
         render_semantic_node_xml(&node),
-        r#"<actor name="hello &lt;agent&gt;" />"#
+        format!("<actor name=\"{text}\" />")
     );
 
     assert_eq!(
         LegacyAgentView::render_field(&text, "name"),
         SemanticField::Attr {
             name: "name".to_owned(),
-            value: "hello <agent>".to_owned(),
+            value: text,
         }
+    );
+}
+
+#[test]
+fn element_text_and_comments_preserve_prompt_content() {
+    let text = "  <example> & literal &gt; ]]> `*_[]#` C:\\memory\\graph\r\nsecond line";
+    let comment = "Keep -- and <!-- prompt markup --> unchanged.";
+    assert_eq!(
+        render_semantic_node_xml(&SemanticNode::element("body", text)),
+        format!("<body>{text}</body>")
+    );
+
+    let mut node = SemanticNode::new("scene");
+    node.push_text(text);
+    node.push_comment(comment);
+    assert_eq!(
+        render_semantic_node_xml(&node),
+        format!("<scene>\n  {text}\n  <!-- {comment} -->\n</scene>")
     );
 }
 

@@ -446,9 +446,9 @@ impl CommandFeedback {
     }
 }
 
-// Bound the displayed fields after XML/Markdown escaping and JSON string
-// encoding, so all eight retained records leave room for the application's
-// current view. The original invocation and output stay in CommandResponse.
+// Bound displayed fields after JSON string encoding, so all eight retained
+// records leave room for the application's current view. Prompt data otherwise
+// stays verbatim; the original invocation and output stay in CommandResponse.
 fn feedback_display(value: &str, encoded_budget: usize) -> String {
     const TRUNCATED: &str = "… (truncated)";
     let suffix_bytes: usize = TRUNCATED.chars().map(feedback_encoded_bytes).sum();
@@ -456,37 +456,57 @@ fn feedback_display(value: &str, encoded_budget: usize) -> String {
     let mut displayed = String::with_capacity(value.len().min(encoded_budget));
     let mut encoded_bytes = 0;
     for character in value.chars() {
-        if matches!(character, '\0'..='\u{8}' | '\u{b}'..='\u{c}' | '\u{e}'..='\u{1f}' | '\u{fffe}' | '\u{ffff}')
-        {
-            // XML forbids these characters. Keep each escape intact when
-            // truncating so even malformed input remains useful feedback.
-            let escaped = character.escape_unicode();
-            encoded_bytes += escaped.clone().map(feedback_encoded_bytes).sum::<usize>();
-            if encoded_bytes > content_budget {
-                displayed.push_str(TRUNCATED);
-                break;
-            }
-            displayed.extend(escaped);
-        } else {
-            encoded_bytes += feedback_encoded_bytes(character);
-            if encoded_bytes > content_budget {
-                displayed.push_str(TRUNCATED);
-                break;
-            }
-            displayed.push(character);
+        encoded_bytes += feedback_encoded_bytes(character);
+        if encoded_bytes > content_budget {
+            displayed.push_str(TRUNCATED);
+            break;
         }
+        displayed.push(character);
     }
     displayed
 }
 
-// A conservative per-character bound for both XML attributes and Markdown text
-// inside XML, including subsequent JSON escaping of the rendered projection.
+// JSON string-content bytes, excluding the surrounding quotes. The rendered
+// projection adds no XML entities or Markdown escapes to these data fields.
 fn feedback_encoded_bytes(character: char) -> usize {
     match character {
-        '\"' | '\'' | ' ' | '\t' | '\n' | '\r' => 6,
-        '&' => 5,
-        '<' | '>' | '\\' => 4,
-        '`' | '*' | '_' | '[' | ']' | '#' | '-' | '+' | '~' | '.' | ')' => 3,
+        '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+        '\0'..='\u{1f}' => 6,
         _ => character.len_utf8(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::feedback_display;
+
+    #[test]
+    fn feedback_preserves_source_text_within_its_display_budget() {
+        let source = "    &<>\"'\\`*_[]#-+~.)\t\n\r\0\u{8}\u{b}\u{c}\u{1f}\u{fffe}\u{ffff}界🦀";
+        let displayed = feedback_display(source, 4096);
+        assert_eq!(displayed, source);
+        let encoded = serde_json::to_string(&displayed).unwrap();
+        assert_eq!(serde_json::from_str::<String>(&encoded).unwrap(), source);
+
+        let punctuation = "&<>*_[]#`' ".repeat(200);
+        assert_eq!(feedback_display(&punctuation, 4096), punctuation);
+    }
+
+    #[test]
+    fn truncated_feedback_fits_its_actual_json_budget_on_character_boundaries() {
+        let mut alphabet = String::from("    &<>\"'\\`*_[]#-+~.)界🦀\u{fffe}\u{ffff}");
+        alphabet.extend('\0'..='\u{1f}');
+        let source = alphabet.repeat(128);
+        for budget in [128, 512, 4096] {
+            let displayed = feedback_display(&source, budget);
+            let prefix = displayed
+                .strip_suffix("… (truncated)")
+                .expect("over-budget feedback declares its truncation");
+            assert!(source.starts_with(prefix));
+            assert!(serde_json::to_vec(&displayed).unwrap().len() - 2 <= budget);
+            let next = source[prefix.len()..].chars().next().unwrap();
+            let extended = format!("{prefix}{next}… (truncated)");
+            assert!(serde_json::to_vec(&extended).unwrap().len() - 2 > budget);
+        }
     }
 }

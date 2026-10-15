@@ -106,24 +106,32 @@ Default socket: $XDG_RUNTIME_DIR/agentview-APP/socket, or\n\
 }
 
 fn print_view(response: Option<&Response>, command: &str, running: bool) -> Result<()> {
+    write_view(&mut io::stdout().lock(), response, command, running)
+}
+
+fn write_view(
+    stdout: &mut impl Write,
+    response: Option<&Response>,
+    command: &str,
+    running: bool,
+) -> Result<()> {
     let (status, message) = if running {
         ("running", "Send an action as JSON on stdin. Closing this connection preserves application state. Use status to observe, stop to end the session, or restart for a fresh session.")
     } else {
         ("stopped", "The daemon is stopped. Use start or send an action to begin a new session. Any view below is the final snapshot of the stopped session.")
     };
-    let mut stdout = io::stdout().lock();
     let ok = response.is_none_or(|response| response.output.ok);
     writeln!(stdout, "<view ok=\"{ok}\">")?;
     writeln!(stdout, "<daemon status=\"{status}\">{message}</daemon>\n")?;
     if let Some(response) = response {
         writeln!(stdout, "<session daemon_pid=\"{}\" />", response.daemon_pid)?;
-        writeln!(stdout, "<connection command=\"{}\" input=\"one JSON action per stdin line\" output=\"callback JSON result and current view after each action\" />\n", escape_xml_text(command).replace('"', "&quot;"))?;
+        writeln!(stdout, "<connection command=\"{command}\" input=\"one JSON action per stdin line\" output=\"callback JSON result and current view after each action\" />\n")?;
         if let Some(result) = &response.output.result {
             writeln!(
                 stdout,
                 "<action_result ok=\"{}\">{}</action_result>\n",
                 response.output.ok,
-                escape_xml_text(&serde_json::to_string(result)?)
+                serde_json::to_string(result)?
             )?;
         }
         stdout.write_all(response.output.view.as_bytes())?;
@@ -131,17 +139,6 @@ fn print_view(response: Option<&Response>, command: &str, running: bool) -> Resu
     writeln!(stdout, "</view>")?;
     stdout.flush()?;
     Ok(())
-}
-
-fn escape_xml_text(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        // JSON permits these scalar values but XML does not. JSON escapes
-        // preserve the exact result when the action_result body is decoded.
-        .replace('\u{fffe}', "\\ufffe")
-        .replace('\u{ffff}', "\\uffff")
 }
 
 async fn interact(socket: &Path, command: &str) -> Result<bool> {
@@ -179,12 +176,12 @@ async fn interact(socket: &Path, command: &str) -> Result<bool> {
 }
 
 fn invalid_action_message(error: &serde_json::Error) -> String {
-    // Escape arbitrary field names, then bound the displayed diagnostic. This
-    // leaves room for JSON quoting and guidance within MAX_REQUEST_BYTES.
+    // Bound the displayed diagnostic while leaving room for JSON quoting and
+    // guidance within MAX_REQUEST_BYTES.
     const MAX_DIAGNOSTIC_BYTES: usize = 1024;
     let error = error.to_string();
     let mut diagnostic = String::new();
-    for character in error.escape_debug() {
+    for character in error.chars() {
         if diagnostic.len() + character.len_utf8() > MAX_DIAGNOSTIC_BYTES {
             diagnostic.push_str("… (truncated)");
             break;
@@ -279,4 +276,53 @@ fn shell_quote(path: &Path) -> Result<String> {
         "CLI paths must not contain control characters"
     );
     Ok(format!("'{}'", value.replace('\'', "'\\''")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{invalid_action_message, write_view, CommandCall, Response};
+    use crate::component::execution::StdinResponse;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn stdout_preserves_prompt_text_and_only_uses_json_escaping_for_results() {
+        let command = r#"'app' --socket 'session<name>&"quoted"'"#;
+        let text = "  <example> & literal &gt; ]]> -- `*_[]#` C:\\memory\\graph\n\"quoted\"\0\u{fffe}\u{ffff}";
+        let result = json!({"text": text});
+        let view = "<state> <prompt> & literal &gt; `*_[]#` </state>\n";
+        let response = Response {
+            output: StdinResponse {
+                ok: true,
+                result: Some(result.clone()),
+                view: view.to_owned(),
+            },
+            daemon_pid: 42,
+        };
+        let mut stdout = Vec::new();
+        write_view(&mut stdout, Some(&response), command, true).unwrap();
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains(&format!("<connection command=\"{command}\"")));
+        assert!(stdout.contains(view));
+
+        let result_body = stdout
+            .split_once("<action_result ok=\"true\">")
+            .and_then(|(_, remainder)| remainder.split_once("</action_result>"))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert_eq!(result_body, serde_json::to_string(&result).unwrap());
+        assert_eq!(serde_json::from_str::<Value>(result_body).unwrap(), result);
+        assert!(result_body.contains("<example> & literal &gt; ]]> -- `*_[]#`"));
+        assert!(result_body.contains(r#"C:\\memory\\graph\n\"quoted\"\u0000"#));
+        assert!(result_body.contains("\u{fffe}\u{ffff}"));
+    }
+
+    #[test]
+    fn invalid_action_feedback_preserves_the_parser_diagnostic() {
+        let key = "<unknown> & `*_[]#` C:\\memory\\graph\n\"quoted\"";
+        let error = serde_json::from_value::<CommandCall>(json!({key: null})).unwrap_err();
+        let message = invalid_action_message(&error);
+        assert!(message.contains(&error.to_string()));
+        assert!(message.contains(key));
+        assert!(message.contains("Choose an action and its input from the current view."));
+    }
 }

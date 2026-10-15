@@ -784,7 +784,7 @@ mod tests {
         assert!(submitted.contains("e2e4"));
         assert!(submitted.contains("e7e5"));
         assert!(!submitted.contains("pending_draw_offer"));
-        assert!(submitted.contains("invalid\\_xml"));
+        assert!(submitted.contains("invalid_xml"));
         assert_eq!(submitted.matches("<choose_move>").count(), 1, "{submitted}");
         assert_eq!(submitted.matches("<resign>").count(), 1, "{submitted}");
         for removed_action in ["move_and_offer_draw", "accept_draw", "claim_draw"] {

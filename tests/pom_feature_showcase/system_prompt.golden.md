@@ -11,7 +11,7 @@ Keep `struct -> POM -> prompt` intact; invoke <tool name="inspect_edge" edge_id=
 
 ## Authoring guarantees
 
-- Dynamic values remain `TextNode` data and are escaped once.
+- Dynamic values remain `TextNode` data and retain their original XML text.
 - System and user stay separate `Document` roots.
 
 ### Builder-only typed Markdown primitives
@@ -32,7 +32,7 @@ The renderer preserves **semantic structure**, literal `inline code`, and typed 
 
 <response_contract transport="markdown+xml" schema_revision="r7" optional_note="No raw prompt fragments">
   <instruction>Return typed tool calls followed by a concise explanation.</instruction>
-  <grammar>`&lt;tool name="inspect_edge" edge_id="..."&gt;`</grammar>
+  <grammar>`<tool name="inspect_edge" edge_id="...">`</grammar>
   <limits kind="limits" max_tool_calls="3" strict="true" />
   <metadata>
     <entry key="dialect" value="hermes" />

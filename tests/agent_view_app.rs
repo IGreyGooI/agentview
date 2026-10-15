@@ -87,6 +87,11 @@ impl AgentViewModel<Turn, ()> for CounterViewModel {
         task: StorageString,
         current_view: &Self::View,
     ) -> anyhow::Result<Document> {
+        if task.as_str() == "invalid code block language" {
+            return Ok(Document::build(|blocks| {
+                blocks.code_block(Some("invalid language".into()), TextNode::new("body"));
+            }));
+        }
         Ok(CounterUserDocument {
             context: current_view.clone(),
             task: CounterTaskView {
@@ -140,7 +145,10 @@ async fn observe_returns_full_snapshot_with_user_document() {
         PromptContext::<Turn, ()>::without_system(),
     );
 
-    let snapshot = app.observe("increment once").await.unwrap();
+    let snapshot = app
+        .observe("increment <once> & `counter_value`\u{0001}")
+        .await
+        .unwrap();
 
     assert_eq!(snapshot.view_epoch, 0);
     assert_eq!(snapshot.turn_id, "turn-1");
@@ -153,7 +161,7 @@ async fn observe_returns_full_snapshot_with_user_document() {
             "  <value>0</value>\n",
             "</agent_context>\n\n",
             "<counter_task turn_id=\"turn-1\">\n",
-            "  <instruction>increment once</instruction>\n",
+            "  <instruction>increment <once> & `counter_value`\u{0001}</instruction>\n",
             "  <reply_contract>{\"delta\": number}</reply_contract>\n",
             "</counter_task>"
         )
@@ -169,10 +177,13 @@ async fn render_failure_does_not_publish_cursor_or_turn_id() {
         PromptContext::<Turn, ()>::without_system(),
     );
 
-    let err = app.observe("invalid \u{0001} task").await.unwrap_err();
+    let err = app
+        .observe("invalid code block language")
+        .await
+        .unwrap_err();
 
     assert!(
-        err.to_string().contains("not allowed in XML content"),
+        err.to_string().contains("code block language"),
         "unexpected error: {err:#}"
     );
     assert!(app.latest_turn_id().is_none());
@@ -204,7 +215,7 @@ async fn act_applies_parsed_reply_and_returns_full_update() {
                 session.push_history(Turn::user("counter updated"));
                 Ok(())
             },
-            "increment again",
+            "increment <again> & `counter_value`\u{0001}",
         )
         .await
         .unwrap();
@@ -220,7 +231,9 @@ async fn act_applies_parsed_reply_and_returns_full_update() {
     assert!(rendered.starts_with(
         "<agent_context rendering_mode=\"delta\" kind=\"counter\">\n  <value>3</value>\n</agent_context>"
     ));
-    assert!(rendered.contains("<instruction>increment again</instruction>"));
+    assert!(
+        rendered.contains("<instruction>increment <again> & `counter_value`\u{0001}</instruction>")
+    );
     assert_eq!(app.session().context().history().len(), 1);
 }
 
@@ -245,13 +258,13 @@ async fn failed_next_snapshot_consumes_the_applied_turn_id() {
                 }
                 Ok(())
             },
-            "invalid \u{0001} task",
+            "invalid code block language",
         )
         .await
         .unwrap_err();
 
     assert!(
-        err.to_string().contains("not allowed in XML content"),
+        err.to_string().contains("code block language"),
         "unexpected error: {err:#}"
     );
     assert_eq!(*source.lock().unwrap(), 1);

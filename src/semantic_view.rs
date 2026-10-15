@@ -441,13 +441,7 @@ fn render_node(node: &SemanticNode, depth: usize) -> String {
     match visible_fragments.as_slice() {
         [] => format!("{indent}<{}{} />", node.tag, attrs),
         [SemanticFragment::Text(text)] => {
-            format!(
-                "{indent}<{}{}>{}</{}>",
-                node.tag,
-                attrs,
-                escape_text(text),
-                node.tag
-            )
+            format!("{indent}<{}{}>{}</{}>", node.tag, attrs, text, node.tag)
         }
         _ => {
             let rendered_children = node
@@ -477,9 +471,9 @@ fn render_child(child: &SemanticChild, depth: usize) -> Option<String> {
 fn render_fragment(fragment: &SemanticFragment, depth: usize) -> String {
     match fragment {
         SemanticFragment::Node(node) => render_node(node, depth),
-        SemanticFragment::Text(text) => format!("{}{}", "  ".repeat(depth), escape_text(text)),
+        SemanticFragment::Text(text) => format!("{}{}", "  ".repeat(depth), text),
         SemanticFragment::Comment(comment) => {
-            format!("{}<!-- {} -->", "  ".repeat(depth), escape_comment(comment))
+            format!("{}<!-- {} -->", "  ".repeat(depth), comment)
         }
     }
 }
@@ -487,22 +481,6 @@ fn render_fragment(fragment: &SemanticFragment, depth: usize) -> String {
 fn render_attrs(attrs: &[(String, String)]) -> String {
     attrs
         .iter()
-        .map(|(name, value)| format!(" {}=\"{}\"", name, escape_attr(value)))
+        .map(|(name, value)| format!(" {}=\"{}\"", name, value))
         .collect::<String>()
-}
-
-fn escape_text(raw: &str) -> String {
-    raw.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn escape_attr(raw: &str) -> String {
-    escape_text(raw)
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn escape_comment(raw: &str) -> String {
-    raw.replace("--", "- -")
 }

@@ -216,7 +216,7 @@ async fn cancelling_a_pending_handler_keeps_prior_signal_writes_and_reuses_the_p
     let committed = components
         .current_projection()
         .expect("cancellation retains the pre-reaction projection");
-    assert!(projection_text(committed).contains("<state>\\[\\]</state>"));
+    assert!(projection_text(committed).contains("<state>[]</state>"));
 
     host.dispatch_llm_reaction(&mut components)
         .await
@@ -236,9 +236,9 @@ async fn cancelling_a_pending_handler_keeps_prior_signal_writes_and_reuses_the_p
     );
     let projections = projections.lock().unwrap();
     assert_eq!(projections.len(), 2);
-    assert!(projection_text(&projections[1]).contains("<state>\\[1\\]</state>"));
+    assert!(projection_text(&projections[1]).contains("<state>[1]</state>"));
     let committed = components
         .current_projection()
         .expect("successful retry commits its post-reconciled projection");
-    assert!(projection_text(committed).contains("<state>\\[1, 2, 102\\]</state>"));
+    assert!(projection_text(committed).contains("<state>[1, 2, 102]</state>"));
 }

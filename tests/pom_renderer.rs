@@ -78,8 +78,8 @@ fn renders_canonical_markdown_and_xml_system_document() {
             "<select local_id=\"x\"/>\n",
             "~~~\n\n",
             "---\n\n",
-            "<response_contract transport=\"xml &amp; strict\">",
-            "Return &lt;select&gt; &amp; **nothing else**.",
+            "<response_contract transport=\"xml & strict\">",
+            "Return <select> & **nothing else**.",
             "</response_contract>"
         )
     );
@@ -237,7 +237,7 @@ fn renderer_combines_xml_layout_with_markdown_list_indentation_only_when_safe() 
 }
 
 #[test]
-fn renderer_keeps_attributes_and_authored_multiline_text_on_one_xml_line() {
+fn renderer_preserves_attribute_and_body_line_breaks() {
     let mut message = XmlNode::try_build("message", |children| {
         children.text(TextNode::new("line one\nline two"));
         Ok(())
@@ -254,8 +254,8 @@ fn renderer_keeps_attributes_and_authored_multiline_text_on_one_xml_line() {
     assert_eq!(
         render_pom_document(&resolve_system_document(document)).unwrap(),
         concat!(
-            "<message note=\"attribute one&#10;attribute two\">",
-            "line one&#10;line two",
+            "<message note=\"attribute one\nattribute two\">\n",
+            "line one\nline two\n",
             "</message>",
         )
     );
@@ -328,16 +328,16 @@ fn renderer_separates_xml_flow_and_block_runs_without_indenting_markdown() {
         rendered,
         concat!(
             "<section>\n",
-            "prefix &amp; **\\*literal\\* &lt;x&gt;**\n\n",
-            "block &lt;text&gt;\n\n",
-            "<child data=\"&quot;&apos;&#9;&#10;&#13;&amp;&lt;&gt;\" /> suffix\n",
+            "prefix & **\\*literal\\* \\<x\\>**\n\n",
+            "block \\<text\\>\n\n",
+            "<child data=\"\"'\t\n\r&<>\" /> suffix\n",
             "</section>"
         )
     );
 }
 
 #[test]
-fn renderer_rejects_invalid_code_language_and_xml_control_characters() {
+fn renderer_rejects_invalid_code_language() {
     let invalid_language = Document::build(|blocks| {
         blocks.code_block(Some("ru\nst".into()), TextNode::new("fn main() {}"));
     });
@@ -345,19 +345,78 @@ fn renderer_rejects_invalid_code_language_and_xml_control_characters() {
         render_pom_document(&resolve_system_document(invalid_language)),
         Err(PomRenderError::InvalidCodeBlockLanguage { .. })
     ));
+}
 
-    let invalid_xml = Document::build(|blocks| {
-        blocks.xml(
-            XmlNode::try_build("value", |children| {
-                children.text(TextNode::new("bad\u{0001}value"));
-                Ok(())
-            })
-            .unwrap(),
+#[test]
+fn renderer_preserves_xml_data_and_attributes_verbatim() {
+    for raw in [
+        r#"<tag attr="value">& 'text'</tag> &lt; &#10; ]]>"#,
+        r#"**bold** _field_name_ [item] #heading `code` C:\path\file"#,
+        "    indented\r\n\tline two\n\nend  ",
+        "\0\u{1}\u{b}\u{1f}\u{fffe}\u{ffff}中文🙂",
+        "---",
+        "1. item",
+    ] {
+        let mut leaf = XmlNode::try_build("value", |children| {
+            children.text(TextNode::new(raw));
+            Ok(())
+        })
+        .unwrap();
+        leaf.push_attribute(XmlName::new("data").unwrap(), raw)
+            .unwrap();
+        let document = Document::from_xml(leaf);
+        let body = if raw.contains('\n') {
+            format!("\n{raw}\n")
+        } else {
+            raw.to_owned()
+        };
+        assert_eq!(
+            render_pom_document(&resolve_system_document(document)).unwrap(),
+            format!("<value data=\"{raw}\">{body}</value>"),
+            "input {raw:?}"
         );
-    });
+    }
+}
+
+#[test]
+fn renderer_retains_xml_indentation_for_nested_multiline_data() {
+    let document = Document::from_xml(
+        XmlNode::try_build("root", |children| {
+            children.xml(XmlNode::try_build("value", |children| {
+                children.text(TextNode::new(
+                    "first <tag> & field_name\r\n  second\n\n\tthird",
+                ));
+                Ok(())
+            })?);
+            Ok(())
+        })
+        .unwrap(),
+    );
     assert_eq!(
-        render_pom_document(&resolve_system_document(invalid_xml)),
-        Err(PomRenderError::InvalidXmlCharacter { code_point: 1 })
+        render_pom_document(&resolve_system_document(document)).unwrap(),
+        "<root>\n  <value>\n  first <tag> & field_name\r\n    second\n\n  \tthird\n  </value>\n</root>"
+    );
+}
+
+#[test]
+fn renderer_preserves_code_inside_xml_without_entity_escaping() {
+    let raw = "<select key=\"a_b\">&lt; & text</select>";
+    let document = Document::from_xml(
+        XmlNode::try_build("example", |children| {
+            children.markdown(MarkdownNode::CodeSpan(agentview::pom::CodeSpanNode::new(
+                TextNode::new(raw),
+            )));
+            children.markdown(MarkdownNode::CodeBlock(agentview::pom::CodeBlockNode::new(
+                Some("xml".into()),
+                TextNode::new(format!("{raw}\r\n\tend")),
+            )));
+            Ok(())
+        })
+        .unwrap(),
+    );
+    assert_eq!(
+        render_pom_document(&resolve_system_document(document)).unwrap(),
+        format!("<example>\n`{raw}`\n\n~~~ xml\n{raw}\r\n\tend\n~~~\n</example>")
     );
 }
 
@@ -395,7 +454,7 @@ fn renderer_keeps_block_like_paragraph_text_literal() {
 }
 
 #[test]
-fn renderer_distinguishes_plain_xml_text_from_markdown_children() {
+fn renderer_preserves_plain_xml_text_and_formats_markdown_children() {
     let plain = Document::build(|blocks| {
         blocks.xml(
             XmlNode::try_build("x", |children| {
@@ -420,7 +479,7 @@ fn renderer_distinguishes_plain_xml_text_from_markdown_children() {
     let plain = render_pom_document(&resolve_system_document(plain)).unwrap();
     let strong = render_pom_document(&resolve_system_document(strong)).unwrap();
 
-    assert_eq!(plain, "<x>\\*\\*same\\*\\*&#13;&#10;&#10;b</x>");
+    assert_eq!(plain, "<x>\n**same**\r\n\nb\n</x>");
     assert_eq!(strong, "<x>**same**</x>");
     assert_ne!(plain, strong);
 }
@@ -658,6 +717,6 @@ fn renderer_keeps_heading_closing_hashes_and_list_thematic_breaks_structural() {
     });
     assert_eq!(
         render_pom_document(&resolve_system_document(xml)).unwrap(),
-        "<x>\n\\---\n\nblock\n</x>"
+        "<x>\n---\n\nblock\n</x>"
     );
 }

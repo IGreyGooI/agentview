@@ -273,8 +273,9 @@ async fn prepared_projection_and_exact_requests_are_captured_separately() -> any
     }
     let projection = std::fs::read_to_string(run_dir.join("0001/projection.txt"))?;
     assert!(projection.contains("# Assistant\n\nReturn one short reply."));
-    assert!(projection
-        .contains("<developer_context>prepared &lt;context&gt; &amp; state</developer_context>"));
+    assert!(
+        projection.contains("<developer_context>prepared <context> & state</developer_context>")
+    );
     assert!(!projection.contains("pending"));
     assert!(!projection.contains("context_management"));
 

@@ -56,7 +56,7 @@ fn empty_raw_document_keeps_its_opaque_block_and_renders_empty() {
 }
 
 #[test]
-fn raw_text_in_xml_uses_only_xml_escaping() {
+fn raw_text_in_xml_is_preserved_verbatim() {
     let xml = XmlNode::try_build("example", |children| {
         children.raw_text(RawTextNode::new("    <tag>& `*_[]#`"));
         Ok(())
@@ -66,7 +66,7 @@ fn raw_text_in_xml_uses_only_xml_escaping() {
 
     assert_eq!(
         render_pom_document(&resolved).expect("XML renders"),
-        "<example>    &lt;tag&gt;&amp; `*_[]#`</example>"
+        "<example>    <tag>& `*_[]#`</example>"
     );
 }
 
