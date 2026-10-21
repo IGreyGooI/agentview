@@ -1,0 +1,34 @@
+<view ok="true">
+<daemon status="running">Send action JSON objects on stdin. End each batch with a newline, then wait 100 ms without input to submit a frame; EOF submits the final frame immediately. Application state survives EOF. Use status to observe, stop to end the session, or restart for a fresh session.</daemon>
+
+<session daemon_pid="1395150" />
+<connection command="'/srv/agent-shared/repositories/agentview/target/debug/examples/command_feedback_cli' --socket '/tmp/av-feedback-g0iz8kbm/interactive/socket'" input="action JSON objects; final newline + 100 ms input idle, or EOF" output="one complete view with all frame feedback" />
+
+<notebook_context>Use record to save a note and inspect to read the current count and latest note. Notes last until this application shuts down. Action results are complete JSON; an error object describes a business rejection.</notebook_context>
+
+<notebook_state>
+  <count>2</count>
+  <latest>second interactive note</latest>
+</notebook_state>
+
+<actions>
+  <action name="record" description="Save a nonempty note and return the current count and complete latest note." enabled="true">
+    <input_schema>{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"text":{"description":"The complete note to save, verbatim.","type":"string"}},"required":["text"],"title":"RecordInput","type":"object"}</input_schema>
+    <stdin>Send a JSON object with "action":"record" and "input" set to an object matching input_schema. Objects may span lines; end the batch with a newline and wait 100 ms without input, or close stdin to submit the frame.</stdin>
+  </action>
+</actions>
+
+<actions>
+  <action name="inspect" description="Read the current count and complete latest note without changing notebook state. Send an empty input object." enabled="true">
+    <input_schema>{"additionalProperties":false,"properties":{},"type":"object"}</input_schema>
+    <stdin>Send a JSON object with "action":"inspect" and "input" set to an object matching input_schema. Objects may span lines; end the batch with a newline and wait 100 ms without input, or close stdin to submit the frame.</stdin>
+  </action>
+</actions>
+
+<command_feedback>
+  <sequence>4</sequence>
+  <records>
+    <command_result sequence="4" command="inspect" status="completed">{"count":2,"latest":"second interactive note"}</command_result>
+  </records>
+</command_feedback>
+</view>

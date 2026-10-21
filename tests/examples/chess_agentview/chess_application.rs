@@ -16,9 +16,10 @@ use agentview::{
         execution::{Application, FrameBasis, ReactionPort},
         ComponentHost,
     },
-    pom_renderer::render_pom_document,
+    pom::ResolvedDocument,
     transcript::CanonicalInputItem,
 };
+use scripted_provider::pom::{self, InspectPom};
 use scripted_provider::{ScriptedProvider, ScriptedReaction};
 
 static NEXT_FAKE_UCI: AtomicU64 = AtomicU64::new(1);
@@ -37,23 +38,10 @@ fn thought_then_resign() -> String {
     format!("{BRIEF_THOUGHT}<resign />")
 }
 
-fn render_chess_prompt(state: ChessState) -> String {
+fn chess_document(state: ChessState) -> ResolvedDocument {
     let mut components = ComponentHost::new_root(chess_projection, state);
-    let rendered = components.render().expect("Chess projection renders");
-    rendered
-        .projection()
-        .nodes()
-        .iter()
-        .flat_map(|node| node.items())
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => {
-                Some(render_pom_document(pom).expect("Chess POM renders"))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let rendered = components.render().expect("Chess projection builds");
+    pom::projection_document(rendered.projection())
 }
 
 fn state_after_committed_moves(moves: &[&str]) -> ChessState {
@@ -220,15 +208,9 @@ async fn assert_thought_rejection(invalid_response: impl Into<String>, expected_
     assert_eq!(result.committed_moves, vec!["e2e4".parse().unwrap()]);
     let frames = capture.frames();
     assert_eq!(frames.len(), 2);
-    let retry = &frames[1].text;
-    assert!(
-        retry.contains(&format!("previous_decision=\"rejected:{expected_reason}\"")),
-        "{retry}"
-    );
-    assert!(
-        retry.contains(&format!("corrective_reason=\"{expected_reason}\"")),
-        "{retry}"
-    );
+    let retry = frames[1].document();
+    assert!(retry.has_attribute("previous_decision", &format!("rejected:{expected_reason}")));
+    assert!(retry.has_attribute("corrective_reason", expected_reason));
     assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
 }
 
@@ -266,22 +248,8 @@ fn mount_chess<P: ReactionPort>(
     (application, stop, cleanup_receiver)
 }
 
-fn current_chess_projection<P: ReactionPort>(application: &Application<P>) -> String {
-    let snapshot = application.current_projection();
-    snapshot
-        .projection()
-        .nodes()
-        .iter()
-        .flat_map(|node| node.items())
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => {
-                Some(render_pom_document(pom).expect("Chess POM renders"))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn current_chess_projection<P: ReactionPort>(application: &Application<P>) -> ResolvedDocument {
+    pom::projection_document(application.current_projection().projection())
 }
 
 async fn shutdown_chess<P: ReactionPort>(
@@ -357,15 +325,13 @@ async fn move_publication_defers_stockfish_until_the_next_react_preparation() {
 
     assert_eq!(capture.submission_count(), 1);
     assert_eq!(stockfish_go_count(&fake_uci), 0);
-    assert!(current_chess_projection(&application)
-        .contains("<history notation=\"uci\" values=\"e2e4\" />"));
+    assert!(current_chess_projection(&application).has_attribute("values", "e2e4"));
 
     assert_continue(application.react().await.unwrap());
 
     assert_eq!(capture.submission_count(), 2);
     assert_eq!(stockfish_go_count(&fake_uci), 1);
-    assert!(current_chess_projection(&application)
-        .contains("<history notation=\"uci\" values=\"e2e4 e7e5\" />"));
+    assert!(current_chess_projection(&application).has_attribute("values", "e2e4 e7e5"));
 
     shutdown_chess(application, stop, cleanup).await;
 }
@@ -559,19 +525,15 @@ async fn preparation_and_contract_drive_the_model_and_stockfish_turns() {
     assert_eq!(frames.len(), 2);
     assert!(matches!(frames[0].basis, FrameBasis::Full));
     assert!(matches!(frames[1].basis, FrameBasis::DeltaFrom(_)));
-    assert!(frames[0]
-        .text
-        .contains("fen>rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"));
-    assert!(frames[1]
-        .text
-        .contains("fen>rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2"));
-    assert_eq!(
-        frames[1].text.matches("## XML action protocol").count(),
-        1,
-        "developer(repeat) sends the current action policy once on every turn"
-    );
-    assert!(!frames[1].text.contains("<remove>"));
-    assert!(!frames[1].text.contains("# Chess agent"));
+    assert!(frames[0].document().has_field(
+        "fen",
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    ));
+    assert!(frames[1].document().has_field(
+        "fen",
+        "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2"
+    ));
+    assert!(!frames[1].document().has_element("remove"));
     assert_eq!(
         frames[1].replay,
         [CanonicalInputItem::assistant_text(
@@ -587,45 +549,21 @@ async fn preparation_and_contract_drive_the_model_and_stockfish_turns() {
             ..
         }
     )));
-    assert!(!frames[1].text.contains("shown after this policy"));
-    assert!(frames[1].text.contains("d2d4"));
-    for action_syntax in ["<choose_move uci=\"...\" />", "<resign />"] {
-        assert_eq!(
-            frames[0].text.matches(action_syntax).count(),
-            1,
-            "typed action syntax should be projected exactly once: {action_syntax}"
-        );
-    }
-    for removed_action_syntax in [
-        "<move_and_offer_draw uci=\"...\" />",
-        "<accept_draw />",
-        "<claim_draw />",
-    ] {
-        assert!(!frames[0].text.contains(removed_action_syntax));
-    }
-    assert!(frames[0]
-        .text
-        .contains("# Chess agent\n\nYou are the chess agent playing white."));
-    assert!(frames[0].text.contains("## XML action protocol"));
-    assert!(frames[0].text.contains("`<thought>...</thought>`"));
-    assert!(frames[0]
-        .text
-        .contains("`/chess_game_state/legal_moves/@values`"));
-    assert!(frames[0].text.contains("<chess_game_state"));
-    assert!(frames[0].text.contains("<model_attempt"));
-    assert!(!frames[0].text.contains("<chess_player>"));
-    assert!(!frames[0].text.contains("<chess_action_policy>"));
+    assert!(frames[0].document().has_element("chess_game_state"));
+    assert!(frames[0].document().has_element("model_attempt"));
     assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
 }
 
 #[test]
-fn chess_prompt_fen_uses_history_derived_halfmove_and_fullmove_counters() {
-    let prompt = render_chess_prompt(state_after_committed_moves(&[
+fn chess_state_fen_uses_history_derived_halfmove_and_fullmove_counters() {
+    let document = chess_document(state_after_committed_moves(&[
         "e2e4", "e7e5", "g1f3", "b8c6",
     ]));
 
-    assert!(prompt
-        .contains("<fen>r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3</fen>"));
+    assert!(document.has_field(
+        "fen",
+        "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3"
+    ));
 }
 
 #[tokio::test]
@@ -725,18 +663,12 @@ async fn invalid_action_requests_a_fresh_model_attempt() {
     assert_eq!(frames.len(), 2);
     assert!(matches!(frames[0].basis, FrameBasis::Full));
     assert!(matches!(frames[1].basis, FrameBasis::DeltaFrom(_)));
-    assert!(
-        frames[1].text.contains(
-            "<previous_action kind=\"choose_move\" uci=\"E2E4\" uci_truncated=\"false\" />"
-        ),
-        "{}",
-        frames[1].text
-    );
-    assert!(
-        !frames[1].text.contains("choose\\_move"),
-        "{}",
-        frames[1].text
-    );
+    let document = frames[1].document();
+    let actions = document.elements("previous_action");
+    assert_eq!(actions.len(), 1);
+    assert_eq!(pom::attribute(actions[0], "kind"), Some("choose_move"));
+    assert_eq!(pom::attribute(actions[0], "uci"), Some("E2E4"));
+    assert_eq!(pom::attribute(actions[0], "uci_truncated"), Some("false"));
     assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
 }
 
@@ -755,14 +687,14 @@ async fn oversized_invalid_uci_is_bounded_in_retry_feedback() {
     let result = crate::play_chess(config, provider).await.unwrap();
 
     assert_eq!(result.outcome, ChessOutcome::PlyLimitReached);
-    let retry = &capture.frames()[1].text;
-    assert!(
-        retry.contains("<previous_action kind=\"choose_move\""),
-        "{retry}"
-    );
-    assert!(retry.contains("uci=\"xxxxxxxx"), "{retry}");
-    assert!(retry.contains("uci_truncated=\"true\""), "{retry}");
-    assert!(!retry.contains(&oversized), "{retry}");
+    let retry = capture.frames()[1].document();
+    let actions = retry.elements("previous_action");
+    assert_eq!(actions.len(), 1);
+    assert_eq!(pom::attribute(actions[0], "kind"), Some("choose_move"));
+    assert_eq!(pom::attribute(actions[0], "uci_truncated"), Some("true"));
+    let uci = pom::attribute(actions[0], "uci").unwrap();
+    assert!(!uci.is_empty() && uci.len() < oversized.len());
+    assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
 }
 
 #[tokio::test]
@@ -784,20 +716,12 @@ async fn missing_action_is_rejected_and_requests_a_fresh_model_attempt() {
     assert_eq!(result.committed_moves, vec!["e2e4".parse().unwrap()]);
     let frames = capture.frames();
     assert_eq!(frames.len(), 2);
-    assert!(
-        frames[1]
-            .text
-            .contains("previous_decision=\"rejected:missing_action\""),
-        "{}",
-        frames[1].text
-    );
-    assert!(
-        frames[1]
-            .text
-            .contains("corrective_reason=\"missing_action\""),
-        "{}",
-        frames[1].text
-    );
+    assert!(frames[1]
+        .document()
+        .has_attribute("previous_decision", "rejected:missing_action"));
+    assert!(frames[1]
+        .document()
+        .has_attribute("corrective_reason", "missing_action"));
     assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
 }
 
@@ -818,11 +742,11 @@ async fn incomplete_action_is_rejected_after_eof_before_completion_settlement() 
     let frames = capture.frames();
     assert_eq!(frames.len(), 2);
     assert!(frames[1]
-        .text
-        .contains("previous_decision=\"rejected:invalid_xml\""));
+        .document()
+        .has_attribute("previous_decision", "rejected:invalid_xml"));
     assert!(!frames[1]
-        .text
-        .contains("previous_decision=\"rejected:missing_action\""));
+        .document()
+        .has_attribute("previous_decision", "rejected:missing_action"));
     assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
 }
 
@@ -845,11 +769,11 @@ async fn multiple_model_actions_are_rejected_as_one_attempt() {
     let frames = capture.frames();
     assert_eq!(frames.len(), 2);
     assert!(frames[1]
-        .text
-        .contains("previous_decision=\"rejected:multiple_actions\""));
+        .document()
+        .has_attribute("previous_decision", "rejected:multiple_actions"));
     assert!(frames[1]
-        .text
-        .contains("corrective_reason=\"multiple_actions\""));
+        .document()
+        .has_attribute("corrective_reason", "multiple_actions"));
     assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
 }
 
@@ -880,11 +804,11 @@ async fn three_reactions_without_registered_actions_forfeit_the_model() {
     let frames = capture.frames();
     assert_eq!(frames.len(), 3);
     assert!(frames[1]
-        .text
-        .contains("previous_decision=\"rejected:missing_action\""));
+        .document()
+        .has_attribute("previous_decision", "rejected:missing_action"));
     assert!(frames[2]
-        .text
-        .contains("previous_decision=\"rejected:missing_action\""));
+        .document()
+        .has_attribute("previous_decision", "rejected:missing_action"));
     assert_eq!(fake_uci.commands().last().map(String::as_str), Some("quit"));
 }
 

@@ -1,0 +1,5 @@
+error: the `ephemeral` placement argument may occur only once
+ --> tests/ui/component_target/fail_user_ephemeral_duplicate_argument.rs:5:35
+  |
+5 |         #[user(ephemeral, repeat, ephemeral)]
+  |                                   ^^^^^^^^^

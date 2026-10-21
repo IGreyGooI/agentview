@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,7 +18,7 @@ use agentview::{
         },
         prelude::*,
     },
-    pom_renderer::render_pom_document,
+    pom::{ContentNode, ContentRef},
     transcript::CanonicalInputItem,
 };
 use futures::poll;
@@ -25,20 +29,43 @@ use tokio::sync::Notify;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 
-fn text(projection: &RenderedProjection) -> String {
+fn feedback_sequence(projection: &RenderedProjection) -> u64 {
     projection
         .nodes()
         .iter()
         .flat_map(|node| node.items())
         .filter_map(|item| match item {
             CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom).unwrap()),
+            | CanonicalInputItem::Message { pom, .. } => Some(pom),
             _ => None,
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .flat_map(|pom| pom.children().iter())
+        .find_map(|root| {
+            let ContentRef::Node(ContentNode::Xml(root)) = root else {
+                return None;
+            };
+            if root.name().as_str() != "command_feedback" {
+                return None;
+            }
+            root.children().iter().find_map(|child| {
+                let ContentRef::Node(ContentNode::Xml(child)) = child else {
+                    return None;
+                };
+                if child.name().as_str() != "sequence" {
+                    return None;
+                }
+                child.children().iter().find_map(|value| match value {
+                    ContentRef::Node(ContentNode::Text(value)) => {
+                        Some(value.value().parse().unwrap())
+                    }
+                    _ => None,
+                })
+            })
+        })
+        .expect("command feedback exposes its current sequence")
 }
 
+#[derive(Default)]
 struct State {
     value: usize,
     loading: bool,
@@ -48,15 +75,6 @@ struct State {
 #[serde(deny_unknown_fields)]
 struct IncrementInput {
     amount: usize,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            value: 0,
-            loading: false,
-        }
-    }
 }
 
 #[derive(Clone, Default)]
@@ -128,7 +146,7 @@ fn feedback_counter(probe: Probe, large_output: String) -> Component {
 }
 
 #[tokio::test]
-async fn large_retained_feedback_leaves_views_deliverable_for_following_actions_and_observations() {
+async fn large_retained_feedback_stays_complete_through_following_actions_and_observations() {
     let probe = Probe::default();
     let root_probe = probe.clone();
     let output = "    &<>\"'\\`*_[]#-+~.)\t\n\r\0\u{ffff}界🦀".repeat(2048);
@@ -142,12 +160,7 @@ async fn large_retained_feedback_leaves_views_deliverable_for_following_actions_
     )
     .unwrap();
 
-    let assert_deliverable = |view: &str, ok: bool| {
-        // The adapter wraps the rendered view in JSON. Test actual encoded
-        // bytes: a character count misses JSON escapes and multibyte text.
-        let wire = serde_json::to_vec(&json!({"ok": ok, "output": view})).unwrap();
-        assert!(wire.len() < 128 * 1024, "view needs {} bytes", wire.len());
-    };
+    let mut diagnostics = Vec::new();
     for sequence in 1..=8 {
         let unknown = format!("missing-{sequence}-{}", "&".repeat(4000));
         let (prepared, response) = tokio::time::timeout(TIMEOUT, async {
@@ -166,11 +179,16 @@ async fn large_retained_feedback_leaves_views_deliverable_for_following_actions_
         };
         assert_eq!(code, "command_unavailable");
         assert!(message.contains(&unknown), "retain the complete diagnostic");
-        let view = text(&response.projection);
-        assert_deliverable(&view, false);
-        assert!(view.contains("truncated"));
-        assert!(view.contains("<count>0</count>"));
-        assert_eq!(view.matches("<command_result ").count(), sequence);
+        let view = projection_document(&response.projection);
+
+        assert!(
+            view.has_attribute("command", &unknown),
+            "retain the complete command name"
+        );
+        assert!(view.has_text(message), "deliver the complete diagnostic");
+        diagnostics.push(message.clone());
+        assert!(view.has_field("count", "0"));
+        assert_eq!(view.elements("command_result").len(), sequence);
     }
 
     let (prepared, response) = tokio::time::timeout(TIMEOUT, async {
@@ -184,7 +202,12 @@ async fn large_retained_feedback_leaves_views_deliverable_for_following_actions_
     assert!(prepared.unwrap().is_continue());
     let response = response.unwrap();
     assert_eq!(response.outcome, CommandOutcome::Output(json!(output)));
-    assert_deliverable(&text(&response.projection), true);
+    let encoded_output = serde_json::to_string(&output).unwrap();
+    let view = projection_document(&response.projection);
+    assert!(
+        view.has_text(&encoded_output),
+        "deliver the complete callback JSON"
+    );
 
     let (prepared, response) = tokio::time::timeout(TIMEOUT, async {
         tokio::join!(
@@ -197,7 +220,6 @@ async fn large_retained_feedback_leaves_views_deliverable_for_following_actions_
     assert!(prepared.unwrap().is_continue());
     let response = response.unwrap();
     assert_eq!(response.outcome, CommandOutcome::Output(json!(1)));
-    assert_deliverable(&text(&response.projection), true);
 
     let (prepared, observed) = tokio::time::timeout(TIMEOUT, async {
         tokio::join!(app.prepare(), sender.observe())
@@ -205,12 +227,22 @@ async fn large_retained_feedback_leaves_views_deliverable_for_following_actions_
     .await
     .unwrap();
     assert!(prepared.unwrap().is_continue());
-    let view = text(&observed.unwrap());
-    assert_deliverable(&view, true);
-    assert!(view.contains("<count>1</count>"));
-    assert!(view.contains("command=\"increment\" status=\"completed\">1"));
-    assert!(view.contains("<command_feedback sequence=\"10\""));
-    assert_eq!(view.matches("<command_result ").count(), 8);
+    let observed = observed.unwrap();
+    let view = projection_document(&observed);
+
+    assert!(view.has_text(&encoded_output));
+    for message in diagnostics {
+        assert!(view.has_text(&message));
+    }
+    assert!(view.has_field("count", "1"));
+    assert!(view
+        .elements("command_result")
+        .into_iter()
+        .any(|record| attribute(record, "command") == Some("increment")
+            && attribute(record, "status") == Some("completed")
+            && direct_text(record) == "1"));
+    assert_eq!(feedback_sequence(&observed), 10);
+    assert_eq!(view.elements("command_result").len(), 10);
     app.shutdown().await.unwrap();
 }
 
@@ -247,13 +279,11 @@ async fn action_feedback_preserves_all_json_characters_and_allows_following_acti
             message.contains('\u{ffff}'),
             "retain the original diagnostic"
         );
-        let view = text(&response.projection);
-        assert!(view.contains(expected_code));
-        assert!(view.contains(message));
-        assert!(view.contains('\u{ffff}'));
-        let wire = serde_json::to_vec(&view).unwrap();
-        assert_eq!(serde_json::from_slice::<String>(&wire).unwrap(), view);
-        assert!(view.contains("<count>0</count>"));
+        let view = projection_document(&response.projection);
+        assert!(view.has_attribute("code", expected_code));
+        assert!(view.has_text(message));
+
+        assert!(view.has_field("count", "0"));
     }
 
     let (prepared, response) = tokio::time::timeout(TIMEOUT, async {
@@ -272,13 +302,11 @@ async fn action_feedback_preserves_all_json_characters_and_allows_following_acti
     .await
     .unwrap();
     assert!(prepared.unwrap().is_continue());
-    let view = text(&observed.unwrap());
-    assert!(view.contains("<count>1</count>"));
-    assert_eq!(view.matches("<command_result ").count(), 3);
-    assert!(view.contains(unknown));
-    assert!(view.contains('\0'));
-    assert!(view.contains('\u{fffe}'));
-    assert!(view.contains('\u{ffff}'));
+    let view = projection_document(&observed.unwrap());
+    assert!(view.has_field("count", "1"));
+    assert_eq!(view.elements("command_result").len(), 3);
+    assert!(view.has_attribute("command", unknown));
+
     app.shutdown().await.unwrap();
 }
 
@@ -297,9 +325,9 @@ async fn observations_refresh_state_and_preserve_the_last_action_feedback_in_que
     .await
     .unwrap();
     assert!(prepared.unwrap().is_continue());
-    let initial = text(&observed.unwrap());
-    assert!(initial.contains("<count>0</count>"));
-    assert!(!initial.contains("<command_result"));
+    let initial = projection_document(&observed.unwrap());
+    assert!(initial.has_field("count", "0"));
+    assert!(!initial.has_element("command_result"));
 
     let mut action = Box::pin(sender.submit(CommandCall::new("increment", json!({}))));
     let mut observation = Box::pin(sender.observe());
@@ -310,9 +338,10 @@ async fn observations_refresh_state_and_preserve_the_last_action_feedback_in_que
         .unwrap()
         .unwrap()
         .is_continue());
-    let action_view = text(&action.await.unwrap().projection);
-    assert!(action_view.contains("<count>1</count>"));
-    assert!(action_view.contains("<command_feedback sequence=\"1\""));
+    let action_projection = action.await.unwrap().projection;
+    let action_view = projection_document(&action_projection);
+    assert!(action_view.has_field("count", "1"));
+    assert_eq!(feedback_sequence(&action_projection), 1);
     assert!(
         poll!(&mut observation).is_pending(),
         "one prepare consumes one queued request"
@@ -328,10 +357,11 @@ async fn observations_refresh_state_and_preserve_the_last_action_feedback_in_que
         .unwrap()
         .is_continue());
     drop(preparing);
-    let observed = text(&observation.await.unwrap());
-    assert!(observed.contains("<count>9</count>"));
-    assert!(observed.contains("<command_feedback sequence=\"1\""));
-    assert_eq!(observed.matches("<command_result ").count(), 1);
+    let observed_projection = observation.await.unwrap();
+    let observed = projection_document(&observed_projection);
+    assert!(observed.has_field("count", "9"));
+    assert_eq!(feedback_sequence(&observed_projection), 1);
+    assert_eq!(observed.elements("command_result").len(), 1);
     assert!(app.current_projection().is_prepared());
     app.shutdown().await.unwrap();
 }
@@ -368,7 +398,7 @@ async fn observations_wait_for_an_explicit_barrier_and_close_with_the_applicatio
         .unwrap()
         .unwrap()
         .is_continue());
-    assert!(text(&observation.await.unwrap()).contains("<count>0</count>"));
+    assert!(projection_document(&observation.await.unwrap()).has_field("count", "0"));
 
     let mut queued = Box::pin(sender.observe());
     assert!(poll!(&mut queued).is_pending());
@@ -407,9 +437,9 @@ async fn cancelling_preparation_retains_a_received_observation_until_retry_is_re
         .unwrap()
         .unwrap()
         .is_continue());
-    let observed = text(&observation.await.unwrap());
-    assert!(observed.contains("<count>7</count>"));
-    assert!(!observed.contains("<command_result"));
+    let observed = projection_document(&observation.await.unwrap());
+    assert!(observed.has_field("count", "7"));
+    assert!(!observed.has_element("command_result"));
     app.shutdown().await.unwrap();
 }
 

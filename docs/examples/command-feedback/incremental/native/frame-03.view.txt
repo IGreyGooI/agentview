@@ -1,0 +1,6 @@
+<command_feedback>
+  <sequence>3</sequence>
+  <records>
+    <command_result sequence="3" command="inspect" status="completed">{"count":1,"latest":"Keep complete action results."}</command_result>
+  </records>
+</command_feedback>

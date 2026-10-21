@@ -1,3 +1,10 @@
+//! Typed Prompt Object Model for the LLM's view.
+//!
+//! POM is not XML. Tag-shaped nodes organize content; their rendered text is
+//! not a machine-readable serialization format and receives no XML escaping.
+//! Code must inspect these typed structures rather than parse rendered prompts.
+//! Unit tests verify structures, state, and behavior, not prompt rendering.
+
 mod children;
 mod content;
 mod diff_slot;

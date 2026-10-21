@@ -207,6 +207,9 @@ fn reconcile_projection_submission(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, item)| {
+                    if old_node.is_ephemeral_item(index) {
+                        return None;
+                    }
                     if !has_diff_template(old_node, index)
                         && !old_node.repeats_item(index)
                         && claimed.claim(item).is_some()
@@ -233,13 +236,20 @@ fn reconcile_projection_submission(
             .map(RenderedProjectionNode::items)
             .unwrap_or_default()
             .iter()
-            .filter(|item| !is_system_instruction(item))
+            .enumerate()
+            .filter(|(index, item)| {
+                !is_system_instruction(item)
+                    && !old_node
+                        .expect("an old item has an old node")
+                        .is_ephemeral_item(*index)
+            })
+            .map(|(_, item)| item)
             .collect::<Vec<_>>();
         let current_items = node
             .items()
             .iter()
             .enumerate()
-            .filter(|(_, item)| !is_system_instruction(item))
+            .filter(|(index, item)| !is_system_instruction(item) && !node.is_ephemeral_item(*index))
             .collect::<Vec<_>>();
         let prefix = old_items
             .iter()
@@ -273,7 +283,12 @@ fn reconcile_projection_submission(
             .unwrap_or_default()
             .iter()
             .enumerate()
-            .filter(|(_, item)| !is_system_instruction(item))
+            .filter(|(index, item)| {
+                !is_system_instruction(item)
+                    && !old_node
+                        .expect("an old item has an old node")
+                        .is_ephemeral_item(*index)
+            })
             .map(|(index, item)| {
                 !has_diff_template(old_node.expect("an old item has an old node"), index)
                     && !old_node
@@ -595,6 +610,11 @@ fn lower_node(
         .collect::<HashMap<_, _>>();
     let mut items = Vec::with_capacity(node.items().len());
     for (item_index, item) in node.items().iter().enumerate() {
+        // Request-only prompts are sent as complete values in a separate final
+        // section. They neither use nor establish a retained semantic baseline.
+        if node.is_ephemeral_item(item_index) {
+            continue;
+        }
         let template = templates.get(&item_index);
         let lowered = match template {
             Some(template) => lower_template_item(
@@ -848,7 +868,6 @@ mod tests {
         pom::{
             BlockChildren, DiffSlot, DiffStrategy, Document, ResolvedDocument, TextNode, XmlNode,
         },
-        pom_renderer::render_pom_document,
         pom_resolution::{resolve_artifact_document, resolve_system_document},
         transcript::{AssistantPhase, CanonicalInputItem, ConversationRole, InstructionAuthority},
     };
@@ -899,6 +918,30 @@ mod tests {
             Ok(())
         })
         .unwrap()
+    }
+
+    fn node(name: &str, children: impl IntoIterator<Item = XmlNode>) -> XmlNode {
+        XmlNode::try_build(name, |builder| {
+            for child in children {
+                builder.xml(child);
+            }
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    fn delta(mut node: XmlNode) -> XmlNode {
+        node.push_attribute("rendering_mode".try_into().unwrap(), "delta")
+            .unwrap();
+        node
+    }
+
+    fn pom_document(roots: impl IntoIterator<Item = XmlNode>) -> ResolvedDocument {
+        resolve_system_document(Document::build(|children| {
+            for root in roots {
+                children.xml(root);
+            }
+        }))
     }
 
     fn semantic_projection(phase: &str, observations: &[&str]) -> RenderedProjection {
@@ -1132,13 +1175,13 @@ mod tests {
         RenderedProjection::from_nodes(vec![node]).unwrap()
     }
 
-    fn rendered_item(projection: &RenderedProjection) -> Option<String> {
+    fn pom_item(projection: &RenderedProjection) -> Option<ResolvedDocument> {
         let item = projection.nodes()[0].items().first()?;
         let pom = match item {
             CanonicalInputItem::Message { pom, .. } => pom,
             other => panic!("expected user POM, got {other:?}"),
         };
-        Some(render_pom_document(pom).unwrap())
+        Some(pom.clone())
     }
 
     fn text_projection(nodes: &[(&str, &[&str])]) -> RenderedProjection {
@@ -1173,14 +1216,14 @@ mod tests {
         RenderedProjection::from_nodes(vec![RenderedProjectionNode::new("root", items)]).unwrap()
     }
 
-    fn rendered_pom_items(projection: &RenderedProjection) -> Vec<String> {
+    fn pom_items(projection: &RenderedProjection) -> Vec<ResolvedDocument> {
         projection
             .nodes()
             .iter()
             .flat_map(RenderedProjectionNode::items)
             .map(|item| match item {
                 CanonicalInputItem::Instruction { pom, .. }
-                | CanonicalInputItem::Message { pom, .. } => render_pom_document(pom).unwrap(),
+                | CanonicalInputItem::Message { pom, .. } => pom.clone(),
                 other => panic!("expected a POM projection item, got {other:?}"),
             })
             .collect()
@@ -1202,23 +1245,23 @@ mod tests {
     fn atomic_root_changes_use_full_values_and_same_is_omitted() {
         let first = ProjectionDiffState::prepare(None, &projection("A"));
         assert_eq!(
-            rendered_item(&first.submission).as_deref(),
-            Some("<state>A</state>")
+            pom_item(&first.submission),
+            Some(pom_document([text_xml("state", "A")]))
         );
 
         let changed = ProjectionDiffState::prepare(Some(&first.candidate), &projection("A+"));
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some("<state>A+</state>")
+            pom_item(&changed.submission),
+            Some(pom_document([text_xml("state", "A+")]))
         );
 
         let unchanged = ProjectionDiffState::prepare(Some(&changed.candidate), &projection("A+"));
-        assert!(rendered_item(&unchanged.submission).is_none());
+        assert!(pom_item(&unchanged.submission).is_none());
 
         let later = ProjectionDiffState::prepare(Some(&unchanged.candidate), &projection("A++"));
         assert_eq!(
-            rendered_item(&later.submission).as_deref(),
-            Some("<state>A++</state>")
+            pom_item(&later.submission),
+            Some(pom_document([text_xml("state", "A++")]))
         );
     }
 
@@ -1229,8 +1272,11 @@ mod tests {
             ProjectionDiffState::prepare(Some(&first.candidate), &single_field_projection("A+"));
 
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some("<single_field_state>\n  <value>A+</value>\n</single_field_state>")
+            pom_item(&changed.submission),
+            Some(pom_document([node(
+                "single_field_state",
+                [text_xml("value", "A+")]
+            )]))
         );
     }
 
@@ -1243,8 +1289,11 @@ mod tests {
         );
 
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some("<single_field_state>\n  <value>A+</value>\n</single_field_state>")
+            pom_item(&changed.submission),
+            Some(pom_document([node(
+                "single_field_state",
+                [text_xml("value", "A+")]
+            )]))
         );
     }
 
@@ -1257,10 +1306,17 @@ mod tests {
         );
 
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some(
-                "<agent_state rendering_mode=\"delta\">\n  <phase>B</phase>\n  <observations rendering_mode=\"delta\">\n    <insert>\n      <item>phase B observed</item>\n    </insert>\n  </observations>\n</agent_state>"
-            )
+            pom_item(&changed.submission),
+            Some(pom_document([delta(node(
+                "agent_state",
+                [
+                    text_xml("phase", "B"),
+                    delta(node(
+                        "observations",
+                        [node("insert", [text_xml("item", "phase B observed")])]
+                    ))
+                ]
+            ))]))
         );
     }
 
@@ -1271,10 +1327,14 @@ mod tests {
             ProjectionDiffState::prepare(Some(&first.candidate), &explicit_replace_projection("B"));
 
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some(
-                "<agent_state rendering_mode=\"delta\">\n  <phase rendering_mode=\"delta\">\n    <replace>\n      <phase>B</phase>\n    </replace>\n  </phase>\n</agent_state>"
-            )
+            pom_item(&changed.submission),
+            Some(pom_document([delta(node(
+                "agent_state",
+                [delta(node(
+                    "phase",
+                    [node("replace", [text_xml("phase", "B")])]
+                ))]
+            ))]))
         );
     }
 
@@ -1287,10 +1347,15 @@ mod tests {
         );
 
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some(
-                "<agent_state>\n  <objective>changed</objective>\n  <phase>A</phase>\n  <observations>\n    <item>initialized</item>\n  </observations>\n</agent_state>"
-            )
+            pom_item(&changed.submission),
+            Some(pom_document([node(
+                "agent_state",
+                [
+                    text_xml("objective", "changed"),
+                    text_xml("phase", "A"),
+                    node("observations", [text_xml("item", "initialized")])
+                ]
+            )]))
         );
     }
 
@@ -1302,8 +1367,8 @@ mod tests {
             ProjectionDiffState::prepare(Some(&first.candidate), &projection_at("A", vec![1]));
 
         assert_eq!(
-            rendered_item(&moved.submission).as_deref(),
-            Some("<state>A</state>")
+            pom_item(&moved.submission),
+            Some(pom_document([text_xml("state", "A")]))
         );
         assert!(moved.append_policy.requires_append("component", 0));
     }
@@ -1459,38 +1524,44 @@ mod tests {
             .iter()
             .map(|item| match item {
                 CanonicalInputItem::Instruction { pom, .. }
-                | CanonicalInputItem::Message { pom, .. } => render_pom_document(pom).unwrap(),
+                | CanonicalInputItem::Message { pom, .. } => pom.clone(),
                 other => panic!("only POM removals are expected, got {other:?}"),
             })
             .collect::<Vec<_>>();
         assert_eq!(
             rendered,
             [
-                "<remove>\n  <developer>policy</developer>\n</remove>",
-                "<remove>\n  <user>request</user>\n</remove>",
+                pom_document([node("remove", [text_xml("developer", "policy")])]),
+                pom_document([node("remove", [text_xml("user", "request")])]),
             ]
         );
     }
 
     #[test]
     fn raw_user_xml_reorder_and_duplicate_omission_emit_ordered_removals() {
-        let cases: [(&str, &[&str], &[&str], &[&str]); 2] = [
+        type Case<'a> = (
+            &'a str,
+            &'a [&'a str],
+            &'a [&'a str],
+            &'a [ResolvedDocument],
+        );
+        let cases: [Case<'_>; 2] = [
             (
                 "reorder",
                 &["a", "b"],
                 &["b", "a"],
                 &[
-                    "<remove>\n  <state>a</state>\n</remove>",
-                    "<remove>\n  <state>b</state>\n</remove>",
-                    "<state>b</state>",
-                    "<state>a</state>",
+                    pom_document([node("remove", [text_xml("state", "a")])]),
+                    pom_document([node("remove", [text_xml("state", "b")])]),
+                    pom_document([text_xml("state", "b")]),
+                    pom_document([text_xml("state", "a")]),
                 ],
             ),
             (
                 "one repeated item omitted",
                 &["a", "a"],
                 &["a"],
-                &["<remove>\n  <state>a</state>\n</remove>"],
+                &[pom_document([node("remove", [text_xml("state", "a")])])],
             ),
         ];
 
@@ -1509,7 +1580,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(rendered_pom_items(&changed.submission), expected, "{name}");
+            assert_eq!(pom_items(&changed.submission), expected, "{name}");
         }
     }
 
@@ -1577,10 +1648,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            rendered_item(&reappeared.submission).as_deref(),
-            Some(
-                "<agent_state>\n  <objective>stable</objective>\n  <phase>A</phase>\n  <observations>\n    <item>initialized</item>\n  </observations>\n</agent_state>"
-            )
+            pom_item(&reappeared.submission),
+            Some(pom_document([node(
+                "agent_state",
+                [
+                    text_xml("objective", "stable"),
+                    text_xml("phase", "A"),
+                    node("observations", [text_xml("item", "initialized")])
+                ]
+            )]))
         );
     }
 
@@ -1602,8 +1678,8 @@ mod tests {
 
         assert_eq!(changed.submission.nodes()[0].items().len(), 1);
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some("<state>Y</state>")
+            pom_item(&changed.submission),
+            Some(pom_document([text_xml("state", "Y")]))
         );
     }
 
@@ -1624,8 +1700,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some("<remove>\n  <policy>old</policy>\n</remove>\n\n<context>new</context>")
+            pom_item(&changed.submission),
+            Some(pom_document([
+                node("remove", [text_xml("policy", "old")]),
+                text_xml("context", "new")
+            ]))
         );
     }
 
@@ -1651,8 +1730,11 @@ mod tests {
         .unwrap();
         assert_ne!(changed.diff_baseline, first.diff_baseline);
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some("<remove>\n  <policy>old</policy>\n</remove>\n\n<context>new</context>")
+            pom_item(&changed.submission),
+            Some(pom_document([
+                node("remove", [text_xml("policy", "old")]),
+                text_xml("context", "new")
+            ]))
         );
 
         let unchanged = ReconciledProjectionPlan::prepare(
@@ -1664,8 +1746,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            rendered_item(&unchanged.submission).as_deref(),
-            Some("<context>new</context>")
+            pom_item(&unchanged.submission),
+            Some(pom_document([text_xml("context", "new")]))
         );
     }
 
@@ -1687,8 +1769,8 @@ mod tests {
 
         assert_eq!(changed.submission.nodes()[0].items().len(), 1);
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some("<remove>\n  <policy>old</policy>\n</remove>")
+            pom_item(&changed.submission),
+            Some(pom_document([node("remove", [text_xml("policy", "old")])]))
         );
     }
 
@@ -1709,8 +1791,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some("<policy>stable</policy>\n\n<state>B</state>")
+            pom_item(&changed.submission),
+            Some(pom_document([
+                text_xml("policy", "stable"),
+                text_xml("state", "B")
+            ]))
         );
     }
 
@@ -1731,10 +1816,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some(
-                "<policy>stable</policy>\n\n<agent_state rendering_mode=\"delta\">\n  <phase>B</phase>\n</agent_state>"
-            )
+            pom_item(&changed.submission),
+            Some(pom_document([
+                text_xml("policy", "stable"),
+                delta(node("agent_state", [text_xml("phase", "B")]))
+            ]))
         );
     }
 
@@ -1755,10 +1841,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some(
-                "<remove>\n  <policy>old</policy>\n</remove>\n\n<remove>\n  <state>A</state>\n</remove>\n\n<context>new</context>\n\n<state>A</state>"
-            )
+            pom_item(&changed.submission),
+            Some(pom_document([
+                node("remove", [text_xml("policy", "old")]),
+                node("remove", [text_xml("state", "A")]),
+                text_xml("context", "new"),
+                text_xml("state", "A")
+            ]))
         );
     }
 
@@ -1779,10 +1868,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            rendered_item(&changed.submission).as_deref(),
-            Some(
-                "<remove>\n  <policy>old</policy>\n</remove>\n\n<remove>\n  <state>A</state>\n</remove>\n\n<state>A</state>"
-            )
+            pom_item(&changed.submission),
+            Some(pom_document([
+                node("remove", [text_xml("policy", "old")]),
+                node("remove", [text_xml("state", "A")]),
+                text_xml("state", "A")
+            ]))
         );
     }
 
@@ -1881,10 +1972,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            rendered_item(&reset.submission).as_deref(),
-            Some(
-                "<agent_state>\n  <objective>stable</objective>\n  <phase>A</phase>\n  <observations>\n    <item>initialized</item>\n  </observations>\n</agent_state>"
-            )
+            pom_item(&reset.submission),
+            Some(pom_document([node(
+                "agent_state",
+                [
+                    text_xml("objective", "stable"),
+                    text_xml("phase", "A"),
+                    node("observations", [text_xml("item", "initialized")])
+                ]
+            )]))
         );
     }
 
@@ -1981,7 +2077,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rendered_item(&changed.submission).is_some());
+        assert!(pom_item(&changed.submission).is_some());
         assert_eq!(changed.reconciliation.unclaimed_provider_outputs.len(), 1);
     }
 
@@ -2070,7 +2166,7 @@ mod tests {
         let plan = ReconciledProjectionPlan::prepare(None, None, Some(&reset), &[], &diff_complete)
             .unwrap();
 
-        assert!(rendered_item(&plan.submission).is_some());
+        assert!(pom_item(&plan.submission).is_some());
         assert_eq!(plan.reconciliation.ambiguous_provider_outputs.len(), 1);
     }
 }

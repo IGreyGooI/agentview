@@ -4,8 +4,7 @@ use agentview::pom::{
     TextNode, XmlNode,
 };
 use agentview::pom_cursor::UserDocumentCursor;
-use agentview::pom_renderer::render_pom_document;
-use agentview::pom_resolution::resolve_user_document;
+use agentview::pom_resolution::{resolve_system_document, resolve_user_document};
 use agentview::templates::TurnArtifact;
 use agentview::AgentView;
 
@@ -35,15 +34,15 @@ fn turn_artifact_rejects_a_kind_that_could_inject_legacy_layout_markup() {
 }
 
 #[test]
-fn turn_artifact_renders_canonical_pom_and_exposes_its_kind() {
+fn turn_artifact_keeps_its_document_and_exposes_its_kind() {
     let artifact =
         TurnArtifact::try_from_document("parser_error", xml_document("parser_error", "<select>&"))
             .unwrap();
 
     assert_eq!(artifact.kind(), "parser_error");
     assert_eq!(
-        render_pom_document(artifact.document()).unwrap(),
-        "<parser_error><select>&</parser_error>"
+        artifact.document(),
+        &resolve_system_document(xml_document("parser_error", "<select>&"))
     );
 }
 
@@ -54,8 +53,8 @@ fn turn_artifact_preserves_original_text_without_xml_validation() {
             .unwrap();
 
     assert_eq!(
-        render_pom_document(artifact.document()).unwrap(),
-        "<parser_error>\u{0}</parser_error>"
+        artifact.document(),
+        &resolve_system_document(xml_document("parser_error", "\u{0}"))
     );
 }
 
@@ -118,14 +117,24 @@ fn derived_user_document_splices_typed_artifact_blocks_in_order() {
         resolve_user_document(prompt.build_root().unwrap(), &UserDocumentCursor::default())
             .unwrap();
 
-    assert_eq!(
-        render_pom_document(&resolved).unwrap(),
-        concat!(
-            "<first_feedback>first</first_feedback>\n\n",
-            "<second_feedback>second</second_feedback>\n\n",
-            "continue"
-        )
-    );
+    let expected = Document::build(|blocks| {
+        blocks.xml(
+            XmlNode::try_build("first_feedback", |children| {
+                children.text(TextNode::new("first"));
+                Ok(())
+            })
+            .unwrap(),
+        );
+        blocks.xml(
+            XmlNode::try_build("second_feedback", |children| {
+                children.text(TextNode::new("second"));
+                Ok(())
+            })
+            .unwrap(),
+        );
+        blocks.paragraph(|paragraph| paragraph.try_text("continue").unwrap());
+    });
+    assert_eq!(resolved.children(), expected.children());
     assert!(
         cursor.is_empty(),
         "ephemeral artifacts do not enter the cursor"
@@ -155,10 +164,18 @@ fn one_typed_artifact_can_splice_multiple_pom_blocks_without_rendering_a_string(
     let document = prompt.build_root().unwrap();
     assert_eq!(document.children().iter().count(), 3);
     let (resolved, _) = resolve_user_document(document, &UserDocumentCursor::default()).unwrap();
-    assert_eq!(
-        render_pom_document(&resolved).unwrap(),
-        "first block\n\n<detail>second block</detail>\n\ncontinue"
-    );
+    let expected = Document::build(|blocks| {
+        blocks.paragraph(|paragraph| paragraph.try_text("first block").unwrap());
+        blocks.xml(
+            XmlNode::try_build("detail", |children| {
+                children.text(TextNode::new("second block"));
+                Ok(())
+            })
+            .unwrap(),
+        );
+        blocks.paragraph(|paragraph| paragraph.try_text("continue").unwrap());
+    });
+    assert_eq!(resolved.children(), expected.children());
 }
 
 #[test]

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::{
     component::{execution::CommandOutcome, signal::HookMount},
-    pom::{Document, MixedContent, RawTextNode, XmlName, XmlNode},
+    pom::{DiffSlot, DiffStrategy, Document, MixedContent, RawTextNode, XmlName, XmlNode},
 };
 
 use super::{
@@ -225,10 +225,12 @@ pub(crate) type CommandCallback = Box<dyn FnMut(Value) -> CommandFuture + Send +
 impl<Input> CliCommandProps<Command<Input>, CliCommandCallback> {
     pub fn build(self) -> Component {
         Component::from_node(ComponentNode::CliCommand(Box::new(CliCommandDeclaration {
-            name: self.command.name,
+            name: self.command.name.to_owned(),
             description: self.command.description.to_owned(),
             argument: self.command.argument,
             input_schema: None,
+            empty_input: false,
+            content: None,
             enabled: self.enabled,
             invoke: self.invoke.invoke,
             mount: None,
@@ -238,10 +240,12 @@ impl<Input> CliCommandProps<Command<Input>, CliCommandCallback> {
 }
 
 pub(crate) struct CliCommandDeclaration {
-    name: &'static str,
+    name: String,
     description: String,
     argument: Option<CommandArgument>,
     input_schema: Option<Value>,
+    empty_input: bool,
+    content: Option<XmlNode>,
     enabled: bool,
     invoke: CommandCallback,
     mount: Option<HookMount>,
@@ -250,10 +254,12 @@ pub(crate) struct CliCommandDeclaration {
 
 impl CliCommandDeclaration {
     pub(crate) fn json(
-        name: &'static str,
+        name: String,
         description: String,
         enabled: bool,
         input_schema: Value,
+        empty_input: bool,
+        content: Option<XmlNode>,
         invoke: CommandCallback,
     ) -> Self {
         Self {
@@ -261,6 +267,8 @@ impl CliCommandDeclaration {
             description,
             argument: None,
             input_schema: Some(input_schema),
+            empty_input,
+            content,
             enabled,
             invoke,
             mount: None,
@@ -268,8 +276,8 @@ impl CliCommandDeclaration {
         }
     }
 
-    pub(crate) fn name(&self) -> &'static str {
-        self.name
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     pub(crate) fn mount(&mut self, mount: HookMount, task_context: Option<ComponentTaskContext>) {
@@ -300,11 +308,7 @@ impl CliCommandDeclaration {
     }
 
     pub(crate) fn prompt_document(&self, prefix: &str) -> Result<Document, ComponentAttemptFault> {
-        validate_metadata(self.name, self.argument)?;
-
-        if let Some(schema) = &self.input_schema {
-            return self.json_prompt_document(schema);
-        }
+        validate_metadata(&self.name, self.argument)?;
 
         let command = if prefix.is_empty() {
             self.name.to_owned()
@@ -332,7 +336,11 @@ impl CliCommandDeclaration {
         Ok(Document::from_xml(actions))
     }
 
-    fn json_prompt_document(&self, schema: &Value) -> Result<Document, ComponentAttemptFault> {
+    pub(crate) fn json_action_node(&self) -> Result<Option<XmlNode>, ComponentAttemptFault> {
+        validate_metadata(&self.name, self.argument)?;
+        let Some(schema) = &self.input_schema else {
+            return Ok(None);
+        };
         if schema.get("type").and_then(Value::as_str) != Some("object") {
             return Err(ComponentAttemptFault::RuntimeInvariant {
                 message: format!(
@@ -344,25 +352,33 @@ impl CliCommandDeclaration {
         let mut action = XmlNode::new(XmlName::new("action").expect("static name"));
         for (name, value) in [
             ("name", self.name.to_owned()),
-            ("description", self.description.clone()),
             ("enabled", self.enabled.to_string()),
         ] {
             action
                 .push_attribute(XmlName::new(name).expect("static name"), value)
                 .expect("unique attribute");
         }
-        let mut input_schema = XmlNode::new(XmlName::new("input_schema").expect("static name"));
-        input_schema.push(MixedContent::raw_text(RawTextNode::new(schema.to_string())));
-        action.push(MixedContent::xml(input_schema));
-        let mut stdin = XmlNode::new(XmlName::new("stdin").expect("static name"));
-        stdin.push(MixedContent::raw_text(RawTextNode::new(format!(
-            "Send one JSON object per line with \"action\":{} and \"input\" set to an object matching input_schema.",
-            json!(self.name),
-        ))));
-        action.push(MixedContent::xml(stdin));
-        let mut actions = XmlNode::new(XmlName::new("actions").expect("static name"));
-        actions.push(MixedContent::xml(action));
-        Ok(Document::from_xml(actions))
+        if !self.description.is_empty() {
+            action
+                .push_attribute(
+                    XmlName::new("description").expect("static name"),
+                    self.description.clone(),
+                )
+                .expect("unique attribute");
+        }
+        if self.empty_input {
+            action
+                .push_attribute(XmlName::new("input").expect("static name"), "{}")
+                .expect("unique attribute");
+        } else {
+            let mut input_schema = XmlNode::new(XmlName::new("input_schema").expect("static name"));
+            input_schema.push(MixedContent::raw_text(RawTextNode::new(schema.to_string())));
+            action.push(MixedContent::xml(input_schema));
+        }
+        if let Some(content) = &self.content {
+            action.push(MixedContent::xml(content.clone()));
+        }
+        Ok(Some(action))
     }
 
     fn action_node(&self, command: String, input: impl Into<String>) -> XmlNode {
@@ -379,6 +395,27 @@ impl CliCommandDeclaration {
         }
         action
     }
+}
+
+/// Complete current native actions and shared stdin guidance. The collection
+/// identity is independent of individual callbacks and their dynamic names.
+pub(crate) fn action_catalogue(actions: Vec<XmlNode>) -> Document {
+    let mut catalogue = XmlNode::new(XmlName::new("action_catalogue").expect("static name"));
+    catalogue.set_removal_identity(XmlNode::new(catalogue.name().clone()));
+    let mut stdin = XmlNode::new(XmlName::new("stdin").expect("static name"));
+    stdin.push(MixedContent::raw_text(RawTextNode::new(
+        "Send JSON {\"action\":\"NAME\",\"input\":{}} using a current enabled action name. For actions with input_schema, input must match that schema; input=\"{}\" takes no fields. Objects may span lines; end the batch with a newline and wait 100 ms without input, or close stdin to submit the frame.",
+    )));
+    catalogue.push(MixedContent::xml(stdin));
+    let mut entries = XmlNode::new(XmlName::new("actions").expect("static name"));
+    for action in actions {
+        entries.push(MixedContent::xml(action));
+    }
+    catalogue.push(MixedContent::xml_slot(DiffSlot::present(
+        DiffStrategy::Keyed(XmlName::new("name").expect("static name")),
+        entries,
+    )));
+    Document::from_xml(catalogue)
 }
 
 fn validate_input<Input: DeserializeOwned>(input: &Value) -> Result<(), String> {

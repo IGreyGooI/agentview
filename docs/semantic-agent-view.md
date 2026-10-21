@@ -1,4 +1,4 @@
-# AgentView Derive: POM Documents And Stateful XML Diff
+# AgentView Derive: POM Documents And Stateful Diff
 
 > **Status: current POM derive, AST, diff, and rendering subsystem documentation.** This document
 > owns only POM syntax and subsystem documentation; it does not own the current Component
@@ -15,9 +15,17 @@ for isolated compatibility APIs and characterization tests. POM-only field
 modes such as `root` and `code_span` do not generate that duplicate
 implementation, and request assembly never uses it.
 
-The POM view is an agent-facing frontend tree. A struct's `kind` describes the
-concrete XML view model being built. A field name describes the role that a
-child value plays inside its parent.
+The POM view is an agent-facing frontend tree. POM is not XML: `XmlNode` and
+the tag-shaped notation describe structured nodes, not an XML serialization
+contract. A struct's `kind` describes the node being built. A field name
+describes the role that a child value plays inside its parent.
+
+The rendered prompt is for the LLM to read. Data text and attribute values are
+not XML-escaped, and the output need not be valid XML. Application code and
+tests must not parse it, including using regexes or string splitting to recover
+fields. Consume the typed AST, projection, or structured protocol data directly.
+Explicit Markdown formatting and JSON transport encoding keep their own rules;
+model-produced XML actions follow their separate input parsing contract.
 
 ## Core Pipeline
 
@@ -59,9 +67,12 @@ only accepts `XmlNode`, so a `Document`, Markdown root, or `TextNode` cannot
 become a diff value. System resolution materializes present slots without
 diffing.
 
-XML examples below are indented for readability. The canonical POM renderer
-may emit an inline-only XML subtree compactly; renderer snapshot tests, not the
-presentation whitespace in this guide, define the exact bytes.
+Tag-shaped examples below are indented for readability. Their presentation is
+not a machine-readable format contract. Unit tests must verify typed nodes,
+values, diff operations, state transitions, and delivery behavior directly;
+they must not verify prompt rendering with exact strings, rendered substrings,
+snapshots, or golden files. Review presentation through examples and the
+observe -> act -> feedback -> next action interaction.
 
 ## Derive Syntax
 
@@ -735,6 +746,12 @@ inserts:
 </scene>
 ```
 
+Collection deltas group consecutive operations of the same kind into one
+`insert`, `remove`, or `update` node containing every affected item. Item order
+and repeated values are preserved; grouping does not deduplicate records.
+This applies to `append`, `seq`, `set`, `key`, and map deltas. The complete
+current collection remains the committed baseline.
+
 `seq` mode is for ordered lists where only the tail should normally change. It
 renders inserted tail items and removed tail items. If the common prefix changes,
 it falls back to rendering the full current list for that field.
@@ -768,7 +785,10 @@ struct CastView {
 ```
 
 This uses each actor root node's `id` attribute and renders `insert`, `remove`,
-and `update` operation wrappers:
+and `update` operation wrappers. Insert and update carry the complete current
+item; remove carries only the item's root name and key attribute, because the key
+already identifies the retired item. Item order is not semantic in keyed mode.
+
 
 ```xml
 <cast rendering_mode="delta">

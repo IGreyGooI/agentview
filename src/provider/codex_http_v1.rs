@@ -68,18 +68,41 @@ enum FunctionToolKind {
     Function,
 }
 
-/// Codex request-side reasoning controls used by the pinned oracle.
+/// Typed request-side reasoning controls for Responses-compatible endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CodexReasoning {
-    effort: ReasoningEffort,
-    summary: ReasoningSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<ReasoningSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
 }
 
 impl CodexReasoning {
     pub const fn max_detailed() -> Self {
         Self {
-            effort: ReasoningEffort::Max,
-            summary: ReasoningSummary::Detailed,
+            effort: Some(ReasoningEffort::Max),
+            summary: Some(ReasoningSummary::Detailed),
+            enabled: None,
+        }
+    }
+
+    /// Disables reasoning on endpoints supporting OpenRouter's `enabled` control.
+    pub const fn disabled() -> Self {
+        Self {
+            effort: None,
+            summary: None,
+            enabled: Some(false),
+        }
+    }
+
+    /// Disables reasoning on models supporting the Responses `none` effort.
+    pub const fn none() -> Self {
+        Self {
+            effort: Some(ReasoningEffort::None),
+            summary: None,
+            enabled: None,
         }
     }
 }
@@ -88,6 +111,7 @@ impl CodexReasoning {
 #[serde(rename_all = "lowercase")]
 enum ReasoningEffort {
     Max,
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -96,16 +120,53 @@ enum ReasoningSummary {
     Detailed,
 }
 
+/// OpenRouter endpoint restrictions, preference order, and parameter support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenRouterProviderRouting {
+    only: Vec<String>,
+    order: Vec<String>,
+    require_parameters: bool,
+}
+
+impl OpenRouterProviderRouting {
+    /// Restricts eligible endpoints to `only`, preferring those in `order`.
+    /// Endpoint slugs are passed through without rewriting variant suffixes.
+    pub fn new(
+        only: Vec<String>,
+        order: Vec<String>,
+        require_parameters: bool,
+    ) -> Result<Self, CodexHttpV1Error> {
+        if only.is_empty()
+            || only.iter().chain(&order).any(|slug| {
+                slug.is_empty()
+                    || slug
+                        .chars()
+                        .any(|character| character.is_whitespace() || character.is_control())
+            })
+        {
+            return Err(CodexHttpV1Error::InvalidOpenRouterProviderRouting);
+        }
+        Ok(Self {
+            only,
+            order,
+            require_parameters,
+        })
+    }
+}
+
 /// Immutable inputs that vary between `codex-http-v1` operations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexHttpV1Options {
     model: ModelSpec,
     tools: Option<Vec<CodexFunctionTool>>,
     reasoning: Option<CodexReasoning>,
+    openrouter_provider_routing: Option<OpenRouterProviderRouting>,
     prompt_cache_key: Option<String>,
     max_output_tokens: Option<u32>,
     temperature: Option<f64>,
     explicit_assistant_status: bool,
+    parallel_tool_calls: bool,
+    prompt_cache_comparison_response_id: Option<String>,
 }
 
 impl CodexHttpV1Options {
@@ -130,16 +191,25 @@ impl CodexHttpV1Options {
             model,
             tools,
             reasoning,
+            openrouter_provider_routing: None,
             prompt_cache_key,
             max_output_tokens: None,
             temperature: None,
             explicit_assistant_status: false,
+            parallel_tool_calls: false,
+            prompt_cache_comparison_response_id: None,
         })
     }
 
     /// The model identity and capacity shared by all requests using these options.
     pub const fn model(&self) -> &ModelSpec {
         &self.model
+    }
+
+    /// Applies the same OpenRouter endpoint routing to foreground and summaries.
+    pub fn with_openrouter_provider_routing(mut self, routing: OpenRouterProviderRouting) -> Self {
+        self.openrouter_provider_routing = Some(routing);
+        self
     }
 
     /// Limits model-generated output tokens for this request profile.
@@ -173,6 +243,18 @@ impl CodexHttpV1Options {
         self.explicit_assistant_status = true;
         self
     }
+
+    /// Allows multiple native calls in one model response. Tool admission and
+    /// execution remain owned by the Application.
+    pub fn with_parallel_tool_calls(mut self, enabled: bool) -> Self {
+        self.parallel_tool_calls = enabled;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CodexPromptCacheOptions {
+    comparison_response_id: String,
 }
 
 /// AgentView-owned request DTO suitable for a later BYOT transport adapter.
@@ -191,11 +273,15 @@ pub struct CodexHttpV1Request {
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
     reasoning: Option<CodexReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<OpenRouterProviderRouting>,
     store: bool,
     stream: bool,
     include: Vec<IncludedField>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_options: Option<CodexPromptCacheOptions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -213,11 +299,15 @@ struct CodexHttpV1WireRequest<'a> {
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
     reasoning: Option<&'a CodexReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<&'a OpenRouterProviderRouting>,
     store: bool,
     stream: bool,
     include: &'a [IncludedField],
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_options: Option<&'a CodexPromptCacheOptions>,
 }
 
 impl<'a> CodexHttpV1WireRequest<'a> {
@@ -236,10 +326,12 @@ impl<'a> CodexHttpV1WireRequest<'a> {
             tool_choice: request.tool_choice,
             parallel_tool_calls: request.parallel_tool_calls,
             reasoning: request.reasoning.as_ref(),
+            provider: request.provider.as_ref(),
             store: request.store,
             stream: request.stream,
             include: &request.include,
             prompt_cache_key: request.prompt_cache_key.as_deref(),
+            prompt_cache_options: request.prompt_cache_options.as_ref(),
         }
     }
 }
@@ -480,6 +572,14 @@ impl CodexHttpV1Encoder {
         self.options.model()
     }
 
+    pub(crate) fn set_parallel_tool_calls(&mut self, enabled: bool) {
+        self.options.parallel_tool_calls = enabled;
+    }
+
+    pub(crate) fn set_prompt_cache_comparison_response_id(&mut self, id: Option<String>) {
+        self.options.prompt_cache_comparison_response_id = id;
+    }
+
     /// An ordinary, isolated model request. Summarization never enables API
     /// compaction, inherits business tools, or continues the foreground response.
     pub(crate) fn encode_summary_request_bounded(
@@ -495,11 +595,14 @@ impl CodexHttpV1Encoder {
             input: &'a [Value],
             instructions: &'a str,
             tools: [(); 0],
+            tool_choice: &'static str,
             stream: bool,
             store: bool,
             max_output_tokens: u64,
             #[serde(skip_serializing_if = "Option::is_none")]
             reasoning: Option<CodexReasoning>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            provider: Option<&'a OpenRouterProviderRouting>,
         }
         serialize_json_bounded(
             &Request {
@@ -507,10 +610,12 @@ impl CodexHttpV1Encoder {
                 input,
                 instructions,
                 tools: [],
+                tool_choice: "none",
                 stream: false,
                 store: false,
                 max_output_tokens,
                 reasoning: self.options.reasoning,
+                provider: self.options.openrouter_provider_routing.as_ref(),
             },
             limit,
         )
@@ -630,12 +735,20 @@ impl CodexHttpV1Encoder {
             input: history.input,
             tools,
             tool_choice: ToolChoice::Auto,
-            parallel_tool_calls: false,
+            parallel_tool_calls: self.options.parallel_tool_calls,
             reasoning: self.options.reasoning,
+            provider: self.options.openrouter_provider_routing.clone(),
             store: false,
             stream: true,
             include: vec![IncludedField::ReasoningEncryptedContent],
             prompt_cache_key: self.options.prompt_cache_key.clone(),
+            prompt_cache_options: self
+                .options
+                .prompt_cache_comparison_response_id
+                .clone()
+                .map(|comparison_response_id| CodexPromptCacheOptions {
+                    comparison_response_id,
+                }),
         }
     }
 
@@ -937,6 +1050,8 @@ pub enum CodexHttpV1Error {
     ZeroMaxOutputTokens,
     #[error("Responses temperature must be finite and between zero and two")]
     InvalidTemperature,
+    #[error("OpenRouter routing requires eligible endpoints and non-empty endpoint slugs without whitespace or control characters")]
+    InvalidOpenRouterProviderRouting,
     #[error("codex-http-v1 accepts at most one System instruction")]
     MultipleSystemInstructions,
     #[error("legacy codex-http-v1 history cannot encode interrupted assistant text")]
@@ -963,19 +1078,13 @@ pub enum CodexHttpV1Error {
 mod tests {
     use super::*;
     use crate::{
-        component::execution::ToolDefinition,
-        pom::{Document, TextNode, XmlNode},
+        component::execution::ToolDefinition, pom::Document,
         pom_resolution::resolve_artifact_document,
     };
     use serde_json::json;
 
-    fn xml_document(name: &str, text: &str) -> crate::pom::ResolvedDocument {
-        let node = XmlNode::try_build(name, |children| {
-            children.text(TextNode::new(text));
-            Ok(())
-        })
-        .unwrap();
-        resolve_artifact_document(Document::from_xml(node)).unwrap()
+    fn prompt_document(text: &str) -> crate::pom::ResolvedDocument {
+        resolve_artifact_document(Document::from_raw_text(text)).unwrap()
     }
 
     #[test]
@@ -995,11 +1104,11 @@ mod tests {
         let transcript = [
             CanonicalInputItem::instruction(
                 InstructionAuthority::System,
-                xml_document("system", "Retain these instructions."),
+                prompt_document("Retain these instructions."),
             ),
             CanonicalInputItem::instruction(
                 InstructionAuthority::Developer,
-                xml_document("developer", "Replace this typed input."),
+                prompt_document("Replace this typed input."),
             ),
         ]
         .into_iter()
@@ -1012,14 +1121,122 @@ mod tests {
             .encode_request_with_input_and_instructions(
                 &transcript,
                 &input,
-                "<system>Retain these instructions.</system>",
+                "Retain these instructions.",
             )
             .unwrap();
 
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"model":"gpt-5.6-codex","instructions":"<system>Retain these instructions.</system>","input":[{"encrypted_content":"opaque","id":"cmp_7","type":"compaction"}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":{"effort":"max","summary":"detailed"},"store":false,"stream":true,"include":["reasoning.encrypted_content"],"prompt_cache_key":"retained-session"}"#
+            r#"{"model":"gpt-5.6-codex","instructions":"Retain these instructions.","input":[{"encrypted_content":"opaque","id":"cmp_7","type":"compaction"}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":{"effort":"max","summary":"detailed"},"store":false,"stream":true,"include":["reasoning.encrypted_content"],"prompt_cache_key":"retained-session"}"#
         );
+    }
+
+    fn openrouter_routing() -> OpenRouterProviderRouting {
+        OpenRouterProviderRouting::new(
+            vec!["together".into(), "fireworks/us".into()],
+            vec!["together".into(), "fireworks/us".into()],
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reasoning_modes_and_routing_survive_all_request_encodings() {
+        let expected_routing = json!({
+            "only": ["together", "fireworks/us"],
+            "order": ["together", "fireworks/us"],
+            "require_parameters": true,
+        });
+        let transcript = CanonicalTranscript::new();
+        for (reasoning, expected) in [
+            (Some(CodexReasoning::disabled()), json!({"enabled": false})),
+            (Some(CodexReasoning::none()), json!({"effort": "none"})),
+            (
+                Some(CodexReasoning::max_detailed()),
+                json!({"effort": "max", "summary": "detailed"}),
+            ),
+            (None, Value::Null),
+        ] {
+            let encoder = CodexHttpV1Encoder::new(
+                CodexHttpV1Options::new(
+                    ModelSpec::new("test-model", 272_000).unwrap(),
+                    None,
+                    reasoning,
+                    None::<String>,
+                )
+                .unwrap()
+                .with_openrouter_provider_routing(openrouter_routing()),
+            );
+            let public = encoder.encode_request(&transcript).unwrap();
+            let native = encoder
+                .encode_frame_request_bounded(&[], "", &[], usize::MAX)
+                .unwrap();
+            let retained = encoder
+                .encode_request_with_input_and_instructions(&transcript, &[], "")
+                .unwrap();
+            for body in [public, native, retained] {
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request.get("reasoning"), Some(&expected));
+                assert_eq!(request["provider"], expected_routing);
+            }
+            let summary = encoder
+                .encode_summary_request_bounded(&[], "summarize", 64, usize::MAX)
+                .unwrap();
+            let summary: Value = serde_json::from_slice(&summary).unwrap();
+            assert_eq!(summary["provider"], expected_routing);
+            if reasoning.is_some() {
+                assert_eq!(summary["reasoning"], expected);
+            } else {
+                assert!(summary.get("reasoning").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn openrouter_routing_is_opt_in_and_counted_in_wire_limits() {
+        let options = CodexHttpV1Options::new(
+            ModelSpec::new("test-model", 272_000).unwrap(),
+            None,
+            Some(CodexReasoning::disabled()),
+            None::<String>,
+        )
+        .unwrap();
+        let baseline = CodexHttpV1Encoder::new(options.clone());
+        let native_baseline = baseline
+            .encode_frame_request_bounded(&[], "", &[], usize::MAX)
+            .unwrap();
+        let summary_baseline = baseline
+            .encode_summary_request_bounded(&[], "summarize", 64, usize::MAX)
+            .unwrap();
+        for body in [&native_baseline, &summary_baseline] {
+            let request: Value = serde_json::from_slice(body).unwrap();
+            assert!(request.get("provider").is_none());
+        }
+        let configured =
+            CodexHttpV1Encoder::new(options.with_openrouter_provider_routing(openrouter_routing()));
+        assert!(matches!(
+            configured.encode_frame_request_bounded(&[], "", &[], native_baseline.len()),
+            Err(CodexHttpV1Error::SerializedRequestBodyLimit)
+        ));
+        assert!(matches!(
+            configured.encode_summary_request_bounded(&[], "summarize", 64, summary_baseline.len()),
+            Err(CodexHttpV1Error::SerializedRequestBodyLimit)
+        ));
+    }
+
+    #[test]
+    fn openrouter_routing_rejects_empty_or_malformed_endpoint_slugs() {
+        for (only, order) in [
+            (vec![], vec![]),
+            (vec!["".into()], vec![]),
+            (vec!["together".into()], vec!["fireworks /us".into()]),
+            (vec!["together\n".into()], vec![]),
+        ] {
+            assert!(matches!(
+                OpenRouterProviderRouting::new(only, order, true),
+                Err(CodexHttpV1Error::InvalidOpenRouterProviderRouting)
+            ));
+        }
     }
 
     #[test]
@@ -1131,7 +1348,7 @@ mod tests {
         let assistant_history = CanonicalTranscript::new()
             .appended(CanonicalInputItem::message(
                 ConversationRole::Assistant,
-                xml_document("say", "completed history"),
+                prompt_document("completed history"),
             ))
             .unwrap();
         let default = CodexHttpV1Encoder::new(
@@ -1228,7 +1445,6 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["tools"], json!([]));
-        assert!(!body.to_string().contains("configured_tool"));
     }
 
     #[test]
@@ -1304,7 +1520,7 @@ mod tests {
         );
         let system = CanonicalInputItem::instruction(
             InstructionAuthority::System,
-            xml_document("system", "Current instructions."),
+            prompt_document("Current instructions."),
         );
         let (instructions, input) = encoder.lower_canonical_item(&system).unwrap().into_parts();
         let instructions = instructions.unwrap();

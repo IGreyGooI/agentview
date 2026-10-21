@@ -72,15 +72,30 @@ best effort 指尽量复用历史、减少重复的交付优化；无法可靠�
 显式组合 `#[diff]` 时仍使用已有字段策略。
 
 需要每轮重发的 policy 或上下文使用 `#[developer(repeat)]` / `#[user(repeat)]`。这类声明在每次
-提交的 Frame 中发送完整当前 POM，即使内容没有变化。`repeat` 优先于 `#[diff]` 的输出选择，
-但 diff baseline 仍随成功 handoff 正常维护；仅 render 或 prepare 不算提交。
+提交的 Frame 中发送完整当前 POM，即使内容没有变化。没有 `ephemeral` 时，`repeat` 优先于
+`#[diff]` 的输出选择，但 diff baseline 仍随成功 handoff 正常维护；仅 render 或 prepare 不算提交。
+
+需要每轮可见但不留存原始 prompt 的上下文使用 `#[developer(ephemeral, repeat)]` /
+`#[user(ephemeral, repeat)]`，参数顺序不限。`ephemeral` 管理历史保留，必须显式搭配 `repeat`；
+单独 `ephemeral` 是编译错误，assistant 和 System placement 不支持它。每个 Full 或 Delta Frame
+都携带完整当前 ephemeral POM，不做 omission 或 semantic delta。它们不进入 canonical transcript、
+retained provider history、continuation baseline 或 compaction source，也不建立 semantic diff baseline；
+其消失不输出 `<remove>`。private complete checkpoint 仍可保留当前声明的完整值。
+模型 reply、reasoning、ToolCall 和 ToolOutput 保持既有留存规则，即使内容引用了临时上下文。
 
 placement 作用于 `view!` 中紧接着的声明节点及其子树。标在组件调用前时，覆盖该组件及其子组件
 输出的普通 POM；不影响后续兄弟声明，也不表示作用于整个 `RenderedProjectionNode` 归属分组。
-外层 placement 优先于内层 placement，role 和 repeat 设置一起继承。捕获时只有同组件、同 role、
-同 repeat 设置的连续内容才可合并；普通内容与 repeat 内容即使同 role 也生成不同 item。
-repeat 是内部交付元数据，不渲染为 POM 标签，不要求声明 item 或 slot。repeat 内容消失仍按普通
-user/developer XML 删除规则处理；assistant 和 System placement 不支持 repeat 参数。
+外层 placement 优先于内层 placement，role、repeat 和 ephemeral 设置一起继承。捕获时只有同组件、
+同 role、同 repeat 和 ephemeral 设置的连续内容才可合并；不同交付模式即使同 role 也生成不同 item。
+repeat 是内部交付元数据，不渲染为 POM 标签，不要求声明 item 或 slot。没有 `ephemeral` 的 repeat
+内容消失仍按普通 user/developer XML 删除规则处理；assistant 和 System placement 不支持 repeat 参数。
+
+ephemeral 同样不添加 POM wrapper。声明可以出现在普通内容之前，跨组件也不报顺序错误。
+compiler 按已有 projection node/item traversal 稳定收集 ephemeral prompts，provider 编码时统一追加在
+`replay -> staged_inputs -> ordinary projection` 之后；ephemeral 之间保留 traversal 相对顺序。
+工具定义和原生调用/结果记录不受 ephemeral placement 影响，仍经正常 ToolCatalog 和 canonical path。
+legacy `ApplicationHost` 和直接 legacy `ProviderPort` 提交不具备该保留契约，遇到 ephemeral projection
+必须在 handoff 前明确拒绝。
 
 ### 完整提示词字符串
 
@@ -98,16 +113,26 @@ quoted 文本模板和显式 Markdown 节点仍按 Markdown inline 上下文校�
 根级字符串适配不改变 `String` 的字段编码，也不放宽 `TextNode` 的 block 转换约束。底层 API
 通过 `Document::from_raw_text(...)` 构造同样的原文内容。
 
-### 提示词 XML 的原文保留
+### POM 与提示词渲染边界
 
-渲染给 LLM 的 XML 只用于组织提示词，不会交给 XML parser。XML 正文、原文 block 和属性值
-保留原始内容，不添加 XML 实体转义，也不因 XML 字符合法性拒绝正文。纯数据字段不添加 Markdown
-转义；`<`、`>`、`&`、引号、反斜杠和已有实体文本均直接保留。XML 继续按既有规则作层级缩进，
-包括嵌套的多行内容；正文自身的相对缩进和 CR/LF 保留。XML 内显式 code span / code block 的正文
-同样不做实体转义。
+POM 不是 XML。`XmlNode` 等类型名和标签形状只表达 POM 的结构，不承诺渲染结果是合法 XML。
+渲染出的 prompt 是给 LLM 阅读的界面，不是供代码消费的序列化协议。应用、runtime、provider adapter
+和测试都不得反向解析 prompt；XML parser、正则、字符串切分或截取都不能用来从中恢复字段、schema、
+身份或状态。需要这些信息时，直接访问 typed POM、projection、Frame 或结构化 action descriptor。
+diff 和状态判断在结构化数据上完成，渲染文本不提供机器解析契约。
+
+POM 正文、原文 block 和属性值保留原始内容，不添加 XML 实体转义，也不因 XML 字符合法性拒绝正文。
+纯数据字段不添加 Markdown 转义；`<`、`>`、`&`、引号、反斜杠和已有实体文本均直接保留。
+标签结构继续按既有规则作层级缩进，包括嵌套的多行内容；正文自身的相对缩进和 CR/LF 保留。
+标签节点内显式 code span / code block 的正文同样不做实体转义。
 显式 Markdown 节点继续提供其声明的格式及必要的 Markdown 转义。JSON 数据及 Provider request
 仍使用 JSON 自身必要的转义，不再叠加 XML 或纯数据 Markdown 转义。
 该规则只适用于发给模型的提示词；模型输出中的 XML 动作仍按既有 parser 和校验规则处理。
+
+Unit test 不验证 prompt 渲染，不断言最终字符串、渲染片段、排版或 prompt snapshot/golden，
+也不通过解析 prompt 构造断言。测试直接验证 typed POM 的节点与值、projection/Frame 的有序 items、
+状态变化、动作结果和交付行为。提示词呈现通过示例和 observe -> act -> feedback -> next action
+交互评审；固定渲染文本不能证明模型获得了可继续操作的界面。
 
 ```text
 application owner
@@ -586,14 +611,16 @@ Frame只能由crate-private validated constructor创建，并同时满足以下�
 snapshot比较，而不需要猜测哪个字段优先。
 
 `Frame::requested_context_bytes()` 是完整当前 Component envelope（normalized System、完整
-ordinary projection 和 ToolCatalog）在 diff/omission 前的 JCS UTF-8 byte length。生产 compiler
-始终提供此 advisory metadata；合成的内部 Frame 可以缺省。它不是本次 Delta payload size，
+ordinary projection、完整 ephemeral prompts 和 ToolCatalog）在 diff/omission 前的 JCS UTF-8 byte length。
+生产 compiler 始终提供此 advisory metadata；合成的内部 Frame 可以缺省。它不是本次 Delta payload size，
 不包含 canonical replay 或 provider-private history，也不赋予 port 读取完整 projection 的能力。
 这个派生计量值不进入 semantic payload meter 或 continuity proof。
 
 `FrameSubmission` 包含本次 Full或Delta的 ordered canonical items和ToolCatalog。`replay`与
 `staged_inputs`永不包含System；Full的`projection.items`至多有一个位于首位的normalized System snapshot，
-缺失即clear，Delta的`projection.items`不包含System。它不包含：
+缺失即clear，Delta的`projection.items`不包含System。`FrameSubmission::ephemeral()` 单独提供完整当前
+ephemeral prompts，它们不在 `projection().items()` 中；port 在上述各 section 之后追加它们到本轮输入。
+这个只用于当前请求的 section 不进入 canonical outbound commit。`FrameSubmission` 不包含：
 
 - complete `RenderedProjection` 或 complete private checkpoint；
 - Component Signal、closures或reaction bindings；
@@ -620,13 +647,18 @@ provider claims，并重置diff baseline。消失的diff地址也随成功handof
 `#[diff]` lowering产生的append-forced item始终直接提交，不参与provider occurrence claim。
 这个过程不对最终渲染字符串做任意文本 diff，也不泄漏完整 checkpoint给Delta port。
 
+原生 POM 集合 delta 将相邻同类操作合并为一个 `insert`、`remove` 或 `update` 节点，
+每个节点可包含多个目标 child；操作对全部 children 生效，并保留原有顺序和重复 occurrence。
+keyed remove 仍只携带目标名称及 key，insert/update 携带完整当前值。
+
 普通projection item默认对比同scope内上一次成功handoff的完整`RenderedProjection`，不查询累计authored
 历史。相同前缀省略；长度相同且只有一个同role item变化时比较其POM，其后的相等item继续保留；
 其他变动后缀先撤下旧XML，再按当前顺序发送
 完整item。重复值按出现次数保留。node序列变化同样保留相同前缀并刷新受影响的后缀；node不渲染成wrapper。
 XML可以输出局部patch或完整当前root；旧root消失时以旧role输出`<remove>旧XML</remove>`。
 删除仅处理普通user/developer POM；ToolCall、ToolResult、assistant、provider extension及System
-item的消失不生成删除patch。System仍走独立snapshot流程。
+item的消失不生成删除patch。ephemeral prompts 不参与普通相邻快照或 provider occurrence claim，
+消失不生成删除patch；它们每轮从完整当前声明直接提交。System仍走独立snapshot流程。
 混合document可比较，无法稳定对齐root时撤下旧XML roots并输出完整当前document。text/Markdown变化
 发送完整值，消失不输出撤回。删除POM只进入本轮submission，新checkpoint仅保留完整当前投影。
 同scope的transport Full仍使用本地完整快照比较普通内容，显式`#[diff]`的target patch基线则重置。
@@ -668,7 +700,9 @@ receipt。
 
 v1唯一合法view是`CompleteTranscript`：按原顺序包含全部committed append-only canonical items，不删除
 前缀、不生成summary、不替换closed turn，也不注入provider artifact。Component-owned System snapshot不在
-transcript中，它按上一节的独立、可证明规则随Full原子replace/clear；这不放宽ordinary history replacement
+transcript中，它按上一节的独立、可证明规则随Full原子replace/clear。ephemeral prompts 也不在
+transcript中；成功 handoff 不将它们追加为 canonical input，context reset 同样不能将它们从当前
+projection 导入历史。这不放宽ordinary history replacement
 或occurrence provenance。FrameSession验证pending ToolCall由本次staged ToolOutput闭合。若完整replay无法
 满足Full reserve，session返回typed`CanonicalReplayTooLarge`并停止后续handoff；不能静默truncate或调用
 未定义的semantic compaction。
@@ -687,7 +721,7 @@ private compaction本身不强制Full。
 **所有 compaction 都是 local compaction，摘要必须使用当前模型进行普通推理。**
 local 指客户端管理触发、候选校验和上下文替换；不表示模型必须运行在本机。
 Native `AsyncOpenAiResponsesProvider` 默认使用 `DefaultCompactionPolicy` 在后台向普通
-`/responses` 发摘要请求，沿用当前 `ModelSpec`、reasoning、transport 和认证配置。
+`/responses` 发摘要请求，沿用当前 `ModelSpec`、reasoning、provider routing、transport 和认证配置。
 禁止使用 `/responses/compact`、`context_management`、`compaction_trigger` 或其他服务端压缩能力；
 也不提供 server compaction 分支或 fallback。此约束同样适用于 forced compaction 和未来 runtime
 checkpoint；见 [design.md](../design.md)。`with_parallel_compaction(policy)` 替换默认策略，
@@ -723,13 +757,23 @@ JSON body，包括历史、私有 artifact、instructions 和工具定义。两�
 `CodexHttpV1Options::new(model_spec, tools, reasoning, prompt_cache_key)` 持有这份模型描述，
 不接受裸模型名或独立的窗口覆盖值；`model()` 返回其只读引用。temperature、reasoning、
 `max_output_tokens` 等请求控制仍属于 options，其中输出请求上限不表示模型的最大输出能力。
+`CodexReasoning::disabled()` 明确发送 OpenRouter 的 `{"enabled":false}`；
+`CodexReasoning::none()` 发送 Responses 的 `{"effort":"none"}`，调用方应选择当前 endpoint/model
+支持的关闭方式。`max_detailed()` 和 options 的 reasoning `None` 保持原有线协议；`None` 不表示
+明确关闭 reasoning。`with_openrouter_provider_routing(OpenRouterProviderRouting::new(only, order,
+require_parameters)?)` 提供 typed OpenRouter `provider` 设置，默认省略该字段；eligible endpoints 和
+preference order 保留完整 endpoint slug（包括 `/us` 等 variant suffix）。这些设置随前台、continuation
+和后台/forced 摘要请求发送，并计入完整 HTTP body 的字节与窗口预算。
 `AsyncOpenAiTransportConfig::new(api_base, api_key)` 只接收连接参数，transport 不持有或覆盖窗口。
 provider 从 encoder 的 `ModelSpec` 派生稳定的 FrameProfile，同时用于 compaction 阈值和请求预算检查。
 只有 ID 编码为 HTTP body 的 `model` 字段，窗口是本地 metadata。
 运行示例时 `AGENTVIEW_CONTEXT_WINDOW_TOKENS` 必填，与 `AGENTVIEW_MODEL` 一起构造 `ModelSpec`。
 
 一次至多一个 attempt。source 取自前一 accepted wire window 的因果闭合前缀，保留至少最后一项，
-不能切开 call/result 或覆盖未完成输出。policy-triggered background attempt 只在普通 Frame 真实
+不能切开 call/result 或覆盖未完成输出。accepted wire window 不保留原始 ephemeral prompt，因此
+background 和 forced compaction 的 source、摘要和安装后的 baseline 均不包含它；当前临时 prompt
+只在前台请求的完整输入末尾追加。模型输出和工具事实仍按既有 source 规则保留。
+policy-triggered background attempt 只在普通 Frame 真实
 handoff 后启动，不阻塞该前台反应。forced attempt 在超窗 Frame handoff 前启动并等待；若已有
 background worker，则等待同一个 worker，不复制 source 或启动第二个 worker。两种路径共用 source
 fingerprint 去重，同一 accepted source 至多尝试一次。worker 不拥有 Component、canonical history、
@@ -742,7 +786,8 @@ monitor 保持 `Ready`，同一 source 不再 compact。只有压缩后 foregrou
 才把候选标为 `Installed` 并进入既有同步 commit。等待中的 submit future 被取消时，worker handle
 仍由 provider 持有；reset、shutdown 和 Drop 沿用统一的取消与收取规则。
 
-摘要请求使用专门的摘要 instructions、闭合历史前缀及空工具列表，`store: false`、`stream: false`，
+摘要请求使用专门的摘要 instructions、闭合历史前缀及空工具列表、`tool_choice: "none"`，
+`store: false`、`stream: false`，
 不复用前台 `previous_response_id`。请求的输出预留为输入估算 token 数的四分之一（向上取整），
 最多 4096，并按当前窗口扣除实际请求估算占用后的剩余容量进一步缩小；无剩余容量则失败。
 只有 completed response 的非空 assistant 文本可以形成候选；reasoning 不进入候选，拒绝工具调用、
@@ -807,6 +852,7 @@ ToolCatalogEntryV1 {
 ComponentEnvelopeV1 {
   version: 1,
   projection: ProjectionSubmissionV1,
+  ephemeral?: ordered current ephemeral prompts,
   tools: [ToolCatalogEntryV1],
 }
 
@@ -822,7 +868,9 @@ FrameSubmissionV1 {
 normalized System snapshot。Full携带shared reconciliation后的self-contained Component segment：
 `replay + staged_inputs + component`整体不依赖旧delivery checkpoint即可解释，但replay/staged已经表示的
 provider-output occurrence不会在Component section重复。raw complete projection始终保存在private
-checkpoint；`max_component_bytes`计量normalized System snapshot加完整ordinary projection和ToolCatalog。
+checkpoint；`max_component_bytes`计量normalized System snapshot、完整ordinary projection、完整
+ephemeral prompts 和ToolCatalog。`component.ephemeral` 为独立有序数组，空时省略，Full 和 Delta
+均携带完整当前值。它不是 retained replay，不包含 tool records，也不参与 canonical outbound commit。
 Delta携带compiler已经lower完成的full/delta ordinary items且不携带System，omit项不出现；node identity和
 diff address保持private。port不得再次对这些section做semantic dedup或System replacement inference。
 `CanonicalInputItemV1`使用canonical transcript的versioned tagged encoding。sealed `AssistantText`沿用
@@ -830,8 +878,9 @@ diff address保持private。port不得再次对这些section做semantic dedup或
 ToolCatalog按name的JCS string comparator升序排列，重复name非法；数组顺序是meter的一部分，port不得
 重排后再解释`canonical_bytes()`。
 
-Component meter包括version、projection/tool字段名、容器和ToolCatalog；Frame meter包括version、三个
-section字段名和全部容器。identity、epoch、revision、prepared-against和basis是fixed-size structured
+Component meter包括version、projection/tool字段名、非空时的ephemeral字段名与数组、容器和ToolCatalog；
+Frame meter包含当前 ephemeral prompts，也包括version、三个section字段名和全部容器。
+identity、epoch、revision、prepared-against和basis是fixed-size structured
 control metadata，不进入semantic payload meter。JCS object key排序，causal/tool arrays保持规定顺序。
 
 Full reserve按exact公式验证。将使用actual CompleteTranscript replay和actual staged inputs的候选Full中
@@ -1182,6 +1231,19 @@ async fn main() -> std::process::ExitCode {
 daemon 内部的 Application owner 持有 ingress、自动 preparation loop、view rendering 和 cleanup。
 session/connection 元数据由 runner 提供，业务 root 不接收 transport props。业务 root 显式声明唯一
 `use_wait_for_command()`，root 与子 Component 在 `view!` 中声明动作。
+默认 stdin 连接在等候输入前立即请求 prepared projection 并交付首个 Full view；空 stdin 的 EOF
+不再追加一次重复观察。`StdinApplication::run_with_options(root, StdinApplicationOptions {
+idle_refresh_interval: Some(Duration::from_secs(1)), })` 可开启正间隔的 idle observation；
+`run(root)` 的默认 options 不轮询。idle observation 通过同一连接和普通 preparation barrier
+读取当前状态，业务 Component 可在 `use_preparation` 载入外部状态。它不调用 Action、不清除 feedback，
+与动作批次串行，并复用 native Frame cursor；无变化的空 Delta 不输出 stdout wrapper。idle refresh
+取消等候输入的 future 时，必须保留已收到的字节和独立的 100 ms framing deadline；不取消执行中的
+动作，不自动重试已提交请求。
+stdin driver 在队列请求到达后才开始 preparation；先保留请求，普通 hooks 完成后再绑定当前 wait
+mount 并 dispatch，避免提前读好状态后在输入 barrier 等待造成一次请求的滞后。批内剩余动作保留
+同一队列项，每个动作重新 preparation，仍不允许其他请求穿插。等待 ingress 时同样响应正常退出及
+Component task panic；shutdown 会明确关闭尚未绑定 mount 的保留请求。通用 `Application::prepare`
+的 hooks / wait 顺序不变。
 
 保留的 SkillPort frontend 与 reaction exchange 分开：
 
@@ -1198,7 +1260,7 @@ ProviderFact，也不隐式开始reaction。只有明确的reaction invocation�
 Plugin message遵守同一reaction-local stale fence；correlation属于adapter protocol，不恢复public core
 `FrameId`。
 
-`Action { name, description, enabled, on_call }` 由 core 像 NativeToolCall 一样在 Component 树遍历时收集，
+`Action { name, description, content, enabled, on_call }` 由 core 像 NativeToolCall 一样在 Component 树遍历时收集，
 并由根 Component 唯一的 `use_wait_for_command()` 显式声明消费边界；子 Component 只声明动作，
 嵌套 wait 在 render 时拒绝。成功 render 的命令绑定进入本轮 `RenderBindings`；
 未采用的节点不登记，失败候选树不发布，重名在等待输入前拒绝。Application 通过
@@ -1210,35 +1272,77 @@ mount。callback 支持同步结果和 async future，创建与 polling 都进�
 preparation 会保留尚未执行的 pending request 和已完成的 outcome；正在执行的 async future 被丢弃，
 下一次准备将其报告为 `Interrupted`，不重放，已发生效果不回滚。显式 preparation 失败清理当前请求。
 `enabled: false` 在调用前返回 `command_disabled` 及当前 view，不执行 callback；其他业务合法性由
-callback 判断。回调返回值直接成为 stdout 结果，框架不解释其中的 bool 或业务成功字段。
+callback 判断。回调返回值进入 action feedback 和程序接口的 result，框架不解释其中的 bool 或业务成功字段。
 
 Action 的 callback 输入结构体以 `Deserialize + JsonSchema` 声明 JSON 解码和可发现的 input schema。
 无参数 callback 直接写 `||`，只接受空 object。stdin envelope 为
 `{"action":"move","input":{"uci":"e2e4"}}`；框架按本轮实际挂载的动作名路由并执行 typed 解码。
 未知动作、错误类型等普通输入错误返回 feedback 和当前 view，不阻止下一次有效动作。callback
 返回错误仍遵循运行时失败规则。业务作者不维护独立 descriptor 常量、parser catalog 或 NoInput 类型。
-保留的 action feedback 对名称、错误码和正文提供有大小上限的展示预览，预算包括 JSON 编码后的
-膨胀；预览保留正文原文，截短有明确标记。`CommandResponse` 仍保留原始调用及完整 outcome。
+action feedback 由普通 Component 通过 `view!` 声明，只在外层设置稳定的 `#[diff(slot = "command_feedback")]`，
+内部字段不做局部 diff。完整快照相等时省略；批次变化时发送完整的新批次，不发送 insert/remove patch。
+同一 native Frame 中的全部动作结果一起保留；成功 handoff 后，下一帧的结果整批替换上一帧，不再按最近 N 条截断。
+render、prepare、提交前取消和提交失败不推进这个边界；观察保留上一批结果。
+保留的 action feedback 完整提供动作名称、错误码和正文；callback 结果保留完整 JSON，拒绝诊断保留
+原文，没有框架字符串或字节截断。`CommandResponse` 同样保留原始调用及完整 outcome。向模型提交时
+仍遵守既有 Component / Frame 和 Provider 的 wire / token 预算；超限必须显式拒绝，不能静默截短。
+
+这里的去重属于 native Frame 的成功交付路径，不等于 Component 只 render 一次。
+普通 Action 按 prompt placement 汇总到稳定的 `action_catalogue`，调用协议只展示一次；`actions` 由
+原生 keyed diff 按 `name` 比较。未变条目省略，删除只发送 action 名称，不重复旧描述、schema 或协议。
+无参数动作以 `input="{}"` 展示；有参数动作保留完整 `input_schema` 与现有 typed 解码。
+可选 `content: XmlNode` 携带结构化选择元数据；空 description 不展示。业务始终声明完整当前动作集合，
+不维护交付标记。native model ToolCatalog 是独立 section，仍完整携带。固定上下文应与动态状态分成
+稳定节点，以免统计变化重发说明。
+feedback 是整批快照，不对 records 使用 keyed 增删 patch；内容相同的不同动作结果仍分别保留。
+无新动作的 Frame 保留最近非空批次且可省略未变交付；成功 handoff 后的第一条新动作才替换旧批次。
 
 `CommandSender::observe()` 通过相同 preparation barrier 请求 prepared projection，不调用业务 callback，
 不增加 action feedback。观察和动作请求都受取消、关闭与队列规则管理。stdout 由前台 adapter 输出
 准备好的 view；stdin 结束只关闭前台输入，daemon 持有的 Application 和业务状态继续存在。
 `CommandSender::feedback()` 通过相同队列将输入诊断保存在根 wait 声明的反馈区域，返回 prepared view；
-观察保留诊断，下一动作清除它。
+诊断错误码和正文完整保留，观察保留诊断，下一动作清除它。
 
 自定义 transport 使用 `StdinApplication::mount(root)` 嵌入 Application owner：内部配置 ingress 和 port，
 持续驱动 `prepare()`，不提交 Provider Frame。必须在 Tokio runtime 内调用且根必须声明 wait。
-`submit` 返回 callback 的完整 JSON result 和渲染后的 view；`observe` 只返回 view；`feedback` 返回
-输入错误及 view。response 的 `ok` 表示 dispatch 是否成功，不解释业务 result。取消 submit waiter
-不取消 driver 中已接纳的动作。已完成 response 先于下一 preparation 的 fault 交付；输入通道关闭时
+`submit_frame(Vec<CommandCall>)` 将整批动作作为一个队列请求接纳，按序执行，批末才渲染并返回最终 view；
+程序接口的 `result` 是按输入顺序排列的 `{action, ok, result}` 数组。普通 typed input、未知动作和
+disabled rejection 各自保留结果并继续后续动作；callback runtime fault 仍按原失败规则处理。
+非空批次开始时明确开启新的 feedback batch，保留整批 outcome；空批次等同 observe，不清除反馈。
+每次 preparation 推进批内一个动作并刷新 callback 绑定，但整批结束前不消费其他队列请求，
+因此其他动作批次或观察不能穿插。`submit` 保持单动作完整 JSON result 和 view 的返回格式，
+作为独立的一项批次；`observe` 只返回 view；`feedback` 返回输入错误及 view。response 的 `ok`
+表示 dispatch 是否全部成功，不解释业务 result。取消 submit 或 submit_frame waiter 不取消 driver
+中已接纳的动作或剩余批次。已完成 response 先于下一 preparation 的 fault 交付；输入通道关闭时
 join driver 仲裁原始 panic。`shutdown()` 在调用时请求退出，其独立 owner 完成 Application cleanup；
 取消或不 poll 返回 waiter 都不取消 cleanup，必须 await 后才能向外确认关闭。
 
-标准 runner 的 CLI 只管理 daemon：`start` 幂等启动或连接并返回当前 view；默认 stdin 动作隐式启动；
+标准 stdin runner 为同一前台进程保留一条 daemon 连接。每条连接拥有独立的 private `FrameSession`，
+对整批执行后的最终 projection 编译一次：首次 Full，后续使用既有 Frame 的 Delta / omission 规则。
+普通 POM、Action schema、System snapshot、`#[diff]`、`repeat` 和 `ephemeral` 都复用同一 compiler，
+不另做文本 diff。未变 context/schema 可省略，状态更新及该批全部 feedback 仍交付；stdout 每批只有
+一个 `<view>`，不额外输出直接 action_result。公开 `StdinApplication::mount` 的方法继续返回完整
+快照，`StdinResponse.result` 仍供程序接口使用。
+baseline 在该连接响应写入成功后才 commit；写入失败关闭连接，不重放已接纳的业务动作。
+新的前台进程拥有自己的完整初始交付，多个 reader 共享业务状态但不共享已读基线。
+stdout 的 System 内容是数据，不具有 provider 的 role authority。System 快照用
+`<system_snapshot>` 显式替换，移除时输出 `<system_snapshot />`；System 变化可触发
+编译器 Full 及其历史 replay。`ephemeral` 只控制该连接编译器自身的历史留存，不能清理
+外部 agent 的工具调用历史。stdin 挂载的交互动作使用 `Action`，不支持 provider 原生工具。
+具体 authoring 示例、输入输出和能力边界见 [command feedback delivery](command-feedback-delivery.md)。
+
+标准 runner 的 CLI 提供 daemon 管理和本地 history 读取：`start` 幂等启动或连接并返回当前 view；默认 stdin 动作隐式启动；
 `status` 返回运行中的 view 或 stopped 状态，不启动 daemon；`stop` 在 Application 清理和 socket
 释放之后返回最终 view 及停止确认；`restart` 返回新会话 view；`help` 描述使用方式。无输入也能观察
-当前 view。按行输入使一条无效 JSON 的反馈可以在下一条有效动作前送达，批次不会因普通输入错误中止。
-stdout 的动作响应包含直接 callback result 和完整 view，并在读取下一动作前 flush。默认 socket 为
+当前 view；默认 stdin 连接会在输入前立即交付。stdin 接受多个顶层 action JSON object，允许 object 跨行，不要求 EOA 或 `actions` 外层。
+长连接批次必须以换行（`\n`）结束。每次收到新字节重置 100 ms idle interval；输入空闲 100 ms、
+buffer 以换行结束时，将它作为一帧提交并继续读取；分帧不检查 JSON 是否完整有效。
+换行本身不立即提交；没有末尾换行时，完整 JSON 也继续缓存。EOF 无须换行，立即提交尾帧；
+空 buffer 不产生帧。确定换行加空闲或 EOF 边界后，才解析整帧 JSON 和 envelope；不完整 JSON、
+JSON 语法错误或 envelope 错误使该帧全部拒绝，返回输入反馈并清空 buffer，后续输入开始新帧。
+同帧的完整前缀也不能提前执行。
+包络解析全部成功后才进入动作执行，普通 typed/unknown/disabled rejection 不阻止批内后续动作。
+每帧 stdout 只有一个 view 并在输出后 flush；同一连接后续 view 可以只包含变化内容。默认 socket 为
 `$XDG_RUNTIME_DIR/agentview-<executable-name>/socket`，回退到
 `$HOME/.cache/agentview-<executable-name>/socket`；`--socket PATH` 覆盖该位置并选择独立会话。
 chess_cli 的目录名为 `agentview-chess_cli`。关闭前台 stdin 不终止 daemon。runner 只有在 Application
@@ -1246,8 +1350,37 @@ cleanup 完成并释放 socket 后才确认 stop；已提交但响应失败的�
 生命周期请求与动作串行处理；尚未结束的 async action 会阻塞后续 stop/restart，可能使其 transport
 超时而 daemon 仍然运行。当前 runner 不提供越过动作队列的取消通道。
 
+标准 runner 自动为每次前台 stdin interaction 和 `start` / `status` / `stop` / `restart`
+调用创建唯一的本地 run ID。记录属于前台调用，不属于 daemon 或某个业务会话；不同 socket 的调用
+可以保存在同一 binary 的 history root，`session.json` 记录该次调用的 executable、socket、invocation、
+进程、起止时间和退出状态。默认位置为 `$XDG_STATE_HOME/agentview-<executable-name>/history`，
+未设置时回退到 `$HOME/.local/state/agentview-<executable-name>/history`；每个 run 独占子目录。
+`stdin.raw`、`stdout.raw`、`stderr.raw` 保存该次前台实际读取或交付的原始字节；`events.jsonl`
+记录有序事件、绝对时间、相对耗时，以及各段字节的 stream、offset 和 length。事件顺序表达 runner
+观察到的 I/O 顺序，不恢复调用者 write 边界或业务事务边界。POM 在记录层保持不透明，不反向解析。
+
+`history` 列出最近 20 次 run；`history latest` 或 `history ID` 按事件顺序显示指定 run 的
+stdio。读取只访问本地文件，不连接或启动 daemon，不 dispatch 动作，不重放副作用，也不创建记录。
+`help` 和内部 daemon 同样不产生前台记录。生命周期调用各有自己的 ID，停止后查看交互应使用
+interaction ID，不能假定 `latest` 仍指向该交互。缺少完成记录表示 run 尚未结束或被中断，不能据此
+推断动作失败。stdio history 独立于 canonical history、FrameSession baseline 和业务持久化；
+它保留当时交付的 Full / Delta 字节，不提供会话恢复或动作重试。
+
+调用者先读取初始 view，再一次写入完整预期批次及末尾换行，等待该批反馈的 view 后再写下一批。
+开启 idle refresh 时，外部状态变化也可无输入地主动交付 view；观察保留既有反馈，新的 action batch
+反馈标识该批次的响应。Application 看不到调用方的
+write 边界；两次写入若未等回包且间隔小于 100 ms，可能合成一帧。在任何换行后停顿超过 100 ms，
+仍可能拆开原本预期的批次，包括多行 object 内部。100 ms 只用于输入分帧，不限制动作执行时间。
+框架不对 stdin 输入、socket 请求或响应另设固定字节上限，也不截断 action 输入、结果或 view。
+连接空闲等待下一请求首字节没有 10 秒限制；首字节开始后的请求读取、请求发送及响应传输
+各有 10 秒 I/O deadline。前台等待应用排队和 async callback
+完成、直到收到响应首字节，使用独立的 5 分钟 deadline。响应开始后仍须在 10 秒内完整传输。
+前台等待超时或被用户中断不会取消、回滚或重放已接纳的动作；重试前应先检查应用当前状态。
+
 这些通用行为实现在 `src/component/execution/stdin.rs` 及其 `stdin/cli.rs`、`stdin/daemon.rs` 模块；
 `examples/chess_cli/main.rs` 只调用 runner，`app.rs` 与 `game.rs` 保留业务声明和棋局逻辑。
+增量交付前的原始输入输出和 native Frame captures 保留在
+[command feedback current captures](examples/command-feedback/current/README.md)。
 
 保留的 `CliCommand { command, enabled, on_call }` 仍支持选择业务 subcommand 的 adapter。
 `Command::definition()` 导出同一 typed descriptor 的 CLI 元数据与输入校验；`CommandParser` 根据
@@ -1406,6 +1539,11 @@ user panic不分类为fault。清理完成是终止
 条件的一部分；fact stream、handler future和reaction-owned lanes不能遗留到下一轮。Component-scoped
 long-lived tasks属于mount，正常reaction结束不取消；unmount或Application teardown时必须cancel并await。
 
+`Admission(Budget)` 会中断本轮剩余工具执行，并使用上述取消清理保留已完成的结果、
+为已接纳但未完成的调用补齐 unknown-outcome 回执。host 必须先交付这些回执才能 reset context；
+已经执行的工具不得重放。此规则不适用于 unsupported call、binding fault 或 lane returned fault，
+这些错误仍按第 9 节阻断后续 Frame。
+
 每个持有Application的production integration必须提供consuming async shutdown；普通Rust `Drop`只允许作为
 emergency best-effort abort，不能证明cleanup完成。External shutdown在API调用时立即把唯一owner移入专用cleanup
 task：先cancel并join active reaction、取回Application，再fence mounts并abort + await全部Component tasks。
@@ -1431,6 +1569,23 @@ Observer观察与Engine相同的因果顺序，但不拥有或修改state。至�
 
 Fact不得先被Observer或Component看见、之后才commit canonical history。Provider的
 `response.completed`只表示adapter terminal frame已经校验，不能记录成整个history或reaction commit。
+
+Native Responses 的 `with_observer` 观察精确、有界的请求和响应 body，不包含认证 headers。
+本地编码或预算拒绝在 handoff 前产生 `RequestPreparationFailed`，附带无 payload 的分类、
+可取得的真实 wire bytes 与估算 token 数、配置窗口/预算、Full/Delta basis、压缩基础和状态。
+没有形成完整 body 时计量字段为 `None`，不能以猜测替代；诊断持久化失败仍返回原始准备拒绝，
+同时关闭该 provider session。请求连接失败的 `TransportDiagnostic` 只提供 phase、
+`is_connect`、`is_timeout` 和 elapsed milliseconds，不携带 URL 或底层错误字符串。
+
+`with_compaction_observer` 为既有摘要 worker 单独记录请求、响应与错误，避免与前台调用身份混淆。
+worker 必须完成配置的审计回执后才能发布 Ready；回执错误使候选以 `Observation` 失败，
+保留前台既有上下文。callback panic 仍按 worker panic 的取回规则原样传播。此选项不改变摘要
+选源、验证、安装或 reset/shutdown 所有权。
+
+`with_parallel_tool_calls(bool)` 控制 foreground Responses 的多调用请求选项，默认 false，
+不绕过 Application 的工具准入。`set_prompt_cache_comparison_response_id` 为后续 foreground
+请求设置可选 cache comparison hint，`None` 移除；hint 与多调用选项都进入同一最终 wire body
+和预算检查。摘要请求不继承前台 comparison hint。这些选项不改变 canonical history 或 continuation。
 
 ## 12. 必须保持的不变量
 
@@ -1497,6 +1652,12 @@ Fact不得先被Observer或Component看见、之后才commit canonical history�
     factory/future必须tolerate repeated/partial execution和cancellation。direct factory/future panic原样unwind。
     普通preparation error为`Preparation` stage/reason，持续remount graph为terminal
     `PreparationGraphUnstable`，legacy host遇到declaration为`ComponentPreparationsUnsupported`。
+33. `ephemeral` 必须显式搭配 `repeat`。每个提交的 Frame 都在 replay、staged inputs 和 ordinary
+    projection 之后发送完整当前 ephemeral prompts，保持其 projection traversal 相对顺序；原始
+    prompt 不进入 canonical history、provider retained context、continuation baseline 或 compaction。
+    它们的消失不发送删除 POM，模型输出和工具事实保持正常保留，legacy execution 明确拒绝。
+34. POM 不是 XML；渲染数据不做 XML 转义，渲染结果不得由代码反向解析。代码消费结构化数据，
+    unit test 验证结构、状态与行为，不验证 prompt 渲染。
 
 ## 13. 非目标
 

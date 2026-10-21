@@ -46,8 +46,10 @@ enum Placement {
     SystemOnce,
     Developer,
     DeveloperRepeat,
+    DeveloperEphemeralRepeat,
     User,
     UserRepeat,
+    UserEphemeralRepeat,
     Assistant,
 }
 
@@ -212,6 +214,12 @@ impl ViewNode {
                     #node,
                 )
             },
+            Some(Placement::DeveloperEphemeralRepeat) => quote! {
+                ::agentview::component::authoring::__private::placed(
+                    ::agentview::component::authoring::__private::Placement::DeveloperEphemeralRepeat,
+                    #node,
+                )
+            },
             Some(Placement::User) => quote! {
                 ::agentview::component::authoring::__private::placed(
                     ::agentview::component::authoring::__private::Placement::User,
@@ -221,6 +229,12 @@ impl ViewNode {
             Some(Placement::UserRepeat) => quote! {
                 ::agentview::component::authoring::__private::placed(
                     ::agentview::component::authoring::__private::Placement::UserRepeat,
+                    #node,
+                )
+            },
+            Some(Placement::UserEphemeralRepeat) => quote! {
+                ::agentview::component::authoring::__private::placed(
+                    ::agentview::component::authoring::__private::Placement::UserEphemeralRepeat,
                     #node,
                 )
             },
@@ -278,7 +292,7 @@ impl ComponentProps {
             for (name, _) in &properties {
                 if !matches!(
                     identifier_text(name).as_str(),
-                    "name" | "description" | "enabled" | "on_call"
+                    "name" | "description" | "content" | "enabled" | "on_call"
                 ) {
                     return Err(syn::Error::new_spanned(name, "unknown Action prop"));
                 }
@@ -353,12 +367,14 @@ impl ComponentProps {
             let name = take_property(&mut properties, "name").expect("required name");
             let description = take_property(&mut properties, "description")
                 .map(|value| quote! { .description(#value) });
+            let content =
+                take_property(&mut properties, "content").map(|value| quote! { .content(#value) });
             let enabled =
                 take_property(&mut properties, "enabled").map(|value| quote! { .enabled(#value) });
             let on_call = take_property(&mut properties, "on_call").expect("required on_call");
             return quote! {
                 ::agentview::component::authoring::__private::dynamic_root(
-                    #path::props().name(#name) #description #enabled .on_call(#on_call).build()
+                    #path::props().name(#name) #description #content #enabled .on_call(#on_call).build()
                 )
             };
         }
@@ -712,16 +728,18 @@ fn parse_directives(attributes: Vec<Attribute>) -> Result<ViewDirectives> {
         let placement = if attribute.path().is_ident("system_once") {
             Some(parse_plain_placement(&attribute, Placement::SystemOnce)?)
         } else if attribute.path().is_ident("developer") {
-            Some(parse_repeat_placement(
+            Some(parse_prompt_placement(
                 &attribute,
                 Placement::Developer,
                 Placement::DeveloperRepeat,
+                Placement::DeveloperEphemeralRepeat,
             )?)
         } else if attribute.path().is_ident("user") {
-            Some(parse_repeat_placement(
+            Some(parse_prompt_placement(
                 &attribute,
                 Placement::User,
                 Placement::UserRepeat,
+                Placement::UserEphemeralRepeat,
             )?)
         } else if attribute.path().is_ident("assistant") {
             Some(parse_plain_placement(&attribute, Placement::Assistant)?)
@@ -771,7 +789,7 @@ fn parse_directives(attributes: Vec<Attribute>) -> Result<ViewDirectives> {
 
         return Err(syn::Error::new_spanned(
             attribute,
-            "view roots support #[system_once], #[developer], #[developer(repeat)], #[user], #[user(repeat)], #[assistant], and #[diff(slot = \"...\")]",
+            "view roots support #[system_once], #[developer], #[developer(repeat)], #[developer(ephemeral, repeat)], #[user], #[user(repeat)], #[user(ephemeral, repeat)], #[assistant], and #[diff(slot = \"...\")]",
         ));
     }
     Ok(directives)
@@ -788,10 +806,11 @@ fn parse_plain_placement(attribute: &Attribute, placement: Placement) -> Result<
     }
 }
 
-fn parse_repeat_placement(
+fn parse_prompt_placement(
     attribute: &Attribute,
     ordinary: Placement,
     repeat: Placement,
+    ephemeral_repeat: Placement,
 ) -> Result<Placement> {
     if matches!(&attribute.meta, Meta::Path(_)) {
         return Ok(ordinary);
@@ -799,30 +818,47 @@ fn parse_repeat_placement(
     if !matches!(&attribute.meta, Meta::List(_)) {
         return Err(syn::Error::new_spanned(
             attribute,
-            "placement accepts only the `repeat` argument",
+            "placement accepts only the `repeat` and `ephemeral` arguments",
         ));
     }
 
     let mut repeat_seen = false;
+    let mut ephemeral_seen = false;
     attribute.parse_nested_meta(|meta| {
-        if !meta.path.is_ident("repeat") {
-            return Err(meta.error("placement accepts only the `repeat` argument"));
-        }
+        let (name, seen) = if meta.path.is_ident("repeat") {
+            ("repeat", &mut repeat_seen)
+        } else if meta.path.is_ident("ephemeral") {
+            ("ephemeral", &mut ephemeral_seen)
+        } else {
+            return Err(meta.error("placement accepts only the `repeat` and `ephemeral` arguments"));
+        };
         if meta.input.peek(syn::Token![=]) || meta.input.peek(syn::token::Paren) {
-            return Err(meta.error("the `repeat` placement argument does not accept a value"));
+            return Err(meta.error(format!(
+                "the `{name}` placement argument does not accept a value"
+            )));
         }
-        if std::mem::replace(&mut repeat_seen, true) {
-            return Err(meta.error("the `repeat` placement argument may occur only once"));
+        if std::mem::replace(seen, true) {
+            return Err(meta.error(format!(
+                "the `{name}` placement argument may occur only once"
+            )));
         }
         Ok(())
     })?;
     if !repeat_seen {
         return Err(syn::Error::new_spanned(
             attribute,
-            "placement requires the `repeat` argument",
+            if ephemeral_seen {
+                "the `ephemeral` placement argument requires `repeat`"
+            } else {
+                "placement requires the `repeat` argument"
+            },
         ));
     }
-    Ok(repeat)
+    Ok(if ephemeral_seen {
+        ephemeral_repeat
+    } else {
+        repeat
+    })
 }
 
 struct XmlElement {
@@ -1230,7 +1266,7 @@ mod tests {
                 "generic view root paths are supported only for XmlStreamingToolCall",
             ),
         ] {
-            let error = expansion(input).err().expect("invalid CLI declaration");
+            let error = expansion(input).expect_err("invalid CLI declaration");
             assert_eq!(error.to_string(), message);
         }
     }
@@ -1272,7 +1308,7 @@ mod tests {
                 "duplicate Component prop",
             ),
         ] {
-            let error = expansion(input).err().expect("invalid action declaration");
+            let error = expansion(input).expect_err("invalid action declaration");
             assert_eq!(error.to_string(), message);
         }
     }
@@ -1376,9 +1412,7 @@ mod tests {
                 "#[diff] can only annotate a POM root",
             ),
         ] {
-            let error = expansion(input)
-                .err()
-                .expect("invalid component declaration");
+            let error = expansion(input).expect_err("invalid component declaration");
             assert_eq!(error.to_string(), message);
         }
     }
@@ -1407,9 +1441,7 @@ mod tests {
                 "#[diff] can only annotate a POM root",
             ),
         ] {
-            let error = expansion(input)
-                .err()
-                .expect("invalid XML callback declaration");
+            let error = expansion(input).expect_err("invalid XML callback declaration");
             assert_eq!(error.to_string(), message);
         }
         for handler in [
@@ -1457,9 +1489,7 @@ mod tests {
                 "choose exactly one of `live_with` and `without_live`",
             ),
         ] {
-            let error = expansion(input)
-                .err()
-                .expect("incomplete streaming declaration");
+            let error = expansion(input).expect_err("incomplete streaming declaration");
             assert!(error.to_string().starts_with(message), "{error}");
         }
     }

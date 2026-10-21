@@ -18,10 +18,10 @@ use crate::{
                 ExternalObservationKind,
             },
             reaction::{FrameBasis, ReactionPort},
-            RenderedProjection,
         },
         prelude::*,
     },
+    test_support::{element_text, frame_items, projection_items},
     transcript::CanonicalInputItem,
 };
 
@@ -235,7 +235,10 @@ async fn skill_latest_and_typed_subcommand_do_not_render_or_submit() {
     let initial = application.current_projection();
     let revision = initial.revision();
     assert!(!initial.is_dirty());
-    assert!(rendered_text(initial.projection()).contains("initial"));
+    assert_eq!(
+        element_text(projection_items(initial.projection()), "skill_state"),
+        ["initial"]
+    );
     assert!(control.next_observation().now_or_never().is_none());
 
     run_typed_skill_subcommand(&signal, "updated");
@@ -243,12 +246,17 @@ async fn skill_latest_and_typed_subcommand_do_not_render_or_submit() {
     let stale = application.current_projection();
     assert_eq!(stale.revision(), revision);
     assert!(stale.is_dirty());
-    assert!(rendered_text(stale.projection()).contains("initial"));
-    assert!(!rendered_text(stale.projection()).contains("updated"));
+    assert_eq!(
+        element_text(projection_items(stale.projection()), "skill_state"),
+        ["initial"]
+    );
     assert!(control.next_observation().now_or_never().is_none());
 
     let observation = drive_skill(&mut application, &control).await;
-    assert!(observation.content().contains("updated"));
+    assert_eq!(
+        element_text(frame_items(observation.frame()), "skill_state"),
+        ["updated"]
+    );
     assert!(!application.current_projection().is_dirty());
     application.shutdown().await.unwrap();
 }
@@ -304,7 +312,9 @@ async fn plugin_registry_owns_one_session_per_parent_and_fences_late_messages() 
         drive_plugin(&mut parent.application, &parent.control, None).await
     };
     assert!(matches!(second_a.frame().basis(), FrameBasis::DeltaFrom(_)));
-    assert!(second_a.content().contains("from-parent-a"));
+    assert!(frame_items(second_a.frame()).any(|item| matches!(item,
+        CanonicalInputItem::AssistantText { text, .. } if text == "from-parent-a"
+    )));
     assert_eq!(second_a.frame().target(), first_a.frame().target());
     assert_eq!(registry.len(), 2);
     assert!(registry
@@ -318,20 +328,4 @@ async fn plugin_registry_owns_one_session_per_parent_and_fences_late_messages() 
     for parent in registry.into_values() {
         parent.application.shutdown().await.unwrap();
     }
-}
-
-fn rendered_text(projection: &RenderedProjection) -> String {
-    projection
-        .nodes()
-        .iter()
-        .flat_map(|node| node.items())
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => {
-                Some(crate::pom_renderer::render_pom_document(pom).unwrap())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }

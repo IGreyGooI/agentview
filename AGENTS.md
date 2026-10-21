@@ -3,6 +3,12 @@
 Read [HELP.md](HELP.md) before authoring or reviewing Components.
 [docs/engine.md](docs/engine.md) is the authoritative runtime contract.
 
+POM is not XML. Its rendered prompt is a view for the LLM, not a machine-readable
+serialization format. Do not XML-escape its data or parse rendered prompts in
+application code or tests. Code must consume typed POM, projections, and structured
+protocol data directly. Unit tests must verify those structures, state transitions,
+and behavior, not prompt rendering, exact prompt strings, or prompt snapshots.
+
 AgentView builds a user interface for the LLM. Interactivity is a primary design
 requirement: the model observes, acts, sees the result, and can act again.
 

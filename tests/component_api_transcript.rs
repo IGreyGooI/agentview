@@ -1,6 +1,5 @@
 use agentview::{
     pom::{Document, ResolvedDocument},
-    pom_renderer::render_pom_document,
     pom_resolution::resolve_artifact_document,
     transcript::{
         AssistantPhase, AssistantTextStatus, CanonicalInputItem, CanonicalTranscript,
@@ -52,7 +51,7 @@ fn canonical_transcript_is_immutable_ordered_pom_history() {
     let CanonicalInputItem::Message { pom, .. } = &restored.items()[1] else {
         panic!("the second item must remain a canonical message");
     };
-    assert_eq!(render_pom_document(pom).unwrap(), "Choose one move.");
+    assert_eq!(pom, &paragraph("Choose one move."));
 }
 
 #[test]

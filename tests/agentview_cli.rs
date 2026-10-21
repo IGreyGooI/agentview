@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom;
+use pom::InspectPom;
+
 use std::{
     collections::HashSet,
     io::{BufRead, Read, Write},
@@ -1437,10 +1441,12 @@ fn protocol_text_preserves_json_legal_characters_without_xml_validation() {
             });
         let document: agentview::pom::ResolvedDocument =
             serde_json::from_value(state["payload"]["pom"].clone()).unwrap();
-        let rendered = agentview::pom_renderer::render_pom_document(&document).unwrap();
         assert!(
-            rendered.contains("delta:\0<&> `*_[]#`\r\n"),
-            "rendered state: {rendered:?}; observation: {observation:#}"
+            document.has_field(
+                "external_state",
+                "delta:\0<&> `*_[]#`\r\n | complete:\0<&> `*_[]#`\r\n",
+            ),
+            "state: {document:?}; observation: {observation:#}"
         );
     }
 }

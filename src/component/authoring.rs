@@ -9,6 +9,7 @@ mod async_task;
 mod attempt;
 mod capture;
 mod cli_command;
+pub(crate) mod command_feedback;
 mod declaration;
 mod event_input;
 mod event_listener;

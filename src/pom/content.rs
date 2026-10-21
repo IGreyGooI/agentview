@@ -243,6 +243,8 @@ impl MixedContent {
         Self(ContentEdge::Diff(slot))
     }
 
+    // Both variants carry owned content; the slot is an alternative, not an error.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn into_node_or_slot(self) -> Result<ContentNode, DiffSlot> {
         match self.0 {
             ContentEdge::Node(node) => Ok(node),

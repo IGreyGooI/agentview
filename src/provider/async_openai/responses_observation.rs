@@ -13,6 +13,87 @@ use crate::component::execution::reaction::{
     ReactionPortFaultReason,
 };
 
+use super::parallel_compaction::ParallelCompactionStatus;
+
+/// Payload-free preparation classification. Optional measurements are absent
+/// when encoding stopped before an exact complete wire body existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiResponsesRequestPreparationReason {
+    ContextWindowLimit,
+    SerializedRequestBodyLimit,
+    MissingContextWindow,
+    InvalidFrameState,
+    Encoding,
+    RequestBuild,
+}
+
+impl OpenAiResponsesRequestPreparationReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextWindowLimit => "context_window_limit",
+            Self::SerializedRequestBodyLimit => "serialized_request_body_limit",
+            Self::MissingContextWindow => "missing_context_window",
+            Self::InvalidFrameState => "invalid_frame_state",
+            Self::Encoding => "encoding",
+            Self::RequestBuild => "request_build",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiResponsesFrameBasis {
+    Full,
+    Delta,
+}
+
+impl OpenAiResponsesFrameBasis {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Delta => "delta",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenAiResponsesRequestPreparationDiagnostic {
+    pub reason: OpenAiResponsesRequestPreparationReason,
+    pub request_body_bytes: Option<usize>,
+    pub estimated_input_tokens: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub reserved_output_tokens: u64,
+    pub serialized_request_body_limit_bytes: usize,
+    pub frame_basis: OpenAiResponsesFrameBasis,
+    pub compacted_base_used: bool,
+    pub compaction: ParallelCompactionStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiResponsesTransportPhase {
+    Request,
+}
+
+/// Structured reqwest facts. Never includes URLs, headers, source errors, or
+/// provider/body text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenAiResponsesTransportDiagnostic {
+    pub phase: OpenAiResponsesTransportPhase,
+    pub is_connect: bool,
+    pub is_timeout: bool,
+    pub elapsed_ms: u64,
+}
+
+impl OpenAiResponsesTransportDiagnostic {
+    pub(super) fn request(error: &reqwest::Error, started: std::time::Instant) -> Self {
+        Self {
+            phase: OpenAiResponsesTransportPhase::Request,
+            is_connect: error.is_connect(),
+            is_timeout: error.is_timeout(),
+            elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        }
+    }
+}
+
 /// Bounded HTTP bodies without credentials or response headers.
 #[derive(Debug, Clone)]
 pub enum OpenAiResponsesObservation {
@@ -23,12 +104,20 @@ pub enum OpenAiResponsesObservation {
     Response {
         status: u16,
         body: Vec<u8>,
-        /// True only after a validated response.completed event. Otherwise
-        /// body contains the bytes captured before the provider failure.
+        /// True only after a validated completed response (the native
+        /// foreground path requires response.completed). Otherwise body
+        /// contains the bounded bytes captured before the provider failure.
         completed: bool,
     },
     Error {
         fault: ReactionPortFault,
+    },
+    RequestPreparationFailed {
+        fault: ReactionPortFault,
+        diagnostic: OpenAiResponsesRequestPreparationDiagnostic,
+    },
+    TransportDiagnostic {
+        diagnostic: OpenAiResponsesTransportDiagnostic,
     },
 }
 
@@ -40,7 +129,9 @@ pub struct OpenAiResponsesObservationError;
 pub trait OpenAiResponsesObserver: Send + Sync {
     /// A failed observation closes this provider session. Final response
     /// observation precedes ReactionCompleted; earlier output facts keep their
-    /// ordinary Responses ordering and are not gated by this callback.
+    /// ordinary Responses ordering and are not gated by this callback. A failed
+    /// preparation receipt retains its primary local rejection. Summary worker
+    /// receipt failure invalidates only that speculative candidate.
     async fn observe(
         &self,
         event: OpenAiResponsesObservation,

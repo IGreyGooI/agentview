@@ -28,7 +28,7 @@ use agentview::{
         prelude::*,
         ComponentHost,
     },
-    pom::{Document, ResolvedDocument, TextNode, XmlNode},
+    pom::{Document, ResolvedDocument},
     pom_resolution::resolve_artifact_document,
     provider::{
         async_openai::{
@@ -55,7 +55,7 @@ use tracing::instrument::WithSubscriber;
 const BINDING: &str = "responses-provider-test-binding";
 const LOOPBACK_PROXY_CHILD_ENV: &str = "AGENTVIEW_LOOPBACK_PROXY_TEST_CHILD";
 const AMBIENT_HEADERS_CHILD_ENV: &str = "AGENTVIEW_RESPONSES_AMBIENT_HEADERS_TEST_CHILD";
-const SAMPLE_CODEX_ORACLE_BODY: &[u8] = br#"{"model":"gpt-5.6-codex","instructions":"<sample_policy>Follow the response protocol.</sample_policy>","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"<sample_request>\nReturn one result.\nturn_id: turn-1\n</sample_request>"}]}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"store":false,"stream":true,"include":["reasoning.encrypted_content"]}"#;
+const SAMPLE_CODEX_ORACLE_BODY: &[u8] = br#"{"model":"gpt-5.6-codex","instructions":"Follow the response protocol.","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Return one result.\nturn_id: turn-1"}]}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"store":false,"stream":true,"include":["reasoning.encrypted_content"]}"#;
 
 #[test]
 fn serialized_responses_request_body_limit_must_be_nonzero() {
@@ -101,7 +101,7 @@ fn diff_prompt_application(
     let value = props.value;
     view! {
         #[diff(slot = "state")]
-        current_state { "{value}" }
+        { value }
     }
 }
 
@@ -127,7 +127,7 @@ fn native_tool_lifecycle_application(
 ) -> Component {
     let projection = props.projection;
     view! {
-        lifecycle_projection { "{projection}" }
+        { projection }
         {
             NativeToolCall::named("lifecycle_lookup")
                 .on_call(|call| async move {
@@ -2935,24 +2935,16 @@ fn sample_projection(task: &str, turn_id: &str) -> RenderedProjection {
 }
 
 fn sample_projection_with_policy(rules: &str, task: &str, turn_id: &str) -> RenderedProjection {
-    fn xml_document(name: &str, text: &str) -> ResolvedDocument {
-        let node = XmlNode::try_build(name, |children| {
-            children.text(TextNode::new(text));
-            Ok(())
-        })
-        .expect("provider test XML is valid");
-        resolve_artifact_document(Document::from_xml(node))
+    fn raw_document(text: &str) -> ResolvedDocument {
+        resolve_artifact_document(Document::from_raw_text(text.to_owned()))
             .expect("provider test projection resolves")
     }
 
     root_projection(vec![
-        CanonicalInputItem::instruction(
-            InstructionAuthority::System,
-            xml_document("sample_policy", rules),
-        ),
+        CanonicalInputItem::instruction(InstructionAuthority::System, raw_document(rules)),
         CanonicalInputItem::message(
             ConversationRole::User,
-            xml_document("sample_request", &format!("{task}\nturn_id: {turn_id}")),
+            raw_document(&format!("{task}\nturn_id: {turn_id}")),
         ),
     ])
 }
@@ -3596,10 +3588,7 @@ async fn wire_bytes_match_the_domain_neutral_oracle() {
     let body: serde_json::Value = serde_json::from_slice(&wire_body).unwrap();
     assert_eq!(body["model"], "gpt-5.6-codex");
     assert_eq!(body["parallel_tool_calls"], false);
-    assert!(body["instructions"]
-        .as_str()
-        .unwrap()
-        .contains("<sample_policy>Follow the response protocol.</sample_policy>"));
+    assert_eq!(body["instructions"], "Follow the response protocol.");
     assert!(body["input"].is_array());
     assert!(body.get("history").is_none());
     assert!(body.get("candidate").is_none());
@@ -6046,10 +6035,7 @@ async fn diff_marked_component_state_is_lowered_against_the_accepted_responses_b
         .await
         .expect("first diff projection succeeds");
     let first: serde_json::Value = serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
-    assert_eq!(
-        first["input"][0]["content"][0]["text"],
-        "<current_state>A</current_state>"
-    );
+    assert_eq!(first["input"][0]["content"][0]["text"], "A");
 
     execute_provider(&mut provider, diff_projection("A+"))
         .await
@@ -6058,7 +6044,7 @@ async fn diff_marked_component_state_is_lowered_against_the_accepted_responses_b
     let submitted = second["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert_eq!(submitted, "<current_state>A+</current_state>");
+    assert_eq!(submitted, "A+");
 
     execute_provider(&mut provider, diff_projection("A"))
         .await
@@ -6067,7 +6053,7 @@ async fn diff_marked_component_state_is_lowered_against_the_accepted_responses_b
     let submitted = third["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert_eq!(submitted, "<current_state>A</current_state>");
+    assert_eq!(submitted, "A");
 
     execute_provider(&mut provider, diff_projection("A+"))
         .await
@@ -6076,7 +6062,7 @@ async fn diff_marked_component_state_is_lowered_against_the_accepted_responses_b
     let submitted = fourth["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert_eq!(submitted, "<current_state>A+</current_state>");
+    assert_eq!(submitted, "A+");
     assert_eq!(attempts.load(Ordering::SeqCst), 4);
 
     shutdown.send(()).unwrap();
@@ -6115,10 +6101,7 @@ async fn faulted_atomic_diff_submission_is_retained_and_scope_change_resends_ful
     assert!(retry_input[3]
         .to_string()
         .contains("<result value=\\\"alpha\\\" />"));
-    assert_eq!(
-        retry_input.last().unwrap()["content"][0]["text"],
-        "<current_state>B</current_state>"
-    );
+    assert_eq!(retry_input.last().unwrap()["content"][0]["text"], "B");
 
     shutdown.send(()).unwrap();
     server.await.unwrap();

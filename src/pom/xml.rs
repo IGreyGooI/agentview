@@ -161,6 +161,8 @@ impl<'de> serde::Deserialize<'de> for XmlAttributes {
 pub(crate) struct XmlMetadata {
     collection_kind: Option<IntrinsicCollectionKind>,
     identity: Option<Box<ContentNode>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    removal_identity: Option<Box<XmlNode>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -266,5 +268,15 @@ impl XmlNode {
 
     pub(crate) fn set_identity(&mut self, identity: Option<ContentNode>) {
         self.metadata.identity = identity.map(Box::new);
+    }
+
+    /// Framework-owned roots may have a sufficient structural identity for a
+    /// removal without repeating all the content they invalidate.
+    pub(crate) fn set_removal_identity(&mut self, identity: XmlNode) {
+        self.metadata.removal_identity = Some(Box::new(identity));
+    }
+
+    pub(crate) fn removal_identity(&self) -> Option<&XmlNode> {
+        self.metadata.removal_identity.as_deref()
     }
 }

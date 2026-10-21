@@ -1,0 +1,13 @@
+<view ok="true">
+<notebook_state>
+  <count>2</count>
+  <latest>second interactive note</latest>
+</notebook_state>
+
+<command_feedback>
+  <sequence>3</sequence>
+  <records>
+    <command_result sequence="3" command="record" status="completed">{"count":2,"latest":"second interactive note"}</command_result>
+  </records>
+</command_feedback>
+</view>

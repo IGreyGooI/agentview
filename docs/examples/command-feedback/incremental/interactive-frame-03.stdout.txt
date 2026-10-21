@@ -1,0 +1,8 @@
+<view ok="true">
+<command_feedback>
+  <sequence>4</sequence>
+  <records>
+    <command_result sequence="4" command="inspect" status="completed">{"count":2,"latest":"second interactive note"}</command_result>
+  </records>
+</command_feedback>
+</view>

@@ -1,0 +1,117 @@
+{
+  "stdin": {
+    "input_bytes": 173,
+    "stdout_bytes": 8739,
+    "stderr_bytes": 0,
+    "exit_code": 2,
+    "response_count": 4,
+    "responses": [
+      {
+        "response": 1,
+        "bytes": 2171,
+        "ok": true,
+        "direct_action_results": 1,
+        "feedback_records": 1,
+        "input_schemas": 2,
+        "static_context_roots": 1
+      },
+      {
+        "response": 2,
+        "bytes": 2172,
+        "ok": true,
+        "direct_action_results": 1,
+        "feedback_records": 1,
+        "input_schemas": 2,
+        "static_context_roots": 1
+      },
+      {
+        "response": 3,
+        "bytes": 2224,
+        "ok": false,
+        "direct_action_results": 1,
+        "feedback_records": 1,
+        "input_schemas": 2,
+        "static_context_roots": 1
+      },
+      {
+        "response": 4,
+        "bytes": 2172,
+        "ok": true,
+        "direct_action_results": 1,
+        "feedback_records": 1,
+        "input_schemas": 2,
+        "static_context_roots": 1
+      }
+    ]
+  },
+  "status": {
+    "exit_code": 0,
+    "stdout_bytes": 2077
+  },
+  "stop": {
+    "exit_code": 0,
+    "stdout_bytes": 2047
+  },
+  "native": {
+    "delivery_scope": "One mounted Application and one DebugProviderPort; no model I/O or shared reader cursor.",
+    "frames": [
+      {
+        "basis": "full",
+        "feedback_patch_operations": 0,
+        "feedback_records": 2,
+        "frame": 1,
+        "frame_bytes": 4231,
+        "projection_items": 4,
+        "roots": [
+          "notebook_context",
+          "notebook_state",
+          "actions",
+          "actions",
+          "command_feedback"
+        ],
+        "view_bytes": 1697
+      },
+      {
+        "basis": "delta",
+        "feedback_patch_operations": 0,
+        "feedback_records": 0,
+        "frame": 2,
+        "frame_bytes": 107,
+        "projection_items": 0,
+        "roots": [],
+        "view_bytes": 0
+      },
+      {
+        "basis": "delta",
+        "feedback_patch_operations": 0,
+        "feedback_records": 1,
+        "frame": 3,
+        "frame_bytes": 884,
+        "projection_items": 1,
+        "roots": [
+          "command_feedback"
+        ],
+        "view_bytes": 228
+      },
+      {
+        "basis": "delta",
+        "feedback_patch_operations": 0,
+        "feedback_records": 1,
+        "frame": 4,
+        "frame_bytes": 1436,
+        "projection_items": 2,
+        "roots": [
+          "notebook_state",
+          "command_feedback"
+        ],
+        "view_bytes": 371
+      }
+    ],
+    "steps": [
+      "record + inspect, then Full handoff",
+      "unchanged Delta",
+      "inspect, then complete new feedback",
+      "record, then changed state and complete new feedback"
+    ]
+  }
+}

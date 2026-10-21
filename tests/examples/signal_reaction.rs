@@ -3,10 +3,8 @@
 mod scripted_provider;
 
 use agentview::component::execution::FrameBasis;
-use agentview::{
-    pom_renderer::render_pom_document,
-    transcript::{CanonicalInputItem, ConversationRole},
-};
+use agentview::transcript::{CanonicalInputItem, ConversationRole};
+use scripted_provider::pom::{self, InspectPom};
 use scripted_provider::{ScriptedProvider, ScriptedReaction};
 
 use super::*;
@@ -24,19 +22,14 @@ async fn completed_review_is_published_in_the_next_frame() -> anyhow::Result<()>
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[0].basis, FrameBasis::Full);
     assert!(matches!(frames[1].basis, FrameBasis::DeltaFrom(_)));
-    assert!(frames[0].text.contains("<review_status>pending"));
-    assert!(frames[0]
-        .text
-        .contains("## Review policy\n\nReturn exactly one token: approved or changes-requested."));
-    assert!(!frames[0].text.contains("<review_policy>"));
-    assert!(frames[0].text.contains("<document_request>"));
-    assert_eq!(frames[1].text, "<review_status>approved</review_status>");
+    assert!(frames[0].document().has_field("review_status", "pending"));
+    assert!(frames[0].document().has_element("document_request"));
     assert!(matches!(
         frames[1].projection.as_slice(),
         [CanonicalInputItem::Message {
             role: ConversationRole::User,
             pom,
-        }] if render_pom_document(pom)? == "<review_status>approved</review_status>"
+        }] if pom == &pom::text_element("review_status", "approved")
     ));
     assert_eq!(
         frames[1].replay,
@@ -57,6 +50,8 @@ async fn non_approved_completion_publishes_changes_requested() -> anyhow::Result
 
     let frames = capture.frames();
     assert_eq!(frames.len(), 2);
-    assert!(frames[1].text.contains("<review_status>changes-requested"));
+    assert!(frames[1]
+        .document()
+        .has_field("review_status", "changes-requested"));
     Ok(())
 }

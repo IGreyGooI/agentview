@@ -11,13 +11,34 @@ use agentview::{
         execution::{ExternalAct, ExternalObservationKind, FrameBasis},
         prelude::*,
     },
-    pom_renderer::render_pom_document,
+    pom::ResolvedDocument,
     transcript::{CanonicalInputItem, InstructionAuthority},
 };
 use anyhow::{Context, Result};
 use futures::FutureExt;
 
 use super::*;
+#[path = "../support/pom.rs"]
+mod pom;
+use pom::InspectPom;
+
+fn observation_document(
+    observation: &agentview::component::execution::ExternalObservation,
+) -> ResolvedDocument {
+    pom::combine(
+        observation
+            .frame()
+            .submission()
+            .projection()
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                CanonicalInputItem::Instruction { pom, .. }
+                | CanonicalInputItem::Message { pom, .. } => Some(pom.clone()),
+                _ => None,
+            }),
+    )
+}
 
 fn panic_message(payload: &PanicPayload) -> Option<&str> {
     payload
@@ -93,32 +114,18 @@ async fn plugin_parents_keep_independent_external_sessions() {
     assert_eq!(first_a.kind(), ExternalObservationKind::Full);
     assert_eq!(first_b.kind(), ExternalObservationKind::Full);
     assert_ne!(first_a.frame().target(), first_b.frame().target());
-    assert!(first_a.content().contains("parent-a"));
-    assert!(first_b.content().contains("parent-b"));
-    let first_a_developer = first_a
+    assert!(observation_document(&first_a).has_field("parent", "parent-a"));
+    assert!(observation_document(&first_b).has_field("parent", "parent-b"));
+    assert!(first_a
         .frame()
         .submission()
         .projection()
         .items()
         .iter()
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction {
-                authority: InstructionAuthority::Developer,
-                pom,
-            } => Some(render_pom_document(pom)),
-            _ => None,
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .expect("render developer projection");
-    assert!(first_a_developer.iter().any(|content| {
-        content.contains("## Plugin request\n\nProvide one concise status update for this plugin.")
-    }));
-    assert!(first_a_developer
-        .iter()
-        .any(|content| content.contains("<frame_plugin>")));
-    assert!(!first_a_developer
-        .iter()
-        .any(|content| content.contains("<plugin_request>")));
+        .any(|item| matches!(item,
+            CanonicalInputItem::Instruction { authority: InstructionAuthority::Developer, pom }
+                if pom.has_element("frame_plugin")
+        )));
 
     let second_a = registry
         .get_mut("parent-a")
@@ -139,8 +146,8 @@ async fn plugin_parents_keep_independent_external_sessions() {
     assert!(matches!(second_b.frame().basis(), FrameBasis::DeltaFrom(_)));
     assert_eq!(second_a.frame().target(), first_a.frame().target());
     assert_eq!(second_b.frame().target(), first_b.frame().target());
-    assert!(second_a.content().contains("parent-a update"));
-    assert!(second_b.content().contains("parent-b update"));
+    assert!(observation_document(&second_a).has_field("parent_response", "parent-a update"));
+    assert!(observation_document(&second_b).has_field("parent_response", "parent-b update"));
 
     let shutdown = shutdown_registry(registry).await;
     assert!(shutdown.first_error.is_none());

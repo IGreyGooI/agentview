@@ -983,12 +983,13 @@ mod tests {
         assert_eq!(application.run().await.unwrap(), ExitReason::Completed);
         application.shutdown().await.unwrap();
         assert_eq!(completions.load(Ordering::SeqCst), 1);
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let first: Value = serde_json::from_slice(&requests[0]).unwrap();
-        let second: Value = serde_json::from_slice(&requests[1]).unwrap();
-        assert_eq!(first["messages"], second["messages"]);
-        drop(requests);
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let first: Value = serde_json::from_slice(&requests[0]).unwrap();
+            let second: Value = serde_json::from_slice(&requests[1]).unwrap();
+            assert_eq!(first["messages"], second["messages"]);
+        }
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
     }
@@ -1048,15 +1049,16 @@ mod tests {
         assert_eq!(wire["max_tokens"], 321);
         assert_eq!(wire["temperature"], 0.2);
         assert_eq!(wire["stream_options"]["include_usage"], true);
-        let events = audit.events.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        assert!(
-            matches!(&events[0], OpenAiChatObservation::Request { body, path } if body == &request && path == "/chat/completions")
-        );
-        assert!(
-            matches!(&events[1], OpenAiChatObservation::Response { body, status: 200, completed: true, usage: Some(observed) } if body == response.as_bytes() && observed == &usage)
-        );
-        drop(events);
+        {
+            let events = audit.events.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            assert!(
+                matches!(&events[0], OpenAiChatObservation::Request { body, path } if body == &request && path == "/chat/completions")
+            );
+            assert!(
+                matches!(&events[1], OpenAiChatObservation::Response { body, status: 200, completed: true, usage: Some(observed) } if body == response.as_bytes() && observed == &usage)
+            );
+        }
         shutdown.send(()).unwrap();
         server.await.unwrap();
     }
@@ -1101,12 +1103,13 @@ mod tests {
         );
         let next = provider.declare().unwrap();
         assert!(next.continuity().epoch().get() > first.continuity().epoch().get());
-        let events = audit.events.lock().unwrap();
-        assert!(
-            matches!(&events[1], OpenAiChatObservation::Response { status: 429, body, completed: false, .. } if body == response.as_bytes())
-        );
-        assert!(matches!(&events[2], OpenAiChatObservation::Error { .. }));
-        drop(events);
+        {
+            let events = audit.events.lock().unwrap();
+            assert!(
+                matches!(&events[1], OpenAiChatObservation::Response { status: 429, body, completed: false, .. } if body == response.as_bytes())
+            );
+            assert!(matches!(&events[2], OpenAiChatObservation::Error { .. }));
+        }
         shutdown.send(()).unwrap();
         server.await.unwrap();
     }

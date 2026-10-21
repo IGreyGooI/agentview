@@ -1,0 +1,4 @@
+{"action":"record","input":{"text":"SQLite keeps long-term memory"}}
+{"action":"inspect","input":{}}
+{"action":"record","input":{"text":42}}
+{"action":"inspect","input":{}}

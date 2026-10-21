@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
@@ -7,11 +11,7 @@ use std::{
     time::Duration,
 };
 
-use agentview::{
-    component::{prelude::*, ComponentHost, SignalAccessError},
-    pom_renderer::render_pom_document,
-    transcript::CanonicalInputItem,
-};
+use agentview::component::{prelude::*, ComponentHost, SignalAccessError};
 
 #[derive(Clone)]
 struct SignalProps {
@@ -82,22 +82,10 @@ fn retained_signal_application(props: SignalProps) -> Component {
     }
 }
 
-fn rendered_projection_text(render: &agentview::component::PreparedRender) -> String {
-    projection_text(render.projection())
-}
-
-fn projection_text(projection: &agentview::component::execution::RenderedProjection) -> String {
-    projection
-        .nodes()
-        .iter()
-        .flat_map(|node| node.items())
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom).unwrap()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn rendered_projection_document(
+    render: &agentview::component::PreparedRender,
+) -> agentview::pom::ResolvedDocument {
+    projection_document(render.projection())
 }
 
 #[tokio::test]
@@ -106,7 +94,7 @@ async fn spawned_signal_write_is_retained_until_the_next_explicit_render() {
     let mut host = ComponentHost::new_root(retained_signal_application, props.clone());
 
     let first = host.render().expect("initial render");
-    assert!(rendered_projection_text(&first).contains("<value>A</value>"));
+    assert!(rendered_projection_document(&first).has_field("value", "A"));
     assert_eq!(props.initializations.load(Ordering::SeqCst), 1);
     assert_eq!(props.renders.load(Ordering::SeqCst), 1);
 
@@ -123,7 +111,7 @@ async fn spawned_signal_write_is_retained_until_the_next_explicit_render() {
     );
 
     let second = host.render().expect("explicit rerender");
-    assert!(rendered_projection_text(&second).contains("<value>B</value>"));
+    assert!(rendered_projection_document(&second).has_field("value", "B"));
     assert_eq!(props.initializations.load(Ordering::SeqCst), 1);
     assert_eq!(props.renders.load(Ordering::SeqCst), 2);
 }
@@ -141,7 +129,7 @@ async fn cloned_signal_updates_from_a_spawned_task() {
         .expect("Signal write succeeded");
 
     let rendered = host.render().expect("render after Signal write");
-    assert!(rendered_projection_text(&rendered).contains("<value>B</value>"));
+    assert!(rendered_projection_document(&rendered).has_field("value", "B"));
 }
 
 #[test]
@@ -155,9 +143,9 @@ fn replacing_props_preserves_signal_slots_for_the_same_mount() {
     assert_eq!(props.renders.load(Ordering::SeqCst), 1);
 
     let rendered = host.render().expect("render with replaced props");
-    let text = rendered_projection_text(&rendered);
-    assert!(text.contains("<label>second</label>"));
-    assert!(text.contains("<value>retained</value>"));
+    let text = rendered_projection_document(&rendered);
+    assert!(text.has_field("label", "second"));
+    assert!(text.has_field("value", "retained"));
     assert_eq!(props.initializations.load(Ordering::SeqCst), 1);
 }
 
@@ -168,23 +156,23 @@ fn current_projection_retains_the_latest_commit_while_state_is_dirty() {
 
     host.render().expect("initial render");
     assert!(!host.is_dirty());
-    assert!(projection_text(host.current_projection().unwrap()).contains("<value>A</value>"));
+    assert!(projection_document(host.current_projection().unwrap()).has_field("value", "A"));
 
     props.signal().set("B".to_owned()).unwrap();
     assert!(host.is_dirty());
     assert!(
-        projection_text(host.current_projection().unwrap()).contains("<value>A</value>"),
+        projection_document(host.current_projection().unwrap()).has_field("value", "A"),
         "a Signal write must leave the latest committed projection readable"
     );
 
     host.render().expect("render updated Signal state");
     assert!(!host.is_dirty());
-    assert!(projection_text(host.current_projection().unwrap()).contains("<value>B</value>"));
+    assert!(projection_document(host.current_projection().unwrap()).has_field("value", "B"));
 
     host.set_props(props.with_values("unused", "second"));
     assert!(host.is_dirty());
     assert!(
-        projection_text(host.current_projection().unwrap()).contains("<value>B</value>"),
+        projection_document(host.current_projection().unwrap()).has_field("value", "B"),
         "new props must leave the latest committed projection readable"
     );
 }
@@ -393,7 +381,7 @@ fn panicking_signal_update_retains_projection_and_poisons_state() {
     );
     assert_eq!(host.wake_revision(), revision + 1);
     assert!(
-        projection_text(host.current_projection().unwrap()).contains("<value>A</value>"),
+        projection_document(host.current_projection().unwrap()).has_field("value", "A"),
         "a panicking update must retain the latest successful projection"
     );
     assert!(matches!(
@@ -427,9 +415,9 @@ fn explicit_remount_invalidates_old_handles_and_initializes_new_slots() {
     ));
 
     let rendered = host.render().expect("remounted render");
-    let text = rendered_projection_text(&rendered);
-    assert!(text.contains("<label>remounted</label>"));
-    assert!(text.contains("<value>C</value>"));
+    let text = rendered_projection_document(&rendered);
+    assert!(text.has_field("label", "remounted"));
+    assert!(text.has_field("value", "C"));
     assert_eq!(props.initializations.load(Ordering::SeqCst), 2);
 }
 
@@ -466,7 +454,7 @@ fn signal_writes_wait_for_a_coherent_render_snapshot() {
     });
 
     let blocked_render = host.render().expect("blocked render");
-    let blocked_projection = rendered_projection_text(&blocked_render);
+    let blocked_projection = rendered_projection_document(&blocked_render);
     let (write_was_blocked, write_result) = coordinator.join().unwrap();
     assert!(
         write_was_blocked,
@@ -474,11 +462,11 @@ fn signal_writes_wait_for_a_coherent_render_snapshot() {
     );
     write_result.expect("signal write succeeded");
     write_thread.join().unwrap();
-    assert!(blocked_projection.contains("<value>A</value>"));
+    assert!(blocked_projection.has_field("value", "A"));
 
     props.block_render.store(false, Ordering::SeqCst);
     let next = host.render().expect("render after serialized write");
-    assert!(rendered_projection_text(&next).contains("<value>B</value>"));
+    assert!(rendered_projection_document(&next).has_field("value", "B"));
 }
 
 #[derive(Clone)]

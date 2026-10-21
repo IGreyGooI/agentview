@@ -4,6 +4,8 @@
 //! canonical history, Component projection reconciliation, and semantic diff
 //! selection remain owned by the private `FrameSession`.
 
+use std::borrow::Cow;
+
 use crate::{
     component::execution::reaction::{Frame, FrameBasis, FrameRevision},
     transcript::{CanonicalInputItem, InstructionAuthority},
@@ -52,9 +54,24 @@ impl ChatFrameRequestState {
             wire_messages.extend(lower_item(item).map_err(ChatFrameRequestFault::Lowering)?);
         }
 
-        let request_body =
-            encode_request(options, &wire_messages, max_serialized_request_body_bytes)
-                .map_err(ChatFrameRequestFault::Lowering)?;
+        // Only retained input belongs to the next Delta baseline. The current
+        // ephemeral prompts are appended to an encoding-only copy instead.
+        let request_messages = if frame.submission().ephemeral().is_empty() {
+            Cow::Borrowed(wire_messages.as_slice())
+        } else {
+            let mut messages = wire_messages.clone();
+            for item in frame.submission().ephemeral() {
+                messages.extend(lower_item(item).map_err(ChatFrameRequestFault::Lowering)?);
+            }
+            Cow::Owned(messages)
+        };
+
+        let request_body = encode_request(
+            options,
+            &request_messages,
+            max_serialized_request_body_bytes,
+        )
+        .map_err(ChatFrameRequestFault::Lowering)?;
         let constraints = &frame.prepared_profile().constraints;
         let limit = constraints
             .context_window
@@ -182,9 +199,9 @@ mod tests {
             FrameRevision, FrameSubmission, ProjectionSubmission, TargetContinuity, TargetEpoch,
             TargetIdentity, ToolCatalog,
         },
-        pom::{Document, TextNode, XmlNode},
+        pom::Document,
         pom_resolution::resolve_system_document,
-        transcript::{CanonicalInputItem, InstructionAuthority},
+        transcript::{CanonicalInputItem, ConversationRole, InstructionAuthority},
     };
 
     use super::{ChatFrameRequestFault, ChatFrameRequestState};
@@ -292,15 +309,65 @@ mod tests {
         )
     }
 
+    fn frame_with_ephemeral(
+        sequence: u64,
+        base: Option<FrameRevision>,
+        replay: Vec<CanonicalInputItem>,
+        staged_inputs: Vec<CanonicalInputItem>,
+        projection: Vec<CanonicalInputItem>,
+        ephemeral: Vec<CanonicalInputItem>,
+    ) -> Frame {
+        let submission = FrameSubmission::from_compiled(
+            replay,
+            staged_inputs,
+            ProjectionSubmission::new(projection),
+            ToolCatalog::new(Vec::new()).unwrap(),
+            Vec::new(),
+        )
+        .with_ephemeral(ephemeral);
+        let (continuity, basis) = match base {
+            Some(base) => (
+                TargetContinuity::Accepted {
+                    epoch: epoch(),
+                    revision: base,
+                },
+                FrameBasis::DeltaFrom(base),
+            ),
+            None => (
+                TargetContinuity::FullRequired { epoch: epoch() },
+                FrameBasis::Full,
+            ),
+        };
+        Frame::from_compiled(
+            revision(sequence),
+            target(),
+            epoch(),
+            continuity,
+            profile(),
+            basis,
+            submission,
+        )
+        .unwrap()
+    }
+
+    fn ephemeral_user(text: &str) -> CanonicalInputItem {
+        CanonicalInputItem::message(
+            ConversationRole::User,
+            resolve_system_document(Document::from_raw_text(text)),
+        )
+    }
+
+    fn ephemeral_developer(text: &str) -> CanonicalInputItem {
+        CanonicalInputItem::instruction(
+            InstructionAuthority::Developer,
+            resolve_system_document(Document::from_raw_text(text)),
+        )
+    }
+
     fn system(text: &str) -> CanonicalInputItem {
-        let node = XmlNode::try_build("system", |children| {
-            children.text(TextNode::new(text));
-            Ok(())
-        })
-        .unwrap();
         CanonicalInputItem::instruction(
             InstructionAuthority::System,
-            resolve_system_document(Document::from_xml(node)),
+            resolve_system_document(Document::from_raw_text(text)),
         )
     }
 
@@ -339,7 +406,7 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(
             contents(&prepared.request_body),
-            ["<system>policy</system>", "replay", "staged", "projection"]
+            ["policy", "replay", "staged", "projection"]
         );
     }
 
@@ -371,6 +438,110 @@ mod tests {
             ["authored", "answer", "next"]
         );
         assert_eq!(prepared.state.revision(), revision(2));
+    }
+
+    #[test]
+    fn ephemeral_prompts_repeat_last_and_leave_no_old_values_in_full_or_delta_baselines() {
+        let initial = frame_with_ephemeral(
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+            vec![
+                system("policy"),
+                CanonicalInputItem::assistant_text("authored", None),
+            ],
+            vec![
+                ephemeral_developer("current policy"),
+                ephemeral_user("temporary A"),
+            ],
+        );
+        let first = ChatFrameRequestState::prepare(None, &initial, &options(), 64 * 1024).unwrap();
+        assert_eq!(
+            contents(&first.request_body),
+            ["policy", "authored", "current policy", "temporary A",]
+        );
+        assert_eq!(
+            body(&first.request_body)["messages"][2]["role"],
+            "developer"
+        );
+        assert_eq!(body(&first.request_body)["messages"][3]["role"], "user");
+        assert_eq!(first.state.wire_messages.len(), 2);
+
+        let next = frame_with_ephemeral(
+            2,
+            Some(revision(1)),
+            vec![CanonicalInputItem::assistant_text("answer", None)],
+            Vec::new(),
+            vec![CanonicalInputItem::assistant_text("updated", None)],
+            vec![
+                ephemeral_developer("current policy"),
+                ephemeral_user("temporary A"),
+            ],
+        );
+        let second =
+            ChatFrameRequestState::prepare(Some(&first.state), &next, &options(), 64 * 1024)
+                .unwrap();
+        assert_eq!(
+            contents(&second.request_body),
+            [
+                "policy",
+                "authored",
+                "answer",
+                "updated",
+                "current policy",
+                "temporary A",
+            ]
+        );
+        assert_eq!(second.state.wire_messages.len(), 4);
+
+        let changed = frame_with_ephemeral(
+            3,
+            Some(revision(2)),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![ephemeral_user("temporary B")],
+        );
+        let changed =
+            ChatFrameRequestState::prepare(Some(&second.state), &changed, &options(), 64 * 1024)
+                .unwrap();
+        assert_eq!(
+            contents(&changed.request_body),
+            ["policy", "authored", "answer", "updated", "temporary B",]
+        );
+        assert_eq!(changed.state.wire_messages.len(), 4);
+
+        let recovered = frame_with_ephemeral(
+            4,
+            None,
+            vec![
+                CanonicalInputItem::assistant_text("authored", None),
+                CanonicalInputItem::assistant_text("answer", None),
+            ],
+            Vec::new(),
+            vec![
+                system("policy"),
+                CanonicalInputItem::assistant_text("updated", None),
+            ],
+            vec![ephemeral_user("temporary B")],
+        );
+        let recovered =
+            ChatFrameRequestState::prepare(Some(&changed.state), &recovered, &options(), 64 * 1024)
+                .unwrap();
+        assert_eq!(
+            contents(&recovered.request_body),
+            contents(&changed.request_body)
+        );
+
+        let removed = delta(5, revision(4), Vec::new(), Vec::new(), Vec::new());
+        let removed =
+            ChatFrameRequestState::prepare(Some(&recovered.state), &removed, &options(), 64 * 1024)
+                .unwrap();
+        assert_eq!(
+            contents(&removed.request_body),
+            ["policy", "authored", "answer", "updated",]
+        );
     }
 
     #[test]
@@ -420,10 +591,7 @@ mod tests {
             ChatFrameRequestState::prepare(Some(&state), &replacement, &options(), 64 * 1024)
                 .unwrap();
 
-        assert_eq!(
-            contents(&prepared.request_body),
-            ["<system>new</system>", "retained"]
-        );
+        assert_eq!(contents(&prepared.request_body), ["new", "retained"]);
     }
 
     #[test]
@@ -466,12 +634,13 @@ mod tests {
     #[test]
     fn exact_serialized_body_limit_is_inclusive() {
         let make = || {
-            full(
+            frame_with_ephemeral(
                 1,
+                None,
                 Vec::new(),
                 Vec::new(),
                 vec![CanonicalInputItem::assistant_text("payload", None)],
-                Vec::new(),
+                vec![ephemeral_user("request-only context")],
             )
         };
         let exact = ChatFrameRequestState::prepare(None, &make(), &options(), 64 * 1024)

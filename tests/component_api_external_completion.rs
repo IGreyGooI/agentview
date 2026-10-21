@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     ops::ControlFlow,
     sync::{
@@ -137,8 +141,13 @@ async fn public_text_and_empty_completion_are_ordered_stale_fenced_and_consuming
         };
         assert_eq!(second.kind(), ExternalObservationKind::Delta);
         assert!(matches!(second.frame().basis(), FrameBasis::DeltaFrom(_)));
-        assert!(second.content().contains("approved"));
-        assert!(second.content().contains("handled:approved"));
+        assert!(second.frame().submission().replay().contains(
+            &agentview::transcript::CanonicalInputItem::assistant_text("approved", None)
+        ));
+        assert!(combine(item_documents(
+            second.frame().submission().projection().items()
+        ))
+        .has_field("public_external_state", "handled:approved"));
         assert_eq!(
             control.act(first_ingress, ExternalAct::text("late")).await,
             Err(ExternalControlFault::StaleIngress)

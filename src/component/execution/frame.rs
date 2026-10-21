@@ -119,6 +119,8 @@ struct ToolCatalogEntryV1<'a> {
 struct ComponentEnvelopeV1<'a> {
     version: u8,
     projection: ProjectionSubmissionV1<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ephemeral: Option<&'a [CanonicalInputItem]>,
     tools: Vec<ToolCatalogEntryV1<'a>>,
 }
 
@@ -138,10 +140,20 @@ impl FrameMeter {
         tool_definitions: Vec<ToolDefinition>,
         constraints: &FrameConstraints,
     ) -> Result<CompiledComponent, FrameBudgetFault> {
+        Self::compile_component_with_ephemeral(items, Vec::new(), tool_definitions, constraints)
+    }
+
+    fn compile_component_with_ephemeral(
+        items: Vec<CanonicalInputItem>,
+        ephemeral: Vec<CanonicalInputItem>,
+        tool_definitions: Vec<ToolDefinition>,
+        constraints: &FrameConstraints,
+    ) -> Result<CompiledComponent, FrameBudgetFault> {
         validate_canonical_items(&items)?;
+        validate_canonical_items(&ephemeral)?;
         let tools = ToolCatalog::from_definitions(tool_definitions)?;
         let projection = ProjectionSubmission::new(items);
-        let canonical_bytes = canonical_component_bytes(&projection, &tools)?;
+        let canonical_bytes = canonical_component_bytes(&projection, &ephemeral, &tools)?;
         if canonical_bytes.len() > constraints.max_component_bytes {
             return Err(FrameBudgetFault::ComponentTooLarge {
                 actual_bytes: canonical_bytes.len(),
@@ -150,6 +162,7 @@ impl FrameMeter {
         }
         Ok(CompiledComponent {
             projection,
+            ephemeral,
             tools,
             canonical_bytes,
         })
@@ -167,6 +180,7 @@ impl FrameMeter {
             &replay,
             &staged_inputs,
             &component.projection,
+            &component.ephemeral,
             &component.tools,
         )?;
         if canonical_bytes.len() > constraints.max_frame_bytes {
@@ -181,7 +195,8 @@ impl FrameMeter {
             component.projection,
             component.tools,
             canonical_bytes,
-        ))
+        )
+        .with_ephemeral(component.ephemeral))
     }
 
     /// Proves that a future Full can carry the actual canonical state while
@@ -351,6 +366,7 @@ impl FrameSession {
         let canonical_projection_items = flatten_non_system_projection(&projection_plan.submission);
         let mut projection_items = canonical_projection_items.clone();
         let mut complete_component_items = flatten_non_system_projection(complete_projection);
+        let ephemeral = flatten_ephemeral_projection(complete_projection);
         if let Some(snapshot) = system_snapshot.as_ref() {
             complete_component_items.insert(0, system_snapshot_item(snapshot));
             if delta_checkpoint.is_none() {
@@ -361,15 +377,17 @@ impl FrameSession {
 
         // The authoring envelope is always measured from the complete
         // projection, even when this exact submission is a much smaller Delta.
-        let requested_context_bytes = FrameMeter::compile_component(
+        let requested_context_bytes = FrameMeter::compile_component_with_ephemeral(
             complete_component_items,
+            ephemeral.clone(),
             complete_projection.native_tools().to_vec(),
             constraints,
         )?
         .canonical_bytes
         .len();
-        let component = FrameMeter::compile_component(
+        let component = FrameMeter::compile_component_with_ephemeral(
             projection_items.clone(),
+            ephemeral,
             complete_projection.native_tools().to_vec(),
             constraints,
         )?;
@@ -816,8 +834,28 @@ fn flatten_non_system_projection(projection: &RenderedProjection) -> Vec<Canonic
     projection
         .nodes()
         .iter()
-        .flat_map(|node| node.items().iter().cloned())
+        .flat_map(|node| {
+            node.items()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !node.is_ephemeral_item(*index))
+                .map(|(_, item)| item.clone())
+        })
         .filter(|item| !is_system_instruction(item))
+        .collect()
+}
+
+fn flatten_ephemeral_projection(projection: &RenderedProjection) -> Vec<CanonicalInputItem> {
+    projection
+        .nodes()
+        .iter()
+        .flat_map(|node| {
+            node.items()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| node.is_ephemeral_item(*index))
+                .map(|(_, item)| item.clone())
+        })
         .collect()
 }
 
@@ -920,6 +958,7 @@ pub(super) enum FrameSessionFault {
 
 pub(super) struct CompiledComponent {
     projection: ProjectionSubmission,
+    ephemeral: Vec<CanonicalInputItem>,
     tools: ToolCatalog,
     canonical_bytes: Vec<u8>,
 }
@@ -933,27 +972,30 @@ impl CompiledComponent {
 
 fn canonical_component_bytes(
     projection: &ProjectionSubmission,
+    ephemeral: &[CanonicalInputItem],
     tools: &ToolCatalog,
 ) -> Result<Vec<u8>, FrameBudgetFault> {
-    canonicalize(&component_envelope(projection, tools))
+    canonicalize(&component_envelope(projection, ephemeral, tools))
 }
 
 fn canonical_frame_bytes(
     replay: &[CanonicalInputItem],
     staged_inputs: &[CanonicalInputItem],
     projection: &ProjectionSubmission,
+    ephemeral: &[CanonicalInputItem],
     tools: &ToolCatalog,
 ) -> Result<Vec<u8>, FrameBudgetFault> {
     canonicalize(&FrameSubmissionV1 {
         version: FRAME_METER_VERSION,
         replay,
         staged_inputs,
-        component: component_envelope(projection, tools),
+        component: component_envelope(projection, ephemeral, tools),
     })
 }
 
 fn component_envelope<'a>(
     projection: &'a ProjectionSubmission,
+    ephemeral: &'a [CanonicalInputItem],
     tools: &'a ToolCatalog,
 ) -> ComponentEnvelopeV1<'a> {
     ComponentEnvelopeV1 {
@@ -961,6 +1003,7 @@ fn component_envelope<'a>(
         projection: ProjectionSubmissionV1 {
             items: projection.items(),
         },
+        ephemeral: (!ephemeral.is_empty()).then_some(ephemeral),
         tools: tools
             .definitions()
             .iter()
@@ -1068,8 +1111,8 @@ mod tests {
             ProviderEvent, RenderedProjection, RenderedProjectionNode, ToolDefinition,
         },
         pom::{Document, TextNode, XmlNode},
-        pom_renderer::render_pom_document,
         pom_resolution::resolve_system_document,
+        test_support::{document, element, text_element},
         transcript::{
             AssistantPhase, CanonicalInputItem, CanonicalTranscript, InstructionAuthority,
         },
@@ -1278,6 +1321,109 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_prompts_are_metered_but_never_accumulate_in_canonical_history() {
+        let prompt = CanonicalInputItem::instruction(
+            InstructionAuthority::Developer,
+            resolve_system_document(Document::from_raw_text("current-only context")),
+        );
+        let complete = RenderedProjection::from_nodes(vec![RenderedProjectionNode::new(
+            "temporary",
+            vec![prompt.clone()],
+        )
+        .with_ephemeral_items(vec![0])])
+        .unwrap();
+        let profile = profile(true);
+        let mut declaration = full(profile.clone(), 1);
+        let mut session = FrameSession::new(&declaration).unwrap();
+        for _ in 0..16 {
+            let prepared = session.prepare(&declaration, &complete).unwrap();
+            let (frame, commit) = prepared.into_parts();
+            assert_eq!(
+                frame.submission().ephemeral(),
+                std::slice::from_ref(&prompt)
+            );
+            assert!(frame.submission().projection().items().is_empty());
+            assert!(frame.submission().replay().is_empty());
+            let payload: serde_json::Value =
+                serde_json::from_slice(frame.submission().canonical_bytes()).unwrap();
+            assert_eq!(
+                payload["component"]["ephemeral"],
+                serde_json::to_value([&prompt]).unwrap()
+            );
+            let measured = serde_json_canonicalizer::to_vec(&payload["component"])
+                .unwrap()
+                .len();
+            assert_eq!(frame.requested_context_bytes(), Some(measured));
+            let limited = FrameProfile::new(
+                constraints(measured - 1, 16_384),
+                FrameCapabilities::new(true),
+            );
+            let limited_declaration = full(limited, 1);
+            assert!(matches!(
+                FrameSession::new(&limited_declaration)
+                    .unwrap()
+                    .prepare(&limited_declaration, &complete),
+                Err(FrameSessionFault::Budget(
+                    FrameBudgetFault::ComponentTooLarge { .. }
+                ))
+            ));
+            declaration = TargetDeclaration::resume(frame.revision(), profile.clone());
+            session.commit(commit);
+            assert!(session.canonical_history.transcript.items().is_empty());
+        }
+    }
+
+    #[test]
+    fn changing_ephemeral_retention_does_not_reuse_absent_history_or_retract_transient_xml() {
+        let xml = XmlNode::try_build("state", |children| {
+            children.text(TextNode::new("current"));
+            Ok(())
+        })
+        .unwrap();
+        let prompt = CanonicalInputItem::instruction(
+            InstructionAuthority::Developer,
+            resolve_system_document(Document::from_xml(xml)),
+        );
+        let ordinary = RenderedProjection::from_nodes(vec![RenderedProjectionNode::new(
+            "state",
+            vec![prompt.clone()],
+        )])
+        .unwrap();
+        let ephemeral = RenderedProjection::from_nodes(vec![RenderedProjectionNode::new(
+            "state",
+            vec![prompt.clone()],
+        )
+        .with_ephemeral_items(vec![0])])
+        .unwrap();
+        let profile = profile(true);
+        let declaration = full(profile.clone(), 1);
+        let mut session = FrameSession::new(&declaration).unwrap();
+        let revision = commit_first(&mut session, &declaration, &ephemeral);
+        let resume = TargetDeclaration::resume(revision, profile.clone());
+        let prepared = session.prepare(&resume, &ordinary).unwrap();
+        assert_eq!(
+            prepared.frame.submission().projection().items(),
+            std::slice::from_ref(&prompt)
+        );
+        let (frame, commit) = prepared.into_parts();
+        let resume = TargetDeclaration::resume(frame.revision(), profile);
+        session.commit(commit);
+        let prepared = session.prepare(&resume, &ephemeral).unwrap();
+        // The retained XML is invalidated once when its ordinary declaration
+        // disappears; the new request-only copy remains a complete prompt.
+        assert_eq!(prepared.frame.submission().ephemeral(), &[prompt]);
+        let [CanonicalInputItem::Instruction { pom, .. }] =
+            prepared.frame.submission().projection().items()
+        else {
+            panic!("expected the ordinary XML removal");
+        };
+        assert_eq!(
+            pom,
+            &document([element("remove", [text_element("state", "current")])])
+        );
+    }
+
+    #[test]
     fn tool_catalog_uses_jcs_utf16_order() {
         let limits = constraints(1_024, 4_096);
         let component = FrameMeter::compile_component(
@@ -1406,9 +1552,17 @@ mod tests {
             &limits,
         )
         .unwrap();
-        let encoded = String::from_utf8(component.canonical_bytes().to_vec()).unwrap();
-        assert!(encoded.contains(r#""status":"interrupted""#));
-        assert!(encoded.contains("partial \u{1f642}"));
+        let encoded: serde_json::Value =
+            serde_json::from_slice(component.canonical_bytes()).unwrap();
+        let items: Vec<CanonicalInputItem> =
+            serde_json::from_value(encoded["projection"]["items"].clone()).unwrap();
+        assert_eq!(
+            items,
+            [CanonicalInputItem::interrupted_assistant_text(
+                "partial \u{1f642}",
+                Some(AssistantPhase::Commentary),
+            )]
+        );
     }
 
     #[test]
@@ -1695,8 +1849,11 @@ mod tests {
         let items = prepared.frame.submission().projection().items();
         assert_eq!(items.len(), 2);
         assert_eq!(
-            render_pom_document(rendered_system(&items[0])).unwrap(),
-            "<first_policy>first</first_policy>\n\n<second_policy>second</second_policy>"
+            rendered_system(&items[0]),
+            &document([
+                text_element("first_policy", "first"),
+                text_element("second_policy", "second"),
+            ])
         );
         assert_eq!(items[1], CanonicalInputItem::assistant_text("turn", None));
         assert!(session.canonical_history.transcript.items().is_empty());
@@ -1733,22 +1890,9 @@ mod tests {
         let changed_candidate = session.prepare(&resume, &changed).unwrap();
         assert_eq!(changed_candidate.frame.basis(), FrameBasis::Full);
         assert_eq!(
-            render_pom_document(rendered_system(
-                &changed_candidate.frame.submission().projection().items()[0]
-            ))
-            .unwrap(),
-            "<policy>new-policy</policy>"
+            rendered_system(&changed_candidate.frame.submission().projection().items()[0]),
+            &document([text_element("policy", "new-policy")])
         );
-        let encoded = String::from_utf8(
-            changed_candidate
-                .frame
-                .submission()
-                .canonical_bytes()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(!encoded.contains("old-secret"));
-        assert!(encoded.contains("new-policy"));
         drop(changed_candidate);
 
         let still_original = session.prepare(&resume, &original).unwrap();

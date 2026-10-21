@@ -118,6 +118,6 @@ pub use reaction::{
     ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason, ResettableReactionPort,
     SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
 };
-pub use stdin::{StdinApplication, StdinApplicationError, StdinResponse};
+pub use stdin::{StdinApplication, StdinApplicationError, StdinApplicationOptions, StdinResponse};
 pub use streaming::{StreamingToolRecoveryReport, StreamingToolRecoveryStatus};
 pub use tool_definition::{ToolDefinition, ToolDefinitionError};

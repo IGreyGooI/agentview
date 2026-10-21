@@ -25,7 +25,8 @@ local 表示由客户端管理压缩策略与上下文替换，不要求模型�
 ## 2. 范围与所有权
 
 通过普通 `/responses` 模型推理生成历史摘要，由 AgentView 在本地替换 provider-private wire window。
-复用当前 provider 的客户端、认证、API base、`ModelSpec` 和 reasoning 配置，不另选摘要模型。
+复用当前 provider 的客户端、认证、API base、`ModelSpec`、reasoning 和 typed provider routing
+配置，不另选摘要模型。显式关闭 reasoning 和 endpoint 限制同样适用于摘要请求，并计入请求预算。
 请求拥有独立的输入快照、
 HTTP 生命周期与结果。前台请求和压缩请求可以实际重叠，压缩输出走专用候选通道。
 
@@ -61,6 +62,11 @@ window 不等于压缩 canonical Frame，也不提供无限历史。
 策略在 handoff 前同步判断，policy-triggered 后台 HTTP 只在普通 Frame 的真实 handoff 后启动。
 forced compaction 可在超窗 Frame 的 handoff 前启动并等待。两者共用一个 coordinator；压缩期间不重新
 复制 source 或启动第二个 attempt，同一个 source fingerprint 不无条件重试。
+
+两种触发统一调用 coordinator 的 `prepare_request` / `request`：`Background` 先判断策略，
+在前台 handoff 后启动任务并继续；`Required` 不经过后台策略，复用 Running/Ready 任务，
+没有任务时创建，再等待同一个候选。等待成功只表示候选可用，仍需重验预算并在前台
+handoff 时安装；等待取消不消费候选，超时则终止该来源的任务并保留去重状态。
 
 ### 策略与计量
 
@@ -155,6 +161,12 @@ max_component_bytes, reserved_output_tokens)` 配置。前台会检查完整 req
 返回 `None`，请求上限继续生效。摘要失败保留原窗口，不改用服务端压缩。
 
 ### Forced compaction
+
+通过 `with_compaction_observer(observer)` 可为摘要 worker 配置独立的请求/响应审计。
+回执使用 `OpenAiResponsesObservation`，其 HTTP body 有既有 request/response 字节上限，
+不包含认证 headers。候选通过原有校验且审计回执完成后才进入 Ready；回执失败报告
+`ParallelCompactionFault::Observation`，不安装该候选、不覆盖前台已接受的上下文。
+此 observer 与 `with_observer` 的前台调用身份独立；两者均不赋予 worker 业务工具或 history 写权限。
 
 `with_forced_compaction()` 独立开启一次有界的超窗恢复尝试，默认关闭。例如只使用 forced、关闭
 policy-triggered background：
@@ -269,7 +281,7 @@ Running / Ready -> Cancelled
 
 1. [`parallel_compaction.rs`](../src/provider/async_openai/parallel_compaction.rs)：策略、计量、controller、
    不可变 source、owned worker、普通文本摘要校验与状态观察。
-2. [`codex_http_v1.rs`](../src/provider/codex_http_v1.rs)：使用当前模型和 reasoning、受 byte limit 限制的普通摘要请求编码。
+2. [`codex_http_v1.rs`](../src/provider/codex_http_v1.rs)：使用当前模型、reasoning 和 provider routing、受 byte limit 限制的普通摘要请求编码。
 3. [`frame_request.rs`](../src/provider/async_openai/frame_request.rs)：闭合前缀选择、来源验证、
    候选加最新 tail、canonical proofs 和请求窗口 estimate 检查。
 4. [`native_reaction.rs`](../src/provider/async_openai/native_reaction.rs)：handoff 时启动或安装候选，
@@ -292,7 +304,8 @@ Running / Ready -> Cancelled
 - forced 候选仍超窗时保持 Ready、不安装、不重复 compact，accepted revision 和 receipt 不提前推进。
 - compact 完成前后，前台均可追加新输入；安装结果精确保留最新 tail。
 - 测试服务器只支持普通 `/responses`；任何其他端点请求都失败，全部请求均不含服务端压缩配置。
-- 摘要使用当前模型及 reasoning，不继承业务工具或前台 continuation；摘要文本不触发 Component handler。
+- 摘要使用当前模型、reasoning 及 provider routing，不继承业务工具或前台 continuation；摘要文本不触发 Component handler。
+- 显式关闭 reasoning 和 endpoint 限制在真实前台 HTTP、工具结果反馈、摘要及安装候选后的下一帧均保留。
 - 完整 observe -> action -> feedback -> next action 在压缩前后继续成立。
 - tool call/result 配对完整，pending calls 受保护，ToolOutput receipt 只交付一次。
 - System change、context reset、前缀替换、过期候选均无法安装错误窗口。

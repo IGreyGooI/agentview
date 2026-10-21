@@ -13,7 +13,7 @@ use agentview::{
         execution::{Application, ProviderIdentity},
         prelude::*,
     },
-    pom_renderer::render_pom_document,
+    pom::ResolvedDocument,
     provider::{
         async_openai::{AsyncOpenAiResponsesProvider, AsyncOpenAiTransportConfig},
         codex_http_v1::{CodexHttpV1Encoder, CodexHttpV1Options, CODEX_HTTP_V1_PROFILE},
@@ -21,6 +21,9 @@ use agentview::{
     transcript::CanonicalInputItem,
 };
 use serde_json::Value;
+#[path = "../support/pom.rs"]
+mod pom;
+use pom::InspectPom;
 
 #[allow(dead_code)]
 #[path = "../support/responses_acceptance_server.rs"]
@@ -68,7 +71,7 @@ struct RetainedHistoryProps {
 fn first_round_history_hint() -> Component {
     view! {
         #[user]
-        "history-hint-from-first-component-state"
+        { FIRST_ROUND_HINT }
     }
 }
 
@@ -77,7 +80,7 @@ fn retained_history_state(value: String) -> Component {
     view! {
         #[user]
         #[diff(slot = "current-state")]
-        current_state { "{value}" }
+        { value }
     }
 }
 
@@ -134,7 +137,7 @@ async fn next_debug_request(server: &mut ResponsesAcceptanceServer) -> anyhow::R
         .map_err(|_| anyhow::anyhow!("mock Responses server did not receive a request in time"))?
 }
 
-fn projection_documents(projection: &Value) -> anyhow::Result<Vec<String>> {
+fn projection_documents(projection: &Value) -> anyhow::Result<Vec<ResolvedDocument>> {
     let nodes = projection
         .get("nodes")
         .and_then(Value::as_array)
@@ -150,9 +153,9 @@ fn projection_documents(projection: &Value) -> anyhow::Result<Vec<String>> {
             match item {
                 CanonicalInputItem::Instruction { pom, .. }
                 | CanonicalInputItem::Message { pom, .. } => {
-                    documents.push(render_pom_document(&pom)?);
+                    documents.push(pom);
                 }
-                CanonicalInputItem::AssistantText { text, .. } => documents.push(text),
+                CanonicalInputItem::AssistantText { .. } => {}
                 CanonicalInputItem::ToolCall { .. }
                 | CanonicalInputItem::ToolResult { .. }
                 | CanonicalInputItem::ProviderExtension(_) => {}
@@ -196,50 +199,13 @@ fn request_messages(request: &Value) -> anyhow::Result<Vec<(String, String)>> {
 fn contains_message(messages: &[(String, String)], role: &str, text: &str) -> bool {
     messages
         .iter()
-        .any(|(actual_role, actual_text)| actual_role == role && actual_text.contains(text))
+        .any(|(actual_role, actual_text)| actual_role == role && actual_text == text)
 }
 
 fn message_position(messages: &[(String, String)], role: &str, text: &str) -> Option<usize> {
     messages
         .iter()
-        .position(|(actual_role, actual_text)| actual_role == role && actual_text.contains(text))
-}
-
-#[test]
-fn readable_prompt_preserves_known_and_unknown_input_items() {
-    let body = br#"{
-        "model":"test-model",
-        "instructions":"system instructions",
-        "input":[
-            {"type":"message","role":"developer","content":[{"type":"input_text","text":"developer context"}]},
-            {"type":"message","role":"user","content":[{"type":"input_text","text":"user request"}]},
-            {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"id\":7}"},
-            {"type":"function_call_output","call_id":"call_1","output":"{\"status\":\"ready\"}"},
-            {"type":"reasoning","encrypted_content":"opaque"}
-        ],
-        "tools":[{
-            "type":"function",
-            "name":"lookup",
-            "description":"Look up a status.",
-            "parameters":{"type":"object","properties":{"id":{"type":"integer"}}},
-            "strict":true
-        }]
-    }"#;
-
-    let prompt = prompt_debug::render_readable_prompt(body, "revision", "Full");
-
-    assert!(prompt.contains("handoff: handed_off"));
-    assert!(prompt.contains("## System instructions\n\nsystem instructions"));
-    assert!(prompt.contains("## Developer message 1\n\ndeveloper context"));
-    assert!(prompt.contains("## User message 2\n\nuser request"));
-    assert!(prompt.contains("## Tool call 3: lookup"));
-    assert!(prompt.contains("call_id: call_1"));
-    assert!(prompt.contains("## Tool result 4"));
-    assert!(prompt.contains("{\"status\":\"ready\"}"));
-    assert!(prompt.contains("## Input item 5 (unknown type: reasoning)"));
-    assert!(prompt.contains("\"encrypted_content\": \"opaque\""));
-    assert!(prompt.contains("## Tool 1: lookup"));
-    assert!(prompt.contains("Look up a status."));
+        .position(|(actual_role, actual_text)| actual_role == role && actual_text == text)
 }
 
 #[tokio::test]
@@ -271,13 +237,9 @@ async fn prepared_projection_and_exact_requests_are_captured_separately() -> any
             serde_json::to_value(current_node.items())?
         );
     }
-    let projection = std::fs::read_to_string(run_dir.join("0001/projection.txt"))?;
-    assert!(projection.contains("# Assistant\n\nReturn one short reply."));
-    assert!(
-        projection.contains("<developer_context>prepared <context> & state</developer_context>")
-    );
-    assert!(!projection.contains("pending"));
-    assert!(!projection.contains("context_management"));
+    let document = pom::combine(projection_documents(&captured)?);
+    assert!(document.has_field("developer_context", "prepared <context> & state"));
+    assert!(!document.has_field("developer_context", "pending"));
 
     let reaction = application.react().await;
     let server_body = server.next_request().await?;
@@ -313,10 +275,6 @@ async fn prepared_projection_and_exact_requests_are_captured_separately() -> any
         .unwrap()
         .iter()
         .any(|item| { item["role"] == "assistant" && item["content"][0]["text"] == "done" }));
-    let prompt = std::fs::read_to_string(run_dir.join("0001/prompt.txt"))?;
-    assert!(prompt.contains("## System instructions"));
-    assert!(prompt.contains("## Developer message 1"));
-    assert!(prompt.contains("## User message 2"));
     Ok(())
 }
 
@@ -361,13 +319,13 @@ async fn current_component_projection_excludes_retained_history_while_request_ke
         assert!(
             first_documents
                 .iter()
-                .any(|document| document == FIRST_ROUND_HINT),
+                .any(|document| document.has_text(FIRST_ROUND_HINT)),
             "first projection did not expose the one-time plain user hint: {first_documents:#?}"
         );
         assert!(
             first_documents
                 .iter()
-                .any(|document| document.contains(FIRST_STATE)),
+                .any(|document| document.has_text(FIRST_STATE)),
             "first projection did not expose state A: {first_documents:#?}"
         );
 
@@ -397,26 +355,21 @@ async fn current_component_projection_excludes_retained_history_while_request_ke
         assert!(
             second_documents
                 .iter()
-                .any(|document| document.contains(SECOND_STATE)),
+                .any(|document| document.has_text(SECOND_STATE)),
             "second projection did not expose state B: {second_documents:#?}"
         );
         assert!(
             !second_documents
                 .iter()
-                .any(|document| document.contains(FIRST_ROUND_HINT)),
+                .any(|document| document.has_text(FIRST_ROUND_HINT)),
             "second projection retained the first-round hint: {second_documents:#?}"
         );
         assert!(
             !second_documents
                 .iter()
-                .any(|document| document.contains(FIRST_STATE)),
+                .any(|document| document.has_text(FIRST_STATE)),
             "second projection retained state A: {second_documents:#?}"
         );
-        let second_projection_text = std::fs::read_to_string(run_dir.join("0002/projection.txt"))?;
-        assert!(second_projection_text.contains(SECOND_STATE));
-        assert!(!second_projection_text.contains(FIRST_ROUND_HINT));
-        assert!(!second_projection_text.contains(FIRST_STATE));
-
         let _ = application.react().await?;
         let second_body = next_debug_request(&mut server).await?;
         anyhow::ensure!(
@@ -474,10 +427,5 @@ async fn current_component_projection_excludes_retained_history_while_request_ke
         "retained state A must precede current state B: {second_messages:#?}"
     );
 
-    let second_prompt = std::fs::read_to_string(run_dir.join("0002/prompt.txt"))?;
-    assert!(second_prompt.contains(FIRST_ROUND_HINT));
-    assert!(second_prompt.contains(RETAINED_HISTORY_REPLIES[0]));
-    assert!(second_prompt.contains(FIRST_STATE));
-    assert!(second_prompt.contains(SECOND_STATE));
     Ok(())
 }

@@ -14,10 +14,13 @@ use agentview::{
         ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultReason, SubmitFault,
         TargetDeclaration, TargetEpoch, TargetIdentity,
     },
-    pom_renderer::render_pom_document,
+    pom::ResolvedDocument,
     transcript::CanonicalInputItem,
 };
 use async_trait::async_trait;
+
+#[path = "pom.rs"]
+pub mod pom;
 
 static NEXT_SCRIPTED_TARGET: AtomicU64 = AtomicU64::new(1);
 const SCRIPTED_TARGET_DOMAIN: u128 = 4_u128 << 64;
@@ -26,9 +29,18 @@ const TEXT_OUTPUT: ProviderOutputKey = ProviderOutputKey::new(1);
 #[derive(Debug, Clone)]
 pub struct AcceptedFrame {
     pub basis: FrameBasis,
-    pub text: String,
     pub projection: Vec<CanonicalInputItem>,
     pub replay: Vec<CanonicalInputItem>,
+}
+
+impl AcceptedFrame {
+    pub fn document(&self) -> ResolvedDocument {
+        pom::combine(self.projection.iter().filter_map(|item| match item {
+            CanonicalInputItem::Instruction { pom, .. }
+            | CanonicalInputItem::Message { pom, .. } => Some(pom.clone()),
+            _ => None,
+        }))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -130,7 +142,6 @@ pub struct ScriptedProvider {
     profile: FrameProfile,
     scripts: VecDeque<ScriptedReaction>,
     capture: ScriptedCapture,
-    terminal_fault: Option<ReactionPortFault>,
     #[cfg(test)]
     fail_next_capture: bool,
 }
@@ -156,7 +167,6 @@ impl ScriptedProvider {
                 ),
                 scripts: scripts.into_iter().collect(),
                 capture: capture.clone(),
-                terminal_fault: None,
                 #[cfg(test)]
                 fail_next_capture: false,
             },
@@ -165,9 +175,6 @@ impl ScriptedProvider {
     }
 
     fn declaration(&self) -> Result<TargetDeclaration, ReactionPortFault> {
-        if let Some(fault) = self.terminal_fault {
-            return Err(fault);
-        }
         let accepted = *self
             .capture
             .accepted
@@ -212,29 +219,6 @@ impl ReactionPort for ScriptedProvider {
             )));
         }
         let revision = frame.revision();
-        let text = match frame
-            .submission()
-            .projection()
-            .items()
-            .iter()
-            .filter_map(|item| match item {
-                CanonicalInputItem::Instruction { pom, .. }
-                | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom)),
-                _ => None,
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(documents) => documents.join("\n"),
-            Err(_) => {
-                let fault = ReactionPortFault::terminal(
-                    ReactionPortFaultCode::Internal,
-                    ReactionPortFaultReason::RequestPreparation,
-                );
-                self.terminal_fault = Some(fault);
-                return Err(SubmitFault::Rejected(fault));
-            }
-        };
-
         let script = self
             .scripts
             .pop_front()
@@ -245,7 +229,6 @@ impl ReactionPort for ScriptedProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(AcceptedFrame {
                 basis: frame.basis(),
-                text,
                 projection: frame.submission().projection().items().to_vec(),
                 replay: frame.submission().replay().to_vec(),
             });
@@ -315,13 +298,6 @@ mod tests {
         }
     }
 
-    #[component]
-    fn unrenderable_capture_application() -> Component {
-        view! {
-            unrenderable_capture { "bad\u{0001}value" }
-        }
-    }
-
     #[tokio::test]
     async fn retryable_capture_failure_preserves_script_capture_and_declaration() {
         let completions = Arc::new(Mutex::new(Vec::new()));
@@ -355,36 +331,6 @@ mod tests {
             *completions.lock().unwrap(),
             vec![String::from("first-script")]
         );
-
-        application.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn deterministic_render_failure_is_terminal_and_sticky() {
-        let (provider, capture) =
-            ScriptedProvider::new([ScriptedReaction::text(["must-not-run"])]).unwrap();
-        let mut application =
-            Application::mount(unrenderable_capture_application, provider).unwrap();
-
-        let submit_fault = application.react().await.unwrap_err();
-        assert_eq!(submit_fault.stage(), ApplicationFaultStage::Submit);
-        assert_eq!(submit_fault.kind(), ApplicationFaultKind::Terminal);
-        assert_eq!(
-            submit_fault.reason(),
-            ApplicationFaultReason::Port(ReactionPortFaultReason::RequestPreparation)
-        );
-        assert_eq!(capture.submission_count(), 0);
-        assert_eq!(capture.accepted_revision(), None);
-
-        let declaration_fault = application.react().await.unwrap_err();
-        assert_eq!(
-            declaration_fault.stage(),
-            ApplicationFaultStage::Declaration
-        );
-        assert_eq!(declaration_fault.kind(), ApplicationFaultKind::Terminal);
-        assert_eq!(declaration_fault.reason(), submit_fault.reason());
-        assert_eq!(capture.submission_count(), 0);
-        assert_eq!(capture.accepted_revision(), None);
 
         application.shutdown().await.unwrap();
     }

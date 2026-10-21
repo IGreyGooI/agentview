@@ -1820,7 +1820,7 @@ mod tests {
             .unwrap();
         let text_index = input
             .iter()
-            .position(|item| item.to_string().contains("later text"))
+            .position(|item| item["content"][0]["text"] == "later text")
             .unwrap();
         assert!(reasoning_index < text_index, "replayed input: {input:?}");
     }
@@ -2356,14 +2356,16 @@ mod tests {
         assert_eq!(snapshot["prompt_cache_key"], "snapshot-cache-key");
         assert_eq!(snapshot["instructions"], "confirmed binding");
         assert_eq!(snapshot["input"], json!([compaction, message]));
-        assert!(!snapshot.to_string().contains("arbitrary-future-projection"));
 
         let future = projection(&[("future", &["arbitrary-future-projection"])]);
         let future_request =
             OpenAiContinuation::prepare(Some(&candidate), Some(&binding), future, &encoder)
                 .unwrap();
-        assert!(String::from_utf8(future_request.request_body)
-            .unwrap()
-            .contains("arbitrary-future-projection"));
+        let future_body: serde_json::Value =
+            serde_json::from_slice(&future_request.request_body).unwrap();
+        assert_eq!(
+            future_body["input"].as_array().unwrap().last().unwrap()["content"][0]["text"],
+            "arbitrary-future-projection"
+        );
     }
 }

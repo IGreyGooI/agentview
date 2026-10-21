@@ -1,12 +1,13 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use agentview::component::{
     execution::RenderedProjectionDiffMarker,
     prelude::{component, view, Component},
     ComponentHost,
 };
-use agentview::{
-    pom_renderer::render_pom_document,
-    transcript::{CanonicalInputItem, ConversationRole},
-};
+use agentview::transcript::{CanonicalInputItem, ConversationRole};
 
 #[derive(Clone, Copy)]
 struct ProjectionProps;
@@ -149,14 +150,8 @@ fn repeat_placement_scope_application(_props: ProjectionProps) -> Component {
     }
 }
 
-fn rendered(item: &CanonicalInputItem) -> String {
-    let pom = match item {
-        CanonicalInputItem::Instruction { pom, .. } | CanonicalInputItem::Message { pom, .. } => {
-            pom
-        }
-        other => panic!("expected POM projection item, got {other:?}"),
-    };
-    render_pom_document(pom).unwrap()
+fn document(item: &CanonicalInputItem) -> agentview::pom::ResolvedDocument {
+    item_document(item)
 }
 
 #[test]
@@ -208,10 +203,10 @@ fn render_treats_components_as_ordered_ownership_units() {
         .unwrap();
 
     assert_eq!(parent.items().len(), 2);
-    assert!(rendered(&parent.items()[0]).contains("<before_item>before</before_item>"));
-    assert!(rendered(&parent.items()[1]).contains("<after_item>after</after_item>"));
+    assert!(document(&parent.items()[0]).has_field("before_item", "before"));
+    assert!(document(&parent.items()[1]).has_field("after_item", "after"));
     assert_eq!(child.items().len(), 1);
-    assert!(rendered(&child.items()[0]).contains("<child_item>child</child_item>"));
+    assert!(document(&child.items()[0]).has_field("child_item", "child"));
 
     let lowered = projection
         .nodes()
@@ -219,16 +214,16 @@ fn render_treats_components_as_ordered_ownership_units() {
         .flat_map(|node| {
             node.items()
                 .iter()
-                .map(|item| (node.identity().to_owned(), rendered(item)))
+                .map(|item| (node.identity().to_owned(), document(item)))
         })
         .collect::<Vec<_>>();
     assert_eq!(lowered.len(), 3);
     assert!(lowered[0].0.contains("interleaved_parent"));
-    assert!(lowered[0].1.contains("<before_item>before</before_item>"));
+    assert!(lowered[0].1.has_field("before_item", "before"));
     assert!(lowered[1].0.contains("interleaved_parent"));
-    assert!(lowered[1].1.contains("<after_item>after</after_item>"));
+    assert!(lowered[1].1.has_field("after_item", "after"));
     assert!(lowered[2].0.contains("interleaved_child"));
-    assert!(lowered[2].1.contains("<child_item>child</child_item>"));
+    assert!(lowered[2].1.has_field("child_item", "child"));
 
     let transcript = projection
         .to_transcript()
@@ -268,11 +263,14 @@ fn authored_assistant_items_merge_only_across_contiguous_same_role_content() {
         ]
     ));
     assert_eq!(
-        rendered(&items[0]),
-        "Example answer.\n\n<answer>First.</answer>"
+        document(&items[0]),
+        combine([
+            paragraph("Example answer."),
+            text_element("answer", "First.")
+        ])
     );
-    assert_eq!(rendered(&items[1]), "<question>Next?</question>");
-    assert_eq!(rendered(&items[2]), "<answer>Second.</answer>");
+    assert_eq!(document(&items[1]), text_element("question", "Next?"));
+    assert_eq!(document(&items[2]), text_element("answer", "Second."));
 }
 
 #[test]
@@ -289,8 +287,11 @@ fn outer_assistant_placement_overrides_descendant_roles() {
         }]
     ));
     assert_eq!(
-        rendered(&transcript.items()[0]),
-        "<history_policy>policy</history_policy>\n\n<history_turn>turn-1</history_turn>"
+        document(&transcript.items()[0]),
+        combine([
+            text_element("history_policy", "policy"),
+            text_element("history_turn", "turn-1")
+        ])
     );
 }
 
@@ -315,12 +316,12 @@ fn repeat_placement_applies_to_one_subtree_and_outer_placement_wins() {
         ]
     ));
     assert_eq!(
-        rendered(&items[0]),
-        "<sibling_turn>ordinary user</sibling_turn>"
+        document(&items[0]),
+        text_element("sibling_turn", "ordinary user")
     );
     assert_eq!(
-        rendered(&items[1]),
-        "<history_policy>policy</history_policy>\n\n<history_turn>turn-1</history_turn>",
+        document(&items[1]),
+        combine([text_element("history_policy", "policy"), text_element("history_turn", "turn-1")]),
         "the outer repeat placement overrides the child's explicit developer root and default user root"
     );
 }
@@ -394,10 +395,10 @@ fn diff_root_retains_stable_item_provenance_and_complete_current_pom() {
     let first_diff: &RenderedProjectionDiffMarker = &first_node.diffs()[0];
     assert_eq!(first_diff.item_index(), 0);
     assert_eq!(first_diff.slot(), "state");
-    let first_prompt = rendered(&first_node.items()[first_diff.item_index()]);
-    assert!(first_prompt.contains("<before_diff>before</before_diff>"));
-    assert!(first_prompt.contains("<current_state>A</current_state>"));
-    assert!(first_prompt.contains("<after_diff>after</after_diff>"));
+    let first_document = document(&first_node.items()[first_diff.item_index()]);
+    assert!(first_document.has_field("before_diff", "before"));
+    assert!(first_document.has_field("current_state", "A"));
+    assert!(first_document.has_field("after_diff", "after"));
 
     host.set_props(DiffProjectionProps {
         value: "A+".to_owned(),
@@ -409,8 +410,8 @@ fn diff_root_retains_stable_item_provenance_and_complete_current_pom() {
         .find(|node| node.identity().contains("diff_projection_application"))
         .unwrap();
     assert_eq!(second_node.diffs(), first_node.diffs());
-    let second_prompt = rendered(&second_node.items()[second_node.diffs()[0].item_index()]);
-    assert!(second_prompt.contains("<before_diff>before</before_diff>"));
-    assert!(second_prompt.contains("<current_state>A+</current_state>"));
-    assert!(second_prompt.contains("<after_diff>after</after_diff>"));
+    let second_document = document(&second_node.items()[second_node.diffs()[0].item_index()]);
+    assert!(second_document.has_field("before_diff", "before"));
+    assert!(second_document.has_field("current_state", "A+"));
+    assert!(second_document.has_field("after_diff", "after"));
 }

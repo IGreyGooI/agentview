@@ -3,7 +3,6 @@ use agentview::pom::{
     MarkdownNode, ParagraphNode, ResolvedDocument, TextNode, XmlName, XmlNode,
 };
 use agentview::pom_cursor::UserDocumentCursor;
-use agentview::pom_renderer::render_pom_document;
 use agentview::pom_resolution::{
     resolve_system_document, resolve_user_document, PomResolutionError,
 };
@@ -129,8 +128,14 @@ fn keyed_collection(name: &str, items: &[(&str, &str)]) -> XmlNode {
 }
 
 fn operation(name: &str, value: XmlNode) -> XmlNode {
+    operation_group(name, [value])
+}
+
+fn operation_group(name: &str, values: impl IntoIterator<Item = XmlNode>) -> XmlNode {
     XmlNode::try_build(name, |children| {
-        children.xml(value);
+        for value in values {
+            children.xml(value);
+        }
         Ok(())
     })
     .unwrap()
@@ -195,6 +200,41 @@ fn map_node(entries: &[(CompoundMapKey, &'static str)]) -> XmlNode {
 
 fn map_entry(key: CompoundMapKey, value: &'static str) -> XmlNode {
     only_xml_child(&map_node(&[(key, value)]))
+}
+
+fn xml_children(node: &XmlNode) -> impl Iterator<Item = &XmlNode> {
+    node.children().iter().map(|child| match child {
+        ContentRef::Node(ContentNode::Xml(child)) => child,
+        other => panic!("expected XML collection content, got {other:?}"),
+    })
+}
+
+fn collection_patch(document: &ResolvedDocument) -> &XmlNode {
+    let mut roots = document.children().iter().filter_map(|child| match child {
+        ContentRef::Node(ContentNode::Xml(node)) => Some(node),
+        _ => None,
+    });
+    let root = roots.next().expect("collection patch");
+    assert!(roots.next().is_none());
+    root
+}
+
+fn assert_collection_baseline(
+    strategy: DiffStrategy,
+    current: &XmlNode,
+    cursor: &UserDocumentCursor,
+) {
+    assert_eq!(cursor.value(current.name()), Some(current));
+    let (unchanged, next) = resolve_user_document(
+        user_document(
+            "Continue.",
+            Some(DiffSlot::present(strategy, current.clone())),
+        ),
+        cursor,
+    )
+    .unwrap();
+    assert_eq!(unchanged, resolved_ordinary("Continue."));
+    assert_eq!(&next, cursor);
 }
 
 #[test]
@@ -299,13 +339,12 @@ fn unchanged_inline_slot_prunes_its_now_empty_markdown_containers() {
             &UserDocumentCursor::default(),
         )
         .unwrap();
-        assert!(!render_pom_document(&first).unwrap().is_empty());
+        assert!(!first.children().is_empty());
 
         let (unchanged, next) =
             resolve_user_document(inline_document(value, strong), &cursor).unwrap();
 
         assert!(unchanged.children().is_empty());
-        assert_eq!(render_pom_document(&unchanged).unwrap(), "");
         assert_eq!(next, cursor);
     }
 }
@@ -341,7 +380,7 @@ fn xml_diff_value_can_retain_markdown_while_a_nested_slot_changes() {
 }
 
 #[test]
-fn resolution_preserves_empty_xml_wrappers_and_authored_empty_markdown_errors() {
+fn resolution_preserves_empty_xml_wrappers_and_authored_empty_markdown() {
     fn wrapped_slot_document(value: XmlNode) -> Document {
         Document::try_build(|blocks| {
             blocks.xml(XmlNode::try_build("wrapper", |children| {
@@ -360,15 +399,17 @@ fn resolution_preserves_empty_xml_wrappers_and_authored_empty_markdown_errors() 
     )
     .unwrap();
     let (unchanged, _) = resolve_user_document(wrapped_slot_document(value), &cursor).unwrap();
-    assert_eq!(render_pom_document(&unchanged).unwrap(), "<wrapper />");
+    assert_eq!(
+        unchanged,
+        resolve_system_document(Document::from_xml(XmlNode::new(
+            XmlName::try_from("wrapper").unwrap(),
+        )))
+    );
 
     let authored_empty = Document::build(|blocks| blocks.paragraph(|_| {}));
-    let (authored_empty, _) =
-        resolve_user_document(authored_empty, &UserDocumentCursor::default()).unwrap();
-    assert_eq!(
-        render_pom_document(&authored_empty),
-        Err(agentview::pom_renderer::PomRenderError::InvalidEmptyParagraph)
-    );
+    let (resolved, _) =
+        resolve_user_document(authored_empty.clone(), &UserDocumentCursor::default()).unwrap();
+    assert_eq!(resolved.children(), authored_empty.children());
 }
 
 #[test]
@@ -510,10 +551,10 @@ fn append_diff_emits_only_insert_operations_for_the_new_tail() {
             "Continue.",
             collection_delta(
                 "items",
-                vec![
-                    operation("insert", text_xml("item", "c")),
-                    operation("insert", text_xml("item", "d")),
-                ],
+                vec![operation_group(
+                    "insert",
+                    [text_xml("item", "c"), text_xml("item", "d")],
+                )],
             ),
         )
     );
@@ -550,10 +591,10 @@ fn sequence_diff_emits_tail_insertions_and_removals() {
             "Continue.",
             collection_delta(
                 "items",
-                vec![
-                    operation("insert", text_xml("item", "b")),
-                    operation("insert", text_xml("item", "c")),
-                ],
+                vec![operation_group(
+                    "insert",
+                    [text_xml("item", "b"), text_xml("item", "c")],
+                )],
             ),
         )
     );
@@ -570,10 +611,10 @@ fn sequence_diff_emits_tail_insertions_and_removals() {
             "Continue.",
             collection_delta(
                 "items",
-                vec![
-                    operation("remove", text_xml("item", "b")),
-                    operation("remove", text_xml("item", "c")),
-                ],
+                vec![operation_group(
+                    "remove",
+                    [text_xml("item", "b"), text_xml("item", "c")],
+                )],
             ),
         )
     );
@@ -590,6 +631,50 @@ fn sequence_diff_falls_back_to_the_complete_current_collection_for_a_middle_chan
     );
 
     assert_eq!(resolved, resolved_with_xml("Continue.", current));
+}
+
+#[test]
+fn grouped_tail_insertions_preserve_order_and_repeated_values() {
+    for strategy in [DiffStrategy::Append, DiffStrategy::Sequence] {
+        let previous = collection("items", &["a"]);
+        let current = collection("items", &["a", "b", "b", "c"]);
+        let (resolved, cursor) =
+            resolve_collection_change(strategy.clone(), previous.clone(), current.clone());
+        let groups = xml_children(collection_patch(&resolved)).collect::<Vec<_>>();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name().as_str(), "insert");
+        assert_eq!(groups[0].children().len(), 3);
+
+        let mut replayed = xml_children(&previous).cloned().collect::<Vec<_>>();
+        replayed.extend(xml_children(groups[0]).cloned());
+        assert_eq!(
+            replayed,
+            xml_children(&current).cloned().collect::<Vec<_>>()
+        );
+        assert_collection_baseline(strategy, &current, &cursor);
+    }
+}
+
+#[test]
+fn grouped_tail_removals_preserve_the_retained_prefix() {
+    let previous = collection("items", &["a", "b", "b", "c"]);
+    let current = collection("items", &["a"]);
+    let (resolved, cursor) =
+        resolve_collection_change(DiffStrategy::Sequence, previous.clone(), current.clone());
+    let groups = xml_children(collection_patch(&resolved)).collect::<Vec<_>>();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name().as_str(), "remove");
+    assert_eq!(groups[0].children().len(), 3);
+
+    let mut replayed = xml_children(&previous).cloned().collect::<Vec<_>>();
+    for removed in xml_children(groups[0]) {
+        assert_eq!(&replayed.remove(current.children().len()), removed);
+    }
+    assert_eq!(
+        replayed,
+        xml_children(&current).cloned().collect::<Vec<_>>()
+    );
+    assert_collection_baseline(DiffStrategy::Sequence, &current, &cursor);
 }
 
 #[test]
@@ -625,6 +710,43 @@ fn set_diff_emits_structural_insertions_and_removals_but_ignores_order() {
 }
 
 #[test]
+fn grouped_set_changes_reconstruct_current_members() {
+    let previous = collection("items", &["keep", "old-a", "old-b"]);
+    let current = collection("items", &["new-b", "keep", "new-a"]);
+    let (resolved, cursor) =
+        resolve_collection_change(DiffStrategy::Set, previous.clone(), current.clone());
+    let groups = xml_children(collection_patch(&resolved)).collect::<Vec<_>>();
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group.name().as_str())
+            .collect::<Vec<_>>(),
+        ["insert", "remove"]
+    );
+
+    let mut replayed = xml_children(&previous).cloned().collect::<Vec<_>>();
+    for group in groups {
+        assert_eq!(group.children().len(), 2);
+        for item in xml_children(group) {
+            match group.name().as_str() {
+                "insert" => {
+                    assert!(!replayed.contains(item));
+                    replayed.push(item.clone());
+                }
+                "remove" => {
+                    let index = replayed.iter().position(|old| old == item).unwrap();
+                    replayed.remove(index);
+                }
+                other => panic!("unexpected set operation {other}"),
+            }
+        }
+    }
+    assert_eq!(replayed.len(), current.children().len());
+    assert!(xml_children(&current).all(|item| replayed.contains(item)));
+    assert_collection_baseline(DiffStrategy::Set, &current, &cursor);
+}
+
+#[test]
 fn keyed_diff_uses_attributes_for_insert_remove_and_update_identity() {
     let current = keyed_collection("actors", &[("c", "new"), ("a", "changed")]);
     let (resolved, _) = resolve_collection_change(
@@ -641,12 +763,85 @@ fn keyed_diff_uses_attributes_for_insert_remove_and_update_identity() {
                 "actors",
                 vec![
                     operation("insert", keyed_item("c", "new")),
-                    operation("remove", keyed_item("b", "gone")),
+                    operation("remove", {
+                        let mut identity = XmlNode::new(XmlName::try_from("actor").unwrap());
+                        identity
+                            .push_attribute(XmlName::try_from("id").unwrap(), "b")
+                            .unwrap();
+                        identity
+                    }),
                     operation("update", keyed_item("a", "changed")),
                 ],
             ),
         )
     );
+}
+
+#[test]
+fn grouped_keyed_changes_reconstruct_current_records_and_remove_only_identities() {
+    let previous = keyed_collection(
+        "actors",
+        &[
+            ("a", "keep"),
+            ("b", "old"),
+            ("c", "old"),
+            ("d", "gone"),
+            ("e", "gone"),
+        ],
+    );
+    let current = keyed_collection(
+        "actors",
+        &[
+            ("g", "new"),
+            ("c", "changed"),
+            ("a", "keep"),
+            ("f", "new"),
+            ("b", "changed"),
+        ],
+    );
+    let strategy = DiffStrategy::Keyed(XmlName::try_from("id").unwrap());
+    let (resolved, cursor) =
+        resolve_collection_change(strategy.clone(), previous.clone(), current.clone());
+    let groups = xml_children(collection_patch(&resolved)).collect::<Vec<_>>();
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group.name().as_str())
+            .collect::<Vec<_>>(),
+        ["insert", "remove", "update"]
+    );
+    let id = |node: &XmlNode| {
+        node.attributes()
+            .get(&XmlName::try_from("id").unwrap())
+            .unwrap()
+            .value()
+            .to_owned()
+    };
+    let mut replayed = xml_children(&previous)
+        .map(|item| (id(item), item.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for group in groups {
+        assert_eq!(group.children().len(), 2);
+        for item in xml_children(group) {
+            match group.name().as_str() {
+                "insert" => assert!(replayed.insert(id(item), item.clone()).is_none()),
+                "update" => assert!(replayed.insert(id(item), item.clone()).is_some()),
+                "remove" => {
+                    assert_eq!(item.attributes().len(), 1);
+                    assert!(item.children().is_empty());
+                    assert!(replayed.remove(&id(item)).is_some());
+                }
+                other => panic!("unexpected keyed operation {other}"),
+            }
+        }
+    }
+    assert_eq!(
+        replayed,
+        xml_children(&current)
+            .map(|item| (id(item), item.clone()))
+            .collect()
+    );
+    assert_collection_baseline(strategy, &current, &cursor);
 }
 
 #[test]
@@ -709,6 +904,61 @@ fn recursive_diff_uses_intrinsic_map_identity_for_insert_remove_and_update() {
             ),
         )
     );
+}
+
+#[test]
+fn grouped_map_changes_preserve_compound_keys_and_current_values() {
+    let key = |id| CompoundMapKey {
+        namespace: "scene",
+        id,
+    };
+    let previous = map_node(&[
+        (key(1), "keep"),
+        (key(2), "old"),
+        (key(3), "old"),
+        (key(4), "gone"),
+        (key(5), "gone"),
+    ]);
+    let current = map_node(&[
+        (key(1), "keep"),
+        (key(2), "changed"),
+        (key(3), "changed"),
+        (key(6), "new"),
+        (key(7), "new"),
+    ]);
+    let (resolved, cursor) =
+        resolve_collection_change(DiffStrategy::Recursive, previous.clone(), current.clone());
+    let groups = xml_children(collection_patch(&resolved)).collect::<Vec<_>>();
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group.name().as_str())
+            .collect::<Vec<_>>(),
+        ["insert", "remove", "update"]
+    );
+    let mut replayed = xml_children(&previous).cloned().collect::<Vec<_>>();
+    for group in groups {
+        assert_eq!(group.children().len(), 2);
+        for item in xml_children(group) {
+            let existing = replayed
+                .iter()
+                .position(|old| only_xml_child(old) == only_xml_child(item));
+            match group.name().as_str() {
+                "insert" => {
+                    assert!(existing.is_none());
+                    replayed.push(item.clone());
+                }
+                "remove" => {
+                    replayed.remove(existing.unwrap());
+                }
+                "update" => replayed[existing.unwrap()] = item.clone(),
+                other => panic!("unexpected map operation {other}"),
+            }
+        }
+    }
+    assert_eq!(replayed.len(), current.children().len());
+    assert!(xml_children(&current).all(|item| replayed.contains(item)));
+    assert_collection_baseline(DiffStrategy::Recursive, &current, &cursor);
 }
 
 #[test]

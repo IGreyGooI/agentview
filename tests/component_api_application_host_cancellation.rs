@@ -4,6 +4,10 @@
     reason = "this compatibility test intentionally exercises ApplicationHost cancellation"
 )]
 
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -24,8 +28,6 @@ use agentview::{
         ComponentHost,
     },
     llm_call::TextTurnEvent,
-    pom_renderer::render_pom_document,
-    transcript::CanonicalInputItem,
 };
 use async_trait::async_trait;
 use tokio::sync::Notify;
@@ -159,20 +161,6 @@ fn exposed_values(exposed: &Arc<Mutex<Option<Signal<Vec<usize>>>>>) -> Vec<usize
         .unwrap()
 }
 
-fn projection_text(projection: &RenderedProjection) -> String {
-    projection
-        .nodes()
-        .iter()
-        .flat_map(|node| node.items())
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom).unwrap()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[tokio::test]
 async fn cancelling_a_pending_handler_keeps_prior_signal_writes_and_reuses_the_port() {
     let exposed = Arc::new(Mutex::new(None));
@@ -216,7 +204,7 @@ async fn cancelling_a_pending_handler_keeps_prior_signal_writes_and_reuses_the_p
     let committed = components
         .current_projection()
         .expect("cancellation retains the pre-reaction projection");
-    assert!(projection_text(committed).contains("<state>[]</state>"));
+    assert!(projection_document(committed).has_field("state", "[]"));
 
     host.dispatch_llm_reaction(&mut components)
         .await
@@ -236,9 +224,9 @@ async fn cancelling_a_pending_handler_keeps_prior_signal_writes_and_reuses_the_p
     );
     let projections = projections.lock().unwrap();
     assert_eq!(projections.len(), 2);
-    assert!(projection_text(&projections[1]).contains("<state>[1]</state>"));
+    assert!(projection_document(&projections[1]).has_field("state", "[1]"));
     let committed = components
         .current_projection()
         .expect("successful retry commits its post-reconciled projection");
-    assert!(projection_text(committed).contains("<state>[1, 2, 102]</state>"));
+    assert!(projection_document(committed).has_field("state", "[1, 2, 102]"));
 }

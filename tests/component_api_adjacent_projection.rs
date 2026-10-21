@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -20,7 +24,6 @@ use agentview::{
         },
         prelude::*,
     },
-    pom_renderer::render_pom_document,
     transcript::{CanonicalInputItem, ConversationRole, InstructionAuthority},
 };
 use async_trait::async_trait;
@@ -305,9 +308,11 @@ fn repeat_and_normal_state_application(props: StringSnapshotProps) -> Component 
     }
 }
 
+type AssistantHistorySignal = Signal<Option<Vec<String>>>;
+
 #[derive(Clone)]
 struct AssistantDiffProps {
-    exposed: Arc<Mutex<Option<Signal<Option<Vec<String>>>>>>,
+    exposed: Arc<Mutex<Option<AssistantHistorySignal>>>,
 }
 
 impl AssistantDiffProps {
@@ -317,7 +322,7 @@ impl AssistantDiffProps {
         }
     }
 
-    fn signal(&self) -> Signal<Option<Vec<String>>> {
+    fn signal(&self) -> AssistantHistorySignal {
         self.exposed
             .lock()
             .expect("signal exposure lock")
@@ -547,18 +552,8 @@ fn conditional_policy_child(props: ConditionalChildProps) -> Component {
     }
 }
 
-fn rendered(item: &CanonicalInputItem) -> String {
-    let pom = match item {
-        CanonicalInputItem::Instruction { pom, .. } | CanonicalInputItem::Message { pom, .. } => {
-            pom
-        }
-        other => panic!("expected a POM projection item, got {other:?}"),
-    };
-    render_pom_document(pom).expect("projection POM renders")
-}
-
-fn projection_texts(frame: &CapturedFrame) -> Vec<String> {
-    frame.projection.iter().map(rendered).collect()
+fn projection_documents(frame: &CapturedFrame) -> Vec<agentview::pom::ResolvedDocument> {
+    item_documents(&frame.projection)
 }
 
 async fn react(application: &mut Application<CapturingPort>) {
@@ -612,14 +607,20 @@ async fn ordinary_items_compare_against_only_the_last_committed_complete_snapsho
     assert!(matches!(frames[1].basis, FrameBasis::DeltaFrom(_)));
     assert!(matches!(frames[2].basis, FrameBasis::DeltaFrom(_)));
     assert!(matches!(frames[3].basis, FrameBasis::DeltaFrom(_)));
-    assert_eq!(projection_texts(&frames[0]), ["<state>A</state>"]);
-    assert_eq!(projection_texts(&frames[1]), ["<state>B</state>"]);
     assert_eq!(
-        projection_texts(&frames[2]),
-        ["<state>A</state>"],
+        projection_documents(&frames[0]),
+        [text_element("state", "A")]
+    );
+    assert_eq!(
+        projection_documents(&frames[1]),
+        [text_element("state", "B")]
+    );
+    assert_eq!(
+        projection_documents(&frames[2]),
+        [text_element("state", "A")],
         "returning to an earlier value compares with B, not cumulative history"
     );
-    assert!(projection_texts(&frames[3]).is_empty());
+    assert!(projection_documents(&frames[3]).is_empty());
     for frame in &frames {
         assert_lookup_metadata(frame);
     }
@@ -649,12 +650,21 @@ async fn assistant_items_are_messages_and_compare_against_the_adjacent_snapshot(
     assert_eq!(frames.len(), 4);
     assert_eq!(frames[0].basis, FrameBasis::Full);
     assert_assistant_message(&frames[0]);
-    assert_eq!(projection_texts(&frames[0]), ["<state>A</state>"]);
+    assert_eq!(
+        projection_documents(&frames[0]),
+        [text_element("state", "A")]
+    );
     assert!(frames[1].projection.is_empty());
     assert_assistant_message(&frames[2]);
-    assert_eq!(projection_texts(&frames[2]), ["<state>B</state>"]);
+    assert_eq!(
+        projection_documents(&frames[2]),
+        [text_element("state", "B")]
+    );
     assert_assistant_message(&frames[3]);
-    assert_eq!(projection_texts(&frames[3]), ["<state>A</state>"]);
+    assert_eq!(
+        projection_documents(&frames[3]),
+        [text_element("state", "A")]
+    );
 
     application.shutdown().await.expect("shutdown application");
 }
@@ -680,13 +690,19 @@ async fn assistant_item_disappearance_is_silent_and_reappearance_is_submitted() 
     let frames = capture.frames();
     assert_eq!(frames.len(), 3);
     assert_assistant_message(&frames[0]);
-    assert_eq!(projection_texts(&frames[0]), ["<state>A</state>"]);
+    assert_eq!(
+        projection_documents(&frames[0]),
+        [text_element("state", "A")]
+    );
     assert!(
         frames[1].projection.is_empty(),
         "assistant item disappearance does not synthesize an XML remove operation"
     );
     assert_assistant_message(&frames[2]);
-    assert_eq!(projection_texts(&frames[2]), ["<state>A</state>"]);
+    assert_eq!(
+        projection_documents(&frames[2]),
+        [text_element("state", "A")]
+    );
 
     application.shutdown().await.expect("shutdown application");
 }
@@ -727,24 +743,24 @@ async fn assistant_diff_delta_keeps_its_message_role_and_disappearance_is_silent
     let frames = capture.frames();
     assert_eq!(frames.len(), 4);
     assert_assistant_message(&frames[1]);
-    let delta = projection_texts(&frames[1])
+    let delta = projection_documents(&frames[1])
         .into_iter()
         .next()
         .expect("assistant semantic delta is submitted");
-    assert!(delta.contains("rendering_mode=\"delta\""));
-    assert!(delta.contains("<insert>"));
-    assert!(delta.contains("second"));
+    assert!(delta.has_attribute("rendering_mode", "delta"));
+    assert!(delta.has_element("insert"));
+    assert!(delta.has_text("second"));
     assert!(
         frames[2].projection.is_empty(),
         "removing an assistant diff item emits no XML remove operation"
     );
     assert_assistant_message(&frames[3]);
-    let restored = projection_texts(&frames[3])
+    let restored = projection_documents(&frames[3])
         .into_iter()
         .next()
         .expect("restored assistant diff item is submitted in full");
-    assert!(restored.contains("first"));
-    assert!(!restored.contains("rendering_mode=\"delta\""));
+    assert!(restored.has_text("first"));
+    assert!(!restored.has_attribute("rendering_mode", "delta"));
 
     application.shutdown().await.expect("shutdown application");
 }
@@ -789,7 +805,10 @@ async fn provider_assistant_text_and_authored_assistant_message_do_not_claim_eac
         "the provider assistant output remains in replay before the Component authors identical XML"
     );
     assert_assistant_message(&frames[1]);
-    assert_eq!(projection_texts(&frames[1]), ["<state>A</state>"]);
+    assert_eq!(
+        projection_documents(&frames[1]),
+        [text_element("state", "A")]
+    );
 
     assert_eq!(frames[2].basis, FrameBasis::Full);
     assert_eq!(frames[2].replay.len(), 2);
@@ -801,10 +820,7 @@ async fn provider_assistant_text_and_authored_assistant_message_do_not_claim_eac
         CanonicalInputItem::Message {
             role: ConversationRole::Assistant,
             pom,
-        } => assert_eq!(
-            render_pom_document(pom).expect("replayed authored assistant POM renders"),
-            "<state>A</state>"
-        ),
+        } => assert_eq!(pom, &text_element("state", "A")),
         other => panic!("expected an authored assistant message in replay, got {other:?}"),
     }
     assert!(
@@ -836,11 +852,17 @@ async fn full_transport_keeps_the_adjacent_complete_snapshot_for_ordinary_items(
     assert_eq!(frames.len(), 4);
     assert_eq!(frames[0].basis, FrameBasis::Full);
     assert_eq!(frames[1].basis, FrameBasis::Full);
-    assert!(projection_texts(&frames[1]).is_empty());
+    assert!(projection_documents(&frames[1]).is_empty());
     assert!(matches!(frames[2].basis, FrameBasis::DeltaFrom(_)));
     assert!(matches!(frames[3].basis, FrameBasis::DeltaFrom(_)));
-    assert_eq!(projection_texts(&frames[2]), ["<state>B</state>"]);
-    assert_eq!(projection_texts(&frames[3]), ["<state>A</state>"]);
+    assert_eq!(
+        projection_documents(&frames[2]),
+        [text_element("state", "B")]
+    );
+    assert_eq!(
+        projection_documents(&frames[3]),
+        [text_element("state", "A")]
+    );
     for frame in &frames {
         assert_lookup_metadata(frame);
     }
@@ -867,15 +889,15 @@ async fn explicit_diff_items_keep_their_structured_delta_semantics() {
 
     let frames = capture.frames();
     assert_eq!(frames.len(), 3);
-    let delta = projection_texts(&frames[1])
+    let delta = projection_documents(&frames[1])
         .into_iter()
         .next()
         .expect("changed diff item is submitted");
-    assert!(delta.contains("rendering_mode=\"delta\""));
-    assert!(delta.contains("<insert>"));
-    assert!(delta.contains("second"));
-    assert!(!delta.contains("first"));
-    assert!(projection_texts(&frames[2]).is_empty());
+    assert!(delta.has_attribute("rendering_mode", "delta"));
+    assert!(delta.has_element("insert"));
+    assert!(delta.has_text("second"));
+    assert!(!delta.has_text("first"));
+    assert!(projection_documents(&frames[2]).is_empty());
 
     application.shutdown().await.expect("shutdown application");
 }
@@ -901,29 +923,29 @@ async fn repeat_items_submit_complete_current_values_without_affecting_adjacent_
 
     let frames = capture.frames();
     assert_eq!(frames.len(), 3);
-    let initial = projection_texts(&frames[0]);
+    let initial = projection_documents(&frames[0]);
     assert_eq!(initial.len(), 2);
-    assert!(initial[0].contains("<normal_context>ordinary</normal_context>"));
-    assert!(initial[1].contains("<repeat_context>always</repeat_context>"));
-    assert!(initial[1].contains("first"));
+    assert!(initial[0].has_field("normal_context", "ordinary"));
+    assert!(initial[1].has_field("repeat_context", "always"));
+    assert!(initial[1].has_text("first"));
 
-    let unchanged = projection_texts(&frames[1]);
+    let unchanged = projection_documents(&frames[1]);
     assert_eq!(unchanged.len(), 1);
-    assert!(unchanged[0].contains("<repeat_context>always</repeat_context>"));
-    assert!(unchanged[0].contains("first"));
-    assert!(!unchanged[0].contains("normal_context"));
+    assert!(unchanged[0].has_field("repeat_context", "always"));
+    assert!(unchanged[0].has_text("first"));
+    assert!(!unchanged[0].has_element("normal_context"));
     assert!(
-        !unchanged[0].contains("rendering_mode=\"delta\""),
+        !unchanged[0].has_attribute("rendering_mode", "delta"),
         "a repeat item is submitted as complete current POM even when it has #[diff] metadata"
     );
 
-    let changed = projection_texts(&frames[2]);
+    let changed = projection_documents(&frames[2]);
     assert_eq!(changed.len(), 1);
-    assert!(changed[0].contains("<repeat_context>always</repeat_context>"));
-    assert!(changed[0].contains("first"));
-    assert!(changed[0].contains("second"));
-    assert!(!changed[0].contains("rendering_mode=\"delta\""));
-    assert!(!changed[0].contains("<insert>"));
+    assert!(changed[0].has_field("repeat_context", "always"));
+    assert!(changed[0].has_text("first"));
+    assert!(changed[0].has_text("second"));
+    assert!(!changed[0].has_attribute("rendering_mode", "delta"));
+    assert!(!changed[0].has_element("insert"));
 
     application.shutdown().await.expect("shutdown application");
 }
@@ -946,15 +968,17 @@ async fn mixed_document_text_changes_keep_text_atomic_and_refresh_its_xml_root()
 
     let frames = capture.frames();
     assert_eq!(frames.len(), 2);
-    let patch = projection_texts(&frames[1])
+    let patch = projection_documents(&frames[1])
         .into_iter()
         .next()
         .expect("changed mixed document is submitted");
-    assert!(patch.starts_with("<remove>"));
-    assert!(patch.contains("<policy>\n  <access>allow-read</access>\n</policy>"));
-    assert!(patch.contains("Updated note."));
+    assert!(
+        matches!(patch.children().iter().next(), Some(agentview::pom::ContentRef::Node(agentview::pom::ContentNode::Xml(node))) if node.name().as_str() == "remove")
+    );
+    assert!(patch.has_field("access", "allow-read"));
+    assert!(patch.has_text("Updated note."));
     assert_eq!(
-        patch.matches("<policy>").count(),
+        patch.elements("policy").len(),
         2,
         "mixed document fallback removes the previous XML root before replaying the complete current document"
     );
@@ -980,7 +1004,7 @@ async fn mixed_item_template_keeps_complete_fragments_around_the_structured_delt
 
     let frames = capture.frames();
     assert_eq!(frames.len(), 2);
-    let submitted = projection_texts(&frames[1]);
+    let submitted = projection_documents(&frames[1]);
     assert_eq!(
         submitted.len(),
         1,
@@ -988,13 +1012,13 @@ async fn mixed_item_template_keeps_complete_fragments_around_the_structured_delt
     );
     let delta = &submitted[0];
     assert!(
-        delta.contains("<prefix>fixed</prefix>"),
-        "mixed template delta: {delta}"
+        delta.has_field("prefix", "fixed"),
+        "mixed template delta: {delta:?}"
     );
-    assert!(delta.contains("<suffix>fixed</suffix>"));
-    assert!(delta.contains("rendering_mode=\"delta\""));
-    assert!(delta.contains("<insert>"));
-    assert!(delta.contains("second"));
+    assert!(delta.has_field("suffix", "fixed"));
+    assert!(delta.has_attribute("rendering_mode", "delta"));
+    assert!(delta.has_element("insert"));
+    assert!(delta.has_text("second"));
 
     application.shutdown().await.expect("shutdown application");
 }
@@ -1020,15 +1044,18 @@ async fn disappearing_xml_item_emits_a_developer_remove_patch_and_can_reappear()
     let frames = capture.frames();
     assert_eq!(frames.len(), 3);
     assert_eq!(
-        projection_texts(&frames[0]),
+        projection_documents(&frames[0]),
         [
-            "<workspace>agentview</workspace>",
-            "<policy>allow-read</policy>"
+            text_element("workspace", "agentview"),
+            text_element("policy", "allow-read")
         ]
     );
     assert_eq!(
-        projection_texts(&frames[1]),
-        ["<remove>\n  <policy>allow-read</policy>\n</remove>"],
+        projection_documents(&frames[1]),
+        [nested_element(
+            "remove",
+            &[text_element("policy", "allow-read")]
+        )],
         "the vanished XML document is compared with an empty document"
     );
     assert!(matches!(
@@ -1039,8 +1066,8 @@ async fn disappearing_xml_item_emits_a_developer_remove_patch_and_can_reappear()
         }]
     ));
     assert_eq!(
-        projection_texts(&frames[2]),
-        ["<policy>allow-read</policy>"],
+        projection_documents(&frames[2]),
+        [text_element("policy", "allow-read")],
         "the complete snapshot keeps workspace but no longer contains policy"
     );
 
@@ -1073,8 +1100,8 @@ async fn disappearing_repeat_user_item_emits_the_normal_xml_remove_patch() {
         }]
     ));
     assert_eq!(
-        projection_texts(&frames[0]),
-        ["<policy>allow-read</policy>"]
+        projection_documents(&frames[0]),
+        [text_element("policy", "allow-read")]
     );
     assert!(matches!(
         frames[1].projection.as_slice(),
@@ -1084,8 +1111,8 @@ async fn disappearing_repeat_user_item_emits_the_normal_xml_remove_patch() {
         }]
     ));
     assert_eq!(
-        projection_texts(&frames[1]),
-        ["<policy>allow-read</policy>"],
+        projection_documents(&frames[1]),
+        [text_element("policy", "allow-read")],
         "an unchanged #[user(repeat)] root is still submitted on the next reaction"
     );
     assert!(matches!(
@@ -1096,8 +1123,11 @@ async fn disappearing_repeat_user_item_emits_the_normal_xml_remove_patch() {
         }]
     ));
     assert_eq!(
-        projection_texts(&frames[2]),
-        ["<remove>\n  <policy>allow-read</policy>\n</remove>"],
+        projection_documents(&frames[2]),
+        [nested_element(
+            "remove",
+            &[text_element("policy", "allow-read")]
+        )],
         "when a repeat item is absent, its former user POM is removed instead of being repeated"
     );
 
@@ -1130,10 +1160,10 @@ async fn outer_placement_overrides_inner_repeat_and_repeat_scope_survives_later_
         ]
     ));
     assert_eq!(
-        projection_texts(&frames[0]),
+        projection_documents(&frames[0]),
         [
-            "<inherited_value>child</inherited_value>",
-            "<inherited_value>child</inherited_value>"
+            text_element("inherited_value", "child"),
+            text_element("inherited_value", "child")
         ]
     );
     for frame in &frames[1..] {
@@ -1145,8 +1175,8 @@ async fn outer_placement_overrides_inner_repeat_and_repeat_scope_survives_later_
             }]
         ));
         assert_eq!(
-            projection_texts(frame),
-            ["<inherited_value>child</inherited_value>"],
+            projection_documents(frame),
+            [text_element("inherited_value", "child")],
             "the outer #[user(repeat)] subtree remains repeatable across reactions while the outer ordinary developer subtree is omitted"
         );
     }
@@ -1170,12 +1200,15 @@ async fn disappearing_component_node_emits_the_xml_remove_patch() {
     let frames = capture.frames();
     assert_eq!(frames.len(), 2);
     assert_eq!(
-        projection_texts(&frames[0]),
-        ["<policy>child-policy</policy>"]
+        projection_documents(&frames[0]),
+        [text_element("policy", "child-policy")]
     );
     assert_eq!(
-        projection_texts(&frames[1]),
-        ["<remove>\n  <policy>child-policy</policy>\n</remove>"]
+        projection_documents(&frames[1]),
+        [nested_element(
+            "remove",
+            &[text_element("policy", "child-policy")]
+        )]
     );
     assert!(matches!(
         frames[1].projection.as_slice(),
@@ -1207,14 +1240,14 @@ async fn plain_text_changes_are_full_and_disappearance_has_no_remove_patch() {
 
     let frames = capture.frames();
     assert_eq!(frames.len(), 3);
-    assert_eq!(projection_texts(&frames[0]), ["first note"]);
+    assert_eq!(projection_documents(&frames[0]), [paragraph("first note")]);
     assert_eq!(
-        projection_texts(&frames[1]),
-        ["second note"],
+        projection_documents(&frames[1]),
+        [paragraph("second note")],
         "plain text changes are sent as complete current text"
     );
     assert!(
-        projection_texts(&frames[2]).is_empty(),
+        projection_documents(&frames[2]).is_empty(),
         "plain text disappearance does not synthesize an XML remove operation"
     );
 
@@ -1251,14 +1284,17 @@ async fn cancelled_pre_handoff_submission_does_not_advance_the_complete_snapshot
 
     let frames = capture.frames();
     assert_eq!(frames.len(), 3);
-    assert_eq!(projection_texts(&frames[0]), ["<state>A</state>"]);
     assert_eq!(
-        projection_texts(&frames[1]),
-        ["<state>B</state>"],
+        projection_documents(&frames[0]),
+        [text_element("state", "A")]
+    );
+    assert_eq!(
+        projection_documents(&frames[1]),
+        [text_element("state", "B")],
         "the blocked frame was prepared but never handed off"
     );
     assert!(
-        projection_texts(&frames[2]).is_empty(),
+        projection_documents(&frames[2]).is_empty(),
         "the successful retry still compares with the last handed-off A snapshot"
     );
 
@@ -1307,21 +1343,21 @@ async fn repeat_items_are_delivered_only_by_react_and_cancelled_frames_do_not_ad
     let frames = capture.frames();
     assert_eq!(frames.len(), 3);
     assert_eq!(
-        projection_texts(&frames[0]),
+        projection_documents(&frames[0]),
         [
-            "<normal_state>A</normal_state>",
-            "<repeat_state>A</repeat_state>"
+            text_element("normal_state", "A"),
+            text_element("repeat_state", "A")
         ]
     );
     assert!(
-        projection_texts(&frames[1])
+        projection_documents(&frames[1])
             .iter()
-            .any(|item| item.contains("<repeat_state>B</repeat_state>")),
+            .any(|item| item.has_field("repeat_state", "B")),
         "the cancelled attempt prepared B but never committed it"
     );
     assert_eq!(
-        projection_texts(&frames[2]),
-        ["<repeat_state>A</repeat_state>"],
+        projection_documents(&frames[2]),
+        [text_element("repeat_state", "A")],
         "the retry compares normal state with the last handed-off A while delivering the repeat item"
     );
 

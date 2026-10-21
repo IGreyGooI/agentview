@@ -1,7 +1,12 @@
 //! Speculative provider-private compaction. Workers produce candidates; only
 //! foreground handoff can install them. No worker owns application capabilities.
 
-use std::{num::NonZeroU64, panic::resume_unwind, time::Duration};
+use std::{
+    num::NonZeroU64,
+    panic::resume_unwind,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_openai::config::{Config, OpenAIConfig};
 use futures::{FutureExt, StreamExt};
@@ -10,6 +15,11 @@ use sha2::{Digest, Sha256};
 use tokio::{sync::watch, task::JoinHandle};
 
 use super::frame_request::{ResponsesFrameRequestFault, ResponsesFrameRequestState};
+use super::reaction_fault::{map_openai_fault, OpenAiFailureClass, OpenAiReactionFailure};
+use super::responses_observation::{
+    capture_error_response, observation_fault, CapturedResponse, OpenAiResponsesObservation,
+    OpenAiResponsesObserver, OpenAiResponsesTransportDiagnostic,
+};
 use crate::{component::execution::reaction::Frame, provider::codex_http_v1::CodexHttpV1Encoder};
 
 const SUMMARY_INSTRUCTIONS: &str = "Summarize this conversation prefix for another model to \
@@ -142,6 +152,7 @@ pub enum ParallelCompactionFault {
     Timeout,
     NoReduction,
     RuntimeUnavailable,
+    Observation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +250,22 @@ pub(super) struct CompactionTransport {
     pub(super) response_limit: usize,
     pub(super) read_timeout: Duration,
     pub(super) context_window_tokens: NonZeroU64,
+    pub(super) observer: Option<Arc<dyn OpenAiResponsesObserver>>,
+}
+
+/// Both triggers use one task lifecycle. Background requests obey the policy;
+/// required requests wait for the existing candidate or start one if needed.
+#[derive(Clone, Copy)]
+pub(super) enum CompactionMode<'a> {
+    Background(&'a CompactionContext),
+    Required { wait_timeout: Duration },
+}
+
+/// Policy evaluation happens before foreground handoff. Launching background
+/// work remains deferred until that handoff has accepted its source lineage.
+pub(super) struct CompactionRequest {
+    source: Option<CompactionSource>,
+    wait_timeout: Option<Duration>,
 }
 
 impl CompactionTransport {
@@ -304,6 +331,10 @@ impl ParallelCompaction {
         ParallelCompactionMonitor {
             receiver: self.status.subscribe(),
         }
+    }
+
+    pub(super) fn status(&self) -> ParallelCompactionStatus {
+        *self.status.borrow()
     }
 
     pub(super) fn replace_policy(&mut self, policy: impl CompactionPolicy + 'static) {
@@ -387,38 +418,49 @@ impl ParallelCompaction {
         Ok(None)
     }
 
-    pub(super) fn select_source(
+    pub(super) fn prepare_request(
         &self,
         source: Option<CompactionSource>,
-        context: &CompactionContext,
-    ) -> Option<CompactionSource> {
-        if self.attempt.is_some() {
-            return None;
+        mode: CompactionMode<'_>,
+    ) -> CompactionRequest {
+        let wait_timeout = match mode {
+            CompactionMode::Background(_) => None,
+            CompactionMode::Required { wait_timeout } => Some(wait_timeout),
+        };
+        let source = source.filter(|source| {
+            self.attempt.is_none()
+                && self.last_source != Some(source.fingerprint)
+                && match mode {
+                    CompactionMode::Background(context) => self.policy.should_compact(context),
+                    CompactionMode::Required { .. } => true,
+                }
+        });
+        CompactionRequest {
+            source,
+            wait_timeout,
         }
-        let source = source?;
-        if self.last_source == Some(source.fingerprint) {
-            return None;
-        }
-        self.policy.should_compact(context).then_some(source)
     }
 
-    /// Forced admission bypasses only the background policy. It still shares
-    /// the one-worker and one-attempt-per-source guards.
-    pub(super) fn select_forced_source(
-        &self,
-        source: Option<CompactionSource>,
-    ) -> Option<CompactionSource> {
-        if self.attempt.is_some() {
-            return None;
+    /// The single entry point for starting or joining a compaction task.
+    /// Waiting never consumes a candidate; only foreground handoff installs it.
+    pub(super) async fn request(
+        &mut self,
+        request: CompactionRequest,
+        transport: CompactionTransport,
+    ) -> bool {
+        if let Some(source) = request.source {
+            self.start(source, transport);
         }
-        let source = source?;
-        (self.last_source != Some(source.fingerprint)).then_some(source)
+        match request.wait_timeout {
+            Some(timeout) => self.wait_ready(timeout).await,
+            None => self.has_attempt(),
+        }
     }
 
     /// Waits only for the single active candidate. Timeout aborts this source
     /// and leaves `last_source` intact, so a caller cannot loop forever by
     /// repeatedly forcing the same accepted prefix.
-    pub(super) async fn wait_ready(&mut self, wait_timeout: Duration) -> bool {
+    async fn wait_ready(&mut self, wait_timeout: Duration) -> bool {
         self.refresh();
         if self
             .attempt
@@ -524,7 +566,7 @@ impl ParallelCompaction {
     /// The worker is independent of the foreground stream and cannot mutate its
     /// accepted state. Background callers start after handoff; forced callers
     /// may start before handoff and must wait for a validated candidate.
-    pub(super) fn start(&mut self, source: CompactionSource, transport: CompactionTransport) {
+    fn start(&mut self, source: CompactionSource, transport: CompactionTransport) {
         if self.attempt.is_some() {
             return;
         }
@@ -622,44 +664,141 @@ async fn compact(
     request: reqwest::Request,
     input_bytes: usize,
 ) -> Result<Vec<Value>, ParallelCompactionFault> {
-    let response = transport.client.execute(request).await.map_err(|error| {
-        if error.is_timeout() {
-            ParallelCompactionFault::Timeout
-        } else {
-            ParallelCompactionFault::Transport
-        }
-    })?;
-    if !response.status().is_success() {
-        return Err(ParallelCompactionFault::HttpStatus(
-            response.status().as_u16(),
-        ));
+    if let Some(observer) = &transport.observer {
+        observer
+            .observe(OpenAiResponsesObservation::Request {
+                path: request.url().path().to_owned(),
+                body: request
+                    .body()
+                    .and_then(reqwest::Body::as_bytes)
+                    .unwrap_or_default()
+                    .to_vec(),
+            })
+            .await
+            .map_err(|_| ParallelCompactionFault::Observation)?;
     }
-    let limit = transport.response_limit;
-    if response
-        .content_length()
-        .is_some_and(|size| size > limit as u64)
-    {
-        return Err(ParallelCompactionFault::Limit);
-    }
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = tokio::time::timeout(transport.read_timeout, stream.next())
-        .await
-        .map_err(|_| ParallelCompactionFault::Timeout)?
-    {
-        let chunk = chunk.map_err(|error| {
-            if error.is_timeout() {
+    let started = Instant::now();
+    let response = match transport.client.execute(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some(observer) = &transport.observer {
+                observer
+                    .observe(OpenAiResponsesObservation::TransportDiagnostic {
+                        diagnostic: OpenAiResponsesTransportDiagnostic::request(&error, started),
+                    })
+                    .await
+                    .map_err(|_| ParallelCompactionFault::Observation)?;
+            }
+            let fault = if error.is_timeout() {
                 ParallelCompactionFault::Timeout
             } else {
                 ParallelCompactionFault::Transport
-            }
-        })?;
-        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            };
+            observe_compaction_error(&transport.observer, fault).await?;
+            return Err(fault);
+        }
+    };
+    let status = response.status();
+    let limit = transport.response_limit;
+    if !status.is_success() {
+        if let Some(observer) = &transport.observer {
+            let capture = Arc::new(std::sync::Mutex::new(CapturedResponse::default()));
+            capture_error_response(response, &capture, transport.read_timeout, limit).await;
+            let body = std::mem::take(
+                &mut capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .body,
+            );
+            observer
+                .observe(OpenAiResponsesObservation::Response {
+                    status: status.as_u16(),
+                    body,
+                    completed: false,
+                })
+                .await
+                .map_err(|_| ParallelCompactionFault::Observation)?;
+        }
+        let fault = ParallelCompactionFault::HttpStatus(status.as_u16());
+        observe_compaction_error(&transport.observer, fault).await?;
+        return Err(fault);
+    }
+    let mut bytes = Vec::new();
+    let result = async {
+        if response
+            .content_length()
+            .is_some_and(|size| size > limit as u64)
+        {
             return Err(ParallelCompactionFault::Limit);
         }
-        bytes.extend_from_slice(&chunk);
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = tokio::time::timeout(transport.read_timeout, stream.next())
+            .await
+            .map_err(|_| ParallelCompactionFault::Timeout)?
+        {
+            let chunk = chunk.map_err(|error| {
+                if error.is_timeout() {
+                    ParallelCompactionFault::Timeout
+                } else {
+                    ParallelCompactionFault::Transport
+                }
+            })?;
+            if chunk.len() > limit.saturating_sub(bytes.len()) {
+                return Err(ParallelCompactionFault::Limit);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        validate_output(&bytes, input_bytes)
     }
-    validate_output(&bytes, input_bytes)
+    .await;
+    if let Some(observer) = &transport.observer {
+        observer
+            .observe(OpenAiResponsesObservation::Response {
+                status: status.as_u16(),
+                body: bytes,
+                completed: result.is_ok()
+                    || matches!(result, Err(ParallelCompactionFault::NoReduction)),
+            })
+            .await
+            .map_err(|_| ParallelCompactionFault::Observation)?;
+    }
+    if let Err(fault) = &result {
+        observe_compaction_error(&transport.observer, *fault).await?;
+    }
+    result
+}
+
+async fn observe_compaction_error(
+    observer: &Option<Arc<dyn OpenAiResponsesObserver>>,
+    fault: ParallelCompactionFault,
+) -> Result<(), ParallelCompactionFault> {
+    if let Some(observer) = observer {
+        let fault = match fault {
+            ParallelCompactionFault::Observation => observation_fault(),
+            ParallelCompactionFault::HttpStatus(status) => {
+                map_openai_fault(&OpenAiReactionFailure::http_status(
+                    reqwest::StatusCode::from_u16(status).expect("validated HTTP status"),
+                ))
+            }
+            fault => {
+                let class = match fault {
+                    ParallelCompactionFault::Transport => OpenAiFailureClass::RequestTransport,
+                    ParallelCompactionFault::Timeout => OpenAiFailureClass::StreamTimeout,
+                    ParallelCompactionFault::Limit => OpenAiFailureClass::ResponseBodyLimit,
+                    _ => OpenAiFailureClass::ResponseProtocolViolation,
+                };
+                map_openai_fault(&OpenAiReactionFailure::static_diagnostic(
+                    class,
+                    "summary worker failed",
+                ))
+            }
+        };
+        observer
+            .observe(OpenAiResponsesObservation::Error { fault })
+            .await
+            .map_err(|_| ParallelCompactionFault::Observation)?;
+    }
+    Ok(())
 }
 
 fn validate_output(
@@ -976,6 +1115,7 @@ mod tests {
             response_limit: 10_000,
             read_timeout: Duration::from_secs(1),
             context_window_tokens: NonZeroU64::new(128_000).unwrap(),
+            observer: None,
         };
         let source = CompactionSource::new(
             vec![json!({
@@ -1057,7 +1197,7 @@ mod tests {
             std::panic::panic_any(319_u32);
         });
         let error = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            compaction.select_source(Some(source()), &context(4, 100))
+            compaction.prepare_request(Some(source()), CompactionMode::Background(&context(4, 100)))
         }))
         .err()
         .unwrap();

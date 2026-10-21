@@ -2,9 +2,7 @@ use agentview::agent_view::AgentView as PomAgentView;
 use agentview::pom::{
     ContentNode, ContentRef, DiffStrategy, Document, MarkdownNode, ParagraphNode, XmlName, XmlNode,
 };
-use agentview::pom_renderer::render_pom_document;
-use agentview::pom_resolution::resolve_system_document;
-use agentview::semantic_view::render_agent_view_xml;
+use agentview::semantic_view::{AgentView as LegacyAgentView, SemanticFragment, SemanticNode};
 
 #[derive(agentview::AgentView)]
 #[agent_view(kind = "contract")]
@@ -290,14 +288,10 @@ fn document_block_field_embeds_a_derived_typed_block_root() {
         children[0],
         ContentRef::Node(ContentNode::Markdown(MarkdownNode::Paragraph(_)))
     ));
-    assert_eq!(
-        render_pom_document(&resolve_system_document(document)).unwrap(),
-        r#"Call `<verify scope="demo"/>`."#
-    );
 }
 
 #[test]
-fn document_derive_builds_and_renders_mixed_markdown_and_xml_in_field_order() {
+fn document_derive_builds_mixed_markdown_and_xml_in_field_order() {
     let document = build_document(&SystemPromptView {
         title: "Demo selector".to_owned(),
         task: "Choose one intent.".to_owned(),
@@ -313,19 +307,24 @@ fn document_derive_builds_and_renders_mixed_markdown_and_xml_in_field_order() {
         },
     });
 
-    assert_eq!(document.children().len(), 5);
+    let children = document.children().iter().collect::<Vec<_>>();
+    let [ContentRef::Node(ContentNode::Markdown(MarkdownNode::Heading(title))), ContentRef::Node(ContentNode::Markdown(MarkdownNode::Paragraph(task))), ContentRef::Node(ContentNode::Markdown(MarkdownNode::Heading(workflow_title))), ContentRef::Node(ContentNode::Markdown(MarkdownNode::List(workflow))), ContentRef::Node(ContentNode::Xml(contract))] =
+        children.as_slice()
+    else {
+        panic!("expected title, task, workflow heading, workflow list, and response contract");
+    };
+    assert_eq!(title.level().number(), 1);
+    assert_eq!(workflow_title.level().number(), 2);
+    assert!(matches!(
+        task.children().iter().next(),
+        Some(ContentRef::Node(ContentNode::Text(text))) if text.value() == "Choose one intent."
+    ));
     assert_eq!(
-        render_pom_document(&resolve_system_document(document)).unwrap(),
-        concat!(
-            "# Demo selector\n\n",
-            "Choose one intent.\n\n",
-            "## Required workflow\n\n",
-            "1. Call `<verify scope=\"demo\"/>`.\n\n",
-            "<response_contract transport=\"xml\">\n",
-            "  <instruction>Return only tool elements.</instruction>\n",
-            "</response_contract>",
-        )
+        workflow.kind(),
+        &agentview::pom::ListKind::Ordered { start: 1 }
     );
+    assert_eq!(workflow.items().len(), 1);
+    assert_eq!(contract.name().as_str(), "response_contract");
 }
 
 #[test]
@@ -350,28 +349,19 @@ fn structured_flatten_preserves_the_child_root_in_pom_and_legacy_trees() {
         }),
     };
 
-    let pom = render_pom_document(&resolve_system_document(Document::from_xml(
-        view.build_root().unwrap(),
-    )))
+    let expected_child = build_xml(view.details.as_ref().unwrap());
+    let expected = XmlNode::try_build("panel", |children| {
+        children.xml(expected_child);
+        Ok(())
+    })
     .unwrap();
+    assert_eq!(view.build_root().unwrap(), expected);
 
+    let mut expected = SemanticNode::new("panel");
+    expected.push_fragment(LegacyAgentView::render_root(view.details.as_ref().unwrap()));
     assert_eq!(
-        pom,
-        concat!(
-            "<panel>\n",
-            "  <details id=\"details.1\">\n",
-            "    <summary>Ready</summary>\n",
-            "  </details>\n",
-            "</panel>"
-        )
-    );
-    assert_eq!(
-        render_agent_view_xml(&view),
-        r#"<panel>
-  <details id="details.1">
-    <summary>Ready</summary>
-  </details>
-</panel>"#
+        LegacyAgentView::render_root(&view),
+        SemanticFragment::Node(expected)
     );
 }
 
@@ -381,28 +371,18 @@ fn map_flatten_preserves_the_map_root_in_pom_and_legacy_trees() {
         properties: BTreeMap::from([("mood".to_owned(), "tense".to_owned())]),
     };
 
-    let pom = render_pom_document(&resolve_system_document(Document::from_xml(
-        view.build_root().unwrap(),
-    )))
+    let expected = XmlNode::try_build("map_panel", |children| {
+        children.xml(view.properties.build_root()?);
+        Ok(())
+    })
     .unwrap();
+    assert_eq!(view.build_root().unwrap(), expected);
 
+    let mut expected = SemanticNode::new("map_panel");
+    expected.push_fragment(LegacyAgentView::render_root(&view.properties));
     assert_eq!(
-        pom,
-        concat!(
-            "<map_panel>\n",
-            "  <map>\n",
-            "    <entry key=\"mood\" value=\"tense\" />\n",
-            "  </map>\n",
-            "</map_panel>"
-        )
-    );
-    assert_eq!(
-        render_agent_view_xml(&view),
-        r#"<map_panel>
-  <map>
-    <entry key="mood" value="tense" />
-  </map>
-</map_panel>"#
+        LegacyAgentView::render_root(&view),
+        SemanticFragment::Node(expected)
     );
 }
 

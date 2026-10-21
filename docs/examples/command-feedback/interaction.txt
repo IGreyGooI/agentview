@@ -1,0 +1,254 @@
+Original captured I/O of the command_feedback_cli example.
+Command lines below are shell equivalents of the subprocess argv used by capture.py.
+Section labels and exit codes are added; captured input/output is not shortened.
+
+$ '/srv/agent-shared/repositories/agentview/target/debug/examples/command_feedback_cli' --socket '/tmp/av-feedback-gjvpl72z/socket'
+
+[stdin]
+{"action":"record","input":{"text":"SQLite keeps long-term memory"}}
+{"action":"inspect","input":{}}
+{"action":"record","input":{"text":42}}
+{"action":"inspect","input":{}}
+
+[stdout]
+<view ok="true">
+<daemon status="running">Send an action as JSON on stdin. Closing this connection preserves application state. Use status to observe, stop to end the session, or restart for a fresh session.</daemon>
+
+<session daemon_pid="763655" />
+<connection command="'/srv/agent-shared/repositories/agentview/target/debug/examples/command_feedback_cli' --socket '/tmp/av-feedback-gjvpl72z/socket'" input="one JSON action per stdin line" output="callback JSON result and current view after each action" />
+
+<action_result ok="true">{"count":1,"latest":"SQLite keeps long-term memory"}</action_result>
+
+<notebook_context>Use record to save a note and inspect to read the current count and latest note. Notes last until this application shuts down. Action results are complete JSON; an error object describes a business rejection.</notebook_context>
+
+<notebook_state>
+  <count>1</count>
+  <latest>SQLite keeps long-term memory</latest>
+</notebook_state>
+
+<actions>
+  <action name="record" description="Save a nonempty note and return the current count and complete latest note." enabled="true">
+    <input_schema>{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"text":{"description":"The complete note to save, verbatim.","type":"string"}},"required":["text"],"title":"RecordInput","type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"record" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<actions>
+  <action name="inspect" description="Read the current count and complete latest note without changing notebook state. Send an empty input object." enabled="true">
+    <input_schema>{"additionalProperties":false,"properties":{},"type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"inspect" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<command_feedback>
+  <sequence>1</sequence>
+  <records>
+    <command_result sequence="1" command="record" status="completed">{"count":1,"latest":"SQLite keeps long-term memory"}</command_result>
+  </records>
+</command_feedback>
+</view>
+<view ok="true">
+<daemon status="running">Send an action as JSON on stdin. Closing this connection preserves application state. Use status to observe, stop to end the session, or restart for a fresh session.</daemon>
+
+<session daemon_pid="763655" />
+<connection command="'/srv/agent-shared/repositories/agentview/target/debug/examples/command_feedback_cli' --socket '/tmp/av-feedback-gjvpl72z/socket'" input="one JSON action per stdin line" output="callback JSON result and current view after each action" />
+
+<action_result ok="true">{"count":1,"latest":"SQLite keeps long-term memory"}</action_result>
+
+<notebook_context>Use record to save a note and inspect to read the current count and latest note. Notes last until this application shuts down. Action results are complete JSON; an error object describes a business rejection.</notebook_context>
+
+<notebook_state>
+  <count>1</count>
+  <latest>SQLite keeps long-term memory</latest>
+</notebook_state>
+
+<actions>
+  <action name="record" description="Save a nonempty note and return the current count and complete latest note." enabled="true">
+    <input_schema>{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"text":{"description":"The complete note to save, verbatim.","type":"string"}},"required":["text"],"title":"RecordInput","type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"record" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<actions>
+  <action name="inspect" description="Read the current count and complete latest note without changing notebook state. Send an empty input object." enabled="true">
+    <input_schema>{"additionalProperties":false,"properties":{},"type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"inspect" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<command_feedback>
+  <sequence>2</sequence>
+  <records>
+    <command_result sequence="2" command="inspect" status="completed">{"count":1,"latest":"SQLite keeps long-term memory"}</command_result>
+  </records>
+</command_feedback>
+</view>
+<view ok="false">
+<daemon status="running">Send an action as JSON on stdin. Closing this connection preserves application state. Use status to observe, stop to end the session, or restart for a fresh session.</daemon>
+
+<session daemon_pid="763655" />
+<connection command="'/srv/agent-shared/repositories/agentview/target/debug/examples/command_feedback_cli' --socket '/tmp/av-feedback-gjvpl72z/socket'" input="one JSON action per stdin line" output="callback JSON result and current view after each action" />
+
+<action_result ok="false">{"code":"invalid_arguments","message":"invalid type: integer `42`, expected a string"}</action_result>
+
+<notebook_context>Use record to save a note and inspect to read the current count and latest note. Notes last until this application shuts down. Action results are complete JSON; an error object describes a business rejection.</notebook_context>
+
+<notebook_state>
+  <count>1</count>
+  <latest>SQLite keeps long-term memory</latest>
+</notebook_state>
+
+<actions>
+  <action name="record" description="Save a nonempty note and return the current count and complete latest note." enabled="true">
+    <input_schema>{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"text":{"description":"The complete note to save, verbatim.","type":"string"}},"required":["text"],"title":"RecordInput","type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"record" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<actions>
+  <action name="inspect" description="Read the current count and complete latest note without changing notebook state. Send an empty input object." enabled="true">
+    <input_schema>{"additionalProperties":false,"properties":{},"type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"inspect" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<command_feedback>
+  <sequence>3</sequence>
+  <records>
+    <command_result sequence="3" command="record" status="rejected" code="invalid_arguments">invalid type: integer `42`, expected a string</command_result>
+  </records>
+</command_feedback>
+</view>
+<view ok="true">
+<daemon status="running">Send an action as JSON on stdin. Closing this connection preserves application state. Use status to observe, stop to end the session, or restart for a fresh session.</daemon>
+
+<session daemon_pid="763655" />
+<connection command="'/srv/agent-shared/repositories/agentview/target/debug/examples/command_feedback_cli' --socket '/tmp/av-feedback-gjvpl72z/socket'" input="one JSON action per stdin line" output="callback JSON result and current view after each action" />
+
+<action_result ok="true">{"count":1,"latest":"SQLite keeps long-term memory"}</action_result>
+
+<notebook_context>Use record to save a note and inspect to read the current count and latest note. Notes last until this application shuts down. Action results are complete JSON; an error object describes a business rejection.</notebook_context>
+
+<notebook_state>
+  <count>1</count>
+  <latest>SQLite keeps long-term memory</latest>
+</notebook_state>
+
+<actions>
+  <action name="record" description="Save a nonempty note and return the current count and complete latest note." enabled="true">
+    <input_schema>{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"text":{"description":"The complete note to save, verbatim.","type":"string"}},"required":["text"],"title":"RecordInput","type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"record" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<actions>
+  <action name="inspect" description="Read the current count and complete latest note without changing notebook state. Send an empty input object." enabled="true">
+    <input_schema>{"additionalProperties":false,"properties":{},"type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"inspect" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<command_feedback>
+  <sequence>4</sequence>
+  <records>
+    <command_result sequence="4" command="inspect" status="completed">{"count":1,"latest":"SQLite keeps long-term memory"}</command_result>
+  </records>
+</command_feedback>
+</view>
+
+[stderr]
+(empty)
+
+[exit code] 2
+
+$ '/srv/agent-shared/repositories/agentview/target/debug/examples/command_feedback_cli' --socket '/tmp/av-feedback-gjvpl72z/socket' status
+
+[stdin]
+(empty)
+
+[stdout]
+<view ok="true">
+<daemon status="running">Send an action as JSON on stdin. Closing this connection preserves application state. Use status to observe, stop to end the session, or restart for a fresh session.</daemon>
+
+<session daemon_pid="763655" />
+<connection command="'/srv/agent-shared/repositories/agentview/target/debug/examples/command_feedback_cli' --socket '/tmp/av-feedback-gjvpl72z/socket'" input="one JSON action per stdin line" output="callback JSON result and current view after each action" />
+
+<notebook_context>Use record to save a note and inspect to read the current count and latest note. Notes last until this application shuts down. Action results are complete JSON; an error object describes a business rejection.</notebook_context>
+
+<notebook_state>
+  <count>1</count>
+  <latest>SQLite keeps long-term memory</latest>
+</notebook_state>
+
+<actions>
+  <action name="record" description="Save a nonempty note and return the current count and complete latest note." enabled="true">
+    <input_schema>{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"text":{"description":"The complete note to save, verbatim.","type":"string"}},"required":["text"],"title":"RecordInput","type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"record" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<actions>
+  <action name="inspect" description="Read the current count and complete latest note without changing notebook state. Send an empty input object." enabled="true">
+    <input_schema>{"additionalProperties":false,"properties":{},"type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"inspect" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<command_feedback>
+  <sequence>4</sequence>
+  <records>
+    <command_result sequence="4" command="inspect" status="completed">{"count":1,"latest":"SQLite keeps long-term memory"}</command_result>
+  </records>
+</command_feedback>
+</view>
+
+[stderr]
+(empty)
+
+[exit code] 0
+
+$ '/srv/agent-shared/repositories/agentview/target/debug/examples/command_feedback_cli' --socket '/tmp/av-feedback-gjvpl72z/socket' stop
+
+[stdin]
+(empty)
+
+[stdout]
+<view ok="true">
+<daemon status="stopped">The daemon is stopped. Use start or send an action to begin a new session. Any view below is the final snapshot of the stopped session.</daemon>
+
+<session daemon_pid="763655" />
+<connection command="'/srv/agent-shared/repositories/agentview/target/debug/examples/command_feedback_cli' --socket '/tmp/av-feedback-gjvpl72z/socket'" input="one JSON action per stdin line" output="callback JSON result and current view after each action" />
+
+<notebook_context>Use record to save a note and inspect to read the current count and latest note. Notes last until this application shuts down. Action results are complete JSON; an error object describes a business rejection.</notebook_context>
+
+<notebook_state>
+  <count>1</count>
+  <latest>SQLite keeps long-term memory</latest>
+</notebook_state>
+
+<actions>
+  <action name="record" description="Save a nonempty note and return the current count and complete latest note." enabled="true">
+    <input_schema>{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"text":{"description":"The complete note to save, verbatim.","type":"string"}},"required":["text"],"title":"RecordInput","type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"record" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<actions>
+  <action name="inspect" description="Read the current count and complete latest note without changing notebook state. Send an empty input object." enabled="true">
+    <input_schema>{"additionalProperties":false,"properties":{},"type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"inspect" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<command_feedback>
+  <sequence>4</sequence>
+  <records>
+    <command_result sequence="4" command="inspect" status="completed">{"count":1,"latest":"SQLite keeps long-term memory"}</command_result>
+  </records>
+</command_feedback>
+</view>
+
+[stderr]
+(empty)
+
+[exit code] 0

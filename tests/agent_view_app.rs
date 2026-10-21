@@ -136,6 +136,43 @@ impl TurnSink<ControlReply> for DeltaSink {
     }
 }
 
+fn assert_counter_document(
+    document: &ResolvedDocument,
+    value: i32,
+    turn_id: &str,
+    task: &str,
+    delta: bool,
+) {
+    let mut context = XmlNode::try_build("agent_context", |children| {
+        children.xml(XmlNode::try_build("value", |children| {
+            children.text(TextNode::new(value.to_string()));
+            Ok(())
+        })?);
+        Ok(())
+    })
+    .unwrap();
+    context
+        .push_attribute(XmlName::try_from("kind").unwrap(), "counter")
+        .unwrap();
+    if delta {
+        context
+            .push_attribute(XmlName::try_from("rendering_mode").unwrap(), "delta")
+            .unwrap();
+    }
+    let task = CounterTaskView {
+        turn_id: turn_id.to_owned(),
+        instruction: task.to_owned(),
+        reply_contract: r#"{"delta": number}"#,
+    }
+    .build_root()
+    .unwrap();
+    let expected = Document::build(|blocks| {
+        blocks.xml(context);
+        blocks.xml(task);
+    });
+    assert_eq!(document.children(), expected.children());
+}
+
 #[tokio::test]
 async fn observe_returns_full_snapshot_with_user_document() {
     let source = Arc::new(Mutex::new(0));
@@ -154,17 +191,12 @@ async fn observe_returns_full_snapshot_with_user_document() {
     assert_eq!(snapshot.turn_id, "turn-1");
     assert_eq!(snapshot.view, CounterView { value: 0 });
     assert_eq!(app.session().user_document_cursor().len(), 1);
-    assert_eq!(
-        render_pom_document(&snapshot.user_document).unwrap(),
-        concat!(
-            "<agent_context kind=\"counter\">\n",
-            "  <value>0</value>\n",
-            "</agent_context>\n\n",
-            "<counter_task turn_id=\"turn-1\">\n",
-            "  <instruction>increment <once> & `counter_value`\u{0001}</instruction>\n",
-            "  <reply_contract>{\"delta\": number}</reply_contract>\n",
-            "</counter_task>"
-        )
+    assert_counter_document(
+        &snapshot.user_document,
+        0,
+        "turn-1",
+        "increment <once> & `counter_value`\u{0001}",
+        false,
     );
 }
 
@@ -227,12 +259,12 @@ async fn act_applies_parsed_reply_and_returns_full_update() {
     assert_eq!(next.turn_id, "turn-2");
     assert_eq!(next.view, CounterView { value: 3 });
     assert_eq!(app.session().user_document_cursor().len(), 1);
-    let rendered = render_pom_document(&next.user_document).unwrap();
-    assert!(rendered.starts_with(
-        "<agent_context rendering_mode=\"delta\" kind=\"counter\">\n  <value>3</value>\n</agent_context>"
-    ));
-    assert!(
-        rendered.contains("<instruction>increment <again> & `counter_value`\u{0001}</instruction>")
+    assert_counter_document(
+        &next.user_document,
+        3,
+        "turn-2",
+        "increment <again> & `counter_value`\u{0001}",
+        true,
     );
     assert_eq!(app.session().context().history().len(), 1);
 }
@@ -353,9 +385,7 @@ async fn hook_waits_for_app_awake_then_returns_full_snapshot() {
     assert_eq!(next.view_epoch, 1);
     assert_eq!(next.view, CounterView { value: 9 });
     assert_eq!(app.session().user_document_cursor().len(), 1);
-    assert!(render_pom_document(&next.user_document)
-        .unwrap()
-        .contains("<value>9</value>"));
+    assert_counter_document(&next.user_document, 9, "turn-2", "watch again", true);
 }
 
 #[derive(Clone)]
@@ -454,14 +484,40 @@ async fn epoch_retry_does_not_commit_the_discarded_candidate_cursor() {
     source.race_once.store(true, Ordering::SeqCst);
 
     let snapshot = app.observe("retry").await.unwrap();
-    let rendered = render_pom_document(&snapshot.user_document).unwrap();
-
     assert_eq!(snapshot.turn_id, "turn-2");
     assert_eq!(
         snapshot.view.items,
         vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
     );
-    assert_eq!(rendered.matches("<insert>").count(), 2, "{rendered}");
-    assert!(rendered.contains("<insert>\n      <item>b</item>\n    </insert>"));
-    assert!(rendered.contains("<insert>\n      <item>c</item>\n    </insert>"));
+    let mut items = XmlNode::try_build("items", |children| {
+        children.xml(XmlNode::try_build("insert", |children| {
+            for value in ["b", "c"] {
+                children.xml(XmlNode::try_build("item", |children| {
+                    children.text(TextNode::new(value));
+                    Ok(())
+                })?);
+            }
+            Ok(())
+        })?);
+        Ok(())
+    })
+    .unwrap();
+    items
+        .push_attribute(XmlName::try_from("rendering_mode").unwrap(), "delta")
+        .unwrap();
+    let mut context = XmlNode::try_build("agent_context", |children| {
+        children.xml(items);
+        Ok(())
+    })
+    .unwrap();
+    context
+        .push_attribute(XmlName::try_from("rendering_mode").unwrap(), "delta")
+        .unwrap();
+    context
+        .push_attribute(XmlName::try_from("kind").unwrap(), "retry_context")
+        .unwrap();
+    assert_eq!(
+        snapshot.user_document.children(),
+        Document::from_xml(context).children()
+    );
 }

@@ -1,4 +1,4 @@
-error: view roots support #[system_once], #[developer], #[developer(repeat)], #[user], #[user(repeat)], #[assistant], and #[diff(slot = "...")]
+error: view roots support #[system_once], #[developer], #[developer(repeat)], #[developer(ephemeral, repeat)], #[user], #[user(repeat)], #[user(ephemeral, repeat)], #[assistant], and #[diff(slot = "...")]
  --> tests/ui/component_target/fail_unknown_placement.rs:5:9
   |
 5 |         #[unknown]

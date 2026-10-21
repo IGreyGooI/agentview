@@ -2,19 +2,24 @@
 
 use std::{
     env,
-    io::{self, IsTerminal, Write},
+    fs::{self, File},
+    io::{self, BufRead, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::ExitCode,
+    time::Duration,
 };
 
 use anyhow::{ensure, Context, Result};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::time::{sleep_until, Instant};
 
 use super::super::CommandCall;
 use super::daemon::{self, request, Operation, Response};
+use super::history::{self, History, HistoryReader, HistoryWriter, Stream};
+use super::StdinApplicationOptions;
 use crate::component::authoring::Component;
 
-const MAX_INPUT_BYTES: usize = 4096;
+const FRAME_IDLE: Duration = Duration::from_millis(100);
 
 enum Invocation {
     Help,
@@ -24,37 +29,104 @@ enum Invocation {
     Status,
     Stop,
     Restart,
+    History(Option<String>),
 }
 
-pub(super) async fn run(root: impl Fn() -> Component + Send + Sync + 'static) -> ExitCode {
-    match invoke(root).await {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(2),
-        Err(error) => {
-            eprintln!("agentview: {error:#}");
-            ExitCode::FAILURE
+impl Invocation {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Help => "help",
+            Self::Daemon => "__daemon",
+            Self::Interact => "interact",
+            Self::Start => "start",
+            Self::Status => "status",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::History(_) => "history",
         }
     }
 }
 
-async fn invoke(root: impl Fn() -> Component + Send + Sync + 'static) -> Result<bool> {
+pub(super) async fn run(
+    root: impl Fn() -> Component + Send + Sync + 'static,
+    options: StdinApplicationOptions,
+) -> ExitCode {
+    let mut history = None;
+    let mut code = match invoke(root, options, &mut history).await {
+        Ok(true) => 0,
+        Ok(false) => 2,
+        Err(error) => {
+            let message = format!("agentview: {error:#}\n");
+            if let Some(history) = &history {
+                let _ = history.record_error(&format!("{error:#}"));
+                let mut stderr = HistoryWriter::new(io::stderr(), history.clone(), Stream::Stderr);
+                if let Err(error) = stderr.write_all(message.as_bytes()) {
+                    eprintln!("agentview: could not record diagnostic: {error}");
+                }
+            } else {
+                eprint!("{message}");
+            }
+            1
+        }
+    };
+    if let Some(history) = history {
+        if let Err(error) = history.finish(code) {
+            eprintln!(
+                "agentview: could not finish history {}: {error}",
+                history.path().display()
+            );
+            code = 1;
+        }
+    }
+    ExitCode::from(code)
+}
+
+async fn invoke(
+    root: impl Fn() -> Component + Send + Sync + 'static,
+    options: StdinApplicationOptions,
+    history: &mut Option<History>,
+) -> Result<bool> {
     let (socket, invocation) = parse_cli()?;
     if matches!(invocation, Invocation::Help) {
         print!("{}", help());
         return Ok(true);
     }
+    let executable = env::current_exe()?;
+    if let Invocation::History(selection) = &invocation {
+        show_history(&executable, selection.as_deref())?;
+        return Ok(true);
+    }
+    if !matches!(invocation, Invocation::Daemon) {
+        *history = Some(History::create(&executable, &socket, invocation.name())?);
+    }
+    ensure!(
+        options
+            .idle_refresh_interval
+            .is_none_or(|interval| !interval.is_zero()),
+        "idle_refresh_interval must be positive"
+    );
     // Validate and prepare connection metadata before any request can start a
     // daemon or change application state. Output must not fail later on a path
     // that the frontend could have rejected before executing the action.
     let command = format!(
         "{} --socket {}",
-        shell_quote(&env::current_exe()?)?,
+        shell_quote(&executable)?,
         shell_quote(&socket)?
     );
     match invocation {
-        Invocation::Help => unreachable!("help returned before session setup"),
+        Invocation::Help | Invocation::History(_) => {
+            unreachable!("read-only command returned before session setup")
+        }
         Invocation::Daemon => daemon::serve(&socket, root).await?,
-        Invocation::Interact => return interact(&socket, &command).await,
+        Invocation::Interact => {
+            return interact(
+                &socket,
+                &command,
+                options,
+                history.as_ref().expect("foreground history").clone(),
+            )
+            .await;
+        }
         Invocation::Start | Invocation::Restart => {
             if matches!(invocation, Invocation::Restart) {
                 request(&socket, &Operation::Stop, false).await?;
@@ -62,15 +134,33 @@ async fn invoke(root: impl Fn() -> Component + Send + Sync + 'static) -> Result<
             let response = request(&socket, &Operation::Observe, true)
                 .await?
                 .context("daemon did not start")?;
-            print_view(Some(&response), &command, true)?;
+            print_view(
+                Some(&response),
+                &command,
+                true,
+                true,
+                history.as_ref().expect("foreground history"),
+            )?;
         }
         Invocation::Status => {
             let response = request(&socket, &Operation::Observe, false).await?;
-            print_view(response.as_ref(), &command, response.is_some())?;
+            print_view(
+                response.as_ref(),
+                &command,
+                response.is_some(),
+                true,
+                history.as_ref().expect("foreground history"),
+            )?;
         }
         Invocation::Stop => {
             let response = request(&socket, &Operation::Stop, false).await?;
-            print_view(response.as_ref(), &command, false)?;
+            print_view(
+                response.as_ref(),
+                &command,
+                false,
+                true,
+                history.as_ref().expect("foreground history"),
+            )?;
         }
     }
     Ok(true)
@@ -84,29 +174,53 @@ fn help() -> String {
                 .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "app".to_owned());
-    let usage = "APP [--socket PATH] [start|status|stop|restart|help]\n\n\
-No subcommand: read one JSON action per stdin line and print each resulting view.\n\
+    let usage = "APP [--socket PATH] [start|status|stop|restart|history [latest|ID]|help]\n\n\
+No subcommand: print the initial view, then read action JSON objects and print one resulting view per frame.\n\
 Input format: {\"action\":\"<action name>\",\"input\":{}}\n\
+Multiple top-level objects may span lines; no enclosing array or wrapper is needed.\n\
+A terminating newline followed by 100 ms without input submits a frame.\n\
+New input restarts that timer; complete JSON without a final newline keeps waiting.\n\
+JSON is parsed after the boundary; incomplete or invalid frames return feedback.\n\
+EOF submits the final frame immediately, without requiring a newline.\n\
 The view describes available actions and their input schemas.\n\
-Empty stdin shows the current view. At a terminal, the initial view appears first.\n\
-A missing daemon starts automatically. Closing stdin keeps the application running.\n\n\
+The initial prepared view arrives without waiting for input; empty EOF adds no duplicate view.\n\
+A missing daemon starts automatically. Application state survives EOF.\n\n\
   start    Start or connect to the daemon and show the current view\n\
   status   Show the running view or stopped status without starting a daemon\n\
   stop     Stop the daemon, await cleanup, and show the final view\n\
   restart  Stop the daemon and show a fresh session (discards the old state)\n\
+  history  List recent CLI runs; history latest or history ID reads their transcript\n\
   help     Show this usage without starting a daemon\n\n\
-stdout carries callback JSON results, views and feedback; diagnostics use stderr.\n\
-Invalid actions return feedback and later input lines still run.\n\
+stdout carries one view per frame with every action result in its feedback; diagnostics use stderr.\n\
+The first view is complete; later views may omit ordinary unchanged content. Repeated content is delivered in full.\n\
+Each new CLI invocation receives a complete initial view.\n\
+Invalid JSON or action envelopes reject the whole frame before callbacks run.\n\
+Invalid action arguments return feedback; later valid actions in the frame still run.\n\
 Exit codes: 0 callbacks completed, 2 invalid/disabled input, 1 transport/runtime failure.\n\
 Business acceptance or refusal is expressed by the callback's JSON result.\n\
+Foreground interactions and lifecycle commands automatically save raw stdin, stdout, stderr, and a timed event log.\n\
+History lives in $XDG_STATE_HOME/agentview-APP/history, or $HOME/.local/state/agentview-APP/history.\n\
+Reading history does not start a daemon or execute actions.\n\
 Use --socket PATH for independent sessions. State lasts until the daemon stops.\n\
 Default socket: $XDG_RUNTIME_DIR/agentview-APP/socket, or\n\
                 $HOME/.cache/agentview-APP/socket\n";
     usage.replace("APP", &name)
 }
 
-fn print_view(response: Option<&Response>, command: &str, running: bool) -> Result<()> {
-    write_view(&mut io::stdout().lock(), response, command, running)
+fn print_view(
+    response: Option<&Response>,
+    command: &str,
+    running: bool,
+    include_context: bool,
+    history: &History,
+) -> Result<()> {
+    write_view(
+        &mut HistoryWriter::new(io::stdout().lock(), history.clone(), Stream::Stdout),
+        response,
+        command,
+        running,
+        include_context,
+    )
 }
 
 fn write_view(
@@ -114,113 +228,333 @@ fn write_view(
     response: Option<&Response>,
     command: &str,
     running: bool,
+    include_context: bool,
 ) -> Result<()> {
+    // Deliver one prepared view at a time so durable recording does not add
+    // disk syncs between individual formatting fragments.
+    let mut view = Vec::new();
     let (status, message) = if running {
-        ("running", "Send an action as JSON on stdin. Closing this connection preserves application state. Use status to observe, stop to end the session, or restart for a fresh session.")
+        (
+            "running",
+            "Send action JSON objects on stdin. End each batch with a newline, then wait 100 ms without input to submit a frame; EOF submits the final frame immediately. Application state survives EOF. Use status to observe, stop to end the session, or restart for a fresh session.",
+        )
     } else {
-        ("stopped", "The daemon is stopped. Use start or send an action to begin a new session. Any view below is the final snapshot of the stopped session.")
+        (
+            "stopped",
+            "The daemon is stopped. Use start or send an action to begin a new session. Any view below is the final snapshot of the stopped session.",
+        )
     };
     let ok = response.is_none_or(|response| response.output.ok);
-    writeln!(stdout, "<view ok=\"{ok}\">")?;
-    writeln!(stdout, "<daemon status=\"{status}\">{message}</daemon>\n")?;
-    if let Some(response) = response {
-        writeln!(stdout, "<session daemon_pid=\"{}\" />", response.daemon_pid)?;
-        writeln!(stdout, "<connection command=\"{command}\" input=\"one JSON action per stdin line\" output=\"callback JSON result and current view after each action\" />\n")?;
-        if let Some(result) = &response.output.result {
+    writeln!(view, "<view ok=\"{ok}\">")?;
+    if include_context {
+        writeln!(view, "<daemon status=\"{status}\">{message}</daemon>\n")?;
+        if let Some(response) = response {
+            writeln!(view, "<session daemon_pid=\"{}\" />", response.daemon_pid)?;
             writeln!(
-                stdout,
-                "<action_result ok=\"{}\">{}</action_result>\n",
-                response.output.ok,
-                serde_json::to_string(result)?
+                view,
+                "<connection command=\"{command}\" input=\"action JSON objects; final newline + 100 ms input idle, or EOF\" output=\"one view with all frame feedback\" />\n"
             )?;
         }
-        stdout.write_all(response.output.view.as_bytes())?;
     }
-    writeln!(stdout, "</view>")?;
+    if let Some(response) = response {
+        view.write_all(response.output.view.as_bytes())?;
+    }
+    writeln!(view, "</view>")?;
+    stdout.write_all(&view)?;
     stdout.flush()?;
     Ok(())
 }
 
-async fn interact(socket: &Path, command: &str) -> Result<bool> {
-    let mut observed = false;
-    if io::stdin().is_terminal() {
-        let response = request(socket, &Operation::Observe, true).await?;
-        print_view(response.as_ref(), command, true)?;
-        observed = true;
-    }
-    let mut stdin = BufReader::new(tokio::io::stdin());
+async fn interact(
+    socket: &Path,
+    command: &str,
+    options: StdinApplicationOptions,
+    history: History,
+) -> Result<bool> {
+    let stdin = HistoryReader::new(super::input::stdin()?, history.clone());
+    let mut stdout = HistoryWriter::new(io::stdout(), history, Stream::Stdout);
+    interact_io(socket, command, options, stdin, &mut stdout).await
+}
+
+async fn interact_io(
+    socket: &Path,
+    command: &str,
+    options: StdinApplicationOptions,
+    mut stdin: impl AsyncRead + Unpin,
+    stdout: &mut impl Write,
+) -> Result<bool> {
+    let mut frames = FrameInput::default();
+    let mut connection = daemon::Connection::connect(socket, true)
+        .await?
+        .context("daemon did not start")?;
+    let initial = connection.request(&Operation::Observe).await?;
+    write_view(stdout, Some(&initial), command, true, true)?;
     let mut succeeded = true;
-    while let Some(line) = input_line(&mut stdin).await? {
-        let operation = match line {
-            Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => continue,
-            Ok(bytes) => match serde_json::from_slice::<CommandCall>(&bytes) {
-                Ok(call) => Operation::Action { call },
-                Err(error) => Operation::Feedback {
-                    message: invalid_action_message(&error),
-                },
-            },
-            Err(message) => Operation::Feedback { message },
+    loop {
+        let operation = match options.idle_refresh_interval {
+            Some(interval) => {
+                // Cancellation of next() retains its buffered bytes and framing
+                // deadline. Do not cancel an in-flight daemon request to poll.
+                tokio::select! {
+                    biased;
+                    operation = frames.next(&mut stdin) => operation?,
+                    _ = tokio::time::sleep(interval) => Some(Operation::Observe),
+                }
+            }
+            None => frames.next(&mut stdin).await?,
         };
-        let response = request(socket, &operation, true)
-            .await?
-            .context("daemon did not start")?;
+        let Some(operation) = operation else {
+            break;
+        };
+        // Framing idle limits only input collection, never callback execution.
+        let idle_refresh = matches!(&operation, Operation::Observe);
+        let response = connection.request(&operation).await?;
         succeeded &= response.output.ok;
-        print_view(Some(&response), command, true)?;
-        observed = true;
-    }
-    if !observed {
-        let response = request(socket, &Operation::Observe, true).await?;
-        print_view(response.as_ref(), command, true)?;
+        if !idle_refresh || !response.output.view.is_empty() {
+            write_view(stdout, Some(&response), command, true, false)?;
+        }
     }
     Ok(succeeded)
 }
 
 fn invalid_action_message(error: &serde_json::Error) -> String {
-    // Bound the displayed diagnostic while leaving room for JSON quoting and
-    // guidance within MAX_REQUEST_BYTES.
-    const MAX_DIAGNOSTIC_BYTES: usize = 1024;
-    let error = error.to_string();
-    let mut diagnostic = String::new();
-    for character in error.chars() {
-        if diagnostic.len() + character.len_utf8() > MAX_DIAGNOSTIC_BYTES {
-            diagnostic.push_str("… (truncated)");
-            break;
-        }
-        diagnostic.push(character);
-    }
-    format!("Invalid action JSON: {diagnostic}. Send one object per line, using {{\"action\":\"<action name>\",\"input\":{{}}}}. Choose an action and its input from the current view.")
+    format!(
+        "Invalid action frame: {error}. No actions from this frame were executed. Send top-level objects using {{\"action\":\"<action name>\",\"input\":{{}}}}; end the batch with a newline and wait 100 ms without input, or close stdin to submit. Choose an action and its input from the current view."
+    )
 }
 
-// Keep one buffered reader for the entire connection so multiple lines are not
-// lost to read-ahead. Drain an oversized line without allocating the full input.
-async fn input_line(
-    reader: &mut (impl AsyncBufRead + Unpin),
-) -> Result<Option<Result<Vec<u8>, String>>> {
-    let mut bytes = Vec::new();
-    (&mut *reader)
-        .take((MAX_INPUT_BYTES + 1) as u64)
-        .read_until(b'\n', &mut bytes)
-        .await?;
-    if bytes.is_empty() {
-        return Ok(None);
+fn decode_frame(bytes: &[u8]) -> std::result::Result<Vec<CommandCall>, serde_json::Error> {
+    serde_json::Deserializer::from_slice(bytes)
+        .into_iter::<CommandCall>()
+        .collect()
+}
+
+fn saved_runs(directory: &Path) -> Result<Vec<(PathBuf, serde_json::Value)>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut runs = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = path.join("session.json");
+        if metadata.is_file() {
+            runs.push((
+                path,
+                serde_json::from_slice::<serde_json::Value>(&fs::read(metadata)?)?,
+            ));
+        }
     }
-    if bytes.len() > MAX_INPUT_BYTES {
-        if bytes.last() != Some(&b'\n') {
-            loop {
-                let buffer = reader.fill_buf().await?;
-                let newline = buffer.iter().position(|byte| *byte == b'\n');
-                let consumed = newline.map_or(buffer.len(), |index| index + 1);
-                reader.consume(consumed);
-                if consumed == 0 || newline.is_some() {
-                    break;
+    runs.sort_by(|left, right| {
+        right.1["started_at_unix_ms"]
+            .as_u64()
+            .cmp(&left.1["started_at_unix_ms"].as_u64())
+            .then_with(|| right.0.cmp(&left.0))
+    });
+    Ok(runs)
+}
+
+fn show_history(executable: &Path, selection: Option<&str>) -> Result<()> {
+    let directory = history::root_for(executable)?;
+    let mut stdout = io::stdout().lock();
+    let Some(selection) = selection else {
+        writeln!(stdout, "History: {}", directory.display())?;
+        let runs = saved_runs(&directory)?;
+        if runs.is_empty() {
+            writeln!(stdout, "No recorded CLI runs.")?;
+        }
+        for (path, session) in runs.into_iter().take(20) {
+            let status = session["exit_code"]
+                .as_u64()
+                .map(|code| format!("exit={code}"))
+                .unwrap_or_else(|| "unfinished".to_owned());
+            writeln!(
+                stdout,
+                "{}  {}  {}  {}",
+                session["id"].as_str().unwrap_or_default(),
+                session["invocation"].as_str().unwrap_or_default(),
+                status,
+                path.display()
+            )?;
+        }
+        return Ok(());
+    };
+    let path = if selection == "latest" {
+        saved_runs(&directory)?
+            .into_iter()
+            .next()
+            .map(|(path, _)| path)
+            .context("no recorded CLI runs")?
+    } else {
+        let mut components = Path::new(selection).components();
+        ensure!(
+            matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none(),
+            "history ID must be a single run ID"
+        );
+        directory.join(selection)
+    };
+    print_history(&path, &mut stdout)
+}
+
+struct HistorySpan {
+    stream: String,
+    offset: u64,
+    length: u64,
+    elapsed_us: u64,
+}
+
+fn print_history_span(path: &Path, span: HistorySpan, stdout: &mut impl Write) -> Result<()> {
+    ensure!(
+        matches!(span.stream.as_str(), "stdin" | "stdout" | "stderr"),
+        "unknown history stream"
+    );
+    writeln!(
+        stdout,
+        "\n--- {} +{}.{:06}s ---",
+        span.stream,
+        span.elapsed_us / 1_000_000,
+        span.elapsed_us % 1_000_000
+    )?;
+    let mut input = File::open(path.join(format!("{}.raw", span.stream)))?;
+    input.seek(SeekFrom::Start(span.offset))?;
+    let copied = io::copy(&mut input.take(span.length), stdout)?;
+    ensure!(
+        copied == span.length,
+        "history stream is shorter than its recorded event"
+    );
+    writeln!(stdout)?;
+    Ok(())
+}
+
+fn print_history(path: &Path, stdout: &mut impl Write) -> Result<()> {
+    let session: serde_json::Value = serde_json::from_slice(&fs::read(path.join("session.json"))?)?;
+    writeln!(
+        stdout,
+        "Run: {}\nCommand: {}\nSocket: {}\nFiles: {}",
+        session["id"].as_str().unwrap_or_default(),
+        session["invocation"].as_str().unwrap_or_default(),
+        session["socket"].as_str().unwrap_or_default(),
+        path.display()
+    )?;
+    let mut events = io::BufReader::new(File::open(path.join("events.jsonl"))?);
+    let mut pending: Option<HistorySpan> = None;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if events.read_until(b'\n', &mut line)? == 0 || !line.ends_with(b"\n") {
+            // An active writer may still be appending the final event. Only
+            // complete JSONL records refer to committed stream ranges.
+            break;
+        }
+        let event: serde_json::Value = serde_json::from_slice(&line)?;
+        if event["kind"] == "bytes" {
+            let stream = event["stream"].as_str().context("missing history stream")?;
+            let offset = event["offset"].as_u64().context("missing history offset")?;
+            let length = event["length"].as_u64().context("missing history length")?;
+            if let Some(span) = pending.as_mut() {
+                if span.stream == stream && span.offset.checked_add(span.length) == Some(offset) {
+                    span.length = span
+                        .length
+                        .checked_add(length)
+                        .context("history length overflow")?;
+                    continue;
+                }
+            }
+            if let Some(span) = pending.take() {
+                print_history_span(path, span, stdout)?;
+            }
+            pending = Some(HistorySpan {
+                stream: stream.to_owned(),
+                offset,
+                length,
+                elapsed_us: event["elapsed_us"].as_u64().unwrap_or_default(),
+            });
+        } else {
+            if let Some(span) = pending.take() {
+                print_history_span(path, span, stdout)?;
+            }
+            if event["kind"] == "error" {
+                writeln!(
+                    stdout,
+                    "\n--- error ---\n{}",
+                    event["message"].as_str().unwrap_or_default()
+                )?;
+            } else if event["kind"] == "finished" {
+                writeln!(stdout, "\n--- exit {} ---", event["exit_code"])?;
+            }
+        }
+    }
+    if let Some(span) = pending {
+        print_history_span(path, span, stdout)?;
+    }
+    if session["exit_code"].is_null() {
+        writeln!(
+            stdout,
+            "\nNo recorded completion; the run may still be open or was interrupted."
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct FrameInput {
+    bytes: Vec<u8>,
+    deadline: Option<Instant>,
+    eof: bool,
+}
+
+impl FrameInput {
+    async fn next(&mut self, reader: &mut (impl AsyncRead + Unpin)) -> Result<Option<Operation>> {
+        while !self.eof {
+            let read = if let Some(deadline) = self.deadline {
+                tokio::select! {
+                    biased;
+                    read = reader.read_buf(&mut self.bytes) => Some(read?),
+                    _ = sleep_until(deadline) => None,
+                }
+            } else {
+                Some(reader.read_buf(&mut self.bytes).await?)
+            };
+            match read {
+                Some(0) => {
+                    self.eof = true;
+                    return Ok(self.take_operation(decode_frame(&self.bytes)));
+                }
+                Some(_) => self.deadline = Some(Instant::now() + FRAME_IDLE),
+                None => {
+                    self.deadline = None;
+                    if !self.bytes.ends_with(b"\n") {
+                        continue;
+                    }
+                    if let Some(operation) = self.take_operation(decode_frame(&self.bytes)) {
+                        return Ok(Some(operation));
+                    }
                 }
             }
         }
-        return Ok(Some(Err(format!(
-            "Action input exceeds {MAX_INPUT_BYTES} bytes. Send one smaller JSON object per line."
-        ))));
+        Ok(None)
     }
-    Ok(Some(Ok(bytes)))
+
+    fn take_operation(
+        &mut self,
+        decoded: std::result::Result<Vec<CommandCall>, serde_json::Error>,
+    ) -> Option<Operation> {
+        self.bytes.clear();
+        self.deadline = None;
+        match decoded {
+            Ok(calls) if calls.is_empty() => None,
+            Ok(calls) => Some(Operation::Frame { calls }),
+            Err(error) => Some(Operation::Feedback {
+                message: invalid_action_message(&error),
+            }),
+        }
+    }
 }
 
 fn parse_cli() -> Result<(PathBuf, Invocation)> {
@@ -250,6 +584,8 @@ fn parse_cli() -> Result<(PathBuf, Invocation)> {
         ["status"] => Invocation::Status,
         ["stop"] => Invocation::Stop,
         ["restart"] => Invocation::Restart,
+        ["history"] => Invocation::History(None),
+        ["history", selection] => Invocation::History(Some((*selection).to_owned())),
         _ => anyhow::bail!("unexpected daemon command\n\n{}", help()),
     };
     Ok((socket, invocation))
@@ -280,40 +616,245 @@ fn shell_quote(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{invalid_action_message, write_view, CommandCall, Response};
-    use crate::component::execution::StdinResponse;
-    use serde_json::{json, Value};
+    use super::{
+        decode_frame, invalid_action_message, CommandCall, FrameInput, Operation, FRAME_IDLE,
+    };
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn eof_submits_large_multiline_actions_as_one_frame() {
+        let first = json!({
+            "action": "remember",
+            "input": {"text": "长期记忆\\\"\n".repeat(2048)},
+        });
+        let last = json!({"action": "query", "input": {"text": "最新状态"}});
+        let mut input = serde_json::to_vec_pretty(&first).unwrap();
+        assert!(input.len() > 8192);
+        input.extend_from_slice(b"\n\n");
+        input.extend(serde_json::to_vec_pretty(&last).unwrap());
+        let mut reader = input.as_slice();
+        let mut frames = FrameInput::default();
+        let Some(Operation::Frame { calls }) = frames.next(&mut reader).await.unwrap() else {
+            panic!("expected one frame");
+        };
+        assert_eq!(serde_json::to_value(calls).unwrap(), json!([first, last]));
+        assert!(frames.next(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_submits_complete_input_and_eof_submits_the_next_frame() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let mut frames = FrameInput::default();
+        let first = json!({"action": "inspect", "input": {}});
+        writer
+            .write_all(&serde_json::to_vec(&first).unwrap())
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        let started = tokio::time::Instant::now();
+        let Some(Operation::Frame { calls }) = tokio::time::timeout(
+            FRAME_IDLE + Duration::from_secs(2),
+            frames.next(&mut reader),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("expected a frame after idle");
+        };
+        assert!(started.elapsed() >= FRAME_IDLE);
+        assert_eq!(serde_json::to_value(calls).unwrap(), json!([first]));
+
+        let last = json!({"action": "record", "input": {"text": "second frame"}});
+        writer
+            .write_all(&serde_json::to_vec(&last).unwrap())
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        let Some(Operation::Frame { calls }) = frames.next(&mut reader).await.unwrap() else {
+            panic!("expected the final frame at EOF");
+        };
+        assert_eq!(serde_json::to_value(calls).unwrap(), json!([last]));
+        assert!(frames.next(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_input_wait_preserves_bytes_and_its_framing_deadline() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let mut frames = FrameInput::default();
+        writer
+            .write_all(b"{\"action\":\"inspect\",\"input\":{}}\n")
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(FRAME_IDLE / 2, frames.next(&mut reader))
+                .await
+                .is_err()
+        );
+        let Some(Operation::Frame { calls }) =
+            tokio::time::timeout(FRAME_IDLE * 3 / 4, frames.next(&mut reader))
+                .await
+                .expect("refresh cancellation must not restart the 100 ms frame deadline")
+                .unwrap()
+        else {
+            panic!("the buffered action must survive refresh cancellation");
+        };
+        assert_eq!(
+            serde_json::to_value(calls).unwrap(),
+            json!([{ "action": "inspect", "input": {} }])
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_input_without_its_final_newline_waits_across_idle() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let mut frames = FrameInput::default();
+        writer
+            .write_all(
+                b"{\"action\":\"inspect\",\"input\":{}}\n{\"action\":\"inspect\",\"input\":{}}",
+            )
+            .await
+            .unwrap();
+        let next = frames.next(&mut reader);
+        tokio::pin!(next);
+        assert!(tokio::time::timeout(FRAME_IDLE * 2, &mut next)
+            .await
+            .is_err());
+        writer.write_all(b"\n").await.unwrap();
+        let Some(Operation::Frame { calls }) =
+            tokio::time::timeout(FRAME_IDLE + Duration::from_secs(1), next)
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected both actions after the final newline becomes idle");
+        };
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn incomplete_newline_terminated_frame_is_rejected_at_idle_and_can_recover() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let mut frames = FrameInput::default();
+        writer
+            .write_all(
+                b"{\"action\":\"inspect\",\"input\":{}}\n{\"action\":\"record\",\"input\":{\n",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(
+                FRAME_IDLE + Duration::from_secs(1),
+                frames.next(&mut reader)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            Some(Operation::Feedback { .. })
+        ));
+        writer
+            .write_all(br#"{"action":"inspect","input":{}}"#)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        let Some(Operation::Frame { calls }) = frames.next(&mut reader).await.unwrap() else {
+            panic!("expected a fresh frame after the incomplete frame was rejected");
+        };
+        assert_eq!(
+            serde_json::to_value(calls).unwrap(),
+            json!([{ "action": "inspect", "input": {} }])
+        );
+    }
+
+    #[tokio::test]
+    async fn new_bytes_restart_the_idle_deadline() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let mut frames = FrameInput::default();
+        let started = tokio::time::Instant::now();
+        let write = async {
+            writer
+                .write_all(b"{\"action\":\"inspect\",\"input\":{}}\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(FRAME_IDLE / 2).await;
+            writer
+                .write_all(b" {\"action\":\"inspect\",\"input\":{}}\n")
+                .await
+                .unwrap();
+        };
+        let (operation, ()) = tokio::join!(
+            tokio::time::timeout(FRAME_IDLE * 3, frames.next(&mut reader)),
+            write,
+        );
+        let Some(Operation::Frame { calls }) = operation.unwrap().unwrap() else {
+            panic!("expected the combined frame after the latest bytes become idle");
+        };
+        assert_eq!(calls.len(), 2);
+        assert!(started.elapsed() >= FRAME_IDLE + FRAME_IDLE / 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_idle_frame_is_rejected_and_the_next_frame_can_run() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let mut frames = FrameInput::default();
+        writer
+            .write_all(b"{\"action\":\"inspect\",\"input\":{}} {not JSON}\n")
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(FRAME_IDLE * 2, frames.next(&mut reader))
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(Operation::Feedback { .. })
+        ));
+        writer
+            .write_all(br#"{"action":"inspect","input":{}}"#)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        let Some(Operation::Frame { calls }) = frames.next(&mut reader).await.unwrap() else {
+            panic!("expected a fresh valid frame after the rejected frame");
+        };
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_input_is_not_a_frame_and_unfinished_eof_rejects_the_whole_frame() {
+        let mut empty = &b" \n\t\r"[..];
+        assert!(FrameInput::default()
+            .next(&mut empty)
+            .await
+            .unwrap()
+            .is_none());
+        let mut unfinished = &br#"{"action":"inspect","input":{}} {"action":"record""#[..];
+        assert!(matches!(
+            FrameInput::default().next(&mut unfinished).await.unwrap(),
+            Some(Operation::Feedback { .. })
+        ));
+    }
 
     #[test]
-    fn stdout_preserves_prompt_text_and_only_uses_json_escaping_for_results() {
-        let command = r#"'app' --socket 'session<name>&"quoted"'"#;
-        let text = "  <example> & literal &gt; ]]> -- `*_[]#` C:\\memory\\graph\n\"quoted\"\0\u{fffe}\u{ffff}";
-        let result = json!({"text": text});
-        let view = "<state> <prompt> & literal &gt; `*_[]#` </state>\n";
-        let response = Response {
-            output: StdinResponse {
-                ok: true,
-                result: Some(result.clone()),
-                view: view.to_owned(),
-            },
-            daemon_pid: 42,
-        };
-        let mut stdout = Vec::new();
-        write_view(&mut stdout, Some(&response), command, true).unwrap();
-        let stdout = String::from_utf8(stdout).unwrap();
-        assert!(stdout.contains(&format!("<connection command=\"{command}\"")));
-        assert!(stdout.contains(view));
-
-        let result_body = stdout
-            .split_once("<action_result ok=\"true\">")
-            .and_then(|(_, remainder)| remainder.split_once("</action_result>"))
-            .map(|(body, _)| body)
-            .unwrap();
-        assert_eq!(result_body, serde_json::to_string(&result).unwrap());
-        assert_eq!(serde_json::from_str::<Value>(result_body).unwrap(), result);
-        assert!(result_body.contains("<example> & literal &gt; ]]> -- `*_[]#`"));
-        assert!(result_body.contains(r#"C:\\memory\\graph\n\"quoted\"\u0000"#));
-        assert!(result_body.contains("\u{fffe}\u{ffff}"));
+    fn stream_decoder_rejects_malformed_later_envelopes_without_returning_a_prefix() {
+        for tail in [
+            r#"{not JSON}"#,
+            r#"{"action":"record","action":"inspect","input":{}}"#,
+            r#"{"action":"record","input":{"text":"old","text":"new"}}"#,
+            r#"{"action":"record","input":[]}"#,
+        ] {
+            let input = format!(r#"{{"action":"inspect","input":{{}}}} {tail}"#);
+            assert!(decode_frame(input.as_bytes()).is_err());
+        }
+        // Typed argument validation belongs to dispatch, after envelope decoding.
+        assert_eq!(
+            decode_frame(
+                br#"{"action":"record","input":{"text":42}} {"action":"inspect","input":{}}"#
+            )
+            .unwrap()
+            .len(),
+            2
+        );
     }
 
     #[test]
@@ -323,6 +864,5 @@ mod tests {
         let message = invalid_action_message(&error);
         assert!(message.contains(&error.to_string()));
         assert!(message.contains(key));
-        assert!(message.contains("Choose an action and its input from the current view."));
     }
 }

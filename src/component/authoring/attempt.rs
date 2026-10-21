@@ -16,7 +16,7 @@ use crate::{
         task::MountTaskHandle,
         ComponentId,
     },
-    pom::{BlockChildren, Document, ResolvedDocument},
+    pom::{BlockChildren, Document, ResolvedDocument, XmlNode},
     pom_resolution::resolve_artifact_document,
     transcript::AssistantPhase,
 };
@@ -28,7 +28,8 @@ use super::{
         build_projection_items, ComponentCaptureError, ProjectionFragmentCapture,
         ProjectionRunCapture,
     },
-    cli_command::CliCommandDeclaration,
+    cli_command::{action_catalogue, CliCommandDeclaration},
+    command_feedback::command_feedback,
     declaration::{ComponentNode, Placement, RepeatableRender, ScopeRender},
     event_input::EventInputOrigin,
     event_listener::EventListenerDispatchFault,
@@ -247,21 +248,8 @@ where
         );
         rendered?;
 
-        if let Some(wait) = preparations.command_wait()? {
-            let document = wait
-                .feedback
-                .with(|feedback| feedback.prompt_document())
-                .map_err(|error| ComponentAttemptFault::RuntimeInvariant {
-                    message: error.to_string(),
-                })?
-                .map_err(|message| ComponentAttemptFault::RuntimeInvariant { message })?;
-            capture.push(
-                &wait.mount.component,
-                wait.placement,
-                document.into_children(),
-                None,
-            )?;
-        }
+        let command_wait = preparations.command_wait()?;
+        capture.push_action_catalogues(&root_id, command_wait.map(|wait| wait.placement))?;
         let cli_commands = std::mem::take(&mut capture.cli_commands);
         let mut command_names = HashSet::new();
         for command in &cli_commands {
@@ -716,6 +704,9 @@ fn visit_render(
                 )?,
             };
             preparations.set_wait_scope(&component_id, forced, owner == &ComponentId::root())?;
+            let feedback = preparations
+                .command_wait()?
+                .filter(|wait| wait.mount.component == component_id);
             let mut child_cursor = 0;
             let mut child_system_scope_cursor = 0;
             visit_render(
@@ -738,6 +729,30 @@ fn visit_render(
                 task_starts,
                 capture,
             )?;
+            if let Some(wait) = feedback {
+                // The framework child has its own stable function identity and
+                // cursor, independent of the authored children's current count.
+                visit_render(
+                    command_feedback(wait.feedback),
+                    &component_id,
+                    &mut 0,
+                    &mut 0,
+                    &mut Vec::new(),
+                    Some(wait.placement),
+                    depth + 1,
+                    event_origin,
+                    driver_demand,
+                    tasks,
+                    application_exit,
+                    signal_render,
+                    listeners,
+                    reaction_completions,
+                    preparations,
+                    native_tools,
+                    task_starts,
+                    capture,
+                )?;
+            }
         }
         ComponentNode::Placement { placement, child } => {
             let resolved = forced.or(Some(placement));
@@ -946,9 +961,13 @@ fn visit_render(
                 .cloned()
                 .map(|tasks| ComponentTaskContext::new(mount.clone(), tasks));
             declaration.mount(mount, task_context);
-            let document = declaration.prompt_document(&capture.command_prefix)?;
-            capture.register_component(component_id.clone())?;
-            capture.push(&component_id, placement, document.into_children(), None)?;
+            if let Some(action) = declaration.json_action_node()? {
+                capture.actions.push((placement, action));
+            } else {
+                let document = declaration.prompt_document(&capture.command_prefix)?;
+                capture.register_component(component_id.clone())?;
+                capture.push(&component_id, placement, document.into_children(), None)?;
+            }
             capture.cli_commands.push(*declaration);
         }
     }
@@ -1042,6 +1061,7 @@ struct RenderCapture {
     streaming_contracts: Vec<ContractDeclaration>,
     xml_callbacks: Vec<XmlCallbackDeclaration>,
     cli_commands: Vec<CliCommandDeclaration>,
+    actions: Vec<(Placement, XmlNode)>,
     system: BlockChildren,
     nodes: Vec<ProjectionNodeCapture>,
     last_run: Option<ProjectionRunAddress>,
@@ -1058,6 +1078,7 @@ impl RenderCapture {
             streaming_contracts: Vec::new(),
             xml_callbacks: Vec::new(),
             cli_commands: Vec::new(),
+            actions: Vec::new(),
             system: BlockChildren::new(),
             nodes: vec![ProjectionNodeCapture {
                 identity: root,
@@ -1083,6 +1104,48 @@ impl RenderCapture {
             native_items: Vec::new(),
         });
         self.node_indexes.insert(identity, index);
+        Ok(())
+    }
+
+    fn push_action_catalogues(
+        &mut self,
+        root: &ComponentId,
+        wait_placement: Option<Placement>,
+    ) -> Result<(), ComponentAttemptFault> {
+        // Keep the command barrier's empty catalogue only when no placement
+        // advertises actions. This preserves retire-last delivery without
+        // adding an ordinary empty catalogue beside an ephemeral one.
+        for (position, placement) in [
+            Placement::Developer,
+            Placement::DeveloperRepeat,
+            Placement::DeveloperEphemeralRepeat,
+            Placement::User,
+            Placement::UserRepeat,
+            Placement::UserEphemeralRepeat,
+            Placement::Assistant,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let actions = self
+                .actions
+                .iter()
+                .filter(|(action_placement, _)| *action_placement == placement)
+                .map(|(_, action)| action.clone())
+                .collect::<Vec<_>>();
+            let keep_empty_wait = self.actions.is_empty() && wait_placement == Some(placement);
+            if actions.is_empty() && !keep_empty_wait {
+                continue;
+            }
+            let identity = root.child("agentview::ActionCatalogue", position);
+            self.register_component(identity.clone())?;
+            self.push(
+                &identity,
+                placement,
+                action_catalogue(actions).into_children(),
+                Some((Vec::new(), "actions")),
+            )?;
+        }
         Ok(())
     }
 
@@ -1183,7 +1246,8 @@ impl RenderCapture {
                     built.diffs,
                     built.diff_templates,
                 )
-                .with_repeat_items(built.repeat_items))
+                .with_repeat_items(built.repeat_items)
+                .with_ephemeral_items(built.ephemeral_items))
             })
             .collect::<Result<Vec<_>, ComponentCaptureError>>()?;
         RenderedProjection::from_nodes(nodes)

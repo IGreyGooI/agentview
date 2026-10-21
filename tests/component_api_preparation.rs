@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -15,19 +19,15 @@ use std::{
     time::Duration,
 };
 
-use agentview::{
-    component::{
-        execution::{
-            Application, ApplicationFault, ApplicationFaultKind, ApplicationFaultReason,
-            ApplicationFaultStage, ContextWindow, ExitReason, Frame, FrameCapabilities,
-            FrameConstraints, FrameProfile, ProviderFact, ProviderFactStream, ReactionPort,
-            ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultReason, RenderedProjection,
-            SubmitFault, TargetDeclaration, TargetEpoch, TargetIdentity,
-        },
-        prelude::*,
+use agentview::component::{
+    execution::{
+        Application, ApplicationFault, ApplicationFaultKind, ApplicationFaultReason,
+        ApplicationFaultStage, ContextWindow, ExitReason, Frame, FrameCapabilities,
+        FrameConstraints, FrameProfile, ProviderFact, ProviderFactStream, ReactionPort,
+        ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultReason, SubmitFault,
+        TargetDeclaration, TargetEpoch, TargetIdentity,
     },
-    pom_renderer::render_pom_document,
-    transcript::CanonicalInputItem,
+    prelude::*,
 };
 use async_trait::async_trait;
 use futures::{poll, FutureExt};
@@ -83,23 +83,9 @@ struct RecordingProbe {
 }
 
 impl RecordingProbe {
-    fn last_frame_text(&self) -> String {
-        String::from_utf8_lossy(&self.last_frame.lock().unwrap()).into_owned()
+    fn last_frame_document(&self) -> agentview::pom::ResolvedDocument {
+        frame_document(&self.last_frame.lock().unwrap())
     }
-}
-
-fn projection_text(projection: &RenderedProjection) -> String {
-    projection
-        .nodes()
-        .iter()
-        .flat_map(|node| node.items())
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom).unwrap()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 struct RecordingPort {
@@ -713,8 +699,8 @@ async fn react_waits_for_preparation_and_submits_its_signal_write() {
     assert_continue(reaction.await.unwrap());
 
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
-    assert!(probe.last_frame_text().contains("ready"));
-    assert!(!probe.last_frame_text().contains("loading"));
+    assert!(probe.last_frame_document().has_text("ready"));
+    assert!(!probe.last_frame_document().has_text("loading"));
     assert!(app.current_projection().is_prepared());
 }
 
@@ -764,11 +750,11 @@ async fn same_wave_preparations_start_concurrently_and_wait_for_all_before_hando
     assert_continue(reaction.await.unwrap());
 
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
-    let frame = probe.last_frame_text();
-    assert!(frame.contains("first-ready"));
-    assert!(frame.contains("second-ready"));
-    assert!(!frame.contains("first-pending"));
-    assert!(!frame.contains("second-pending"));
+    let frame = probe.last_frame_document();
+    assert!(frame.has_text("first-ready"));
+    assert!(frame.has_text("second-ready"));
+    assert!(!frame.has_text("first-pending"));
+    assert!(!frame.has_text("second-pending"));
 }
 
 #[tokio::test]
@@ -1053,7 +1039,7 @@ fn preparation_free_bootstrap_projection_is_prepared() {
     let snapshot = app.current_projection();
     assert!(snapshot.is_prepared());
     assert!(!snapshot.is_dirty());
-    assert!(projection_text(snapshot.projection()).contains("ready"));
+    assert!(projection_document(snapshot.projection()).has_text("ready"));
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 }
 
@@ -1469,11 +1455,11 @@ async fn preparation_stabilizes_nested_mounts_before_the_first_handoff() {
 
     assert_eq!(*loader_order.lock().unwrap(), ["parent", "child"]);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
-    let frame = probe.last_frame_text();
-    assert!(frame.contains("parent-ready"));
-    assert!(frame.contains("child-ready"));
-    assert!(!frame.contains("loading"));
-    assert!(!frame.contains("nested_child_pending"));
+    let frame = probe.last_frame_document();
+    assert!(frame.has_text("parent-ready"));
+    assert!(frame.has_text("child-ready"));
+    assert!(!frame.has_text("loading"));
+    assert!(!frame.has_element("nested_child_pending"));
 }
 
 #[tokio::test]
@@ -1494,23 +1480,20 @@ async fn newly_remounted_nested_preparation_runs_in_its_new_mount_generation() {
     assert_continue(app.prepare().await.unwrap());
     assert_eq!(parent_runs.load(Ordering::Acquire), 1);
     assert_eq!(child_runs.load(Ordering::Acquire), 1);
-    assert!(
-        !projection_text(app.current_projection().projection()).contains("remounting_child_absent")
-    );
+    assert!(!projection_document(app.current_projection().projection())
+        .has_element("remounting_child_absent"));
 
     assert_continue(app.prepare().await.unwrap());
     assert_eq!(parent_runs.load(Ordering::Acquire), 2);
     assert_eq!(child_runs.load(Ordering::Acquire), 2);
-    assert!(
-        projection_text(app.current_projection().projection()).contains("remounting_child_absent")
-    );
+    assert!(projection_document(app.current_projection().projection())
+        .has_element("remounting_child_absent"));
 
     assert_continue(app.prepare().await.unwrap());
     assert_eq!(parent_runs.load(Ordering::Acquire), 3);
     assert_eq!(child_runs.load(Ordering::Acquire), 3);
-    assert!(
-        !projection_text(app.current_projection().projection()).contains("remounting_child_absent")
-    );
+    assert!(!projection_document(app.current_projection().projection())
+        .has_element("remounting_child_absent"));
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 }
 
@@ -1534,9 +1517,9 @@ async fn remount_within_one_operation_reruns_the_child_but_not_the_parent() {
         ["parent", "child", "bridge", "child"]
     );
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
-    assert!(probe.last_frame_text().contains("remounted-ready"));
-    assert!(!probe.last_frame_text().contains("remounted-pending"));
-    assert!(!probe.last_frame_text().contains("remount_bridge"));
+    assert!(probe.last_frame_document().has_text("remounted-ready"));
+    assert!(!probe.last_frame_document().has_text("remounted-pending"));
+    assert!(!probe.last_frame_document().has_element("remount_bridge"));
 }
 
 #[tokio::test]
@@ -1556,9 +1539,9 @@ async fn sixteen_preparation_waves_can_write_final_data_and_stabilize() {
 
     assert_eq!(runs.load(Ordering::Acquire), 16);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
-    let frame = probe.last_frame_text();
-    assert!(frame.contains("wave-16-ready"));
-    assert!(!frame.contains("wave-16-pending"));
+    let frame = probe.last_frame_document();
+    assert!(frame.has_text("wave-16-ready"));
+    assert!(!frame.has_text("wave-16-pending"));
     assert!(app.current_projection().is_prepared());
 }
 
@@ -1635,7 +1618,7 @@ async fn prepare_resolves_bootstrap_preparations_without_provider_handoff() {
     .unwrap();
 
     let bootstrap = app.current_projection();
-    assert!(projection_text(bootstrap.projection()).contains("loading"));
+    assert!(projection_document(bootstrap.projection()).has_text("loading"));
     assert!(!bootstrap.is_prepared());
 
     let mut preparation = Box::pin(app.prepare());
@@ -1654,8 +1637,8 @@ async fn prepare_resolves_bootstrap_preparations_without_provider_handoff() {
     let prepared = app.current_projection();
     assert!(prepared.is_prepared());
     assert!(!prepared.is_dirty());
-    assert!(projection_text(prepared.projection()).contains("ready"));
-    assert!(!projection_text(prepared.projection()).contains("loading"));
+    assert!(projection_document(prepared.projection()).has_text("ready"));
+    assert!(!projection_document(prepared.projection()).has_text("loading"));
 }
 
 #[tokio::test]
@@ -1749,7 +1732,7 @@ async fn signal_write_keeps_the_previous_prepared_checkpoint_visible_while_dirty
     let first = app.current_projection();
     assert!(first.is_prepared());
     assert!(!first.is_dirty());
-    assert!(projection_text(first.projection()).contains("initial"));
+    assert!(projection_document(first.projection()).has_text("initial"));
     assert_eq!(runs.load(Ordering::Acquire), 1);
 
     exposed
@@ -1762,13 +1745,13 @@ async fn signal_write_keeps_the_previous_prepared_checkpoint_visible_while_dirty
     let dirty = app.current_projection();
     assert!(dirty.is_prepared());
     assert!(dirty.is_dirty());
-    assert!(projection_text(dirty.projection()).contains("initial"));
+    assert!(projection_document(dirty.projection()).has_text("initial"));
 
     assert_continue(app.prepare().await.unwrap());
     let second = app.current_projection();
     assert!(second.is_prepared());
     assert!(!second.is_dirty());
-    assert!(projection_text(second.projection()).contains("updated"));
+    assert!(projection_document(second.projection()).has_text("updated"));
     assert_eq!(runs.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 }
@@ -1797,7 +1780,7 @@ fn synchronous_preparation_factory_can_read_and_write_a_signal_without_deadlock(
                     .expect("mount factory access Component");
                     matches!(app.prepare().await, Ok(ControlFlow::Continue(())))
                         && app.current_projection().is_prepared()
-                        && projection_text(app.current_projection().projection()).contains("2")
+                        && projection_document(app.current_projection().projection()).has_text("2")
                 })
             }))
             .unwrap_or(false);

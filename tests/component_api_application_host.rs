@@ -4,6 +4,10 @@
     reason = "this compatibility test intentionally exercises ApplicationHost and ProviderPort"
 )]
 
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -27,8 +31,6 @@ use agentview::{
         ComponentHost,
     },
     llm_call::TextTurnEvent,
-    pom_renderer::render_pom_document,
-    transcript::CanonicalInputItem,
 };
 use async_trait::async_trait;
 use futures::{channel::mpsc, Stream, StreamExt};
@@ -483,20 +485,6 @@ fn faulting_handler_application(
     }
 }
 
-fn projection_text(projection: &RenderedProjection) -> String {
-    projection
-        .nodes()
-        .iter()
-        .flat_map(|node| node.items())
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom).unwrap()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn number_event(value: usize) -> ProviderEvent {
     ProviderEvent::Text(TextTurnEvent::TextDelta(value.to_string()))
 }
@@ -654,11 +642,11 @@ async fn successful_reaction_post_reconciles_handler_state_before_return() {
     assert!(!components.is_dirty());
     let submitted = projections.lock().unwrap();
     assert_eq!(submitted.len(), 1);
-    assert!(projection_text(&submitted[0]).contains("<state>[]</state>"));
+    assert!(projection_document(&submitted[0]).has_field("state", "[]"));
     let committed = components
         .current_projection()
         .expect("post-reconciled projection is committed");
-    assert!(projection_text(committed).contains("<state>[7]</state>"));
+    assert!(projection_document(committed).has_field("state", "[7]"));
 }
 
 #[tokio::test]
@@ -726,13 +714,13 @@ async fn explicit_reactions_use_complete_projection_and_enforce_host_identity() 
     assert_eq!(first_items.len(), 2);
     assert_eq!(second_items.len(), 2);
     assert_eq!(first_items[0], second_items[0]);
-    let first = projection_text(&captured[0]);
-    let second = projection_text(&captured[1]);
-    assert!(first.contains("<protocol>Stable protocol.</protocol>"));
-    assert!(first.contains("<state>A</state>"));
-    assert!(second.contains("<protocol>Stable protocol.</protocol>"));
-    assert!(second.contains("<state>B</state>"));
-    assert!(!second.contains("<state>A</state>"));
+    let first = projection_document(&captured[0]);
+    let second = projection_document(&captured[1]);
+    assert!(first.has_field("protocol", "Stable protocol."));
+    assert!(first.has_field("state", "A"));
+    assert!(second.has_field("protocol", "Stable protocol."));
+    assert!(second.has_field("state", "B"));
+    assert!(!second.has_field("state", "A"));
 }
 
 struct ObservationLog(Arc<Mutex<Vec<EngineObservation>>>);
@@ -956,8 +944,8 @@ async fn dropping_a_pending_stream_reaction_drops_stream_and_bindings_and_reuses
         .expect("Port remains reusable after command cancellation");
     assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
     assert_eq!(binding_drops.load(Ordering::SeqCst), 2);
-    let second_projection = projection_text(&projections.lock().unwrap()[1]);
-    assert!(second_projection.contains("<state>7</state>"));
+    let second_projection = projection_document(&projections.lock().unwrap()[1]);
+    assert!(second_projection.has_field("state", "7"));
 }
 
 #[tokio::test]
@@ -1029,15 +1017,15 @@ async fn provider_stream_fault_is_reported_and_the_provider_remains_reusable() {
     let committed = components
         .current_projection()
         .expect("pre-reaction projection remains committed after stream fault");
-    assert!(projection_text(committed).contains("<state>[]</state>"));
+    assert!(projection_document(committed).has_field("state", "[]"));
 
     host.dispatch_llm_reaction(&mut components)
         .await
         .expect("Port remains reusable after a stream fault");
     assert!(!components.is_dirty());
     assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
-    let second_projection = projection_text(&projections.lock().unwrap()[1]);
-    assert!(second_projection.contains("<state>[7]</state>"));
+    let second_projection = projection_document(&projections.lock().unwrap()[1]);
+    assert!(second_projection.has_field("state", "[7]"));
 }
 
 #[tokio::test]
@@ -1077,16 +1065,16 @@ async fn binding_fault_preserves_prior_signal_updates_and_the_provider_remains_r
     let committed = components
         .current_projection()
         .expect("pre-reaction projection remains committed after binding fault");
-    assert!(projection_text(committed).contains("<state>0</state>"));
+    assert!(projection_document(committed).has_field("state", "0"));
 
     host.dispatch_llm_reaction(&mut components)
         .await
         .expect("Port remains reusable after a binding fault");
     assert!(!components.is_dirty());
     assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
-    let second_projection = projection_text(&projections.lock().unwrap()[1]);
+    let second_projection = projection_document(&projections.lock().unwrap()[1]);
     assert!(
-        second_projection.contains("<state>7</state>"),
-        "unexpected second projection: {second_projection}"
+        second_projection.has_field("state", "7"),
+        "unexpected second projection: {second_projection:?}"
     );
 }

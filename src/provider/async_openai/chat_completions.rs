@@ -65,9 +65,9 @@ mod history;
 mod native_reaction;
 mod observation;
 
-pub(super) use observation::{
-    OpenAiChatObservation, OpenAiChatObservationError, OpenAiChatObserver,
-};
+pub(super) use observation::OpenAiChatObserver;
+#[cfg(test)]
+pub(super) use observation::{OpenAiChatObservation, OpenAiChatObservationError};
 
 #[cfg(test)]
 mod integration_tests;
@@ -572,6 +572,17 @@ impl ProviderPort for AsyncOpenAiChatCompletionsProvider {
         projection: RenderedProjection,
     ) -> Result<ProviderEventStream<'a>, ProviderFault> {
         self.ensure_legacy_mode()?;
+        if projection.nodes().iter().any(|node| {
+            node.items()
+                .iter()
+                .enumerate()
+                .any(|(index, _)| node.is_ephemeral_item(index))
+        }) {
+            return Err(ProviderFault::model_rejected(
+                "Ephemeral prompts require the frame-native ReactionPort",
+            )
+            .with_code(ProviderFaultCode::RequestPreparation));
+        }
         let prepared = ChatHistory::prepare(
             self.history.as_ref(),
             self.diff_memo.as_ref(),
@@ -901,6 +912,44 @@ mod frame_profile_tests {
 
     fn provider(config: AsyncOpenAiTransportConfig) -> AsyncOpenAiChatCompletionsProvider {
         provider_with_window(config, 272_000)
+    }
+
+    #[cfg(feature = "legacy-provider-port")]
+    #[allow(
+        deprecated,
+        reason = "this test verifies the legacy adapter rejects request-only prompt declarations"
+    )]
+    #[tokio::test]
+    async fn legacy_ephemeral_prompt_is_rejected_before_handoff() {
+        use crate::{
+            component::execution::RenderedProjectionNode,
+            pom::Document,
+            pom_resolution::resolve_system_document,
+            transcript::{CanonicalInputItem, ConversationRole},
+        };
+
+        let mut provider = provider(config());
+        let prompt = CanonicalInputItem::message(
+            ConversationRole::User,
+            resolve_system_document(Document::from_raw_text("request-only-secret")),
+        );
+        let projection =
+            RenderedProjection::from_nodes(vec![RenderedProjectionNode::new("root", vec![prompt])
+                .with_repeat_items(vec![0])
+                .with_ephemeral_items(vec![0])])
+            .unwrap();
+
+        let fault = match ProviderPort::execute(&mut provider, projection).await {
+            Ok(_) => panic!("a legacy ephemeral declaration must be rejected"),
+            Err(fault) => fault,
+        };
+        assert_eq!(fault.code(), ProviderFaultCode::RequestPreparation);
+        assert!(provider.history.is_none());
+        assert!(provider.diff_memo.is_none());
+        assert!(matches!(
+            provider.execution_mode,
+            ChatExecutionMode::Unclaimed
+        ));
     }
 
     fn provider_with_window(

@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     num::{NonZeroU128, NonZeroU64},
     ops::ControlFlow,
@@ -13,7 +17,6 @@ use agentview::{
         },
         prelude::*,
     },
-    pom_renderer::render_pom_document,
     transcript::{CanonicalInputItem, ConversationRole, InstructionAuthority},
 };
 use async_trait::async_trait;
@@ -208,18 +211,8 @@ fn raw_repeat_and_diff(props: RawStringProps) -> Component {
     }
 }
 
-fn rendered(item: &CanonicalInputItem) -> String {
-    let pom = match item {
-        CanonicalInputItem::Instruction { pom, .. } | CanonicalInputItem::Message { pom, .. } => {
-            pom
-        }
-        other => panic!("expected a POM projection item, got {other:?}"),
-    };
-    render_pom_document(pom).expect("raw POM renders")
-}
-
-fn projection_texts(frame: &CapturedFrame) -> Vec<String> {
-    frame.projection.iter().map(rendered).collect()
+fn projection_documents(frame: &CapturedFrame) -> Vec<agentview::pom::ResolvedDocument> {
+    item_documents(&frame.projection)
 }
 
 fn assert_user_developer_raw(frame: &CapturedFrame, raw: &str) {
@@ -236,7 +229,10 @@ fn assert_user_developer_raw(frame: &CapturedFrame, raw: &str) {
             }
         ]
     ));
-    assert_eq!(projection_texts(frame), [raw, raw]);
+    assert_eq!(
+        projection_documents(frame),
+        [pom_support::raw(raw), pom_support::raw(raw)]
+    );
 }
 
 async fn react(application: &mut Application<CapturingPort>) {
@@ -285,11 +281,11 @@ async fn raw_system_text_is_verbatim_and_keeps_later_placements_independent() {
         ]
     ));
     assert_eq!(
-        projection_texts(&frames[0]),
+        projection_documents(&frames[0]),
         vec![
-            SYSTEM_RAW.to_owned(),
-            RAW_A.to_owned(),
-            developer_raw(RAW_A),
+            raw(SYSTEM_RAW),
+            raw(RAW_A),
+            raw(&developer_raw(RAW_A)),
         ],
         "Markdown, fenced XML, body XML, CRLF, indentation, and trailing whitespace remain raw text"
     );
@@ -313,7 +309,7 @@ fn assert_user_developer_raw_with_developer(frame: &CapturedFrame, user: &str, d
             }
         ]
     ));
-    assert_eq!(projection_texts(frame), [user, developer]);
+    assert_eq!(projection_documents(frame), [raw(user), raw(developer)]);
 }
 
 #[tokio::test]
@@ -375,10 +371,14 @@ async fn raw_repeat_and_diff_items_submit_complete_text_on_every_reaction() {
     assert_user_developer_raw(&frames[1], RAW_A);
     assert_user_developer_raw(&frames[2], RAW_B);
     for frame in &frames {
-        for raw in projection_texts(frame) {
-            assert!(!raw.contains("rendering_mode=\"delta\""));
-            assert!(!raw.contains("<insert>"));
-            assert!(!raw.contains("<remove>"));
+        for document in projection_documents(frame) {
+            assert_eq!(document.children().len(), 1);
+            assert!(matches!(
+                document.children().iter().next(),
+                Some(agentview::pom::ContentRef::Node(
+                    agentview::pom::ContentNode::RawText(_)
+                ))
+            ));
         }
     }
 

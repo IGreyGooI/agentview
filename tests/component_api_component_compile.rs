@@ -46,6 +46,7 @@ fn target_component_pom_subset_compiles_from_the_public_preludes() {
     tests.pass("tests/ui/component_target/pass_static_component.rs");
     tests.pass("tests/ui/component_target/pass_dynamic_component.rs");
     tests.pass("tests/ui/component_target/pass_dynamic_root.rs");
+    tests.pass("tests/ui/component_target/pass_ephemeral_prompt.rs");
     #[cfg(feature = "legacy-provider-port")]
     tests.pass("tests/ui/component_target/pass_event_select.rs");
     #[cfg(feature = "legacy-provider-port")]

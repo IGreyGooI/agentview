@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     convert::Infallible,
     ops::ControlFlow,
@@ -14,11 +18,10 @@ use agentview::{
             Application, ApplicationFaultKind, ApplicationFaultReason, ApplicationFaultStage,
             CommandCall, CommandInput, CommandInputError, CommandOutcome, CommandParseError,
             CommandParser, CommandResponse, CommandSender, ExitReason, ExternalControl,
-            ExternalProviderPort, RenderedProjection,
+            ExternalProviderPort,
         },
         prelude::*,
     },
-    pom_renderer::render_pom_document,
     transcript::{CanonicalInputItem, InstructionAuthority},
 };
 use futures::poll;
@@ -221,20 +224,6 @@ fn serialized_command_calls_preserve_the_strict_input_object_boundary() {
     }
 }
 
-fn projection_text(projection: &RenderedProjection) -> String {
-    projection
-        .nodes()
-        .iter()
-        .flat_map(|node| node.items())
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom).unwrap()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 struct Harness {
     app: Application<ExternalProviderPort>,
     sender: CommandSender,
@@ -376,10 +365,10 @@ async fn parsed_commands_reach_current_callbacks_and_return_the_updated_view() {
         assert!(prepared.unwrap().is_continue());
         let response = response.unwrap();
         assert_eq!(response.outcome, CommandOutcome::Output(outcome));
-        let projection = projection_text(&response.projection);
-        assert!(projection.contains("<value>3</value>"));
-        assert!(projection.contains("command_result"));
-        assert!(projection.contains("add --stdin"));
+        let projection = projection_document(&response.projection);
+        assert!(projection.has_field("value", "3"));
+        assert!(projection.has_element("command_result"));
+        assert!(projection.has_attribute("command", "add --stdin"));
     }
     assert_eq!(probe.state().calls, 1);
     harness.app.shutdown().await.unwrap();
@@ -392,10 +381,10 @@ async fn plain_view_collects_child_actions_and_replies_with_updated_state_and_ca
     let mut harness = Harness::mount(move || counter(root_probe.clone()));
     assert_eq!(probe.state().calls, 0, "render does not execute a callback");
     assert!(!harness.app.current_projection().is_prepared());
-    let initial = projection_text(harness.app.current_projection().projection());
-    assert!(initial.contains("add --delta TOKEN"));
-    assert!(initial.contains("add --stdin"));
-    assert!(initial.contains("signed counter adjustment"));
+    let initial = projection_document(harness.app.current_projection().projection());
+    assert!(initial.has_attribute("command", "add --delta TOKEN"));
+    assert!(initial.has_attribute("command", "add --stdin"));
+    assert!(initial.has_attribute("input", "a signed counter adjustment"));
 
     let first = harness.command("add", json!({"delta": 10})).await;
     assert_eq!(first.call.name(), "add");
@@ -403,17 +392,17 @@ async fn plain_view_collects_child_actions_and_replies_with_updated_state_and_ca
         first.outcome,
         CommandOutcome::Output(json!({"value": 10, "observed": 0}))
     );
-    let first_view = projection_text(&first.projection);
-    assert!(first_view.contains("<value>10</value>"));
-    assert!(first_view.contains("enabled=\"false\""));
-    assert!(first_view.contains("command_result"));
+    let first_view = projection_document(&first.projection);
+    assert!(first_view.has_field("value", "10"));
+    assert!(first_view.has_attribute("enabled", "false"));
+    assert!(first_view.has_element("command_result"));
 
     let second = harness.command("add", json!({"delta": -4})).await;
     assert!(matches!(
         second.outcome,
         CommandOutcome::Rejected { ref code, .. } if code == "command_disabled"
     ));
-    assert!(projection_text(&second.projection).contains("<value>10</value>"));
+    assert!(projection_document(&second.projection).has_field("value", "10"));
     assert_eq!(
         probe.state().calls,
         1,
@@ -442,15 +431,17 @@ async fn invalid_arguments_and_unknown_commands_deliver_feedback_then_allow_vali
         assert!(
             matches!(response.outcome, CommandOutcome::Rejected { ref code, .. } if code == "invalid_arguments")
         );
-        assert!(projection_text(&response.projection).contains("invalid_arguments"));
+        assert!(
+            projection_document(&response.projection).has_attribute("code", "invalid_arguments")
+        );
     }
     let unknown = harness.command("missing", json!({})).await;
     assert!(
         matches!(unknown.outcome, CommandOutcome::Rejected { ref code, .. } if code == "command_unavailable")
     );
-    let feedback = projection_text(&unknown.projection);
-    assert!(feedback.contains("command=\"missing\""));
-    assert!(feedback.contains("not currently mounted"));
+    let feedback = projection_document(&unknown.projection);
+    assert!(feedback.has_attribute("command", "missing"));
+
     assert_eq!(probe.state().calls, 0);
 
     let recovered = harness.command("add", json!({"delta": 3})).await;
@@ -458,7 +449,7 @@ async fn invalid_arguments_and_unknown_commands_deliver_feedback_then_allow_vali
         recovered.outcome,
         CommandOutcome::Output(json!({"value": 3, "observed": 0}))
     );
-    assert!(projection_text(&recovered.projection).contains("<value>3</value>"));
+    assert!(projection_document(&recovered.projection).has_field("value", "3"));
     harness.app.shutdown().await.unwrap();
 }
 
@@ -507,7 +498,7 @@ async fn commands_wait_in_the_inbox_until_a_component_explicitly_declares_the_ba
         .unwrap()
         .is_continue());
     let response = response.await.unwrap();
-    assert!(projection_text(&response.projection).contains("<value>5</value>"));
+    assert!(projection_document(&response.projection).has_field("value", "5"));
     assert_eq!(probe.state().calls, 1);
     harness.app.shutdown().await.unwrap();
 }
@@ -553,7 +544,9 @@ async fn state_changes_while_waiting_refresh_removed_commands_and_callback_captu
     assert!(
         matches!(response.outcome, CommandOutcome::Rejected { ref code, .. } if code == "command_unavailable")
     );
-    assert!(!projection_text(&response.projection).contains("add --delta TOKEN"));
+    assert!(
+        !projection_document(&response.projection).has_attribute("command", "add --delta TOKEN")
+    );
     assert_eq!(probe.state().calls, 0);
 
     probe
@@ -668,7 +661,7 @@ async fn cancellation_after_callback_retains_its_result_until_new_preparation_fi
         .is_continue());
     let response = first.await.unwrap();
     assert_eq!(response.outcome, CommandOutcome::Output(json!("started")));
-    assert!(projection_text(&response.projection).contains("<value>100</value>"));
+    assert!(projection_document(&response.projection).has_field("value", "100"));
     assert_eq!(
         probe.state().calls,
         1,
@@ -730,7 +723,7 @@ async fn callback_failure_preserves_prior_writes_and_is_not_replayed_on_retry() 
         response.outcome,
         CommandOutcome::Output(json!({"value": 1, "calls": 1}))
     );
-    assert!(projection_text(&response.projection).contains("<value>1</value>"));
+    assert!(projection_document(&response.projection).has_field("value", "1"));
     harness.app.shutdown().await.unwrap();
 }
 
@@ -953,8 +946,11 @@ async fn callbacks_inherit_task_context_and_unmount_awaits_their_spawned_task_cl
     let response = harness.command("inspect", json!({})).await;
     assert!(probe.dropped.load(Ordering::SeqCst));
     assert!(local.with(|value| *value).is_err());
-    assert!(projection_text(&response.projection).contains("action removed"));
-    assert!(!projection_text(&response.projection).contains("command=\"start\" description="));
+    assert!(projection_document(&response.projection).has_text("action removed"));
+    assert!(projection_document(&response.projection)
+        .elements("action")
+        .into_iter()
+        .all(|action| attribute(action, "command") != Some("start")));
     harness.app.shutdown().await.unwrap();
 }
 
@@ -1030,13 +1026,15 @@ async fn command_received_by_an_old_wait_owner_cannot_run_a_replacement_same_nam
     harness.app.shutdown().await.unwrap();
 }
 
+type FailingPrepStateSignal = Signal<(bool, bool)>;
+
 #[derive(Clone, Default)]
 struct FailingPrepProbe {
-    state: Arc<Mutex<Option<Signal<(bool, bool)>>>>,
+    state: Arc<Mutex<Option<FailingPrepStateSignal>>>,
 }
 
 impl FailingPrepProbe {
-    fn signal(&self) -> Signal<(bool, bool)> {
+    fn signal(&self) -> FailingPrepStateSignal {
         self.state.lock().unwrap().clone().expect("mounted state")
     }
 
@@ -1046,7 +1044,7 @@ impl FailingPrepProbe {
 }
 
 #[component]
-fn failing_after_receive_child(state: Signal<(bool, bool)>) -> Component {
+fn failing_after_receive_child(state: FailingPrepStateSignal) -> Component {
     use_preparation(move || async move {
         if state.with(|state| state.1).unwrap() {
             Err::<(), String>("new preparation failed".to_owned())
@@ -1130,11 +1128,11 @@ async fn repeated_developer_command_owner_places_feedback_in_developer_instructi
     for node in response.projection.nodes() {
         for item in node.items() {
             if let CanonicalInputItem::Instruction { authority, pom } = item {
-                let text = render_pom_document(pom).unwrap();
-                if text.contains("command_feedback") {
+                let text = pom;
+                if text.has_element("command_feedback") {
                     found = true;
                     assert_eq!(*authority, InstructionAuthority::Developer);
-                    assert!(!text.contains("<user>"));
+                    assert!(!text.has_element("user"));
                 }
             }
         }

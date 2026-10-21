@@ -64,9 +64,9 @@ fn two_turn_application(props: TwoTurnProps) -> Component {
 
     view! {
         #[system_once]
-        request_observer_policy { "Return the supplied state as plain text." }
+        { String::from("Return the supplied state as plain text.") }
         #[diff(slot = "turn")]
-        request_observer_turn { "{current_turn}" }
+        { current_turn }
     }
 }
 
@@ -141,7 +141,7 @@ fn message_texts(body: &[u8]) -> anyhow::Result<Vec<(String, String)>> {
 fn contains_message(messages: &[(String, String)], role: &str, text: &str) -> bool {
     messages
         .iter()
-        .any(|(actual_role, actual_text)| actual_role == role && actual_text.contains(text))
+        .any(|(actual_role, actual_text)| actual_role == role && actual_text == text)
 }
 
 #[tokio::test]

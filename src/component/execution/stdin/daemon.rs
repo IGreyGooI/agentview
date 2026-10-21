@@ -13,7 +13,7 @@ use std::{
 use anyhow::{ensure, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     process::Command,
     sync::{mpsc, oneshot},
@@ -22,12 +22,11 @@ use tokio::{
 };
 
 use super::super::CommandCall;
-use super::{StdinApplication, StdinResponse};
+use super::{StdinApplication, StdinDelivery, StdinProjectionResponse, StdinResponse};
 use crate::component::authoring::Component;
 
-const MAX_REQUEST_BYTES: usize = 8192;
-const MAX_RESPONSE_BYTES: usize = 128 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct Response {
@@ -40,34 +39,82 @@ pub(super) struct Response {
 pub(super) enum Operation {
     Observe,
     Action { call: CommandCall },
+    Frame { calls: Vec<CommandCall> },
     Stop,
     Feedback { message: String },
 }
 
 struct Request {
     pub operation: Operation,
-    pub reply: oneshot::Sender<Result<Response, String>>,
+    pub reply: oneshot::Sender<Result<PreparedResponse, String>>,
 }
 
-type ShutdownReply = (oneshot::Sender<Result<Response, String>>, Response);
+#[derive(Debug)]
+struct PreparedResponse {
+    output: StdinProjectionResponse,
+    daemon_pid: u32,
+}
+
+type ShutdownReply = (
+    oneshot::Sender<Result<PreparedResponse, String>>,
+    PreparedResponse,
+);
+
+/// One frontend's delivery session. Never reconnect after submitting a request:
+/// application effects may already have happened when its response is lost.
+pub(super) struct Connection {
+    stream: BufReader<UnixStream>,
+}
+
+impl Connection {
+    pub(super) async fn connect(socket: &Path, autostart: bool) -> Result<Option<Self>> {
+        Ok(connect(socket, autostart).await?.map(|stream| Self {
+            stream: BufReader::new(stream),
+        }))
+    }
+
+    pub(super) async fn request(&mut self, operation: &Operation) -> Result<Response> {
+        exchange(&mut self.stream, operation).await
+    }
+}
 
 pub(super) async fn request(
     socket: &Path,
     operation: &Operation,
     autostart: bool,
 ) -> Result<Option<Response>> {
-    let Some(mut stream) = connect(socket, autostart).await? else {
+    let Some(mut connection) = Connection::connect(socket, autostart).await? else {
         return Ok(None);
     };
+    connection.request(operation).await.map(Some)
+}
+
+async fn exchange(stream: &mut BufReader<UnixStream>, operation: &Operation) -> Result<Response> {
     // Connect retries precede submission. Never replay a submitted action after
     // a write or response failure: it may already have changed application state.
-    let response: Result<Response, String> = timeout(REQUEST_TIMEOUT, async {
-        write_json(&mut stream, operation).await?;
-        read_json(&mut stream, MAX_RESPONSE_BYTES).await
-    })
-    .await
-    .context("response timed out; inspect application state before retrying the action")??;
-    response.map(Some).map_err(anyhow::Error::msg)
+    timeout(IO_TIMEOUT, write_json(stream.get_mut(), operation))
+        .await
+        .context(
+            "command write timed out; inspect application state before retrying the action",
+        )??;
+
+    // A quiet connection while an async callback runs is not stalled socket I/O.
+    // Bound the queue/callback wait separately, then retain the short transfer
+    // timeout once the daemon starts delivering its response.
+    let first_bytes = timeout(RESPONSE_TIMEOUT, stream.fill_buf())
+        .await
+        .context(
+        "response timed out after 5 minutes; inspect application state before retrying the action",
+    )??;
+    ensure!(
+        !first_bytes.is_empty(),
+        "application connection closed; inspect application state before retrying the action"
+    );
+    let response: Result<Response, String> =
+        timeout(IO_TIMEOUT, read_json(stream)).await.context(
+            "response read timed out; inspect application state before retrying the action",
+        )??;
+    response.map_err(anyhow::Error::msg)
 }
 
 async fn connect(socket: &Path, autostart: bool) -> Result<Option<UnixStream>> {
@@ -266,37 +313,70 @@ fn joined_application(
     }
 }
 
-async fn handle_client(mut stream: UnixStream, sender: mpsc::Sender<Request>) -> Result<()> {
-    let operation = timeout(
-        REQUEST_TIMEOUT,
-        read_json::<Operation>(&mut stream, MAX_REQUEST_BYTES),
-    )
-    .await
-    .context("command read timed out")?;
-    let response: Result<Response, String> = match operation {
-        Ok(operation) => {
-            let (reply, received) = oneshot::channel();
-            match sender.send(Request { operation, reply }).await {
-                Ok(()) => received
-                    .await
-                    .unwrap_or_else(|_| Err("Application stopped".to_owned())),
-                Err(_) => Err("Application stopped".to_owned()),
-            }
+async fn handle_client(stream: UnixStream, sender: mpsc::Sender<Request>) -> Result<()> {
+    let mut stream = BufReader::new(stream);
+    let mut delivery = StdinDelivery::new()?;
+    loop {
+        // Waiting for a caller to send its next frame is not stalled socket I/O.
+        // Receiver closure also wakes idle connections when the daemon stops.
+        let first_bytes = tokio::select! {
+            biased;
+            _ = sender.closed() => return Ok(()),
+            first_bytes = stream.fill_buf() => first_bytes?,
+        };
+        if first_bytes.is_empty() {
+            return Ok(());
         }
-        Err(error) => Err(format!("invalid command: {error}")),
-    };
-    timeout(REQUEST_TIMEOUT, write_json(&mut stream, &response))
-        .await
-        .context("response write timed out")??;
-    Ok(())
+        let operation = tokio::select! {
+            biased;
+            _ = sender.closed() => return Ok(()),
+            operation = timeout(IO_TIMEOUT, read_json::<Operation>(&mut stream)) => {
+                operation.context("command read timed out")?
+            }
+        };
+        let stopping = matches!(&operation, Ok(Operation::Stop));
+        let prepared: Result<PreparedResponse, String> = match operation {
+            Ok(operation) => {
+                let (reply, received) = oneshot::channel();
+                match sender.send(Request { operation, reply }).await {
+                    Ok(()) => received
+                        .await
+                        .unwrap_or_else(|_| Err("Application stopped".to_owned())),
+                    Err(_) => Err("Application stopped".to_owned()),
+                }
+            }
+            Err(error) => Err(format!("invalid command: {error}")),
+        };
+        let (response, commit): (Result<Response, String>, _) = match prepared {
+            Ok(prepared) => match delivery.prepare(prepared.output) {
+                Ok((output, commit)) => (
+                    Ok(Response {
+                        output,
+                        daemon_pid: prepared.daemon_pid,
+                    }),
+                    Some(commit),
+                ),
+                Err(error) => (Err(error.to_string()), None),
+            },
+            Err(error) => (Err(error), None),
+        };
+        let close = stopping || response.is_err();
+        timeout(IO_TIMEOUT, write_json(stream.get_mut(), &response))
+            .await
+            .context("response write timed out")??;
+        if let Some(commit) = commit {
+            // No await between successful delivery and baseline publication.
+            delivery.commit(commit);
+        }
+        if close {
+            return Ok(());
+        }
+    }
 }
 
-async fn read_json<T: DeserializeOwned>(stream: &mut UnixStream, maximum: usize) -> Result<T> {
+async fn read_json<T: DeserializeOwned>(stream: &mut (impl AsyncBufRead + Unpin)) -> Result<T> {
     let mut bytes = Vec::new();
-    BufReader::new(stream.take((maximum + 1) as u64))
-        .read_until(b'\n', &mut bytes)
-        .await?;
-    ensure!(bytes.len() <= maximum, "message exceeds size limit");
+    stream.read_until(b'\n', &mut bytes).await?;
     ensure!(
         bytes.last() == Some(&b'\n'),
         "expected one newline-terminated JSON message"
@@ -320,13 +400,16 @@ async fn run(
         while let Some(Request { operation, reply }) = receiver.recv().await {
             let stopping = matches!(&operation, Operation::Stop);
             let response = match operation {
-                Operation::Action { call } => application.submit(call).await,
-                Operation::Observe | Operation::Stop => application.observe().await,
+                Operation::Action { call } => application.submit_projection(call).await,
+                Operation::Frame { calls } => application.submit_frame_projection(calls).await,
+                Operation::Observe | Operation::Stop => application.observe_projection().await,
                 Operation::Feedback { message } => {
-                    application.feedback("invalid_input", message).await
+                    application
+                        .feedback_projection("invalid_input", message)
+                        .await
                 }
             };
-            let response = response.map(|output| Response {
+            let response = response.map(|output| PreparedResponse {
                 output,
                 daemon_pid: std::process::id(),
             });
@@ -356,5 +439,248 @@ async fn run(
         (Err(error), Err(cleanup)) => {
             Err(error.context(format!("Application shutdown also failed: {cleanup}")))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use crate::component::prelude::*;
+    use serde_json::json;
+
+    use super::*;
+
+    #[component]
+    fn transport_actions(calls: Arc<AtomicUsize>, delay: Duration) -> Component {
+        use_wait_for_command();
+        let completed = use_signal(|| 0_usize);
+        let count = completed.with(|completed| *completed).unwrap();
+        view! {
+            completed { "{count}" }
+            Action {
+                name: "work",
+                on_call: move || {
+                    let calls = calls.clone();
+                    let completed = completed.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        sleep(delay).await;
+                        completed.update(|completed| {
+                            *completed += 1;
+                            json!({"completed": *completed})
+                        })
+                    }
+                },
+            }
+        }
+    }
+
+    async fn round_trip(sender: mpsc::Sender<Request>, operation: &Operation) -> Response {
+        let (frontend, daemon) = UnixStream::pair().unwrap();
+        let mut frontend = BufReader::new(frontend);
+        let connection = tokio::spawn(handle_client(daemon, sender));
+        let response = exchange(&mut frontend, operation).await.unwrap();
+        drop(frontend);
+        connection.await.unwrap().unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn large_frame_and_result_cross_the_socket_without_losing_content() {
+        let input = json!({"text": "长期记忆\\\"\n".repeat(2048)});
+        let operation = Operation::Frame {
+            calls: vec![
+                CommandCall::new("remember", input.clone()),
+                CommandCall::new("inspect", json!({})),
+            ],
+        };
+        assert!(serde_json::to_vec(&operation).unwrap().len() > 8192);
+        let result = json!({"text": "完整查询结果\\\"\n".repeat(16 * 1024)});
+        let view = "完整视图\\\"\n".repeat(16 * 1024);
+        assert!(serde_json::to_vec(&result).unwrap().len() > 128 * 1024);
+        assert!(view.len() > 128 * 1024);
+        let expected_result = result.clone();
+        let (sender, mut receiver) = mpsc::channel::<Request>(1);
+        let application = tokio::spawn(async move {
+            let Request { operation, reply } = receiver.recv().await.unwrap();
+            match operation {
+                Operation::Frame { calls } => {
+                    assert_eq!(
+                        serde_json::to_value(calls).unwrap(),
+                        json!([
+                            {"action": "remember", "input": input},
+                            {"action": "inspect", "input": {}},
+                        ]),
+                    );
+                }
+                other => panic!("expected a frame, received {other:?}"),
+            }
+            let projection = crate::component::execution::RenderedProjection::from_nodes(vec![
+                crate::component::execution::RenderedProjectionNode::new(
+                    "large-response",
+                    vec![crate::transcript::CanonicalInputItem::message(
+                        crate::transcript::ConversationRole::User,
+                        crate::pom_resolution::resolve_artifact_document(
+                            crate::pom::Document::from_raw_text(view),
+                        )
+                        .unwrap(),
+                    )],
+                ),
+            ])
+            .unwrap();
+            reply
+                .send(Ok(PreparedResponse {
+                    output: StdinProjectionResponse {
+                        ok: true,
+                        result: Some(result),
+                        projection,
+                    },
+                    daemon_pid: 42,
+                }))
+                .unwrap();
+            assert!(receiver.recv().await.is_none());
+        });
+
+        let response = round_trip(sender, &operation).await;
+        assert!(response.output.ok);
+        assert_eq!(response.output.result, Some(expected_result));
+        assert_eq!(response.daemon_pid, 42);
+        application.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_frame_keeps_its_order_and_rejections_before_the_next_request() {
+        timeout(Duration::from_secs(3), async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let root_calls = calls.clone();
+            let (sender, receiver) = mpsc::channel(16);
+            let application = tokio::spawn(run(receiver, move || {
+                transport_actions(root_calls.clone(), Duration::from_millis(20))
+            }));
+            let (frame_reply, frame_response) = oneshot::channel();
+            sender
+                .send(Request {
+                    operation: Operation::Frame {
+                        calls: vec![
+                            CommandCall::new("work", json!({})),
+                            CommandCall::new("work", json!({"unexpected": true})),
+                            CommandCall::new("missing", json!({})),
+                            CommandCall::new("work", json!({})),
+                        ],
+                    },
+                    reply: frame_reply,
+                })
+                .await
+                .unwrap();
+            let (next_reply, next_response) = oneshot::channel();
+            sender
+                .send(Request {
+                    operation: Operation::Action {
+                        call: CommandCall::new("work", json!({})),
+                    },
+                    reply: next_reply,
+                })
+                .await
+                .unwrap();
+
+            let frame = frame_response.await.unwrap().unwrap();
+            assert!(!frame.output.ok);
+            let outcomes = frame.output.result.unwrap();
+            let outcomes = outcomes.as_array().unwrap();
+            assert_eq!(outcomes.len(), 4);
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .map(|outcome| outcome["action"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["work", "work", "missing", "work"]
+            );
+            assert_eq!(outcomes[0]["result"], json!({"completed": 1}));
+            assert_eq!(outcomes[1]["ok"], false);
+            assert_eq!(outcomes[1]["result"]["code"], "invalid_arguments");
+            assert_eq!(outcomes[2]["ok"], false);
+            assert_eq!(outcomes[3]["result"], json!({"completed": 2}));
+            let next = next_response.await.unwrap().unwrap();
+            assert_eq!(next.output.result, Some(json!({"completed": 3})));
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            drop(sender);
+            assert!(application.await.unwrap().unwrap().is_none());
+        })
+        .await
+        .expect("a frame completes before the next queued request");
+    }
+
+    #[tokio::test]
+    async fn a_callback_longer_than_the_io_timeout_delivers_its_result_once() {
+        timeout(IO_TIMEOUT + Duration::from_secs(5), async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let root_calls = calls.clone();
+            let (sender, receiver) = mpsc::channel(16);
+            let application = tokio::spawn(run(receiver, move || {
+                transport_actions(root_calls.clone(), IO_TIMEOUT + Duration::from_secs(1))
+            }));
+
+            let started = Instant::now();
+            let result = round_trip(
+                sender.clone(),
+                &Operation::Action {
+                    call: CommandCall::new("work", json!({})),
+                },
+            )
+            .await;
+            assert!(started.elapsed() >= IO_TIMEOUT);
+            assert_eq!(result.output.result, Some(json!({"completed": 1})));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let observed = round_trip(sender.clone(), &Operation::Observe).await;
+            assert_eq!(observed.output.result, None);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            drop(sender);
+            assert!(application.await.unwrap().unwrap().is_none());
+        })
+        .await
+        .expect("a slow callback completes within the separate response deadline");
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_frontend_does_not_cancel_or_replay_an_accepted_action() {
+        timeout(Duration::from_secs(3), async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let root_calls = calls.clone();
+            let (sender, receiver) = mpsc::channel(16);
+            let application = tokio::spawn(run(receiver, move || {
+                transport_actions(root_calls.clone(), Duration::from_millis(20))
+            }));
+            let (mut frontend, daemon) = UnixStream::pair().unwrap();
+            let connection = tokio::spawn(handle_client(daemon, sender.clone()));
+            write_json(
+                &mut frontend,
+                &Operation::Action {
+                    call: CommandCall::new("work", json!({})),
+                },
+            )
+            .await
+            .unwrap();
+            drop(frontend);
+
+            assert!(
+                connection.await.unwrap().is_err(),
+                "the response has no reader"
+            );
+            let observed = round_trip(sender.clone(), &Operation::Observe).await;
+            assert_eq!(observed.output.result, None);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            drop(sender);
+            assert!(application.await.unwrap().unwrap().is_none());
+        })
+        .await
+        .expect("a lost response leaves the daemon available for inspection");
     }
 }

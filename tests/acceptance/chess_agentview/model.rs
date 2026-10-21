@@ -440,7 +440,12 @@ fn appended_attempt(
 }
 
 #[cfg(test)]
+#[path = "../../support/pom.rs"]
+mod pom;
+
+#[cfg(test)]
 mod tests {
+    use super::pom::{self, InspectPom};
     use std::{
         collections::VecDeque,
         num::{NonZeroU128, NonZeroU64},
@@ -459,7 +464,7 @@ mod tests {
             ReactionPortFaultReason, SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch,
             TargetIdentity,
         },
-        pom_renderer::render_pom_document,
+        pom::ResolvedDocument,
         transcript::CanonicalInputItem,
     };
     use async_trait::async_trait;
@@ -497,7 +502,7 @@ mod tests {
 
     #[derive(Clone)]
     struct ScriptedCapture {
-        projections: Arc<Mutex<Vec<String>>>,
+        projections: Arc<Mutex<Vec<ResolvedDocument>>>,
         lifecycle: Arc<Mutex<Vec<LifecycleEvent>>>,
         accepted: Arc<Mutex<Option<FrameRevision>>>,
         remaining_scripts: Arc<AtomicUsize>,
@@ -514,7 +519,7 @@ mod tests {
         remaining_scripts: Arc<AtomicUsize>,
         reject_before_handoff: Arc<AtomicBool>,
         frame_attempts: Arc<Mutex<Vec<FrameAttempt>>>,
-        projections: Arc<Mutex<Vec<String>>>,
+        projections: Arc<Mutex<Vec<ResolvedDocument>>>,
         lifecycle: Arc<Mutex<Vec<LifecycleEvent>>>,
     }
 
@@ -550,24 +555,13 @@ mod tests {
                     prepared_against: frame.prepared_against().clone(),
                     basis: frame.basis(),
                 });
-            let rendered = frame
-                .submission()
-                .projection()
-                .items()
-                .iter()
-                .filter_map(|item| match item {
+            let document = pom::combine(frame.submission().projection().items().iter().filter_map(
+                |item| match item {
                     CanonicalInputItem::Instruction { pom, .. }
-                    | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom)),
+                    | CanonicalInputItem::Message { pom, .. } => Some(pom.clone()),
                     _ => None,
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| {
-                    SubmitFault::Rejected(ReactionPortFault::terminal(
-                        ReactionPortFaultCode::Internal,
-                        ReactionPortFaultReason::RequestPreparation,
-                    ))
-                })?
-                .join("\n");
+                },
+            ));
             if self.reject_before_handoff.load(Ordering::SeqCst) {
                 return Err(SubmitFault::Rejected(ReactionPortFault::retryable(
                     ReactionPortFaultCode::Unavailable,
@@ -606,7 +600,7 @@ mod tests {
             self.projections
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(rendered);
+                .push(document);
             self.lifecycle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -779,21 +773,16 @@ mod tests {
             .first()
             .cloned()
             .expect("scripted Chess provider received one Frame");
-        assert!(submitted.contains("white-ply-2"));
-        assert!(submitted.contains("<attempt_index>1</attempt_index>"));
-        assert!(submitted.contains("e2e4"));
-        assert!(submitted.contains("e7e5"));
-        assert!(!submitted.contains("pending_draw_offer"));
-        assert!(submitted.contains("invalid_xml"));
-        assert_eq!(submitted.matches("<choose_move>").count(), 1, "{submitted}");
-        assert_eq!(submitted.matches("<resign>").count(), 1, "{submitted}");
+        assert!(submitted.has_text("white-ply-2"));
+        assert!(submitted.has_field("attempt_index", "1"));
+        assert!(submitted.has_text("e2e4"));
+        assert!(submitted.has_text("e7e5"));
+        assert!(!submitted.has_element("pending_draw_offer"));
+        assert_eq!(submitted.elements("choose_move").len(), 1);
+        assert_eq!(submitted.elements("resign").len(), 1);
         for removed_action in ["move_and_offer_draw", "accept_draw", "claim_draw"] {
-            assert!(!submitted.contains(removed_action), "{submitted}");
+            assert!(!submitted.has_element(removed_action));
         }
-        assert!(
-            submitted.contains("exactly one of the two empty XML elements"),
-            "{submitted}"
-        );
 
         let completed = control
             .read_state()
@@ -841,7 +830,7 @@ mod tests {
             .first()
             .cloned()
             .expect("retry submits one frame");
-        assert!(submitted.contains("E2E4"), "{submitted}");
+        assert!(submitted.has_attribute("uci", "E2E4"));
 
         application
             .shutdown()

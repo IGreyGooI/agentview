@@ -61,8 +61,10 @@ pub(crate) enum Placement {
     SystemOnce,
     Developer,
     DeveloperRepeat,
+    DeveloperEphemeralRepeat,
     User,
     UserRepeat,
+    UserEphemeralRepeat,
     Assistant,
 }
 
@@ -72,8 +74,10 @@ pub enum MacroPlacement {
     SystemOnce,
     Developer,
     DeveloperRepeat,
+    DeveloperEphemeralRepeat,
     User,
     UserRepeat,
+    UserEphemeralRepeat,
     Assistant,
 }
 
@@ -142,8 +146,10 @@ impl From<MacroPlacement> for Placement {
             MacroPlacement::SystemOnce => Self::SystemOnce,
             MacroPlacement::Developer => Self::Developer,
             MacroPlacement::DeveloperRepeat => Self::DeveloperRepeat,
+            MacroPlacement::DeveloperEphemeralRepeat => Self::DeveloperEphemeralRepeat,
             MacroPlacement::User => Self::User,
             MacroPlacement::UserRepeat => Self::UserRepeat,
+            MacroPlacement::UserEphemeralRepeat => Self::UserEphemeralRepeat,
             MacroPlacement::Assistant => Self::Assistant,
         }
     }
@@ -249,29 +255,29 @@ impl IntoDiffViewRoot for String {
     }
 }
 
-impl<'a> private::Sealed for &'a str {}
+impl private::Sealed for &str {}
 
-impl<'a> IntoViewRoot for &'a str {
+impl IntoViewRoot for &str {
     fn into_view_root(self) -> Component {
         raw_text_root(self)
     }
 }
 
-impl<'a> IntoDiffViewRoot for &'a str {
+impl IntoDiffViewRoot for &str {
     fn into_diff_view_root(self) -> Component {
         raw_text_root(self)
     }
 }
 
-impl<'a> private::Sealed for &'a String {}
+impl private::Sealed for &String {}
 
-impl<'a> IntoViewRoot for &'a String {
+impl IntoViewRoot for &String {
     fn into_view_root(self) -> Component {
         raw_text_root(self.as_str())
     }
 }
 
-impl<'a> IntoDiffViewRoot for &'a String {
+impl IntoDiffViewRoot for &String {
     fn into_diff_view_root(self) -> Component {
         raw_text_root(self.as_str())
     }

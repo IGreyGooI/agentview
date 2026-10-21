@@ -33,12 +33,16 @@ use super::{
     has_unsupported_content_part, has_unsupported_lifecycle_item, is_native_tool_event,
     native_function_call,
     output::{OpenAiOutputLedger, SealedOpenAiPrivateOutput},
-    parallel_compaction::{CompactionContext, CompactionTransport, ContextEstimate},
+    parallel_compaction::{
+        CompactionContext, CompactionMode, CompactionTransport, ContextEstimate,
+    },
     reaction_fault::{map_openai_fault, OpenAiFailureClass, OpenAiReactionFailure},
     request_observation::{observe_request, OpenAiResponsesRequestSnapshot},
     responses_observation::{
         capture_error_response, observation_fault, observe_facts, CapturedResponse,
-        OpenAiResponsesObservation,
+        OpenAiResponsesFrameBasis, OpenAiResponsesObservation,
+        OpenAiResponsesRequestPreparationDiagnostic, OpenAiResponsesRequestPreparationReason,
+        OpenAiResponsesTransportDiagnostic,
     },
     sse_event_size,
     usage::{observe_response_usage, validated_response_usage, ResponseUsageObserver},
@@ -57,71 +61,124 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             .frame_native_declaration()
             .map_err(SubmitFault::Rejected)?;
         frame.check_handoff_precondition(&declaration)?;
-        let context_window_tokens = frame
-            .prepared_profile()
-            .constraints
-            .context_window
-            .tokens()
-            .ok_or_else(|| {
-                rejected(
-                    OpenAiFailureClass::RequestPreparation,
-                    "model context window is missing",
+        let Some(context_window_tokens) =
+            frame.prepared_profile().constraints.context_window.tokens()
+        else {
+            return Err(self
+                .reject_frame_preparation(
+                    &frame,
+                    ResponsesFrameRequestFault::MissingContextWindow,
+                    None,
+                    false,
                 )
-            })?;
-        let mut compacted_base = self
-            .parallel_compaction
-            .prepare_base(self.reaction_frame.as_ref(), &frame, &self.encoder)
-            .map_err(frame_submit_fault)?;
+                .await);
+        };
+        let mut compacted_base = match self.parallel_compaction.prepare_base(
+            self.reaction_frame.as_ref(),
+            &frame,
+            &self.encoder,
+        ) {
+            Ok(base) => base,
+            Err(error) => {
+                return Err(self
+                    .reject_frame_preparation(&frame, error, None, false)
+                    .await);
+            }
+        };
         let base = compacted_base
             .as_ref()
             .map(|(_, state)| state)
             .or(self.reaction_frame.as_ref());
-        let prepared = ResponsesFrameRequestState::prepare(
+        let mut compacted_base_used = base.is_some_and(ResponsesFrameRequestState::is_compacted);
+        let mut request_body_bytes = None;
+        let prepared = ResponsesFrameRequestState::prepare_with_measurements(
             base,
             &frame,
             &self.encoder,
             self.max_responses_serialized_request_body_bytes,
+            &mut request_body_bytes,
         );
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(ResponsesFrameRequestFault::ContextWindowLimit)
                 if self.forced_compaction_enabled && compacted_base.is_none() =>
             {
-                if !self.parallel_compaction.has_attempt() {
-                    let source = self
-                        .reaction_frame
-                        .as_ref()
-                        .and_then(ResponsesFrameRequestState::compaction_source);
-                    if let Some(source) = self.parallel_compaction.select_forced_source(source) {
-                        let transport = self.compaction_transport(context_window_tokens);
-                        self.parallel_compaction.start(source, transport);
+                let source = self
+                    .reaction_frame
+                    .as_ref()
+                    .and_then(ResponsesFrameRequestState::compaction_source);
+                let request = self.parallel_compaction.prepare_request(
+                    source,
+                    CompactionMode::Required {
+                        wait_timeout: self.read_timeout,
+                    },
+                );
+                let transport = self.compaction_transport(context_window_tokens);
+                if !self.parallel_compaction.request(request, transport).await {
+                    return Err(self
+                        .reject_frame_preparation(
+                            &frame,
+                            ResponsesFrameRequestFault::ContextWindowLimit,
+                            request_body_bytes,
+                            compacted_base_used,
+                        )
+                        .await);
+                }
+                compacted_base = match self.parallel_compaction.prepare_base(
+                    self.reaction_frame.as_ref(),
+                    &frame,
+                    &self.encoder,
+                ) {
+                    Ok(base) => base,
+                    Err(error) => {
+                        return Err(self
+                            .reject_frame_preparation(&frame, error, None, false)
+                            .await);
                     }
-                }
-                if !self.parallel_compaction.wait_ready(self.read_timeout).await {
-                    return Err(frame_submit_fault(
-                        ResponsesFrameRequestFault::ContextWindowLimit,
-                    ));
-                }
-                compacted_base = self
-                    .parallel_compaction
-                    .prepare_base(self.reaction_frame.as_ref(), &frame, &self.encoder)
-                    .map_err(frame_submit_fault)?;
-                let Some((_, forced_base)) = compacted_base.as_ref() else {
-                    return Err(frame_submit_fault(
-                        ResponsesFrameRequestFault::ContextWindowLimit,
-                    ));
                 };
-                ResponsesFrameRequestState::prepare(
+                let Some((_, forced_base)) = compacted_base.as_ref() else {
+                    return Err(self
+                        .reject_frame_preparation(
+                            &frame,
+                            ResponsesFrameRequestFault::ContextWindowLimit,
+                            request_body_bytes,
+                            compacted_base_used,
+                        )
+                        .await);
+                };
+                compacted_base_used = forced_base.is_compacted();
+                match ResponsesFrameRequestState::prepare_with_measurements(
                     Some(forced_base),
                     &frame,
                     &self.encoder,
                     self.max_responses_serialized_request_body_bytes,
-                )
-                .map_err(frame_submit_fault)?
+                    &mut request_body_bytes,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        return Err(self
+                            .reject_frame_preparation(
+                                &frame,
+                                error,
+                                request_body_bytes,
+                                compacted_base_used,
+                            )
+                            .await);
+                    }
+                }
             }
-            Err(error) => return Err(frame_submit_fault(error)),
+            Err(error) => {
+                return Err(self
+                    .reject_frame_preparation(
+                        &frame,
+                        error,
+                        request_body_bytes,
+                        compacted_base_used,
+                    )
+                    .await);
+            }
         };
-        let compaction_source = if compacted_base.is_none()
+        let compaction_request = if compacted_base.is_none()
             && self.parallel_compaction_enabled
             && !self.parallel_compaction.has_attempt()
         {
@@ -140,32 +197,56 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 context_window_tokens,
                 reserved_output_tokens: frame.prepared_profile().constraints.reserved_output_tokens,
             };
-            self.parallel_compaction.select_source(source, &context)
+            Some(
+                self.parallel_compaction
+                    .prepare_request(source, CompactionMode::Background(&context)),
+            )
         } else {
             None
         };
-        let compaction_transport = compaction_source
+        let compaction_transport = compaction_request
             .as_ref()
             .map(|_| self.compaction_transport(context_window_tokens));
-        serde_json::from_slice::<Value>(&prepared.request_body).map_err(|_| {
-            rejected(
+        if serde_json::from_slice::<Value>(&prepared.request_body).is_err() {
+            let fault = port_fault(
                 OpenAiFailureClass::RequestPreparation,
                 "native request body is not one JSON value",
-            )
-        })?;
-        let request = self
+            );
+            return Err(self
+                .observe_preparation_rejection(
+                    &frame,
+                    fault,
+                    OpenAiResponsesRequestPreparationReason::Encoding,
+                    request_body_bytes,
+                    compacted_base_used,
+                )
+                .await);
+        }
+        let request = match self
             .client
             .post(self.config.url("/responses"))
             .headers(self.config.headers())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(prepared.request_body.clone())
             .build()
-            .map_err(|error| {
-                rejected(
+        {
+            Ok(request) => request,
+            Err(_) => {
+                let fault = port_fault(
                     OpenAiFailureClass::RequestPreparation,
-                    format!("request build failed: {error:?}"),
-                )
-            })?;
+                    "request build failed",
+                );
+                return Err(self
+                    .observe_preparation_rejection(
+                        &frame,
+                        fault,
+                        OpenAiResponsesRequestPreparationReason::RequestBuild,
+                        request_body_bytes,
+                        compacted_base_used,
+                    )
+                    .await);
+            }
+        };
 
         if let Some(observer) = &self.observer {
             observer
@@ -180,6 +261,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 })?;
         }
         let observer = self.observer.clone();
+        let transport_observer = observer.clone();
         let observation_failed = self.observation_failed.clone();
         let capture = Arc::new(Mutex::new(CapturedResponse::default()));
         let stream_capture = capture.clone();
@@ -199,6 +281,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         let max_sse_event_bytes = self.max_sse_event_bytes;
         let max_output_text_bytes = self.max_output_text_bytes;
         let response_usage_observer = self.response_usage_observer.clone();
+        let transport_started = std::time::Instant::now();
         let mut transport = Box::pin(client.execute(request));
         let mut prepared = Some(prepared);
 
@@ -235,8 +318,8 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         if let Some((id, _)) = compacted_base {
             self.parallel_compaction.installed(id);
         }
-        if let Some((source, transport)) = compaction_source.zip(compaction_transport) {
-            self.parallel_compaction.start(source, transport);
+        if let Some((request, transport)) = compaction_request.zip(compaction_transport) {
+            self.parallel_compaction.request(request, transport).await;
         }
         let mut continuity = PostHandoffContinuity::new(target);
         observe_request(&request_observer, request_snapshot);
@@ -244,6 +327,13 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             let response = match first_response {
                 Poll::Ready(Ok(response)) => response,
                 Poll::Ready(Err(error)) => {
+                    if observe_transport_failure(&transport_observer, &error, transport_started)
+                        .await
+                        .is_err()
+                    {
+                        observation_failed.store(true, Ordering::Release);
+                        return continuity.fail(observation_fault());
+                    }
                     return continuity.fail(port_fault(
                         OpenAiFailureClass::RequestTransport,
                         format!("request transport failed: {error:?}"),
@@ -252,6 +342,13 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 Poll::Pending => match transport.await {
                     Ok(response) => response,
                     Err(error) => {
+                        if observe_transport_failure(&transport_observer, &error, transport_started)
+                            .await
+                            .is_err()
+                        {
+                            observation_failed.store(true, Ordering::Release);
+                            return continuity.fail(observation_fault());
+                        }
                         return continuity.fail(port_fault(
                             OpenAiFailureClass::RequestTransport,
                             format!("request transport failed: {error:?}"),
@@ -378,7 +475,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             Box::pin(futures::stream::once(pending).flatten()),
             observer,
             capture,
-            observation_failed,
+            self.observation_failed.clone(),
         ))
     }
 
@@ -411,6 +508,77 @@ impl ResettableReactionPort for AsyncOpenAiResponsesProvider {
 }
 
 impl AsyncOpenAiResponsesProvider {
+    async fn reject_frame_preparation(
+        &self,
+        frame: &Frame,
+        error: ResponsesFrameRequestFault,
+        request_body_bytes: Option<usize>,
+        compacted_base_used: bool,
+    ) -> SubmitFault {
+        use OpenAiResponsesRequestPreparationReason as Reason;
+        let reason = match &error {
+            ResponsesFrameRequestFault::ContextWindowLimit => Reason::ContextWindowLimit,
+            ResponsesFrameRequestFault::MissingContextWindow => Reason::MissingContextWindow,
+            ResponsesFrameRequestFault::Encoding(
+                crate::provider::codex_http_v1::CodexHttpV1Error::SerializedRequestBodyLimit,
+            ) => Reason::SerializedRequestBodyLimit,
+            ResponsesFrameRequestFault::Encoding(_) => Reason::Encoding,
+            _ => Reason::InvalidFrameState,
+        };
+        let fault = port_fault(error.failure_class(), format!("{error:?}"));
+        self.observe_preparation_rejection(
+            frame,
+            fault,
+            reason,
+            request_body_bytes,
+            compacted_base_used,
+        )
+        .await
+    }
+
+    async fn observe_preparation_rejection(
+        &self,
+        frame: &Frame,
+        fault: ReactionPortFault,
+        reason: OpenAiResponsesRequestPreparationReason,
+        request_body_bytes: Option<usize>,
+        compacted_base_used: bool,
+    ) -> SubmitFault {
+        if let Some(observer) = &self.observer {
+            let constraints = &frame.prepared_profile().constraints;
+            let diagnostic = OpenAiResponsesRequestPreparationDiagnostic {
+                reason,
+                request_body_bytes,
+                estimated_input_tokens: request_body_bytes
+                    .map(|bytes| ContextEstimate::from_bytes(bytes).tokens),
+                context_window_tokens: constraints.context_window.tokens().map(NonZeroU64::get),
+                reserved_output_tokens: constraints.reserved_output_tokens.unwrap_or(0),
+                serialized_request_body_limit_bytes: self
+                    .max_responses_serialized_request_body_bytes,
+                frame_basis: match frame.basis() {
+                    crate::component::execution::reaction::FrameBasis::Full => {
+                        OpenAiResponsesFrameBasis::Full
+                    }
+                    crate::component::execution::reaction::FrameBasis::DeltaFrom(_) => {
+                        OpenAiResponsesFrameBasis::Delta
+                    }
+                },
+                compacted_base_used,
+                compaction: self.parallel_compaction.status(),
+            };
+            if observer
+                .observe(OpenAiResponsesObservation::RequestPreparationFailed { fault, diagnostic })
+                .await
+                .is_err()
+            {
+                self.observation_failed.store(true, Ordering::Release);
+            }
+        }
+        // An unavailable diagnostic must not replace the actual wire/limit
+        // rejection that explains why no request was handed off.
+        SubmitFault::Rejected(fault)
+    }
+
     fn compaction_transport(&self, context_window_tokens: NonZeroU64) -> CompactionTransport {
         CompactionTransport {
             client: self.client.clone(),
@@ -420,6 +588,7 @@ impl AsyncOpenAiResponsesProvider {
             response_limit: self.max_response_body_bytes,
             read_timeout: self.read_timeout,
             context_window_tokens,
+            observer: self.compaction_observer.clone(),
         }
     }
 
@@ -452,9 +621,19 @@ fn validate_native_frame_state(
     }
 }
 
-fn frame_submit_fault(error: ResponsesFrameRequestFault) -> SubmitFault {
-    let class = error.failure_class();
-    rejected(class, format!("{error:?}"))
+async fn observe_transport_failure(
+    observer: &Option<Arc<dyn super::OpenAiResponsesObserver>>,
+    error: &reqwest::Error,
+    started: std::time::Instant,
+) -> Result<(), super::OpenAiResponsesObservationError> {
+    if let Some(observer) = observer {
+        observer
+            .observe(OpenAiResponsesObservation::TransportDiagnostic {
+                diagnostic: OpenAiResponsesTransportDiagnostic::request(error, started),
+            })
+            .await?;
+    }
+    Ok(())
 }
 
 fn rejected(class: OpenAiFailureClass, diagnostic: impl Into<String>) -> SubmitFault {
@@ -1163,7 +1342,7 @@ mod tests {
     };
     use eventsource_stream::EventStreamError;
     use futures::StreamExt;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tokio::sync::oneshot;
 
     #[cfg(feature = "legacy-provider-port")]
@@ -1187,7 +1366,9 @@ mod tests {
         },
         provider::{
             async_openai::{AsyncOpenAiResponsesProvider, AsyncOpenAiTransportConfig},
-            codex_http_v1::{CodexHttpV1Encoder, CodexHttpV1Options},
+            codex_http_v1::{
+                CodexHttpV1Encoder, CodexHttpV1Options, CodexReasoning, OpenRouterProviderRouting,
+            },
         },
     };
 
@@ -1259,17 +1440,18 @@ mod tests {
             assert!(fact.is_ok());
         }
         drop(facts);
-        let events = audit.events.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        assert!(
-            matches!(&events[0], OpenAiResponsesObservation::Request { path, body }
-            if path == "/responses" && serde_json::from_slice::<serde_json::Value>(body).unwrap()["model"] == "test-model")
-        );
-        assert!(
-            matches!(&events[1], OpenAiResponsesObservation::Response { status: 200, body: captured, completed: true }
-            if captured == body.as_bytes())
-        );
-        drop(events);
+        {
+            let events = audit.events.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            assert!(
+                matches!(&events[0], OpenAiResponsesObservation::Request { path, body }
+                if path == "/responses" && serde_json::from_slice::<serde_json::Value>(body).unwrap()["model"] == "test-model")
+            );
+            assert!(
+                matches!(&events[1], OpenAiResponsesObservation::Response { status: 200, body: captured, completed: true }
+                if captured == body.as_bytes())
+            );
+        }
         shutdown.send(()).unwrap();
         server.await.unwrap();
     }
@@ -1289,6 +1471,196 @@ mod tests {
             provider.declare().unwrap_err().kind(),
             ReactionPortFaultKind::Terminal
         );
+    }
+
+    #[tokio::test]
+    async fn comparison_hint_can_be_removed_without_changing_response_continuity() {
+        let (base, shutdown, server) = spawn_sse_server(completed_text_sse()).await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = provider(&base, None)
+            .with_parallel_tool_calls(true)
+            .with_observer(audit.clone());
+        provider
+            .set_prompt_cache_comparison_response_id(Some("prior_response".into()))
+            .unwrap();
+        let frame = full_frame(&provider.declare().unwrap());
+        let facts: Vec<_> = provider.submit(frame).await.unwrap().collect().await;
+        assert!(facts.iter().all(Result::is_ok));
+        let accepted = provider.declare().unwrap();
+        provider
+            .set_prompt_cache_comparison_response_id(None)
+            .unwrap();
+        assert_eq!(
+            provider.declare().unwrap().continuity(),
+            accepted.continuity()
+        );
+        let frame = full_frame_with_replay(
+            &accepted,
+            2,
+            vec![crate::transcript::CanonicalInputItem::assistant_text(
+                "hello", None,
+            )],
+        );
+        let facts: Vec<_> = provider.submit(frame).await.unwrap().collect().await;
+        assert!(facts.iter().all(Result::is_ok));
+        {
+            let events = audit.events.lock().unwrap();
+            let requests: Vec<Value> = events
+                .iter()
+                .filter_map(|event| match event {
+                    OpenAiResponsesObservation::Request { body, .. } => {
+                        Some(serde_json::from_slice(body).unwrap())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0]["parallel_tool_calls"], true);
+            assert_eq!(
+                requests[0]["prompt_cache_options"]["comparison_response_id"],
+                "prior_response"
+            );
+            assert!(requests[1].get("prompt_cache_options").is_none());
+        }
+        provider.shutdown().await;
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_http_continuation_preserves_disabled_reasoning_and_endpoint_routing() {
+        let (base, shutdown, server) = spawn_sse_server(completed_text_sse()).await;
+        let audit = Arc::new(Audit::default());
+        let options = CodexHttpV1Options::new(
+            crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+            None,
+            Some(CodexReasoning::disabled()),
+            None::<String>,
+        )
+        .unwrap()
+        .with_openrouter_provider_routing(
+            OpenRouterProviderRouting::new(
+                vec!["together".into(), "fireworks/us".into()],
+                vec!["together".into(), "fireworks/us".into()],
+                true,
+            )
+            .unwrap(),
+        );
+        let mut provider = AsyncOpenAiResponsesProvider::new(
+            AsyncOpenAiTransportConfig::new(&base, "test-token").unwrap(),
+            ProviderIdentity::new("openai", "native-responses", 1, "native-test").unwrap(),
+            CodexHttpV1Encoder::new(options),
+        )
+        .with_observer(audit.clone());
+        let frame = full_frame(&provider.declare().unwrap());
+        let facts: Vec<_> = provider.submit(frame).await.unwrap().collect().await;
+        assert!(facts.iter().all(Result::is_ok));
+        let accepted = provider.declare().unwrap();
+        let frame = full_frame_with_replay(
+            &accepted,
+            2,
+            vec![crate::transcript::CanonicalInputItem::assistant_text(
+                "hello", None,
+            )],
+        );
+        let facts: Vec<_> = provider.submit(frame).await.unwrap().collect().await;
+        assert!(facts.iter().all(Result::is_ok));
+        {
+            let events = audit.events.lock().unwrap();
+            let requests: Vec<Value> = events
+                .iter()
+                .filter_map(|event| match event {
+                    OpenAiResponsesObservation::Request { body, .. } => {
+                        Some(serde_json::from_slice(body).unwrap())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1]["input"].as_array().unwrap().iter().any(|item| {
+                item["role"] == "assistant" && item["content"][0]["text"] == "hello"
+            }));
+            for request in requests {
+                assert_eq!(request["reasoning"], json!({"enabled": false}));
+                assert_eq!(
+                    request["provider"],
+                    json!({
+                        "only": ["together", "fireworks/us"],
+                        "order": ["together", "fireworks/us"],
+                        "require_parameters": true,
+                    })
+                );
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        OpenAiResponsesObservation::Response {
+                            status: 200,
+                            completed: true,
+                            ..
+                        }
+                    ))
+                    .count(),
+                2,
+            );
+        }
+        provider.shutdown().await;
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn comparison_hint_is_included_in_the_serialized_request_gate() {
+        let base = "http://127.0.0.1:1";
+        let mut baseline = provider(base, None);
+        let frame = full_frame(&baseline.declare().unwrap());
+        let request =
+            ResponsesFrameRequestState::prepare(None, &frame, &baseline.encoder, usize::MAX)
+                .unwrap();
+        let audit = Arc::new(Audit::default());
+        let mut provider =
+            provider(base, Some(request.request_body.len())).with_observer(audit.clone());
+        provider
+            .set_prompt_cache_comparison_response_id(Some("prior_response".into()))
+            .unwrap();
+        let frame = full_frame(&provider.declare().unwrap());
+        assert!(matches!(provider.submit(frame).await,
+            Err(SubmitFault::Rejected(fault)) if fault.code() == ReactionPortFaultCode::Limit));
+        {
+            let events = audit.events.lock().unwrap();
+            assert!(
+                matches!(events.as_slice(), [OpenAiResponsesObservation::RequestPreparationFailed { diagnostic, .. }]
+                if diagnostic.reason == super::OpenAiResponsesRequestPreparationReason::SerializedRequestBodyLimit
+                    && diagnostic.request_body_bytes.is_none())
+            );
+        }
+        provider.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_connection_emits_safe_transport_diagnostic_after_handoff() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let audit = Arc::new(Audit::default());
+        let mut provider = provider(&base, None).with_observer(audit.clone());
+        let frame = full_frame(&provider.declare().unwrap());
+        let facts: Vec<_> = provider.submit(frame).await.unwrap().collect().await;
+        assert!(matches!(facts.as_slice(), [Err(fault)]
+            if fault.kind() == ReactionPortFaultKind::Retryable
+                && fault.reason() == ReactionPortFaultReason::Transport));
+        {
+            let events = audit.events.lock().unwrap();
+            assert!(matches!(events.as_slice(), [
+                OpenAiResponsesObservation::Request { .. },
+                OpenAiResponsesObservation::TransportDiagnostic { diagnostic },
+                OpenAiResponsesObservation::Error { .. },
+            ] if diagnostic.phase == super::super::OpenAiResponsesTransportPhase::Request
+                && diagnostic.is_connect && !diagnostic.is_timeout));
+        }
+        provider.shutdown().await;
     }
 
     #[tokio::test]
@@ -1340,17 +1712,18 @@ mod tests {
             provider.declare().unwrap().continuity().epoch().get()
                 > first.continuity().epoch().get()
         );
-        let events = audit.events.lock().unwrap();
-        assert_eq!(events.len(), 3);
-        assert!(
-            matches!(&events[1], OpenAiResponsesObservation::Response { status: 429, body: captured, completed: false }
-            if captured == body.as_bytes())
-        );
-        assert!(matches!(
-            &events[2],
-            OpenAiResponsesObservation::Error { .. }
-        ));
-        drop(events);
+        {
+            let events = audit.events.lock().unwrap();
+            assert_eq!(events.len(), 3);
+            assert!(
+                matches!(&events[1], OpenAiResponsesObservation::Response { status: 429, body: captured, completed: false }
+                if captured == body.as_bytes())
+            );
+            assert!(matches!(
+                &events[2],
+                OpenAiResponsesObservation::Error { .. }
+            ));
+        }
         shutdown.send(()).unwrap();
         server.await.unwrap();
     }
@@ -2190,9 +2563,10 @@ mod tests {
             provider.max_responses_serialized_request_body_bytes,
         )
         .unwrap();
-        let request = String::from_utf8(prepared.request_body).unwrap();
-        assert!(request.contains("replacement-context"));
-        assert!(!request.contains("old-context"));
+        let request: Value = serde_json::from_slice(&prepared.request_body).unwrap();
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["content"][0]["text"], "replacement-context");
 
         let _ = shutdown.send(());
         server.await.unwrap();
@@ -2238,10 +2612,10 @@ mod tests {
             provider.max_responses_serialized_request_body_bytes,
         )
         .unwrap();
-        let request = String::from_utf8(prepared.request_body).unwrap();
-        assert!(request.contains("replacement-context"));
-        assert!(!request.contains("old-context"));
-        assert!(!request.contains("hel"));
+        let request: Value = serde_json::from_slice(&prepared.request_body).unwrap();
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["content"][0]["text"], "replacement-context");
 
         let _ = shutdown.send(());
         server.await.unwrap();
@@ -2292,10 +2666,10 @@ mod tests {
             provider.max_responses_serialized_request_body_bytes,
         )
         .unwrap();
-        let request = String::from_utf8(prepared.request_body).unwrap();
-        assert!(request.contains("replacement-context"));
-        assert!(!request.contains("old-context"));
-        assert!(!request.contains("partial"));
+        let request: Value = serde_json::from_slice(&prepared.request_body).unwrap();
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["content"][0]["text"], "replacement-context");
 
         let _ = shutdown.send(());
         server.await.unwrap();

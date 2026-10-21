@@ -32,6 +32,10 @@ use crate::component::execution::{
     },
     ProviderEvent, ProviderFault,
 };
+use crate::{
+    test_support::{element_text, frame_items},
+    transcript::CanonicalInputItem,
+};
 
 #[derive(Clone)]
 struct ExternalProps {
@@ -815,7 +819,10 @@ async fn observe_captures_full_then_act_captures_exact_delta_frame() {
     assert_eq!(first.kind(), ExternalObservationKind::Full);
     assert_eq!(first.base_generation(), None);
     assert_eq!(first.frame().basis(), FrameBasis::Full);
-    assert!(first.content().contains("External protocol."));
+    assert_eq!(
+        element_text(frame_items(first.frame()), "protocol"),
+        ["External protocol."]
+    );
     assert_eq!(
         first.content().as_bytes(),
         first.frame().submission().canonical_bytes()
@@ -828,7 +835,9 @@ async fn observe_captures_full_then_act_captures_exact_delta_frame() {
         second.frame().basis(),
         FrameBasis::DeltaFrom(first.frame().revision())
     );
-    assert!(second.content().contains("one"));
+    assert!(frame_items(second.frame()).any(|item| matches!(item,
+        CanonicalInputItem::AssistantText { text, .. } if text == "one"
+    )));
     assert_eq!(
         *props.log.lock().unwrap(),
         ["complete:one:start", "complete:one:end"]
@@ -913,7 +922,9 @@ async fn late_act_is_explicitly_rejected_by_ingress_generation() {
         .unwrap();
     let next = external.observe().await.unwrap();
     assert_ne!(next.ingress_generation(), generation);
-    assert!(next.content().contains("one"));
+    assert!(frame_items(next.frame()).any(|item| matches!(item,
+        CanonicalInputItem::AssistantText { text, .. } if text == "one"
+    )));
 
     assert_eq!(
         control.act(generation, completed_text("late")).await,
@@ -953,7 +964,9 @@ async fn abnormal_protocol_resets_continuity_for_the_next_explicit_reaction() {
 
     let recovered = external.observe().await.unwrap();
     assert_eq!(recovered.kind(), ExternalObservationKind::Full);
-    assert!(recovered.content().contains("partial"));
+    assert!(frame_items(recovered.frame()).any(|item| matches!(item,
+        CanonicalInputItem::AssistantText { text, .. } if text == "partial"
+    )));
     assert_eq!(
         *props.log.lock().unwrap(),
         ["delta:partial:start", "delta:partial:end"]
@@ -985,7 +998,9 @@ async fn cancelling_post_handoff_act_allows_the_next_observe_to_recover() {
 
     let recovered = external.observe().await.unwrap();
     assert_eq!(recovered.kind(), ExternalObservationKind::Full);
-    assert!(recovered.content().contains("blocked"));
+    assert!(frame_items(recovered.frame()).any(|item| matches!(item,
+        CanonicalInputItem::AssistantText { text, .. } if text == "blocked"
+    )));
     assert!(matches!(
         control.complete(cancelled_generation).await,
         Err(ExternalControlFault::StaleIngress)

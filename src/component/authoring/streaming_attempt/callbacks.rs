@@ -646,7 +646,7 @@ impl<Head: Send + Sync + 'static, Value: Send + 'static> ErasedCallback
         ) {
             ElementCompleteDispatch::Completed(update) => Ok(self.dispatch(update)),
             ElementCompleteDispatch::DomainInvalid(never) => {
-                for value in never {
+                if let Some(value) = never.into_iter().next() {
                     match value {}
                 }
                 Err(reducer_fault(

@@ -1,0 +1,129 @@
+{
+  "stdin": {
+    "input_bytes": 183,
+    "stdout_bytes": 2857,
+    "stderr_bytes": 0,
+    "exit_code": 2,
+    "elapsed_ms": 195.32,
+    "response_count": 1,
+    "responses": [
+      {
+        "response": 1,
+        "bytes": 2857,
+        "ok": false,
+        "direct_action_results": 0,
+        "feedback_records": 4,
+        "input_schemas": 2,
+        "static_context_roots": 1
+      }
+    ]
+  },
+  "status": {
+    "exit_code": 0,
+    "stdout_bytes": 2856
+  },
+  "stop": {
+    "exit_code": 0,
+    "stdout_bytes": 2723
+  },
+  "native": {
+    "delivery_scope": "One mounted Application and one DebugProviderPort; no model I/O or shared reader cursor.",
+    "frames": [
+      {
+        "basis": "full",
+        "feedback_patch_operations": 0,
+        "feedback_records": 2,
+        "frame": 1,
+        "frame_bytes": 4449,
+        "projection_items": 4,
+        "roots": [
+          "notebook_context",
+          "notebook_state",
+          "actions",
+          "actions",
+          "command_feedback"
+        ],
+        "view_bytes": 1915
+      },
+      {
+        "basis": "delta",
+        "feedback_patch_operations": 0,
+        "feedback_records": 0,
+        "frame": 2,
+        "frame_bytes": 107,
+        "projection_items": 0,
+        "roots": [],
+        "view_bytes": 0
+      },
+      {
+        "basis": "delta",
+        "feedback_patch_operations": 0,
+        "feedback_records": 1,
+        "frame": 3,
+        "frame_bytes": 884,
+        "projection_items": 1,
+        "roots": [
+          "command_feedback"
+        ],
+        "view_bytes": 228
+      },
+      {
+        "basis": "delta",
+        "feedback_patch_operations": 0,
+        "feedback_records": 1,
+        "frame": 4,
+        "frame_bytes": 1436,
+        "projection_items": 2,
+        "roots": [
+          "notebook_state",
+          "command_feedback"
+        ],
+        "view_bytes": 371
+      }
+    ],
+    "steps": [
+      "record + inspect, then Full handoff",
+      "unchanged Delta",
+      "inspect, then complete new feedback",
+      "record, then changed state and complete new feedback"
+    ]
+  },
+  "interactive": {
+    "exit_code": 0,
+    "frames": [
+      {
+        "frame": 1,
+        "boundary": "idle",
+        "sent_at_ms": 0.278,
+        "received_at_ms": 1027.951,
+        "elapsed_ms": 1027.673,
+        "input_bytes": 104,
+        "stdout_bytes": 2547,
+        "feedback_records": 2,
+        "direct_action_results": 0
+      },
+      {
+        "frame": 2,
+        "boundary": "idle",
+        "sent_at_ms": 1028.895,
+        "received_at_ms": 1212.312,
+        "elapsed_ms": 183.417,
+        "input_bytes": 73,
+        "stdout_bytes": 2416,
+        "feedback_records": 1,
+        "direct_action_results": 0
+      },
+      {
+        "frame": 3,
+        "boundary": "eof",
+        "sent_at_ms": 1212.973,
+        "received_at_ms": 1223.413,
+        "elapsed_ms": 10.44,
+        "input_bytes": 31,
+        "stdout_bytes": 2417,
+        "feedback_records": 1,
+        "direct_action_results": 0
+      }
+    ]
+  }
+}

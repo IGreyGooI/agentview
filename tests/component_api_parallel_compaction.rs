@@ -22,7 +22,9 @@ use agentview::{
             OpenAiResponsesObservationError, OpenAiResponsesObserver, ParallelCompactionFault,
             ParallelCompactionMonitor, ParallelCompactionPhase,
         },
-        codex_http_v1::{CodexHttpV1Encoder, CodexHttpV1Options},
+        codex_http_v1::{
+            CodexHttpV1Encoder, CodexHttpV1Options, CodexReasoning, OpenRouterProviderRouting,
+        },
     },
 };
 use axum::{
@@ -134,6 +136,7 @@ async fn responses(
     }));
     if request["stream"] == false {
         assert_eq!(request["tools"], json!([]));
+        assert_eq!(request["tool_choice"], "none");
         assert_eq!(request["store"], false);
         assert!(request.get("previous_response_id").is_none());
         assert!(request["max_output_tokens"].as_u64().unwrap() > 0);
@@ -203,8 +206,10 @@ fn counter(text_events: Arc<AtomicUsize>) -> Component {
         async { Ok::<(), std::convert::Infallible>(()) }
     });
     view! {
-        counter_state { value: count, }
+        #[developer]
         { memo }
+        #[user]
+        { format!("counter value: {count}") }
         NativeToolCall {
             name: "advance",
             description: "Increment the counter. The result and next view show the actual count.",
@@ -295,6 +300,16 @@ fn summary_reply(text: &str) -> Value {
     })
 }
 
+fn has_message(request: &Value, role: &str, text: &str) -> bool {
+    request["input"].as_array().unwrap().iter().any(|item| {
+        item["type"] == "message"
+            && item["role"] == role
+            && item["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["text"] == text))
+    })
+}
+
 fn compacted_output() -> Vec<Value> {
     vec![
         json!({"type":"message", "role":"assistant", "content":[{"type":"output_text","text":format!("{SUMMARY_PREFIX}{SUMMARY_TEXT}"),"annotations":[]}],"status":"completed"}),
@@ -319,7 +334,7 @@ fn large_current_context() -> Component {
     view! {
         #[developer]
         { context }
-        counter_state { value: value, }
+        { format!("counter value: {value}") }
         NativeToolCall {
             name: "advance",
             description: "Increment the counter; the next view includes the updated count.",
@@ -334,7 +349,7 @@ fn replacing_large_context() -> Component {
     let value = count.with(|count| *count).unwrap();
     let context = format!("generation {value}: {}", "needed context ".repeat(4_096));
     view! {
-        context_block { value: context, }
+        { context }
         NativeToolCall {
             name: "advance",
             description: "Increment the generation and replace the large current context.",
@@ -365,7 +380,7 @@ async fn default_threshold_starts_compaction_without_a_small_requested_context()
         .unwrap()
         .unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Running);
-    assert!(second.to_string().contains("value=\\\"1\\\""));
+    assert!(has_message(&second, "user", "counter value: 1"));
 
     server.release.add_permits(1);
     until_phase(&mut monitor, ParallelCompactionPhase::Ready).await;
@@ -373,7 +388,7 @@ async fn default_threshold_starts_compaction_without_a_small_requested_context()
     let next = server.requests.recv().await.unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     assert!(next["input"].as_array().unwrap().starts_with(&output));
-    assert!(next.to_string().contains("value=\\\"2\\\""));
+    assert!(has_message(&next, "user", "counter value: 2"));
     assert!(next["input"]
         .as_array()
         .unwrap()
@@ -394,7 +409,11 @@ async fn background_summarization_can_be_disabled_independently_of_request_limit
         assert!(app.react().await.unwrap().is_continue());
         let request = server.requests.recv().await.unwrap();
         assert!(request.get("context_management").is_none());
-        assert!(request.to_string().contains("old context old context"));
+        assert!(has_message(
+            &request,
+            "developer",
+            &"old context ".repeat(8192)
+        ));
     }
     app.shutdown().await.unwrap();
     assert!(server.compactions.try_recv().is_err());
@@ -503,7 +522,11 @@ async fn cancelling_a_forced_wait_keeps_the_same_candidate_for_retry() {
             .count(),
         1
     );
-    assert!(retry.to_string().contains("generation 1"));
+    assert!(has_message(
+        &retry,
+        "user",
+        &format!("generation 1: {}", "needed context ".repeat(4_096))
+    ));
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     assert_eq!(monitor.status().attempt, 1);
     assert!(server.compactions.try_recv().is_err());
@@ -676,6 +699,79 @@ async fn forced_limit_waits_for_the_existing_background_worker() {
 }
 
 #[tokio::test]
+async fn disabled_reasoning_and_endpoint_routing_survive_tool_feedback_and_compaction() {
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
+    let options = CodexHttpV1Options::new(
+        ModelSpec::new("test-model", 272_000).unwrap(),
+        None,
+        Some(CodexReasoning::disabled()),
+        None::<String>,
+    )
+    .unwrap()
+    .with_openrouter_provider_routing(
+        OpenRouterProviderRouting::new(
+            vec!["together".into(), "fireworks/us".into()],
+            vec!["together".into(), "fireworks/us".into()],
+            true,
+        )
+        .unwrap(),
+    );
+    let provider = AsyncOpenAiResponsesProvider::new(
+        AsyncOpenAiTransportConfig::new(&server.base, "test-key").unwrap(),
+        ProviderIdentity::new("openai", "parallel-compaction-test", 1, "test").unwrap(),
+        CodexHttpV1Encoder::new(options),
+    );
+    let mut monitor = provider.parallel_compaction_monitor().unwrap();
+    let events = Arc::new(AtomicUsize::new(0));
+    let root_events = events.clone();
+    let mut app = Application::mount(move || counter(root_events.clone()), provider).unwrap();
+
+    assert!(app.react().await.unwrap().is_continue());
+    let first = server.requests.recv().await.unwrap();
+    assert!(app.react().await.unwrap().is_continue());
+    let second = server.requests.recv().await.unwrap();
+    let summary = tokio::time::timeout(Duration::from_secs(5), server.compactions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(second["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| { item["call_id"] == "call_1" && item["output"] == "1" }));
+    assert!(has_message(&second, "user", "counter value: 1"));
+    server.release.add_permits(1);
+    until_phase(&mut monitor, ParallelCompactionPhase::Ready).await;
+    assert!(app.react().await.unwrap().is_continue());
+    let compacted = server.requests.recv().await.unwrap();
+    assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
+    assert!(compacted["input"]
+        .as_array()
+        .unwrap()
+        .starts_with(&compacted_output()));
+    assert!(compacted["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| { item["call_id"] == "call_2" && item["output"] == "2" }));
+    assert!(has_message(&compacted, "user", "counter value: 2"));
+    for request in [first, second, summary, compacted] {
+        assert_eq!(request["reasoning"], json!({"enabled": false}));
+        assert_eq!(
+            request["provider"],
+            json!({
+                "only": ["together", "fireworks/us"],
+                "order": ["together", "fireworks/us"],
+                "require_parameters": true,
+            })
+        );
+    }
+    assert_eq!(events.load(Ordering::SeqCst), 0);
+    app.shutdown().await.unwrap();
+    server.finish().await;
+}
+
+#[tokio::test]
 async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_new_tail() {
     let output = compacted_output();
     let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
@@ -705,10 +801,6 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
     assert_eq!(compact_request["model"], "test-model");
     assert_eq!(compact_request["tools"], json!([]));
     assert_eq!(compact_request["stream"], false);
-    assert!(compact_request["instructions"]
-        .as_str()
-        .unwrap()
-        .contains("Summarize"));
     let prefix = compact_request["input"].as_array().unwrap();
     assert!(!prefix.iter().any(|item| item["type"] == "function_call"));
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Running);
@@ -717,7 +809,7 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
         .unwrap()
         .iter()
         .any(|item| item["call_id"] == "call_1" && item["output"] == "1"));
-    assert!(second.to_string().contains("value=\\\"1\\\""));
+    assert!(has_message(&second, "user", "counter value: 1"));
 
     assert!(tokio::time::timeout(Duration::from_secs(5), app.react())
         .await
@@ -730,7 +822,7 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
         .unwrap()
         .iter()
         .any(|item| item["call_id"] == "call_2" && item["output"] == "2"));
-    assert!(third.to_string().contains("value=\\\"2\\\""));
+    assert!(has_message(&third, "user", "counter value: 2"));
     assert!(server.compactions.try_recv().is_err());
 
     server.release.add_permits(1);
@@ -762,7 +854,7 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
             1
         );
     }
-    assert!(fourth.to_string().contains("value=\\\"3\\\""));
+    assert!(has_message(&fourth, "user", "counter value: 3"));
     assert!(fourth.to_string().len() < first.to_string().len() / 10);
     assert_eq!(
         events.load(Ordering::SeqCst),
@@ -831,7 +923,107 @@ async fn failed_compaction_keeps_foreground_context_and_reports_failure() {
     );
     assert!(app.react().await.unwrap().is_continue());
     let next = server.requests.recv().await.unwrap();
-    assert!(next.to_string().contains("old context old context"));
+    assert!(has_message(
+        &next,
+        "developer",
+        &"old context ".repeat(8192)
+    ));
+    app.shutdown().await.unwrap();
+    server.finish().await;
+}
+
+#[derive(Default)]
+struct RejectSummaryReceipt {
+    entered: Notify,
+    release: Notify,
+    requests: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl OpenAiResponsesObserver for RejectSummaryReceipt {
+    async fn observe(
+        &self,
+        event: OpenAiResponsesObservation,
+    ) -> Result<(), OpenAiResponsesObservationError> {
+        match event {
+            OpenAiResponsesObservation::Request { body, .. } => {
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["stream"], false);
+                assert_eq!(body["tools"], json!([]));
+                assert!(body.get("prompt_cache_options").is_none());
+                self.requests.fetch_add(1, Ordering::SeqCst);
+            }
+            OpenAiResponsesObservation::Response { completed, .. } => {
+                assert!(completed);
+                self.entered.notify_one();
+                self.release.notified().await;
+                return Err(OpenAiResponsesObservationError);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn summary_receipt_barrier_blocks_installation_and_preserves_foreground_results() {
+    let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
+    let observer = Arc::new(RejectSummaryReceipt::default());
+    let mut provider = provider(&server.base, ContextRatioPolicy::default())
+        .with_parallel_tool_calls(true)
+        .with_compaction_observer(observer.clone());
+    provider
+        .set_prompt_cache_comparison_response_id(Some("foreground_baseline".into()))
+        .unwrap();
+    let mut monitor = provider.parallel_compaction_monitor().unwrap();
+    let events = Arc::new(AtomicUsize::new(0));
+    let mut app = Application::mount(move || counter(events.clone()), provider).unwrap();
+    assert!(app.react().await.unwrap().is_continue());
+    let first = server.requests.recv().await.unwrap();
+    assert_eq!(first["parallel_tool_calls"], true);
+    assert_eq!(
+        first["prompt_cache_options"]["comparison_response_id"],
+        "foreground_baseline"
+    );
+    assert!(app.react().await.unwrap().is_continue());
+    server.requests.recv().await.unwrap();
+    server.compactions.recv().await.unwrap();
+    server.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), observer.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(monitor.status().phase, ParallelCompactionPhase::Running);
+    assert!(app.react().await.unwrap().is_continue());
+    let while_receipt_pending = server.requests.recv().await.unwrap();
+    assert!(has_message(
+        &while_receipt_pending,
+        "developer",
+        &"old context ".repeat(8192)
+    ));
+    assert!(while_receipt_pending["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| { item["call_id"] == "call_2" && item["output"] == "2" }));
+    observer.release.notify_one();
+    until_phase(&mut monitor, ParallelCompactionPhase::Failed).await;
+    assert_eq!(
+        monitor.status().fault,
+        Some(ParallelCompactionFault::Observation)
+    );
+    assert_eq!(observer.requests.load(Ordering::SeqCst), 1);
+    assert!(app.react().await.unwrap().is_continue());
+    let after_refusal = server.requests.recv().await.unwrap();
+    assert!(has_message(
+        &after_refusal,
+        "developer",
+        &"old context ".repeat(8192)
+    ));
+    assert!(after_refusal["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| { item["call_id"] == "call_3" && item["output"] == "3" }));
     app.shutdown().await.unwrap();
     server.finish().await;
 }
@@ -895,7 +1087,11 @@ async fn background_http_limits_and_timeouts_report_sanitized_faults_without_bre
         assert_eq!(monitor.status().fault, Some(expected));
         assert!(app.react().await.unwrap().is_continue());
         let next = server.requests.recv().await.unwrap();
-        assert!(next.to_string().contains("old context old context"));
+        assert!(has_message(
+            &next,
+            "developer",
+            &"old context ".repeat(8192)
+        ));
         assert!(next["input"]
             .as_array()
             .unwrap()
@@ -924,9 +1120,16 @@ async fn reset_invalidates_a_pending_compaction_before_its_late_response() {
     server.release.add_permits(1);
     assert!(app.react().await.unwrap().is_continue());
     let next = server.requests.recv().await.unwrap();
-    assert!(!next.to_string().contains(SUMMARY_TEXT));
-    assert!(!next.to_string().contains("old context old context"));
-    assert!(next.to_string().contains("value=\\\"3\\\""));
+    assert!(!next["input"]
+        .as_array()
+        .unwrap()
+        .starts_with(&compacted_output()));
+    assert!(!has_message(
+        &next,
+        "developer",
+        &"old context ".repeat(8192)
+    ));
+    assert!(has_message(&next, "user", "counter value: 3"));
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Cancelled);
     app.shutdown().await.unwrap();
     server.finish().await;
@@ -943,17 +1146,11 @@ impl OpenAiResponsesObserver for BlockFirstCompactedRequest {
         &self,
         event: OpenAiResponsesObservation,
     ) -> Result<(), OpenAiResponsesObservationError> {
-        if let OpenAiResponsesObservation::Request { body, .. } = event {
-            let request: Value = serde_json::from_slice(&body).unwrap();
-            if request["input"].as_array().unwrap().iter().any(|item| {
-                item["content"][0]["text"]
-                    .as_str()
-                    .is_some_and(|text| text.starts_with(SUMMARY_PREFIX))
-            }) && self.block.swap(false, Ordering::SeqCst)
-            {
-                self.entered.notify_one();
-                std::future::pending::<()>().await;
-            }
+        if matches!(event, OpenAiResponsesObservation::Request { .. })
+            && self.block.swap(false, Ordering::SeqCst)
+        {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
         }
         Ok(())
     }
@@ -964,7 +1161,7 @@ async fn cancelling_before_handoff_keeps_the_candidate_and_tool_receipts_for_ret
     let output = compacted_output();
     let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let observer = Arc::new(BlockFirstCompactedRequest {
-        block: AtomicBool::new(true),
+        block: AtomicBool::new(false),
         entered: Notify::new(),
     });
     let provider =
@@ -979,6 +1176,7 @@ async fn cancelling_before_handoff_keeps_the_candidate_and_tool_receipts_for_ret
     server.compactions.recv().await.unwrap();
     server.release.add_permits(1);
     until_phase(&mut monitor, ParallelCompactionPhase::Ready).await;
+    observer.block.store(true, Ordering::SeqCst);
     {
         let pending = app.react();
         tokio::pin!(pending);
@@ -1006,10 +1204,10 @@ async fn cancelling_before_handoff_keeps_the_candidate_and_tool_receipts_for_ret
             1
         );
     }
-    assert!(retry.to_string().contains("value=\\\"2\\\""));
+    assert!(has_message(&retry, "user", "counter value: 2"));
     assert!(app.react().await.unwrap().is_continue());
     let feedback = server.requests.recv().await.unwrap();
-    assert!(feedback.to_string().contains("value=\\\"3\\\""));
+    assert!(has_message(&feedback, "user", "counter value: 3"));
     assert!(feedback["input"]
         .as_array()
         .unwrap()

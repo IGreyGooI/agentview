@@ -3,6 +3,7 @@
 mod scripted_provider;
 
 use agentview::component::execution::FrameBasis;
+use scripted_provider::pom::InspectPom;
 use scripted_provider::{ScriptedProvider, ScriptedReaction};
 
 use super::*;
@@ -20,11 +21,11 @@ async fn publishes_a_delta_frame_before_normal_exit() -> anyhow::Result<()> {
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[0].basis, FrameBasis::Full);
     assert!(matches!(frames[1].basis, FrameBasis::DeltaFrom(_)));
-    assert!(frames[0].text.contains(
-        "## Publication policy\n\nState the publication status in one concise sentence."
-    ));
-    assert!(!frames[0].text.contains("<publication_policy>"));
-    assert!(frames[0].text.contains("<publication_status>initial"));
-    assert!(frames[1].text.contains("<publication_status>published"));
+    assert!(frames[0]
+        .document()
+        .has_field("publication_status", "initial"));
+    assert!(frames[1]
+        .document()
+        .has_field("publication_status", "published"));
     Ok(())
 }

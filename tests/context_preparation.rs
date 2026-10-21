@@ -194,14 +194,15 @@ where
     Agent::with_view(TestViewModel, "model", 64, ctx)
 }
 
-fn committed_context_xml(session: &AgentSession<Turn, TestContextState>) -> String {
-    let role = XmlName::try_from("agent_context").unwrap();
-    let value = session
-        .user_document_cursor()
-        .value(&role)
-        .expect("a successful turn commits the agent_context slot")
-        .clone();
-    render_pom_document(&resolve_system_document(Document::from_xml(value))).unwrap()
+fn assert_committed_context(session: &AgentSession<Turn, TestContextState>, value: usize) {
+    let document = TestUserDocument {
+        context: TestView { value },
+        task: None,
+    }
+    .build_root()
+    .unwrap();
+    let (_, expected) = resolve_user_document(document, &UserDocumentCursor::default()).unwrap();
+    assert_eq!(session.user_document_cursor(), &expected);
 }
 
 #[tokio::test]
@@ -231,19 +232,17 @@ async fn replacement_reprepares_same_turn_with_full_view() {
         &*state.executed_requests[0].history[1].text,
         "working context"
     );
-    assert!(state.executed_requests[0].user.contains("<agent_context"));
-    assert!(state.executed_requests[0].user.contains("<value>1</value>"));
     drop(state);
 
     let session = agent.session().await;
     assert_eq!(&*session.context().history()[0].text, "summary 1");
     assert_eq!(&*session.context().working_set()[0].text, "working context");
     assert_eq!(session.context().context_state().marker, 7);
-    assert!(committed_context_xml(&session).contains("<value>1</value>"));
+    assert_committed_context(&session, 1);
 }
 
 #[tokio::test]
-async fn unchanged_slot_is_omitted_while_current_task_is_still_sent() {
+async fn unchanged_turn_preserves_the_committed_baseline() {
     let executor = ReplacingExecutor::replace_once();
     let agent = test_agent::<ReplacingExecutor>();
 
@@ -259,15 +258,14 @@ async fn unchanged_slot_is_omitted_while_current_task_is_still_sent() {
 
     let state = executor.state.lock().await;
     assert_eq!(state.executed_requests.len(), 1);
-    assert_eq!(state.executed_requests[0].user, "continue");
     drop(state);
 
     let session = agent.session().await;
-    assert!(committed_context_xml(&session).contains("<value>1</value>"));
+    assert_committed_context(&session, 1);
 }
 
 #[tokio::test]
-async fn fork_clones_the_slot_baseline_and_emits_a_delta_on_change() {
+async fn fork_updates_its_baseline_independently() {
     let executor = ReplacingExecutor::replace_once();
     let agent = test_agent::<ReplacingExecutor>();
     agent.call("seed").execute(&1, &executor).await.unwrap();
@@ -281,16 +279,14 @@ async fn fork_clones_the_slot_baseline_and_emits_a_delta_on_change() {
         .unwrap();
 
     let state = executor.state.lock().await;
-    let user = &state.executed_requests[0].user;
-    assert!(user.starts_with("<agent_context rendering_mode=\"delta\" kind=\"test_view\">"));
-    assert!(user.contains("<value>2</value>"));
+    assert_eq!(state.execute_calls, 1);
     drop(state);
 
     let original_session = agent.session().await;
-    assert!(committed_context_xml(&original_session).contains("<value>1</value>"));
+    assert_committed_context(&original_session, 1);
     drop(original_session);
     let fork_session = fork.session().await;
-    assert!(committed_context_xml(&fork_session).contains("<value>2</value>"));
+    assert_committed_context(&fork_session, 2);
 }
 
 #[tokio::test]
@@ -323,7 +319,7 @@ async fn replacement_limit_stops_before_fourth_rewrite() {
     assert_eq!(session.context().history().len(), 3);
     assert_eq!(&*session.context().history()[0].text, "old history");
     assert_eq!(session.context().context_state().marker, 7);
-    assert!(committed_context_xml(&session).contains("<value>1</value>"));
+    assert_committed_context(&session, 1);
 }
 
 #[tokio::test]
@@ -344,7 +340,7 @@ async fn provider_failure_discards_prepared_session_draft() {
     assert_eq!(session.context().history().len(), 3);
     assert_eq!(&*session.context().history()[0].text, "old history");
     assert_eq!(session.context().context_state().marker, 7);
-    assert!(committed_context_xml(&session).contains("<value>1</value>"));
+    assert_committed_context(&session, 1);
 }
 
 #[tokio::test]
@@ -365,7 +361,7 @@ async fn commit_failure_discards_mutated_session_draft() {
     assert_eq!(session.context().history().len(), 3);
     assert_eq!(&*session.context().history()[0].text, "old history");
     assert_eq!(session.context().context_state().marker, 7);
-    assert!(committed_context_xml(&session).contains("<value>1</value>"));
+    assert_committed_context(&session, 1);
 }
 
 #[derive(Debug, Default)]
@@ -490,7 +486,7 @@ async fn reads_and_forks_see_the_committed_session_during_a_turn() {
     turn.await.unwrap().unwrap();
     let session = agent.session().await;
     assert_eq!(session.context().history().len(), 3);
-    assert!(committed_context_xml(&session).contains("<value>2</value>"));
+    assert_committed_context(&session, 2);
 }
 
 #[tokio::test]
@@ -523,7 +519,7 @@ async fn external_session_mutation_waits_for_the_turn_then_is_preserved() {
     let session = agent.session().await;
     assert_eq!(session.context().history().len(), 3);
     assert_eq!(session.context().context_state().marker, 9);
-    assert!(committed_context_xml(&session).contains("<value>2</value>"));
+    assert_committed_context(&session, 2);
 }
 
 #[tokio::test]
@@ -593,5 +589,5 @@ async fn committed_session_publication_has_no_cancellable_observer_await_after_i
     assert!(matches!(result, Ok(Ok(()))));
     let session = agent.session().await;
     assert_eq!(session.context().history().len(), 3);
-    assert!(committed_context_xml(&session).contains("<value>2</value>"));
+    assert_committed_context(&session, 2);
 }

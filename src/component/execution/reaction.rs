@@ -351,6 +351,7 @@ pub struct FrameSubmission {
     replay: Vec<CanonicalInputItem>,
     staged_inputs: Vec<CanonicalInputItem>,
     projection: ProjectionSubmission,
+    ephemeral: Vec<CanonicalInputItem>,
     tools: ToolCatalog,
     canonical_bytes: Box<[u8]>,
 }
@@ -369,6 +370,7 @@ impl FrameSubmission {
             replay,
             staged_inputs,
             projection,
+            ephemeral: Vec::new(),
             tools,
             canonical_bytes: canonical_bytes.into_boxed_slice(),
         }
@@ -387,6 +389,19 @@ impl FrameSubmission {
 
     pub fn projection(&self) -> &ProjectionSubmission {
         &self.projection
+    }
+
+    /// Complete request-only prompts, delivered after all retained input.
+    ///
+    /// Ports must include these in this request only, never in replay state,
+    /// continuation baselines, or the source of history compaction.
+    pub fn ephemeral(&self) -> &[CanonicalInputItem] {
+        &self.ephemeral
+    }
+
+    pub(crate) fn with_ephemeral(mut self, ephemeral: Vec<CanonicalInputItem>) -> Self {
+        self.ephemeral = ephemeral;
+        self
     }
 
     pub fn tools(&self) -> &ToolCatalog {
@@ -424,6 +439,20 @@ impl Frame {
         basis: FrameBasis,
         submission: FrameSubmission,
     ) -> Result<Self, FrameInvariantFault> {
+        if submission.ephemeral().iter().any(|item| {
+            !matches!(
+                item,
+                CanonicalInputItem::Instruction {
+                    authority: crate::transcript::InstructionAuthority::Developer,
+                    ..
+                } | CanonicalInputItem::Message {
+                    role: crate::transcript::ConversationRole::User,
+                    ..
+                }
+            )
+        }) {
+            return Err(FrameInvariantFault::InvalidEphemeralItem);
+        }
         if revision.target != target || revision.epoch != epoch {
             return Err(FrameInvariantFault::RevisionScopeMismatch);
         }
@@ -527,6 +556,8 @@ impl Frame {
 /// Internal compiler fault for a self-contradictory Frame candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum FrameInvariantFault {
+    #[error("ephemeral input must be a user or developer prompt")]
+    InvalidEphemeralItem,
     #[error("Frame revision does not belong to the Frame target and epoch")]
     RevisionScopeMismatch,
     #[error("prepared continuity epoch does not match the Frame epoch")]
@@ -740,6 +771,11 @@ pub trait ReactionPort: Send {
 
     /// Hands one exact Frame to this target and returns its ordered fact stream.
     ///
+    /// Encode [`FrameSubmission::ephemeral`] after all retained input, for this
+    /// request only. These prompts must not enter replay or continuation state
+    /// or history compaction sources. The port does not recompute Component
+    /// placement, semantic diff, or delivery policy from the compiled sections.
+    ///
     /// The port must check [`Frame::check_handoff_precondition`] against its
     /// current target snapshot in the crossing poll. Every `Pending` poll and
     /// every `Ready(Err(_))` proves the Frame has not crossed the handoff
@@ -851,6 +887,7 @@ mod tests {
             replay: Vec::new(),
             staged_inputs: Vec::new(),
             projection: ProjectionSubmission::new(Vec::new()),
+            ephemeral: Vec::new(),
             tools: ToolCatalog::new(Vec::new()).unwrap(),
             canonical_bytes: b"test-only-canonical-frame".to_vec().into_boxed_slice(),
         }

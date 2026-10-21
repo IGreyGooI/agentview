@@ -1,0 +1,11 @@
+<notebook_state>
+  <count>2</count>
+  <latest>Keep static context separate from changing state.</latest>
+</notebook_state>
+
+<command_feedback>
+  <sequence>4</sequence>
+  <records>
+    <command_result sequence="4" command="record" status="completed">{"count":2,"latest":"Keep static context separate from changing state."}</command_result>
+  </records>
+</command_feedback>

@@ -108,7 +108,10 @@ pub use self::parallel_compaction::{
 };
 pub use self::request_observation::OpenAiResponsesRequestSnapshot;
 pub use self::responses_observation::{
-    OpenAiResponsesObservation, OpenAiResponsesObservationError, OpenAiResponsesObserver,
+    OpenAiResponsesFrameBasis, OpenAiResponsesObservation, OpenAiResponsesObservationError,
+    OpenAiResponsesObserver, OpenAiResponsesRequestPreparationDiagnostic,
+    OpenAiResponsesRequestPreparationReason, OpenAiResponsesTransportDiagnostic,
+    OpenAiResponsesTransportPhase,
 };
 pub use self::usage::OpenAiResponsesUsage;
 
@@ -434,6 +437,7 @@ pub struct AsyncOpenAiResponsesProvider {
     response_usage_observer: Option<Arc<ResponseUsageObserver>>,
     request_observer: Option<Arc<RequestObserver>>,
     observer: Option<Arc<dyn OpenAiResponsesObserver>>,
+    compaction_observer: Option<Arc<dyn OpenAiResponsesObserver>>,
     observation_failed: Arc<AtomicBool>,
     execution_mode: ResponsesExecutionMode,
     reaction_target: ResponsesReactionTarget,
@@ -640,6 +644,7 @@ impl AsyncOpenAiResponsesProvider {
             response_usage_observer: None,
             request_observer: None,
             observer: None,
+            compaction_observer: None,
             observation_failed: Arc::new(AtomicBool::new(false)),
             execution_mode: ResponsesExecutionMode::Unclaimed,
             reaction_target,
@@ -718,6 +723,36 @@ impl AsyncOpenAiResponsesProvider {
     pub fn with_observer(mut self, observer: Arc<dyn OpenAiResponsesObserver>) -> Self {
         self.observer = Some(observer);
         self
+    }
+
+    /// Observes the existing background/forced summary worker independently
+    /// from foreground requests. A failed receipt prevents a Ready candidate.
+    pub fn with_compaction_observer(mut self, observer: Arc<dyn OpenAiResponsesObserver>) -> Self {
+        self.compaction_observer = Some(observer);
+        self
+    }
+
+    /// Requests multiple function calls without changing native tool admission.
+    pub fn with_parallel_tool_calls(mut self, enabled: bool) -> Self {
+        self.encoder.set_parallel_tool_calls(enabled);
+        self
+    }
+
+    /// Sets the next foreground request's optional cache comparison hint.
+    /// None removes it. This hint is never sent to the summary worker and does
+    /// not change provider continuity or canonical history.
+    pub fn set_prompt_cache_comparison_response_id(
+        &mut self,
+        id: Option<String>,
+    ) -> Result<(), AsyncOpenAiConfigError> {
+        if id
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty() || id.chars().any(char::is_control))
+        {
+            return Err(AsyncOpenAiConfigError::InvalidPromptCacheComparisonResponseId);
+        }
+        self.encoder.set_prompt_cache_comparison_response_id(id);
+        Ok(())
     }
 
     /// Observes each exact Frame-native request after its first transport poll.
@@ -1416,20 +1451,24 @@ impl AsyncOpenAiResponsesProvider {
                                         return Some((Err(ledger_mismatch_fault(error)), state));
                                     }
                                 };
-                                let ordinal =
-                                    match frame.payload.get("output_index").and_then(Value::as_u64)
-                                    {
-                                        Some(ordinal) => ordinal,
-                                        None => {
-                                            state.finished = true;
-                                            return Some((
-                                        Err(ledger_mismatch_fault(ProviderFault::model_rejected(
-                                            "OpenAI function call is missing output identity",
-                                        ))),
-                                        state,
-                                    ));
-                                        }
-                                    };
+                                let ordinal = match frame
+                                    .payload
+                                    .get("output_index")
+                                    .and_then(Value::as_u64)
+                                {
+                                    Some(ordinal) => ordinal,
+                                    None => {
+                                        state.finished = true;
+                                        return Some((
+                                            Err(ledger_mismatch_fault(
+                                                ProviderFault::model_rejected(
+                                                    "OpenAI function call is missing output identity",
+                                                ),
+                                            )),
+                                            state,
+                                        ));
+                                    }
+                                };
                                 let Some(continuation) = state.continuation_slot.as_mut() else {
                                     state.finished = true;
                                     return Some((
@@ -1536,11 +1575,11 @@ impl AsyncOpenAiResponsesProvider {
                         event_type if is_native_tool_event(event_type) => {
                             state.finished = true;
                             return Some((
-                            Err(ProviderFault::model_rejected(
-                                "native OpenAI tool events are not supported by this adapter version",
-                            )),
-                            state,
-                        ));
+                                Err(ProviderFault::model_rejected(
+                                    "native OpenAI tool events are not supported by this adapter version",
+                                )),
+                                state,
+                            ));
                         }
                         event_type if event_type.starts_with("response.output_") => {
                             state.finished = true;
@@ -1577,6 +1616,17 @@ impl ProviderPort for AsyncOpenAiResponsesProvider {
         projection: RenderedProjection,
     ) -> Result<ProviderEventStream<'a>, ProviderFault> {
         self.ensure_legacy_mode()?;
+        if projection.nodes().iter().any(|node| {
+            node.items()
+                .iter()
+                .enumerate()
+                .any(|(index, _)| node.is_ephemeral_item(index))
+        }) {
+            return Err(ProviderFault::model_rejected(
+                "Ephemeral prompts require the frame-native ReactionPort",
+            )
+            .with_code(ProviderFaultCode::RequestPreparation));
+        }
         let staged_tool_outputs = self.staged_tool_output_receipt()?;
         let prepared = OpenAiContinuation::prepare_bounded(
             self.continuation.as_ref(),
@@ -2032,6 +2082,63 @@ fn has_native_function_call_completed(payload: &Map<String, Value>) -> bool {
 }
 
 #[cfg(all(test, feature = "legacy-provider-port"))]
+#[allow(
+    deprecated,
+    reason = "this test verifies the legacy adapter rejects request-only prompt declarations"
+)]
+mod legacy_ephemeral_tests {
+    use super::*;
+    use crate::{
+        component::execution::RenderedProjectionNode,
+        pom::Document,
+        pom_resolution::resolve_system_document,
+        provider::codex_http_v1::CodexHttpV1Options,
+        transcript::{CanonicalInputItem, ConversationRole},
+    };
+
+    #[tokio::test]
+    async fn legacy_ephemeral_prompt_is_rejected_before_handoff() {
+        let config =
+            AsyncOpenAiTransportConfig::new("http://127.0.0.1:1/v1", "test-token").unwrap();
+        let identity = ProviderIdentity::new("openai", "legacy-ephemeral", 1, "test").unwrap();
+        let options = CodexHttpV1Options::new(
+            crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+            None,
+            None,
+            None::<String>,
+        )
+        .unwrap();
+        let mut provider = AsyncOpenAiResponsesProvider::try_new(
+            config,
+            identity,
+            CodexHttpV1Encoder::new(options),
+        )
+        .unwrap();
+        let prompt = CanonicalInputItem::message(
+            ConversationRole::User,
+            resolve_system_document(Document::from_raw_text("request-only-secret")),
+        );
+        let projection =
+            RenderedProjection::from_nodes(vec![RenderedProjectionNode::new("root", vec![prompt])
+                .with_repeat_items(vec![0])
+                .with_ephemeral_items(vec![0])])
+            .unwrap();
+
+        let fault = match ProviderPort::execute(&mut provider, projection).await {
+            Ok(_) => panic!("a legacy ephemeral declaration must be rejected"),
+            Err(fault) => fault,
+        };
+        assert_eq!(fault.code(), ProviderFaultCode::RequestPreparation);
+        assert!(provider.continuation.is_none());
+        assert!(provider.artifact_binding.is_none());
+        assert!(matches!(
+            provider.execution_mode,
+            ResponsesExecutionMode::Unclaimed
+        ));
+    }
+}
+
+#[cfg(all(test, feature = "legacy-provider-port"))]
 mod terminal_precedence_tests {
     use super::*;
     use crate::provider::codex_http_v1::CodexHttpV1Options;
@@ -2259,6 +2366,10 @@ pub enum AsyncOpenAiConfigError {
     ResponsesTargetIdentityExhausted,
     #[error("OpenAI transport initialization failed")]
     TransportInitialization,
+    #[error(
+        "OpenAI prompt cache comparison response ID must be non-empty and contain no control characters"
+    )]
+    InvalidPromptCacheComparisonResponseId,
 }
 
 #[cfg(test)]

@@ -1,0 +1,28 @@
+<notebook_context>Use record to save a note and inspect to read the current count and latest note. Notes last until this application shuts down. Action results are complete JSON; an error object describes a business rejection.</notebook_context>
+
+<notebook_state>
+  <count>1</count>
+  <latest>Keep complete action results.</latest>
+</notebook_state>
+
+<actions>
+  <action name="record" description="Save a nonempty note and return the current count and complete latest note." enabled="true">
+    <input_schema>{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"text":{"description":"The complete note to save, verbatim.","type":"string"}},"required":["text"],"title":"RecordInput","type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"record" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<actions>
+  <action name="inspect" description="Read the current count and complete latest note without changing notebook state. Send an empty input object." enabled="true">
+    <input_schema>{"additionalProperties":false,"properties":{},"type":"object"}</input_schema>
+    <stdin>Send one JSON object per line with "action":"inspect" and "input" set to an object matching input_schema.</stdin>
+  </action>
+</actions>
+
+<command_feedback>
+  <sequence>2</sequence>
+  <records>
+    <command_result sequence="1" command="record" status="completed">{"count":1,"latest":"Keep complete action results."}</command_result>
+    <command_result sequence="2" command="inspect" status="completed">{"count":1,"latest":"Keep complete action results."}</command_result>
+  </records>
+</command_feedback>

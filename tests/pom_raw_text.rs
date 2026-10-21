@@ -1,14 +1,13 @@
 use agentview::{
     pom::{
-        ContentContext, ContentKind, ContentNode, Document, InlineContent, PomError, RawTextNode,
-        ResolvedDocument, XmlNode,
+        ContentContext, ContentKind, ContentNode, ContentRef, Document, InlineContent, PomError,
+        RawTextNode, ResolvedDocument,
     },
-    pom_renderer::render_pom_document,
     pom_resolution::resolve_artifact_document,
 };
 
 #[test]
-fn raw_document_renders_byte_for_byte_without_markdown_or_xml_interpretation() {
+fn raw_document_round_trips_without_interpreting_its_content() {
     let raw = "  # literal\r\n<sample>&x</sample>\r\n\ttrailing spaces  \r\n";
     let document: Document = serde_json::from_str(
         &serde_json::to_string(&Document::from_raw_text(raw)).expect("raw document serializes"),
@@ -21,53 +20,23 @@ fn raw_document_renders_byte_for_byte_without_markdown_or_xml_interpretation() {
     )
     .expect("resolved raw document deserializes");
 
-    assert_eq!(
-        render_pom_document(&resolved).expect("raw document renders"),
-        raw
-    );
+    let children = resolved.children().iter().collect::<Vec<_>>();
+    assert!(matches!(
+        children.as_slice(),
+        [ContentRef::Node(ContentNode::RawText(text))] if text.value() == raw
+    ));
 }
 
 #[test]
-fn separate_raw_blocks_keep_the_standard_block_separator() {
-    let document = Document::try_build(|blocks| {
-        blocks.raw_text(RawTextNode::new("first"));
-        blocks.raw_text(RawTextNode::new("second"));
-        Ok(())
-    })
-    .expect("raw blocks are valid document blocks");
-    let resolved = resolve_artifact_document(document).expect("raw blocks resolve");
-
-    assert_eq!(
-        render_pom_document(&resolved).expect("raw blocks render"),
-        "first\n\nsecond"
-    );
-}
-
-#[test]
-fn empty_raw_document_keeps_its_opaque_block_and_renders_empty() {
+fn empty_raw_document_keeps_its_opaque_block() {
     let document = Document::from_raw_text("");
     let resolved = resolve_artifact_document(document).expect("empty raw block resolves");
 
-    assert_eq!(resolved.children().len(), 1);
-    assert_eq!(
-        render_pom_document(&resolved).expect("empty raw block renders"),
-        ""
-    );
-}
-
-#[test]
-fn raw_text_in_xml_is_preserved_verbatim() {
-    let xml = XmlNode::try_build("example", |children| {
-        children.raw_text(RawTextNode::new("    <tag>& `*_[]#`"));
-        Ok(())
-    })
-    .expect("valid XML node");
-    let resolved = resolve_artifact_document(Document::from_xml(xml)).expect("XML resolves");
-
-    assert_eq!(
-        render_pom_document(&resolved).expect("XML renders"),
-        "<example>    <tag>& `*_[]#`</example>"
-    );
+    let children = resolved.children().iter().collect::<Vec<_>>();
+    assert!(matches!(
+        children.as_slice(),
+        [ContentRef::Node(ContentNode::RawText(text))] if text.value().is_empty()
+    ));
 }
 
 #[test]

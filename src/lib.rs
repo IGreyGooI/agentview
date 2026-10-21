@@ -57,6 +57,9 @@ pub mod view_app;
 pub mod view_awake;
 pub mod view_state;
 
+#[cfg(test)]
+mod test_support;
+
 pub type StorageString = ecow::EcoString;
 
 pub use agent_view::AgentView;

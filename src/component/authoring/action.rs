@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 
-use crate::component::execution::CommandOutcome;
+use crate::{component::execution::CommandOutcome, pom::XmlNode};
 
 use super::{
     cli_command::{decode_input, CliCommandDeclaration, CommandCallback, CommandFuture},
@@ -19,6 +19,9 @@ use super::{
 /// callback's input type derives `Deserialize` and `JsonSchema`; the mounted view
 /// advertises that schema and the runtime decodes input before calling it. A
 /// callback without arguments can be written as `||` and accepts an empty object.
+/// Native discovery groups current actions by name, shares invocation guidance,
+/// and advertises no-argument inputs as `input="{}"`. Optional `content: XmlNode`
+/// carries structured action details without repeating them in the description.
 /// Collection and execution use the application's explicit
 /// [`use_wait_for_command`](super::use_wait_for_command) barrier.
 pub struct Action;
@@ -28,6 +31,7 @@ impl Action {
         ActionProps {
             name: (),
             description: String::new(),
+            content: None,
             enabled: true,
             callback: (),
         }
@@ -38,15 +42,17 @@ impl Action {
 pub struct ActionProps<Name = (), Callback = ()> {
     name: Name,
     description: String,
+    content: Option<XmlNode>,
     enabled: bool,
     callback: Callback,
 }
 
 impl<Name, Callback> ActionProps<Name, Callback> {
-    pub fn name(self, name: &'static str) -> ActionProps<&'static str, Callback> {
+    pub fn name(self, name: impl Into<String>) -> ActionProps<String, Callback> {
         ActionProps {
-            name,
+            name: name.into(),
             description: self.description,
+            content: self.content,
             enabled: self.enabled,
             callback: self.callback,
         }
@@ -54,6 +60,13 @@ impl<Name, Callback> ActionProps<Name, Callback> {
 
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
+        self
+    }
+
+    /// Add structured action details to the native catalogue. Use this for
+    /// choice metadata that belongs beside its callable action identity.
+    pub fn content(mut self, content: XmlNode) -> Self {
+        self.content = Some(content);
         self
     }
 
@@ -81,13 +94,14 @@ impl<Name> ActionProps<Name> {
         ActionProps {
             name: self.name,
             description: self.description,
+            content: self.content,
             enabled: self.enabled,
             callback: handler.into_action_callback(),
         }
     }
 }
 
-impl ActionProps<&'static str, ActionCallback> {
+impl ActionProps<String, ActionCallback> {
     pub fn build(self) -> Component {
         Component::from_node(ComponentNode::CliCommand(Box::new(
             CliCommandDeclaration::json(
@@ -95,6 +109,8 @@ impl ActionProps<&'static str, ActionCallback> {
                 self.description,
                 self.enabled,
                 self.callback.schema,
+                self.callback.empty_input,
+                self.content,
                 self.callback.invoke,
             ),
         )))
@@ -105,6 +121,7 @@ impl ActionProps<&'static str, ActionCallback> {
 #[doc(hidden)]
 pub struct ActionCallback {
     schema: Value,
+    empty_input: bool,
     invoke: CommandCallback,
 }
 
@@ -123,6 +140,7 @@ where
     fn into_action_callback(mut self) -> ActionCallback {
         ActionCallback {
             schema: schemars::schema_for!(Input).to_value(),
+            empty_input: false,
             invoke: Box::new(move |input| {
                 let input = match decode_input::<Input>(input) {
                     Ok(input) => input,
@@ -148,6 +166,7 @@ where
                 "properties": {},
                 "additionalProperties": false,
             }),
+            empty_input: true,
             invoke: Box::new(move |input| {
                 if !input.as_object().is_some_and(|fields| fields.is_empty()) {
                     return Box::pin(async move {

@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -19,7 +23,6 @@ use agentview::{
         },
         prelude::*,
     },
-    pom_renderer::render_pom_document,
     transcript::{AssistantPhase, CanonicalInputItem},
 };
 use async_trait::async_trait;
@@ -30,23 +33,17 @@ use tokio::sync::Notify;
 struct Capture(Arc<Mutex<Vec<Vec<CanonicalInputItem>>>>);
 
 impl Capture {
-    fn views(&self) -> Vec<String> {
+    fn views(&self) -> Vec<agentview::pom::ResolvedDocument> {
         self.0
             .lock()
             .unwrap()
             .iter()
             .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| match item {
-                        CanonicalInputItem::Instruction { pom, .. }
-                        | CanonicalInputItem::Message { pom, .. } => {
-                            Some(render_pom_document(pom).unwrap())
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                combine(items.iter().filter_map(|item| match item {
+                    CanonicalInputItem::Instruction { pom, .. }
+                    | CanonicalInputItem::Message { pom, .. } => Some(pom.clone()),
+                    _ => None,
+                }))
             })
             .collect()
     }
@@ -312,15 +309,24 @@ async fn callbacks_preserve_source_order_skip_typos_and_deliver_feedback_for_the
     let _ = app.react().await.unwrap();
     assert_eq!(probe.snapshot().confirmations, [1, 2]);
     let views = capture.views();
-    assert!(views[0].contains("Save one note."));
-    assert!(views[0].contains("confirm"));
-    assert!(views[0].contains("count"));
-    assert!(views[1].contains("<saved_count>2</saved_count>"));
+    assert!(views[0].has_text("Save one note. Its decoded text becomes the note."));
+    assert!(views[0].has_text("Confirm the number of notes currently saved."));
+    assert!(views[0].has_element("notebook_state"));
+    assert!(views[1].has_field("saved_count", "2"));
     assert!(
-        views[1].contains("saya"),
+        views[1].has_field(
+            "feedback",
+            &probe
+                .snapshot()
+                .diagnostics
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         "the next submitted Frame exposes the skipped action"
     );
-    assert!(views[2].contains("<confirmations>2</confirmations>"));
+    assert!(views[2].has_field("confirmations", "2"));
 }
 
 #[tokio::test]
@@ -375,19 +381,8 @@ async fn rerender_refreshes_captures_and_unmount_removes_the_action() {
     assert_eq!(state.diagnostics[0].code, "unknown_element");
     assert_eq!(capture.views().len(), 3);
     let current = app.current_projection();
-    let current_text = current
-        .projection()
-        .nodes()
-        .iter()
-        .flat_map(|node| node.items())
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom).unwrap()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!current_text.contains("Save one note."));
+    let current_text = projection_document(current.projection());
+    assert!(!current_text.has_text("Save one note. Its decoded text becomes the note."));
 }
 
 #[tokio::test]
@@ -417,8 +412,16 @@ async fn commentary_is_not_executed_and_eof_reports_incomplete_actions() {
     assert_eq!(state.diagnostics.len(), 1);
     assert_eq!(state.diagnostics[0].element.as_deref(), Some("say"));
     let _ = app.react().await.unwrap();
-    assert!(capture.views()[1].contains("<saved_count>1</saved_count>"));
-    assert!(capture.views()[1].contains("unfinished") || capture.views()[1].contains("incomplete"));
+    assert!(capture.views()[1].has_field("saved_count", "1"));
+    assert!(capture.views()[1].has_field(
+        "feedback",
+        &state
+            .diagnostics
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
 }
 
 #[component]
@@ -539,7 +542,7 @@ async fn cancellation_drops_callback_future_and_does_not_replay_buffered_complet
         ["delta:pause", "delta:next", "complete:next"]
     );
     assert!(
-        capture.views()[1].contains("delta:pause"),
+        capture.views()[1].has_field("pending_state", "delta:pause"),
         "completed state writes survive cancellation"
     );
 }
@@ -567,8 +570,8 @@ async fn self_closing_defaults_to_unit_and_invalid_input_has_feedback_without_a_
     let _ = app.react().await.unwrap();
     let _ = app.react().await.unwrap();
     assert_eq!(*pings.lock().unwrap(), 1);
-    assert!(capture.views()[1].contains("pign"));
-    assert!(capture.views()[1].contains("unknown_element"));
+    assert!(capture.views()[1].has_attribute("element", "pign"));
+    assert!(capture.views()[1].has_attribute("code", "unknown_element"));
 }
 
 #[derive(Clone, Default)]

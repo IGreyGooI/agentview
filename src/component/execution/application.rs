@@ -560,6 +560,72 @@ impl<P: ReactionPort> Application<P> {
         self.components.has_command_wait()
     }
 
+    /// The stdin owner starts preparation only after ingress demand arrives.
+    /// Otherwise an eager preparation can finish its external reads, then wait
+    /// indefinitely for an action or observation against that older snapshot.
+    pub(crate) async fn wait_for_command_request(
+        &mut self,
+    ) -> Result<ControlFlow<ExitReason>, ApplicationFault> {
+        let stage = ApplicationFaultStage::Preparation;
+        let application_state = Arc::clone(&self.state);
+        let monitor = self.tasks.panic_monitor();
+        begin_outer_driver_boundary(&application_state, &monitor)
+            .map_err(|fault| application_fault_from_outer_driver_boundary(stage, fault))?;
+        let exit = self.application_exit.clone();
+        let input = self
+            .command_input
+            .as_mut()
+            .ok_or_else(ApplicationFault::command_input_unavailable)?;
+        let mut waiting = Box::pin(async {
+            tokio::select! {
+                biased;
+                reason = exit.wait() => {
+                    input.close();
+                    ControlFlow::Break(reason)
+                }
+                ready = input.reserve_next() => {
+                    if ready {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(ExitReason::Completed)
+                    }
+                }
+            }
+        });
+        let result = tokio::select! {
+            biased;
+            task = monitor.wait() => {
+                drop_driver_future_before_panic_arbitration(waiting, &monitor);
+                return match task {
+                    Ok(()) => {
+                        consume_supervised_task_panic(&application_state, &monitor);
+                        Err(task_panic_terminal_fault(stage))
+                    }
+                    Err(source) => Err(ApplicationFault::from_task_supervisor(stage, source)),
+                };
+            }
+            result = &mut waiting => result,
+        };
+        drop_driver_future_before_panic_arbitration(waiting, &monitor);
+        match monitor.status() {
+            TaskSupervisorStatus::Healthy => Ok(result),
+            TaskSupervisorStatus::Panicked => {
+                consume_supervised_task_panic(&application_state, &monitor);
+                Err(task_panic_terminal_fault(stage))
+            }
+            TaskSupervisorStatus::Closed => Err(ApplicationFault::from_task_supervisor(
+                stage,
+                MountTaskSupervisorError::Closed,
+            )),
+        }
+    }
+
+    pub(crate) fn finish_command_frame(&mut self) {
+        if let Some(input) = &mut self.command_input {
+            input.finish_feedback_frame();
+        }
+    }
+
     /// Resolve retained contract operations without starting a provider reaction.
     /// Dropping this waiter leaves already started worker operations running.
     pub async fn recover_streaming_attempt(
@@ -752,6 +818,7 @@ impl<P: ReactionPort> Application<P> {
             match run_submission_attempt(
                 &mut self.port,
                 &mut self.session,
+                &mut self.command_input,
                 &mut bindings,
                 prepared,
                 cancellation,
@@ -779,6 +846,7 @@ impl<P: ReactionPort> Application<P> {
                     match run_submission_attempt(
                         &mut self.port,
                         &mut self.session,
+                        &mut self.command_input,
                         &mut bindings,
                         retry,
                         cancellation,
@@ -991,8 +1059,9 @@ impl<P: ReactionPort> Application<P> {
                             input.applied(outcome.clone());
                             command_done = true;
                             if let Some(wait) = &wait {
+                                let new_frame = input.take_new_feedback_frame();
                                 wait.feedback
-                                    .update(|feedback| feedback.record(&call, outcome))
+                                    .update(|feedback| feedback.record(&call, outcome, new_frame))
                                     .map_err(|_| ApplicationFault::command_handler())?;
                             }
                             if self.components.is_dirty() {
@@ -1194,9 +1263,12 @@ async fn submit_prepared_frame<'port, P: ReactionPort>(
     Ok(stream)
 }
 
+// Keep the independently borrowed runtime owners explicit across handoff.
+#[allow(clippy::too_many_arguments)]
 async fn run_submission_attempt<P: ReactionPort>(
     port: &mut P,
     session: &mut FrameSession,
+    command_input: &mut Option<CommandInput>,
     bindings: &mut RenderBindings<ProviderEvent>,
     prepared: PreparedFrame,
     cancellation: &ReactionCancellationControl,
@@ -1211,6 +1283,9 @@ async fn run_submission_attempt<P: ReactionPort>(
     let submission = submit_prepared_frame(port, session, prepared).await;
     match submission {
         Ok(facts) => {
+            if let Some(input) = command_input {
+                input.finish_feedback_frame();
+            }
             pump_provider_facts(session, bindings, facts, cancellation.clone(), streaming).await?;
             Ok(SubmissionAttempt::Completed)
         }
@@ -1373,7 +1448,16 @@ async fn pump_provider_facts(
     }
     .await;
 
-    recovery.disarm();
+    // A budget rejection interrupts active tool lanes; their reserved receipts
+    // must survive a later context recovery.
+    if !matches!(
+        &result,
+        Err(fault)
+            if fault.reason()
+                == ApplicationFaultReason::Admission(ReactionAdmissionReason::Budget)
+    ) {
+        recovery.disarm();
+    }
     result
 }
 
@@ -1998,6 +2082,11 @@ mod tests {
 
     enum FactScript {
         Finite(Vec<Result<ProviderFact, ReactionPortFault>>),
+        Gated {
+            before: Vec<Result<ProviderFact, ReactionPortFault>>,
+            ready: Arc<Notify>,
+            after: Vec<Result<ProviderFact, ReactionPortFault>>,
+        },
         PendingAfter(Vec<Result<ProviderFact, ReactionPortFault>>),
         PendingAfterFullReset(Vec<Result<ProviderFact, ReactionPortFault>>),
         PanicOnDropPending,
@@ -2161,6 +2250,19 @@ mod tests {
             let script = self.scripts.pop_front().expect("test fact script");
             let facts: ProviderFactStream<'a> = match script {
                 FactScript::Finite(facts) => Box::pin(stream::iter(facts)),
+                FactScript::Gated {
+                    before,
+                    ready,
+                    after,
+                } => Box::pin(
+                    stream::iter(before).chain(
+                        stream::once(async move {
+                            ready.notified().await;
+                            stream::iter(after)
+                        })
+                        .flatten(),
+                    ),
+                ),
                 FactScript::PendingAfter(facts) => Box::pin(
                     stream::iter(facts)
                         .chain(stream::pending::<Result<ProviderFact, ReactionPortFault>>()),
@@ -2776,20 +2878,11 @@ mod tests {
         view! { immediate_panic { "mounted" } }
     }
 
-    fn rendered_text(projection: &super::super::RenderedProjection) -> String {
-        projection
-            .nodes()
-            .iter()
-            .flat_map(|node| node.items())
-            .filter_map(|item| match item {
-                CanonicalInputItem::Instruction { pom, .. }
-                | CanonicalInputItem::Message { pom, .. } => {
-                    Some(crate::pom_renderer::render_pom_document(pom).unwrap())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+    fn field_values<'a>(
+        projection: &'a super::super::RenderedProjection,
+        name: &str,
+    ) -> Vec<&'a str> {
+        crate::test_support::element_text(crate::test_support::projection_items(projection), name)
     }
 
     fn valid_profile() -> FrameProfile {
@@ -3591,6 +3684,155 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn admission_budget_failure_closes_pending_tools_without_replaying_completed_actions() {
+        struct PendingLaneDrop(Arc<AtomicBool>);
+        impl Drop for PendingLaneDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let ready = Arc::new(Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        let pending_dropped = Arc::new(AtomicBool::new(false));
+        let observed_ready = ready.clone();
+        let observed_started = started.clone();
+        let observed_dropped = pending_dropped.clone();
+        let (port, probe) = scripted_port(
+            vec![
+                FactScript::Gated {
+                    before: vec![
+                        Ok(tool_fact(11, 1, "call-finished", "finished")),
+                        Ok(tool_fact(12, 2, "call-pending", "pending")),
+                    ],
+                    ready,
+                    after: vec![Ok(ProviderFact::TextDelta {
+                        output: ProviderOutputKey::new(13),
+                        phase: None,
+                        delta: "x".repeat(valid_profile().constraints.max_frame_bytes * 2),
+                    })],
+                },
+                completed_reaction(),
+                completed_reaction(),
+            ],
+            0,
+        );
+        let mut application = Application::mount(
+            move || {
+                let ready = observed_ready.clone();
+                let started = observed_started.clone();
+                let finished = NativeToolCall::named("finished").on_call(move |call| {
+                    let ready = ready.clone();
+                    let started = started.clone();
+                    async move {
+                        if started.fetch_add(1, Ordering::AcqRel) == 1 {
+                            ready.notify_one();
+                        }
+                        Ok::<_, String>(call.output("finished-once"))
+                    }
+                });
+                let ready = observed_ready.clone();
+                let started = observed_started.clone();
+                let dropped = observed_dropped.clone();
+                let pending = NativeToolCall::named("pending").on_call(move |call| {
+                    let ready = ready.clone();
+                    let started = started.clone();
+                    let dropped = dropped.clone();
+                    async move {
+                        let _drop = PendingLaneDrop(dropped);
+                        if started.fetch_add(1, Ordering::AcqRel) == 1 {
+                            ready.notify_one();
+                        }
+                        std::future::pending::<()>().await;
+                        Ok::<_, String>(call.output("unreachable"))
+                    }
+                });
+                __private::fragment(vec![finished, pending])
+            },
+            port,
+        )
+        .unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(1), application.react())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            failure.reason(),
+            ApplicationFaultReason::Admission(ReactionAdmissionReason::Budget)
+        );
+        assert_eq!(started.load(Ordering::Acquire), 2);
+        assert!(pending_dropped.load(Ordering::Acquire));
+        let outputs = application
+            .session
+            .target_delivery
+            .tool_outputs
+            .ordered_outputs()
+            .map(|(_, item)| item.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            vec![
+                CanonicalInputItem::tool_result("call-finished", "finished-once").unwrap(),
+                CanonicalInputItem::tool_result(
+                    "call-pending",
+                    crate::component::execution::admission::CANCELLATION_FALLBACK_CONTENT
+                )
+                .unwrap(),
+            ]
+        );
+        assert_eq!(
+            application.reset_model_context().unwrap_err().reason(),
+            ApplicationFaultReason::ModelContextBusy
+        );
+        assert!(application.react().await.unwrap().is_continue());
+        application.reset_model_context().unwrap();
+        assert!(application.react().await.unwrap().is_continue());
+        assert_eq!(started.load(Ordering::Acquire), 2);
+        assert_eq!(*probe.staged_input_counts.lock().unwrap(), [0, 2, 0]);
+        application.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn returned_tool_faults_keep_pending_calls_unresolved() {
+        for (tool_name, reason) in [
+            ("undeclared", ApplicationFaultReason::ToolBinding),
+            ("failing", ApplicationFaultReason::ToolLane),
+        ] {
+            let (port, probe) = scripted_port(
+                vec![FactScript::PendingAfter(vec![Ok(tool_fact(
+                    1,
+                    1,
+                    "call-failure",
+                    tool_name,
+                ))])],
+                0,
+            );
+            let mut application = Application::mount(
+                || {
+                    NativeToolCall::named("failing")
+                        .on_call(|_call| async { Err::<ToolOutput, _>("handler failed") })
+                },
+                port,
+            )
+            .unwrap();
+            let failure = application.react().await.unwrap_err();
+            assert_eq!(failure.kind(), ApplicationFaultKind::Terminal);
+            assert_eq!(failure.reason(), reason);
+            assert_tool_fallback_remains_hidden(&mut application, 1);
+            assert_eq!(
+                application.reset_model_context().unwrap_err().reason(),
+                ApplicationFaultReason::ModelContextBusy
+            );
+            let retry = application.react().await.unwrap_err();
+            assert_eq!(
+                retry.reason(),
+                ApplicationFaultReason::ToolOutput(ToolOutputStagingReason::UnresolvedOutput)
+            );
+            assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
+            application.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -4489,8 +4731,13 @@ mod tests {
         assert_eq!(probe.invocations.load(Ordering::Acquire), 3);
         assert_eq!(probe.cancelled_drops.load(Ordering::Acquire), 1);
         assert_eq!(probe.post_await.load(Ordering::Acquire), 2);
-        assert!(rendered_text(application.current_projection().projection())
-            .contains("written-before-cancellation"));
+        assert_eq!(
+            field_values(
+                application.current_projection().projection(),
+                "callback_state"
+            ),
+            ["written-before-cancellation"]
+        );
     }
 
     #[tokio::test]
@@ -4655,18 +4902,24 @@ mod tests {
             0,
         );
         let mut application = Application::mount(stateful_tool_component, port).unwrap();
-        assert!(
-            rendered_text(application.components.current_projection().unwrap())
-                .contains("<state>before</state>")
+        assert_eq!(
+            field_values(
+                application.components.current_projection().unwrap(),
+                "state"
+            ),
+            ["before"]
         );
 
         assert!(application.react().await.unwrap().is_continue());
 
         assert_eq!(probe.handoffs.load(Ordering::Relaxed), 1);
         assert!(!application.components.is_dirty());
-        assert!(
-            rendered_text(application.components.current_projection().unwrap())
-                .contains("<state>after</state>")
+        assert_eq!(
+            field_values(
+                application.components.current_projection().unwrap(),
+                "state"
+            ),
+            ["after"]
         );
         assert_eq!(
             application
@@ -4721,9 +4974,12 @@ mod tests {
             port,
         )
         .unwrap();
-        assert!(
-            rendered_text(application.components.current_projection().unwrap())
-                .contains("<state>before</state>")
+        assert_eq!(
+            field_values(
+                application.components.current_projection().unwrap(),
+                "state"
+            ),
+            ["before"]
         );
 
         assert!(application.react().await.unwrap().is_continue());
@@ -4732,9 +4988,12 @@ mod tests {
         assert_eq!(probe.handoffs.load(Ordering::Relaxed), 1);
         assert_eq!(probe.submissions.load(Ordering::Relaxed), 1);
         assert!(!application.components.is_dirty());
-        assert!(
-            rendered_text(application.components.current_projection().unwrap())
-                .contains("<state>after</state>")
+        assert_eq!(
+            field_values(
+                application.components.current_projection().unwrap(),
+                "state"
+            ),
+            ["after"]
         );
         assert!(matches!(
             application.session.canonical_history.transcript.items().last(),
@@ -4793,7 +5052,7 @@ mod tests {
 
         let stale = application.current_projection();
         assert!(stale.is_dirty());
-        assert!(rendered_text(stale.projection()).contains("before"));
+        assert_eq!(field_values(stale.projection(), "demand_state"), ["before"]);
         application.wait_for_reaction_request().await.unwrap();
         assert_eq!(probe.submissions.load(Ordering::Relaxed), 0);
         assert!(!application.take_reaction_request().unwrap());
@@ -4801,9 +5060,13 @@ mod tests {
         assert!(application.react().await.unwrap().is_continue());
 
         let frames = probe.canonical_frames.lock().unwrap();
-        let frame = std::str::from_utf8(&frames[0]).unwrap();
-        assert!(frame.contains("after"));
-        assert!(!frame.contains("before"));
+        let frame: serde_json::Value = serde_json::from_slice(&frames[0]).unwrap();
+        let items: Vec<CanonicalInputItem> =
+            serde_json::from_value(frame["component"]["projection"]["items"].clone()).unwrap();
+        assert_eq!(
+            crate::test_support::element_text(&items, "demand_state"),
+            ["after"]
+        );
         drop(frames);
         assert_eq!(probe.submissions.load(Ordering::Relaxed), 1);
 
@@ -4964,10 +5227,11 @@ mod tests {
 
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(*probe.task_drop_observed_at_submit.lock().unwrap(), [true]);
-        assert!(
-            !rendered_text(application.current_projection().projection())
-                .contains("retiring_child")
-        );
+        assert!(field_values(
+            application.current_projection().projection(),
+            "retiring_child"
+        )
+        .is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5023,7 +5287,10 @@ mod tests {
         let pending = application.current_projection();
         assert!(pending.is_dirty());
         assert_eq!(pending.revision(), previous_revision);
-        assert!(rendered_text(pending.projection()).contains("retiring_child"));
+        assert_eq!(
+            field_values(pending.projection(), "retiring_child"),
+            ["mounted"]
+        );
         assert_eq!(probe.submissions.load(Ordering::Acquire), 1);
 
         assert!(application.react().await.unwrap().is_continue());
@@ -5033,10 +5300,11 @@ mod tests {
             previous_revision + 1
         );
         assert_eq!(probe.submissions.load(Ordering::Acquire), 2);
-        assert!(
-            !rendered_text(application.current_projection().projection())
-                .contains("retiring_child")
-        );
+        assert!(field_values(
+            application.current_projection().projection(),
+            "retiring_child"
+        )
+        .is_empty());
     }
 
     async fn assert_retirement_panic_overrides(next_reaction: FactScript) {

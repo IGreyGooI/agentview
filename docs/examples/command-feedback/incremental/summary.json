@@ -1,0 +1,149 @@
+{
+  "stdin": {
+    "input_bytes": 183,
+    "stdout_bytes": 2899,
+    "stderr_bytes": 0,
+    "exit_code": 2,
+    "elapsed_ms": 78.315,
+    "response_count": 1,
+    "responses": [
+      {
+        "response": 1,
+        "bytes": 2899,
+        "ok": false,
+        "direct_action_results": 0,
+        "feedback_records": 4,
+        "input_schemas": 2,
+        "static_context_roots": 1
+      }
+    ]
+  },
+  "status": {
+    "exit_code": 0,
+    "stdout_bytes": 2898
+  },
+  "stop": {
+    "exit_code": 0,
+    "stdout_bytes": 2765
+  },
+  "native": {
+    "delivery_scope": "One mounted Application and one DebugProviderPort; no model I/O or shared reader cursor.",
+    "frames": [
+      {
+        "basis": "full",
+        "feedback_patch_operations": 0,
+        "feedback_records": 2,
+        "frame": 1,
+        "frame_bytes": 4449,
+        "projection_items": 4,
+        "roots": [
+          "notebook_context",
+          "notebook_state",
+          "actions",
+          "actions",
+          "command_feedback"
+        ],
+        "view_bytes": 1915
+      },
+      {
+        "basis": "delta",
+        "feedback_patch_operations": 0,
+        "feedback_records": 0,
+        "frame": 2,
+        "frame_bytes": 107,
+        "projection_items": 0,
+        "roots": [],
+        "view_bytes": 0
+      },
+      {
+        "basis": "delta",
+        "feedback_patch_operations": 0,
+        "feedback_records": 1,
+        "frame": 3,
+        "frame_bytes": 884,
+        "projection_items": 1,
+        "roots": [
+          "command_feedback"
+        ],
+        "view_bytes": 228
+      },
+      {
+        "basis": "delta",
+        "feedback_patch_operations": 0,
+        "feedback_records": 1,
+        "frame": 4,
+        "frame_bytes": 1436,
+        "projection_items": 2,
+        "roots": [
+          "notebook_state",
+          "command_feedback"
+        ],
+        "view_bytes": 371
+      }
+    ],
+    "steps": [
+      "record + inspect, then Full handoff",
+      "unchanged Delta",
+      "inspect, then complete new feedback",
+      "record, then changed state and complete new feedback"
+    ]
+  },
+  "interactive": {
+    "exit_code": 0,
+    "frames": [
+      {
+        "frame": 1,
+        "boundary": "idle",
+        "sent_at_ms": 0.126,
+        "received_at_ms": 161.419,
+        "elapsed_ms": 161.292,
+        "input_bytes": 104,
+        "stdout_bytes": 2589,
+        "feedback_records": 2,
+        "direct_action_results": 0,
+        "input_schemas": 2,
+        "static_context_roots": 1,
+        "state_roots": 1,
+        "connection_metadata": 1
+      },
+      {
+        "frame": 2,
+        "boundary": "idle",
+        "sent_at_ms": 162.133,
+        "received_at_ms": 286.011,
+        "elapsed_ms": 123.878,
+        "input_bytes": 73,
+        "stdout_bytes": 345,
+        "feedback_records": 1,
+        "direct_action_results": 0,
+        "input_schemas": 0,
+        "static_context_roots": 0,
+        "state_roots": 1,
+        "connection_metadata": 0
+      },
+      {
+        "frame": 3,
+        "boundary": "eof",
+        "sent_at_ms": 286.388,
+        "received_at_ms": 300.391,
+        "elapsed_ms": 14.003,
+        "input_bytes": 31,
+        "stdout_bytes": 248,
+        "feedback_records": 1,
+        "direct_action_results": 0,
+        "input_schemas": 0,
+        "static_context_roots": 0,
+        "state_roots": 0,
+        "connection_metadata": 0
+      }
+    ]
+  },
+  "interactive_fresh_reader": {
+    "exit_code": 0,
+    "stdout_bytes": 2459,
+    "input_schemas": 2,
+    "static_context_roots": 1,
+    "state_roots": 1,
+    "feedback_records": 1
+  }
+}

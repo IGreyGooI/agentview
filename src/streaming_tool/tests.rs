@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent::TurnFlow;
-use crate::templates::{PromptRenderable, TemplateEngine};
+use crate::test_support::{document, text_element};
 
 #[derive(Debug, thiserror::Error)]
 enum DecisionError {
@@ -357,7 +357,6 @@ async fn streaming_tool_updates_concrete_parse_context_in_parser_order() {
 #[tokio::test]
 async fn decision_function_returns_retry_artifact_when_required_tool_missing() {
     let mut ctx = NpcParseContext::new();
-    let engine = TemplateEngine::new();
 
     let update = drain_npc_turn_update(&mut ctx);
 
@@ -371,18 +370,16 @@ async fn decision_function_returns_retry_artifact_when_required_tool_missing() {
     assert_eq!(update.artifacts.len(), 1);
     assert_eq!(update.artifacts[0].kind(), "parser_error");
     assert_eq!(
-        update.artifacts[0]
-            .render_full(&engine)
-            .await
-            .unwrap()
-            .into_string(),
-        "<parser_error>Expected a <speak> tag to start speech.</parser_error>"
+        update.artifacts[0].document(),
+        &document([text_element(
+            "parser_error",
+            "Expected a <speak> tag to start speech."
+        )])
     );
 }
 
 #[tokio::test]
 async fn sleep_feedback_uses_behavior_feedback_kind_for_next_awake() {
-    let engine = TemplateEngine::new();
     let update = TestTurnUpdate {
         flow: TurnFlow::Wait,
         artifacts: vec![
@@ -400,18 +397,16 @@ async fn sleep_feedback_uses_behavior_feedback_kind_for_next_awake() {
     assert_eq!(update.artifacts.len(), 1);
     assert_eq!(update.artifacts[0].kind(), "behavior_feedback");
     assert_eq!(
-        update.artifacts[0]
-            .render_full(&engine)
-            .await
-            .unwrap()
-            .into_string(),
-        "<behavior_feedback>Use <thought> before <speak> next time.</behavior_feedback>"
+        update.artifacts[0].document(),
+        &document([text_element(
+            "behavior_feedback",
+            "Use <thought> before <speak> next time."
+        )])
     );
 }
 
 #[tokio::test]
 async fn tool_checks_parse_context_before_committing_side_effect() {
-    let engine = TemplateEngine::new();
     let mut runner = StreamingToolRunner::new(NpcParseContext::new()).with_tool(SpeakTool {});
 
     runner.feed("<speak></speak><speak>second</speak>").await;
@@ -424,26 +419,23 @@ async fn tool_checks_parse_context_before_committing_side_effect() {
     assert_eq!(ctx.artifacts[0].kind(), "parser_error");
     assert_eq!(ctx.artifacts[1].kind(), "parser_error");
     assert_eq!(
-        ctx.artifacts[0]
-            .render_full(&engine)
-            .await
-            .unwrap()
-            .into_string(),
-        "<parser_error><speak> invalid content: speech content cannot be empty</parser_error>"
+        ctx.artifacts[0].document(),
+        &document([text_element(
+            "parser_error",
+            "<speak> invalid content: speech content cannot be empty"
+        )])
     );
     assert_eq!(
-        ctx.artifacts[1]
-            .render_full(&engine)
-            .await
-            .unwrap()
-            .into_string(),
-        "<parser_error><speak> rejected: duplicate speech tag</parser_error>"
+        ctx.artifacts[1].document(),
+        &document([text_element(
+            "parser_error",
+            "<speak> rejected: duplicate speech tag"
+        )])
     );
 }
 
 #[tokio::test]
 async fn invalid_attribute_becomes_parser_error_artifact() {
-    let engine = TemplateEngine::new();
     let mut runner = StreamingToolRunner::new(NpcParseContext::new()).with_tool(RelationTool {});
 
     runner
@@ -455,8 +447,11 @@ async fn invalid_attribute_becomes_parser_error_artifact() {
     assert_eq!(ctx.artifacts.len(), 1);
     assert_eq!(ctx.artifacts[0].kind(), "parser_error");
     assert_eq!(
-        ctx.artifacts[0].render_full(&engine).await.unwrap().into_string(),
-        "<parser_error><update_relationship> invalid attribute `trust_delta`: expected integer</parser_error>"
+        ctx.artifacts[0].document(),
+        &document([text_element(
+            "parser_error",
+            "<update_relationship> invalid attribute `trust_delta`: expected integer"
+        )])
     );
 }
 
@@ -469,18 +464,16 @@ async fn tool_error_artifact_preserves_dynamic_text_through_pom() {
     .into_turn_artifact();
 
     assert_eq!(
-        artifact
-            .render_full(&TemplateEngine::new())
-            .await
-            .unwrap()
-            .as_str(),
-        "<parser_error><select> invalid content: <select>&</parser_error>"
+        artifact.document(),
+        &document([text_element(
+            "parser_error",
+            "<select> invalid content: <select>&"
+        )])
     );
 }
 
 #[tokio::test]
 async fn execution_error_becomes_parser_error_and_stream_continues() {
-    let engine = TemplateEngine::new();
     let mut runner = StreamingToolRunner::new(NpcParseContext::new())
         .with_tool(FailingTool {})
         .with_tool(SpeakTool {});
@@ -494,18 +487,16 @@ async fn execution_error_becomes_parser_error_and_stream_continues() {
     assert_eq!(ctx.completed, vec!["still speaks"]);
     assert_eq!(ctx.artifacts.len(), 1);
     assert_eq!(
-        ctx.artifacts[0]
-            .render_full(&engine)
-            .await
-            .unwrap()
-            .into_string(),
-        "<parser_error><emit_event> execution failed: event channel closed</parser_error>"
+        ctx.artifacts[0].document(),
+        &document([text_element(
+            "parser_error",
+            "<emit_event> execution failed: event channel closed"
+        )])
     );
 }
 
 #[tokio::test]
 async fn multiple_tool_errors_accumulate_without_short_circuiting() {
-    let engine = TemplateEngine::new();
     let mut runner = StreamingToolRunner::new(NpcParseContext::new())
         .with_tool(RelationTool {})
         .with_tool(FailingTool {})
@@ -522,22 +513,23 @@ async fn multiple_tool_errors_accumulate_without_short_circuiting() {
     assert_eq!(ctx.completed, vec!["ok"]);
     assert_eq!(ctx.artifacts.len(), 2);
     assert_eq!(
-        ctx.artifacts[0].render_full(&engine).await.unwrap().into_string(),
-        "<parser_error><update_relationship> invalid attribute `trust_delta`: missing trust delta</parser_error>"
+        ctx.artifacts[0].document(),
+        &document([text_element(
+            "parser_error",
+            "<update_relationship> invalid attribute `trust_delta`: missing trust delta"
+        )])
     );
     assert_eq!(
-        ctx.artifacts[1]
-            .render_full(&engine)
-            .await
-            .unwrap()
-            .into_string(),
-        "<parser_error><emit_event> execution failed: event channel closed</parser_error>"
+        ctx.artifacts[1].document(),
+        &document([text_element(
+            "parser_error",
+            "<emit_event> execution failed: event channel closed"
+        )])
     );
 }
 
 #[tokio::test]
 async fn thought_after_speech_is_feedback_but_does_not_rollback_speech() {
-    let engine = TemplateEngine::new();
     let mut runner = StreamingToolRunner::new(NpcParseContext::new())
         .with_tool(SpeakTool {})
         .with_tool(ThoughtTool {});
@@ -552,7 +544,7 @@ async fn thought_after_speech_is_feedback_but_does_not_rollback_speech() {
     assert_eq!(ctx.artifacts.len(), 1);
     assert_eq!(ctx.artifacts[0].kind(), "parser_error");
     assert_eq!(
-        ctx.artifacts[0].render_full(&engine).await.unwrap().into_string(),
-        "<parser_error><thought> appeared after <speak>. Put private reasoning before visible speech next time.</parser_error>"
+        ctx.artifacts[0].document(),
+        &document([text_element("parser_error", "<thought> appeared after <speak>. Put private reasoning before visible speech next time.")])
     );
 }

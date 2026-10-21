@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -1597,19 +1601,13 @@ fn callback_counter_application(props: CallbackCounterProps) -> Component {
     }
 }
 
-fn callback_frame_view(frame: &CapturedFrame) -> String {
-    frame
-        .projection
-        .iter()
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => {
-                Some(agentview::pom_renderer::render_pom_document(pom).expect("valid counter view"))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn callback_frame_document(frame: &CapturedFrame) -> agentview::pom::ResolvedDocument {
+    combine(frame.projection.iter().filter_map(|item| match item {
+        CanonicalInputItem::Instruction { pom, .. } | CanonicalInputItem::Message { pom, .. } => {
+            Some(pom.clone())
+        }
+        _ => None,
+    }))
 }
 
 #[tokio::test]
@@ -1654,7 +1652,6 @@ async fn native_callback_infers_schema_and_rejects_invalid_arguments_before_invo
         "Amount to add to the current counter."
     );
     assert_eq!(tools[0].input_schema(), tools[1].input_schema());
-    drop(projection);
     let _ = application
         .react()
         .await
@@ -1663,7 +1660,7 @@ async fn native_callback_infers_schema_and_rejects_invalid_arguments_before_invo
     assert_eq!(props.sync_calls.load(Ordering::SeqCst), 1);
     assert_eq!(props.async_calls.load(Ordering::SeqCst), 0);
     let frames = capture.frames();
-    assert!(callback_frame_view(&frames[0]).contains("<value>10</value>"));
+    assert!(callback_frame_document(&frames[0]).has_field("value", "10"));
     let results = native_items(&frames[1].staged_inputs);
     assert_eq!(results.len(), 4);
     for (item, expected_call_id) in results
@@ -1689,7 +1686,7 @@ async fn native_callback_infers_schema_and_rejects_invalid_arguments_before_invo
         tool_result("valid-after-errors", r#"{"value":12,"observed_value":10}"#),
         "an independent valid call still executes after invalid model inputs"
     );
-    assert!(callback_frame_view(&frames[1]).contains("<value>12</value>"));
+    assert!(callback_frame_document(&frames[1]).has_field("value", "12"));
 }
 
 #[tokio::test]
@@ -1723,7 +1720,7 @@ async fn native_callbacks_deliver_state_and_results_and_refresh_captures_between
 
     let frames = capture.frames();
     assert_eq!(frames[0].tools, ["adjust", "adjust_async"]);
-    assert!(callback_frame_view(&frames[0]).contains("<value>10</value>"));
+    assert!(callback_frame_document(&frames[0]).has_field("value", "10"));
     for (frame, call_id, value, observed_value) in [
         (&frames[1], "sync-first", 12, 10),
         (&frames[2], "async-next", 15, 12),
@@ -1742,7 +1739,7 @@ async fn native_callbacks_deliver_state_and_results_and_refresh_captures_between
             "the next Frame delivers the real result with the current callback capture"
         );
         assert!(
-            callback_frame_view(frame).contains(&format!("<value>{value}</value>")),
+            callback_frame_document(frame).has_field("value", &value.to_string()),
             "the same Frame must expose the updated state for the next action"
         );
         assert_native_submission_has_no_duplicates(frame);
@@ -1821,8 +1818,6 @@ async fn zero_argument_native_callbacks_reject_input_fields_and_deliver_sync_and
             })
         );
     }
-    drop(projection);
-
     for _ in 0..3 {
         let _ = app.react().await.unwrap();
     }
@@ -1846,7 +1841,7 @@ async fn zero_argument_native_callbacks_reject_input_fields_and_deliver_sync_and
         vec![tool_result("async-valid", "2")]
     );
     for (frame, current) in frames.iter().zip([0, 1, 2]) {
-        assert!(callback_frame_view(frame).contains(&format!("<value>{current}</value>")));
+        assert!(callback_frame_document(frame).has_field("value", &current.to_string()));
         assert_native_submission_has_no_duplicates(frame);
     }
     app.shutdown().await.unwrap();

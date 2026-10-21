@@ -1,3 +1,7 @@
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::{
     ops::ControlFlow,
     sync::{Arc, Mutex},
@@ -116,18 +120,30 @@ async fn retained_application_emits_developer_sequence_delta_and_suppresses_no_c
     assert!(matches!(frames[1].basis(), FrameBasis::DeltaFrom(_)));
     assert!(matches!(frames[2].basis(), FrameBasis::DeltaFrom(_)));
 
-    let first = String::from_utf8(frames[0].canonical_payload().to_vec()).unwrap();
-    assert!(first.contains(r#""authority":"developer""#));
-    assert!(first.contains("first"));
+    let first_items = frame_projection_items(frames[0].canonical_payload());
+    assert!(matches!(
+        &first_items[..],
+        [CanonicalInputItem::Instruction {
+            authority: InstructionAuthority::Developer,
+            ..
+        }]
+    ));
+    let first = combine(item_documents(&first_items));
+    assert!(first.has_field("item", "first"));
 
-    let delta = String::from_utf8(frames[1].canonical_payload().to_vec()).unwrap();
-    assert!(delta.contains(r#""authority":"developer""#));
-    assert!(delta.contains("rendering_mode"));
-    assert!(delta.contains("insert"));
-    assert!(delta.contains("second"));
-    assert!(!delta.contains("first"));
-
-    let unchanged = String::from_utf8(frames[2].canonical_payload().to_vec()).unwrap();
-    assert!(unchanged.contains(r#""items":[]"#));
+    let delta_items = frame_projection_items(frames[1].canonical_payload());
+    assert!(matches!(
+        &delta_items[..],
+        [CanonicalInputItem::Instruction {
+            authority: InstructionAuthority::Developer,
+            ..
+        }]
+    ));
+    let delta = combine(item_documents(&delta_items));
+    assert!(delta.has_attribute("rendering_mode", "delta"));
+    assert!(delta.has_element("insert"));
+    assert!(delta.has_field("item", "second"));
+    assert!(!delta.has_text("first"));
+    assert!(frame_projection_items(frames[2].canonical_payload()).is_empty());
     app.shutdown().await.unwrap();
 }

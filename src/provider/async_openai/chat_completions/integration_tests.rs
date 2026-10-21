@@ -25,7 +25,7 @@ use crate::{
         ComponentHost,
     },
     llm_call::TextTurnEvent,
-    pom::{Document, ResolvedDocument, TextNode, XmlNode},
+    pom::{Document, ResolvedDocument},
     pom_resolution::resolve_artifact_document,
     transcript::{CanonicalInputItem, ConversationRole, InstructionAuthority},
 };
@@ -102,7 +102,7 @@ fn diff_prompt_application(
     let value = props.value;
     view! {
         #[diff(slot = "state")]
-        current_state { "{value}" }
+        { value }
     }
 }
 
@@ -115,10 +115,10 @@ fn chat_input_gate_application(
     let state = props.state;
     view! {
         #[system_once]
-        gate_system { "{system}" }
+        { system }
 
         #[diff(slot = "state")]
-        gate_state { "{state}" }
+        { state }
     }
 }
 
@@ -131,7 +131,7 @@ fn chat_native_tool_gate_application(
     if props.declare_tool {
         view! {
             #[diff(slot = "state")]
-            native_gate_state { "{state}" }
+            { state }
             {
                 NativeToolCall::named("native-gate-secret-tool")
                     .on_call(|call| async move {
@@ -142,7 +142,7 @@ fn chat_native_tool_gate_application(
     } else {
         view! {
             #[diff(slot = "state")]
-            native_gate_state { "{state}" }
+            { state }
         }
     }
 }
@@ -301,13 +301,8 @@ async fn spawn_header_capture_server() -> (
     (format!("http://{address}"), header_rx, shutdown_tx, server)
 }
 
-fn xml_document(name: &str, text: &str) -> ResolvedDocument {
-    let node = XmlNode::try_build(name, |children| {
-        children.text(TextNode::new(text));
-        Ok(())
-    })
-    .unwrap();
-    resolve_artifact_document(Document::from_xml(node)).unwrap()
+fn prompt_document(text: &str) -> ResolvedDocument {
+    resolve_artifact_document(Document::from_raw_text(text)).unwrap()
 }
 
 fn projection(items: Vec<CanonicalInputItem>) -> RenderedProjection {
@@ -469,15 +464,12 @@ async fn complete_projection_maps_instruction_authority_and_streams_text() {
         spawn_server(vec![ServerReply::Completed(&["hello ", "world"])]).await;
     let mut provider = provider(api_base);
     let current = projection(vec![
-        CanonicalInputItem::instruction(
-            InstructionAuthority::System,
-            xml_document("rules", "system"),
-        ),
+        CanonicalInputItem::instruction(InstructionAuthority::System, prompt_document("system")),
         CanonicalInputItem::instruction(
             InstructionAuthority::Developer,
-            xml_document("policy", "developer"),
+            prompt_document("developer"),
         ),
-        CanonicalInputItem::message(ConversationRole::User, xml_document("request", "user")),
+        CanonicalInputItem::message(ConversationRole::User, prompt_document("user")),
     ]);
 
     let (events, fault) = trace_provider(&mut provider, current).await;
@@ -514,7 +506,7 @@ async fn serialized_chat_request_body_limit_uses_exact_json_bytes_before_dispatc
     let exact_text = "p".repeat(raw_bytes);
     let exact_projection = projection(vec![CanonicalInputItem::message(
         ConversationRole::User,
-        xml_document("payload", &exact_text),
+        prompt_document(&exact_text),
     )]);
     let mut calibration = provider(api_base.clone());
 
@@ -549,7 +541,7 @@ async fn serialized_chat_request_body_limit_uses_exact_json_bytes_before_dispatc
         &mut plus_one_provider,
         projection(vec![CanonicalInputItem::message(
             ConversationRole::User,
-            xml_document("payload", &plus_one_sentinel),
+            prompt_document(&plus_one_sentinel),
         )]),
     )
     .await;
@@ -566,7 +558,7 @@ async fn serialized_chat_request_body_limit_uses_exact_json_bytes_before_dispatc
         &mut escaped_provider,
         projection(vec![CanonicalInputItem::message(
             ConversationRole::User,
-            xml_document("payload", &escaped_sentinel),
+            prompt_document(&escaped_sentinel),
         )]),
     )
     .await;
@@ -633,9 +625,6 @@ async fn serialized_chat_request_body_limit_failure_preserves_history_and_diff_m
     assert!(valid_fault.is_none());
     let valid_body = bodies.recv().await.unwrap();
     assert_eq!(valid_body, calibrated_retry_body);
-    assert!(!String::from_utf8(valid_body)
-        .unwrap()
-        .contains(&oversized_sentinel));
 
     let _ = shutdown.send(());
     server.await.unwrap();
@@ -649,10 +638,9 @@ async fn private_assistant_history_is_reused_without_duplicate_projection_submis
     ])
     .await;
     let mut provider = provider(api_base);
-    let first_user =
-        CanonicalInputItem::message(ConversationRole::User, xml_document("request", "first"));
+    let first_user = CanonicalInputItem::message(ConversationRole::User, prompt_document("first"));
     let second_user =
-        CanonicalInputItem::message(ConversationRole::User, xml_document("request", "second"));
+        CanonicalInputItem::message(ConversationRole::User, prompt_document("second"));
 
     let (_, first_fault) =
         trace_provider(&mut provider, projection(vec![first_user.clone()])).await;
@@ -695,10 +683,7 @@ async fn diff_marked_component_state_is_lowered_against_the_accepted_chat_baseli
     let (_, first_fault) = trace_provider(&mut provider, diff_projection("A")).await;
     assert!(first_fault.is_none());
     let first: serde_json::Value = serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
-    assert_eq!(
-        first["messages"][0]["content"],
-        "<current_state>A</current_state>"
-    );
+    assert_eq!(first["messages"][0]["content"], "A");
 
     let (_, second_fault) = trace_provider(&mut provider, diff_projection("A+")).await;
     assert!(second_fault.is_none());
@@ -706,7 +691,7 @@ async fn diff_marked_component_state_is_lowered_against_the_accepted_chat_baseli
     let submitted = second["messages"].as_array().unwrap().last().unwrap()["content"]
         .as_str()
         .unwrap();
-    assert_eq!(submitted, "<current_state>A+</current_state>");
+    assert_eq!(submitted, "A+");
 
     let (_, third_fault) = trace_provider(&mut provider, diff_projection("A")).await;
     assert!(third_fault.is_none());
@@ -714,7 +699,7 @@ async fn diff_marked_component_state_is_lowered_against_the_accepted_chat_baseli
     let submitted = third["messages"].as_array().unwrap().last().unwrap()["content"]
         .as_str()
         .unwrap();
-    assert_eq!(submitted, "<current_state>A</current_state>");
+    assert_eq!(submitted, "A");
 
     let (_, fourth_fault) = trace_provider(&mut provider, diff_projection("A+")).await;
     assert!(fourth_fault.is_none());
@@ -722,7 +707,7 @@ async fn diff_marked_component_state_is_lowered_against_the_accepted_chat_baseli
     let submitted = fourth["messages"].as_array().unwrap().last().unwrap()["content"]
         .as_str()
         .unwrap();
-    assert_eq!(submitted, "<current_state>A+</current_state>");
+    assert_eq!(submitted, "A+");
 
     let _ = shutdown.send(());
     server.await.unwrap();
@@ -781,14 +766,10 @@ async fn changed_system_is_rejected_without_advancing_history_or_diff_memo() {
     let messages = retry["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[0]["role"], "system");
-    assert_eq!(
-        messages[0]["content"],
-        "<gate_system>system-authority-a</gate_system>"
-    );
-    assert_eq!(messages[1]["content"], "<gate_state>state-a</gate_state>");
+    assert_eq!(messages[0]["content"], "system-authority-a");
+    assert_eq!(messages[1]["content"], "state-a");
     assert_eq!(messages[2]["content"], "first answer");
-    assert_eq!(messages[3]["content"], "<gate_state>state-b</gate_state>");
-    assert!(!retry.to_string().contains("system-authority-b-secret"));
+    assert_eq!(messages[3]["content"], "state-b");
 
     let _ = shutdown.send(());
     server.await.unwrap();
@@ -835,8 +816,12 @@ async fn identical_system_remains_legal_after_projection_scope_reset() {
         final_fault.is_none(),
         "an unchanged System must remain legal after a scope reset"
     );
-    let final_body = String::from_utf8(bodies.recv().await.unwrap()).unwrap();
-    assert!(final_body.contains("state-c"));
+    let final_body: serde_json::Value =
+        serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
+    assert_eq!(
+        final_body["messages"].as_array().unwrap().last().unwrap()["content"],
+        "state-c"
+    );
 
     let _ = shutdown.send(());
     server.await.unwrap();
@@ -891,16 +876,10 @@ async fn native_tool_declarations_are_rejected_without_advancing_history_or_diff
     let retry: serde_json::Value = serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
     let messages = retry["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 3);
-    assert_eq!(
-        messages[0]["content"],
-        "<native_gate_state>native-state-a</native_gate_state>"
-    );
+    assert_eq!(messages[0]["content"], "native-state-a");
     assert_eq!(messages[1]["content"], "retained answer");
-    assert_eq!(
-        messages[2]["content"],
-        "<native_gate_state>native-state-b</native_gate_state>"
-    );
-    assert!(!retry.to_string().contains("native-gate-secret-tool"));
+    assert_eq!(messages[2]["content"], "native-state-b");
+    assert!(retry.get("tools").is_none());
 
     let _ = shutdown.send(());
     server.await.unwrap();
@@ -941,12 +920,12 @@ async fn faulted_diff_submission_replays_causal_input_and_retained_partial() {
     assert_eq!(
         contents,
         [
-            "<current_state>A</current_state>",
+            "A",
             "accepted",
-            "<current_state>B</current_state>",
+            "B",
             "discarded",
             "[agentview: assistant output interrupted before completion]",
-            "<current_state>B</current_state>",
+            "B",
         ]
     );
 
@@ -962,10 +941,9 @@ async fn provider_private_output_bridges_a_projection_that_has_not_claimed_it_ye
     ])
     .await;
     let mut provider = provider(api_base);
-    let first_user =
-        CanonicalInputItem::message(ConversationRole::User, xml_document("request", "first"));
+    let first_user = CanonicalInputItem::message(ConversationRole::User, prompt_document("first"));
     let second_user =
-        CanonicalInputItem::message(ConversationRole::User, xml_document("request", "second"));
+        CanonicalInputItem::message(ConversationRole::User, prompt_document("second"));
 
     let _ = trace_provider(&mut provider, projection(vec![first_user.clone()])).await;
     let _ = bodies.recv().await.unwrap();
@@ -1013,7 +991,7 @@ async fn dropping_after_text_complete_retains_validated_history_before_public_eo
     let mut provider = provider(api_base);
     let first = projection(vec![CanonicalInputItem::message(
         ConversationRole::User,
-        xml_document("request", "first"),
+        prompt_document("first"),
     )]);
     let mut stream = provider.execute(first).await.unwrap();
     while let Some(event) = stream.next().await {
@@ -1029,16 +1007,16 @@ async fn dropping_after_text_complete_retains_validated_history_before_public_eo
 
     let next = projection(vec![CanonicalInputItem::message(
         ConversationRole::User,
-        xml_document("request", "next"),
+        prompt_document("next"),
     )]);
     let (_, fault) = trace_provider(&mut provider, next).await;
     assert!(fault.is_none());
     let request: serde_json::Value = serde_json::from_slice(&bodies.recv().await.unwrap()).unwrap();
     let messages = request["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 3);
-    assert_eq!(messages[0]["content"], "<request>first</request>");
+    assert_eq!(messages[0]["content"], "first");
     assert_eq!(messages[1]["content"], "uncommitted answer");
-    assert_eq!(messages[2]["content"], "<request>next</request>");
+    assert_eq!(messages[2]["content"], "next");
 
     let _ = shutdown.send(());
     server.await.unwrap();
@@ -1058,12 +1036,9 @@ async fn faulted_submission_retains_causal_input_and_interrupted_partial_history
     ])
     .await;
     let mut provider = provider(api_base);
-    let first =
-        CanonicalInputItem::message(ConversationRole::User, xml_document("request", "first"));
-    let second =
-        CanonicalInputItem::message(ConversationRole::User, xml_document("request", "second"));
-    let third =
-        CanonicalInputItem::message(ConversationRole::User, xml_document("request", "third"));
+    let first = CanonicalInputItem::message(ConversationRole::User, prompt_document("first"));
+    let second = CanonicalInputItem::message(ConversationRole::User, prompt_document("second"));
+    let third = CanonicalInputItem::message(ConversationRole::User, prompt_document("third"));
 
     let (_, first_fault) = trace_provider(&mut provider, projection(vec![first.clone()])).await;
     assert!(first_fault.is_none());
@@ -1088,16 +1063,14 @@ async fn faulted_submission_retains_causal_input_and_interrupted_partial_history
     assert_eq!(
         contents,
         [
-            "<request>first</request>",
+            "first",
             "confirmed",
-            "<request>second</request>",
+            "second",
             "discarded",
             "[agentview: assistant output interrupted before completion]",
-            "<request>third</request>"
+            "third"
         ]
     );
-    assert!(request.to_string().contains("discarded"));
-    assert!(request.to_string().contains("second"));
 
     let _ = shutdown.send(());
     server.await.unwrap();

@@ -10,8 +10,10 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use super::RenderedProjection;
+use crate::component::authoring::command_feedback::{
+    CommandFeedbackView, CommandResultView, InputFeedbackView,
+};
 use crate::component::signal::HookMount;
-use crate::pom::{BlockChildren, BlockContent, Document, MixedContent, TextNode, XmlName, XmlNode};
 
 /// An external invocation, decoded by a CLI or another application adapter.
 ///
@@ -132,6 +134,11 @@ pub struct CommandResponse {
     pub projection: RenderedProjection,
 }
 
+pub(crate) struct CommandFrameResponse {
+    pub(crate) outcomes: Vec<(CommandCall, CommandOutcome)>,
+    pub(crate) projection: RenderedProjection,
+}
+
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum CommandInputError {
     #[error("application command input is closed")]
@@ -158,6 +165,24 @@ impl CommandSender {
         self.sender
             .send(QueuedCommand::Call {
                 call,
+                reply: Some(reply),
+            })
+            .await
+            .map_err(|_| CommandInputError::Closed)?;
+        response.await.unwrap_or(Err(CommandInputError::Closed))
+    }
+
+    /// Retain one complete stdin frame in the queue until every action has
+    /// prepared. A dropped waiter does not retract the accepted frame.
+    pub(crate) async fn submit_frame(
+        &self,
+        calls: Vec<CommandCall>,
+    ) -> Result<CommandFrameResponse, CommandInputError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(QueuedCommand::Frame {
+                calls: calls.into(),
+                outcomes: Vec::new(),
                 reply: Some(reply),
             })
             .await
@@ -204,6 +229,11 @@ enum QueuedCommand {
         call: CommandCall,
         reply: Option<oneshot::Sender<Result<CommandResponse, CommandInputError>>>,
     },
+    Frame {
+        calls: VecDeque<CommandCall>,
+        outcomes: Vec<(CommandCall, CommandOutcome)>,
+        reply: Option<oneshot::Sender<Result<CommandFrameResponse, CommandInputError>>>,
+    },
     Observe {
         reply: Option<oneshot::Sender<Result<RenderedProjection, CommandInputError>>>,
         feedback: Option<(String, String)>,
@@ -214,6 +244,11 @@ impl QueuedCommand {
     fn fail(&mut self, error: CommandInputError) {
         match self {
             Self::Call { reply, .. } => {
+                if let Some(reply) = reply.take() {
+                    let _ = reply.send(Err(error));
+                }
+            }
+            Self::Frame { reply, .. } => {
                 if let Some(reply) = reply.take() {
                     let _ = reply.send(Err(error));
                 }
@@ -244,8 +279,10 @@ struct PendingCommand {
 /// Components access it by declaring `use_wait_for_command()`.
 pub struct CommandInput {
     receiver: mpsc::Receiver<QueuedCommand>,
+    reserved: Option<QueuedCommand>,
     pending: Option<PendingCommand>,
     prefix: String,
+    new_feedback_frame: bool,
 }
 
 impl CommandInput {
@@ -256,8 +293,10 @@ impl CommandInput {
             CommandSender { sender },
             Self {
                 receiver,
+                reserved: None,
                 pending: None,
                 prefix: String::new(),
+                new_feedback_frame: true,
             },
         )
     }
@@ -270,6 +309,14 @@ impl CommandInput {
 
     pub(crate) fn prefix(&self) -> &str {
         &self.prefix
+    }
+
+    pub(crate) fn finish_feedback_frame(&mut self) {
+        self.new_feedback_frame = true;
+    }
+
+    pub(crate) fn take_new_feedback_frame(&mut self) -> bool {
+        std::mem::take(&mut self.new_feedback_frame)
     }
 
     pub(crate) fn belongs_to(&self, mount: &HookMount) -> bool {
@@ -291,6 +338,7 @@ impl CommandInput {
     pub(crate) fn call(&self) -> Option<&CommandCall> {
         match &self.pending.as_ref()?.request {
             QueuedCommand::Call { call, .. } => Some(call),
+            QueuedCommand::Frame { calls, .. } => calls.front(),
             QueuedCommand::Observe { .. } => None,
         }
     }
@@ -302,11 +350,30 @@ impl CommandInput {
         }
     }
 
+    /// The stdin owner waits for demand before running ordinary preparations.
+    /// Keep the request unbound until preparation reaches the current wait mount.
+    pub(crate) async fn reserve_next(&mut self) -> bool {
+        if self.pending.is_some() || self.reserved.is_some() {
+            return true;
+        }
+        // recv is cancellation safe; retain ownership in the same poll that
+        // receives the entry, before the caller can begin another operation.
+        self.reserved = self.receiver.recv().await;
+        self.reserved.is_some()
+    }
+
     pub(crate) async fn receive(&mut self, origin: HookMount) -> bool {
         if self.pending.is_none() {
-            let Some(request) = self.receiver.recv().await else {
+            let request = match self.reserved.take() {
+                Some(request) => Some(request),
+                None => self.receiver.recv().await,
+            };
+            let Some(request) = request else {
                 return false;
             };
+            if matches!(&request, QueuedCommand::Frame { calls, .. } if !calls.is_empty()) {
+                self.finish_feedback_frame();
+            }
             // No await between receiving and retaining ownership.
             self.pending = Some(PendingCommand {
                 request,
@@ -348,13 +415,61 @@ impl CommandInput {
         ) {
             return;
         }
-        let pending = self.pending.take().expect("completed request");
-        match (pending.request, pending.state) {
+        let PendingCommand {
+            request,
+            state,
+            origin,
+        } = self.pending.take().expect("completed request");
+        match (request, state) {
             (QueuedCommand::Call { call, reply }, PendingCommandState::Applied(outcome)) => {
                 if let Some(reply) = reply {
                     let _ = reply.send(Ok(CommandResponse {
                         call,
                         outcome,
+                        projection: projection.clone(),
+                    }));
+                }
+            }
+            (
+                QueuedCommand::Frame {
+                    mut calls,
+                    mut outcomes,
+                    reply,
+                },
+                PendingCommandState::Applied(outcome),
+            ) => {
+                let call = calls.pop_front().expect("completed frame action");
+                outcomes.push((call, outcome));
+                if calls.is_empty() {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(CommandFrameResponse {
+                            outcomes,
+                            projection: projection.clone(),
+                        }));
+                    }
+                } else {
+                    // Keep ownership of this queue entry across preparations;
+                    // no observation or other frame can interrupt its actions.
+                    self.pending = Some(PendingCommand {
+                        request: QueuedCommand::Frame {
+                            calls,
+                            outcomes,
+                            reply,
+                        },
+                        state: PendingCommandState::Received,
+                        origin,
+                    });
+                }
+            }
+            (
+                QueuedCommand::Frame {
+                    outcomes, reply, ..
+                },
+                PendingCommandState::Observed,
+            ) => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Ok(CommandFrameResponse {
+                        outcomes,
                         projection: projection.clone(),
                     }));
                 }
@@ -370,6 +485,9 @@ impl CommandInput {
 
     pub(crate) fn close(&mut self) {
         self.receiver.close();
+        if let Some(mut reserved) = self.reserved.take() {
+            reserved.fail(CommandInputError::Closed);
+        }
         self.fail_command(CommandInputError::Closed);
         while let Ok(mut queued) = self.receiver.try_recv() {
             queued.fail(CommandInputError::Closed);
@@ -386,127 +504,54 @@ impl Drop for CommandInput {
 #[derive(Clone, Default)]
 pub(crate) struct CommandFeedback {
     sequence: u64,
-    records: VecDeque<(u64, String, CommandOutcome)>,
+    records: Vec<(u64, String, CommandOutcome)>,
     input_feedback: Option<(String, String)>,
 }
 
 impl CommandFeedback {
-    pub(crate) fn record(&mut self, call: &CommandCall, outcome: CommandOutcome) {
+    pub(crate) fn record(&mut self, call: &CommandCall, outcome: CommandOutcome, new_frame: bool) {
         self.input_feedback = None;
         self.sequence = self.sequence.saturating_add(1);
-        if self.records.len() == 8 {
-            self.records.pop_front();
+        if new_frame {
+            self.records.clear();
         }
         self.records
-            .push_back((self.sequence, call.name().to_owned(), outcome));
+            .push((self.sequence, call.name().to_owned(), outcome));
     }
 
     pub(crate) fn input_feedback(&mut self, code: String, message: String) {
         self.input_feedback = Some((code, message));
     }
 
-    pub(crate) fn prompt_document(&self) -> Result<Document, String> {
-        self.build_document().map_err(|error| error.to_string())
-    }
-
-    fn build_document(&self) -> Result<Document, crate::pom::PomError> {
-        let mut root = XmlNode::new(XmlName::new("command_feedback")?);
-        root.push_attribute(XmlName::new("sequence")?, self.sequence.to_string())?;
-        if let Some((code, message)) = &self.input_feedback {
-            let mut feedback = XmlNode::new(XmlName::new("input_feedback")?);
-            feedback.push_attribute(XmlName::new("code")?, feedback_display(code, 128))?;
-            feedback.push(MixedContent::text(TextNode::new(feedback_display(
-                message, 4096,
-            ))));
-            root.push(MixedContent::xml(feedback));
-        }
-        for (sequence, command, outcome) in &self.records {
-            let mut entry = XmlNode::new(XmlName::new("command_result")?);
-            entry.push_attribute(XmlName::new("sequence")?, sequence.to_string())?;
-            entry.push_attribute(XmlName::new("command")?, feedback_display(command, 512))?;
-            let text = match outcome {
-                CommandOutcome::Output(value) => {
-                    entry.push_attribute(XmlName::new("status")?, "completed")?;
-                    value.to_string()
-                }
-                CommandOutcome::Rejected { code, message } => {
-                    entry.push_attribute(XmlName::new("status")?, "rejected")?;
-                    entry.push_attribute(XmlName::new("code")?, feedback_display(code, 128))?;
-                    message.clone()
-                }
-            };
-            entry.push(MixedContent::text(TextNode::new(feedback_display(
-                &text, 4096,
-            ))));
-            root.push(MixedContent::xml(entry));
-        }
-        let mut children = BlockChildren::new();
-        children.push(BlockContent::xml(root));
-        Ok(Document::new(children))
-    }
-}
-
-// Bound displayed fields after JSON string encoding, so all eight retained
-// records leave room for the application's current view. Prompt data otherwise
-// stays verbatim; the original invocation and output stay in CommandResponse.
-fn feedback_display(value: &str, encoded_budget: usize) -> String {
-    const TRUNCATED: &str = "… (truncated)";
-    let suffix_bytes: usize = TRUNCATED.chars().map(feedback_encoded_bytes).sum();
-    let content_budget = encoded_budget.saturating_sub(suffix_bytes);
-    let mut displayed = String::with_capacity(value.len().min(encoded_budget));
-    let mut encoded_bytes = 0;
-    for character in value.chars() {
-        encoded_bytes += feedback_encoded_bytes(character);
-        if encoded_bytes > content_budget {
-            displayed.push_str(TRUNCATED);
-            break;
-        }
-        displayed.push(character);
-    }
-    displayed
-}
-
-// JSON string-content bytes, excluding the surrounding quotes. The rendered
-// projection adds no XML entities or Markdown escapes to these data fields.
-fn feedback_encoded_bytes(character: char) -> usize {
-    match character {
-        '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
-        '\0'..='\u{1f}' => 6,
-        _ => character.len_utf8(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::feedback_display;
-
-    #[test]
-    fn feedback_preserves_source_text_within_its_display_budget() {
-        let source = "    &<>\"'\\`*_[]#-+~.)\t\n\r\0\u{8}\u{b}\u{c}\u{1f}\u{fffe}\u{ffff}界🦀";
-        let displayed = feedback_display(source, 4096);
-        assert_eq!(displayed, source);
-        let encoded = serde_json::to_string(&displayed).unwrap();
-        assert_eq!(serde_json::from_str::<String>(&encoded).unwrap(), source);
-
-        let punctuation = "&<>*_[]#`' ".repeat(200);
-        assert_eq!(feedback_display(&punctuation, 4096), punctuation);
-    }
-
-    #[test]
-    fn truncated_feedback_fits_its_actual_json_budget_on_character_boundaries() {
-        let mut alphabet = String::from("    &<>\"'\\`*_[]#-+~.)界🦀\u{fffe}\u{ffff}");
-        alphabet.extend('\0'..='\u{1f}');
-        let source = alphabet.repeat(128);
-        for budget in [128, 512, 4096] {
-            let displayed = feedback_display(&source, budget);
-            let prefix = displayed
-                .strip_suffix("… (truncated)")
-                .expect("over-budget feedback declares its truncation");
-            assert!(source.starts_with(prefix));
-            assert!(serde_json::to_vec(&displayed).unwrap().len() - 2 <= budget);
-            let next = source[prefix.len()..].chars().next().unwrap();
-            let extended = format!("{prefix}{next}… (truncated)");
-            assert!(serde_json::to_vec(&extended).unwrap().len() - 2 > budget);
+    pub(crate) fn snapshot(&self) -> CommandFeedbackView {
+        CommandFeedbackView {
+            sequence: self.sequence,
+            input_feedback: self
+                .input_feedback
+                .as_ref()
+                .map(|(code, text)| InputFeedbackView {
+                    code: code.clone(),
+                    text: text.clone(),
+                }),
+            records: self
+                .records
+                .iter()
+                .map(|(sequence, command, outcome)| {
+                    let (status, code, text) = match outcome {
+                        CommandOutcome::Output(value) => ("completed", None, value.to_string()),
+                        CommandOutcome::Rejected { code, message } => {
+                            ("rejected", Some(code.clone()), message.clone())
+                        }
+                    };
+                    CommandResultView {
+                        sequence: *sequence,
+                        command: command.clone(),
+                        status,
+                        code,
+                        text,
+                    }
+                })
+                .collect(),
         }
     }
 }

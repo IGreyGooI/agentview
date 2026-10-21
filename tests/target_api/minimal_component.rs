@@ -20,10 +20,12 @@ use agentview::{
         prelude::*,
         ComponentHost,
     },
-    pom_renderer::render_pom_document,
     transcript::{CanonicalInputItem, InstructionAuthority},
 };
 use async_trait::async_trait;
+#[path = "../support/pom.rs"]
+mod pom;
+use pom::InspectPom;
 
 #[derive(Clone)]
 struct TargetProps {
@@ -100,20 +102,6 @@ impl ProviderPort for ScriptedProvider {
     }
 }
 
-fn projection_text(projection: &RenderedProjection) -> String {
-    projection
-        .nodes()
-        .iter()
-        .flat_map(|node| node.items())
-        .filter_map(|item| match item {
-            CanonicalInputItem::Instruction { pom, .. }
-            | CanonicalInputItem::Message { pom, .. } => Some(render_pom_document(pom).unwrap()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[tokio::test]
 async fn full_projection_and_typed_feedback_use_the_same_component_host() {
     let provider = ScriptedProvider::new([VecDeque::from([ProviderEvent::Text(
@@ -149,7 +137,7 @@ async fn full_projection_and_typed_feedback_use_the_same_component_host() {
             ..
         })
     ));
-    assert!(projection_text(&projections[0]).contains("first request"));
+    assert!(pom::projection_document(&projections[0]).has_field("request", "first request"));
 }
 
 #[tokio::test]
@@ -181,6 +169,6 @@ async fn every_reaction_sends_a_complete_current_projection() {
 
     let projections = observer.projections();
     assert_eq!(projections.len(), 2);
-    assert!(projection_text(&projections[0]).contains("first request"));
-    assert!(projection_text(&projections[1]).contains("second request"));
+    assert!(pom::projection_document(&projections[0]).has_field("request", "first request"));
+    assert!(pom::projection_document(&projections[1]).has_field("request", "second request"));
 }

@@ -1,5 +1,5 @@
 use agentview::{
-    pom::{Document, ResolvedDocument, TextNode, XmlName, XmlNode},
+    pom::{Document, ResolvedDocument},
     pom_resolution::resolve_artifact_document,
     provider::{
         async_openai::{AsyncOpenAiConfigError, AsyncOpenAiTransportConfig},
@@ -25,36 +25,23 @@ use sha2::{Digest, Sha256};
 const ORACLE_BODY: &[u8] = include_bytes!("fixtures/codex_http_v1/request.body");
 const ORACLE_METADATA: &str = include_str!("fixtures/codex_http_v1/metadata.json");
 
-fn xml_document(name: &str, attributes: &[(&str, &str)], text: &str) -> ResolvedDocument {
-    let mut node = XmlNode::try_build(name, |children| {
-        children.text(TextNode::new(text));
-        Ok(())
-    })
-    .unwrap();
-    for (name, value) in attributes {
-        node.push_attribute(XmlName::new(*name).unwrap(), *value)
-            .unwrap();
-    }
-    resolve_artifact_document(Document::from_xml(node)).unwrap()
+fn raw_document(text: &str) -> ResolvedDocument {
+    resolve_artifact_document(Document::from_raw_text(text.to_owned())).unwrap()
 }
 
 fn oracle_transcript() -> CanonicalTranscript {
     let transcript = [
         CanonicalInputItem::instruction(
             InstructionAuthority::System,
-            xml_document("chess_rules", &[], "Play legal chess."),
+            raw_document("<chess_rules>Play legal chess.</chess_rules>"),
         ),
         CanonicalInputItem::instruction(
             InstructionAuthority::Developer,
-            xml_document("chess_reply_protocol", &[], "Return exactly one move."),
+            raw_document("<chess_reply_protocol>Return exactly one move.</chess_reply_protocol>"),
         ),
         CanonicalInputItem::message(
             ConversationRole::User,
-            xml_document(
-                "chess_task",
-                &[("turn_id", "turn-7")],
-                "Choose a move & explain.",
-            ),
+            raw_document(r#"<chess_task turn_id="turn-7">Choose a move & explain.</chess_task>"#),
         ),
     ]
     .into_iter()
@@ -85,7 +72,7 @@ fn oracle_transcript() -> CanonicalTranscript {
         CanonicalInputItem::tool_result("call_7", r#"["e2e4","d2d4"]"#).unwrap(),
         CanonicalInputItem::message(
             ConversationRole::User,
-            xml_document("continue", &[], "Choose from the legal moves."),
+            raw_document("<continue>Choose from the legal moves.</continue>"),
         ),
     ]
     .into_iter()
@@ -195,7 +182,7 @@ fn history_policy_maps_assistant_text_to_output_text() {
     let transcript = CanonicalTranscript::new()
         .appended(CanonicalInputItem::message(
             ConversationRole::Assistant,
-            xml_document("move", &[], "e2e4"),
+            raw_document("e2e4"),
         ))
         .unwrap();
     let options = CodexHttpV1Options::new(
@@ -213,7 +200,7 @@ fn history_policy_maps_assistant_text_to_output_text() {
 
     assert_eq!(body["input"][0]["role"], "assistant");
     assert_eq!(body["input"][0]["content"][0]["type"], "output_text");
-    assert_eq!(body["input"][0]["content"][0]["text"], "<move>e2e4</move>");
+    assert_eq!(body["input"][0]["content"][0]["text"], "e2e4");
 }
 
 #[test]
@@ -385,10 +372,7 @@ fn a_second_system_instruction_fails_closed() {
     let transcript = ["first", "second"]
         .into_iter()
         .map(|text| {
-            CanonicalInputItem::instruction(
-                InstructionAuthority::System,
-                xml_document("system", &[], text),
-            )
+            CanonicalInputItem::instruction(InstructionAuthority::System, raw_document(text))
         })
         .try_fold(CanonicalTranscript::new(), |transcript, item| {
             transcript.appended(item)

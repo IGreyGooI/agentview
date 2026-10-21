@@ -1,6 +1,6 @@
 //! A retained application for stdin/stdout frontends, without a model provider.
 
-use std::{future::Future, ops::ControlFlow};
+use std::{future::Future, ops::ControlFlow, time::Duration};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
@@ -21,8 +21,18 @@ use super::{
 mod cli;
 #[cfg(unix)]
 mod daemon;
+#[cfg(unix)]
+mod delivery;
+#[cfg(unix)]
+mod history;
+#[cfg(unix)]
+mod input;
 
-/// One response for stdout: a callback result alongside the complete current view.
+#[cfg(unix)]
+use delivery::StdinDelivery;
+
+/// A callback result alongside its view. The programmatic application methods
+/// return complete snapshots; the standard CLI lowers reader-specific Frames.
 ///
 /// `ok` says the action was dispatched successfully, not whether the business
 /// operation was accepted. Business outcomes belong to the callback's `result`.
@@ -37,6 +47,24 @@ pub struct StdinResponse {
     )]
     pub result: Option<Value>,
     pub view: String,
+}
+
+/// The application declares complete state; each frontend lowers its own Frame.
+#[derive(Debug)]
+struct StdinProjectionResponse {
+    ok: bool,
+    result: Option<Value>,
+    projection: RenderedProjection,
+}
+
+impl StdinProjectionResponse {
+    fn into_response(self) -> Result<StdinResponse, StdinApplicationError> {
+        Ok(StdinResponse {
+            ok: self.ok,
+            result: self.result,
+            view: render(&self.projection)?,
+        })
+    }
 }
 
 // A callback may legitimately return JSON null. An absent field denotes an
@@ -72,6 +100,19 @@ pub enum StdinApplicationError {
     },
 }
 
+/// Process frontend delivery policy. Preparation and callbacks remain serialized
+/// by the retained application's ordinary command queue.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StdinApplicationOptions {
+    /// Observe prepared application state while stdin is idle. The first view is
+    /// always delivered immediately; unchanged idle observations produce no
+    /// stdout. A positive interval is required when this option is enabled.
+    ///
+    /// Refreshing does not invoke an Action or clear its feedback. Applications
+    /// that read external state should do so in their ordinary preparation hook.
+    pub idle_refresh_interval: Option<Duration>,
+}
+
 /// Mount a Component tree whose root explicitly waits for command input.
 ///
 /// [`Self::run`] owns the complete CLI, stdin/stdout and daemon lifecycle.
@@ -90,10 +131,22 @@ impl StdinApplication {
     ///
     /// Call this from a Tokio `main` and return its exit code. The CLI accepts
     /// `start`, `status`, `stop`, `restart`, `help`, and an optional `--socket PATH`.
-    /// Without a subcommand it reads JSON actions from stdin, starts a missing
-    /// daemon, and flushes each callback result and updated view to stdout.
-    /// Empty stdin observes the current view; terminal input observes first.
+    /// Without a subcommand it immediately shows the prepared initial view, then
+    /// collects JSON action objects into ordered frames.
+    /// A final newline followed by 100 ms without input submits a frame;
+    /// EOF immediately submits the remaining frame, even without a newline.
+    /// Objects may span lines. Connecting starts a missing daemon as needed;
+    /// each action frame returns one final view with every result.
+    /// The first response is complete; later responses on the same frontend
+    /// connection use native Frame diff to omit unchanged state and schemas.
+    /// A new frontend connection starts with its own complete view.
+    /// A long-lived caller sends a complete batch, waits for its view, then
+    /// sends the next batch. Tool or OS write calls are not framing boundaries.
+    /// Empty stdin receives only the initial view, with no duplicate at EOF.
+    /// Use [`Self::run_with_options`] to observe external state while input is idle.
     /// EOF leaves the daemon and its application state running.
+    /// Socket transfers time out after ten seconds. Queue and callback execution
+    /// may take up to five minutes before the daemon starts its response.
     /// Lifecycle requests wait behind accepted actions; an unfinished async
     /// action can make `stop` or `restart` time out without stopping the daemon.
     ///
@@ -104,13 +157,24 @@ impl StdinApplication {
     pub async fn run(
         root: impl Fn() -> Component + Send + Sync + 'static,
     ) -> std::process::ExitCode {
+        Self::run_with_options(root, StdinApplicationOptions::default()).await
+    }
+
+    /// Run the standard process frontend with an optional idle observation
+    /// interval. A refresh waits for accepted action batches to finish, preserves
+    /// buffered stdin and command feedback, and uses the same native Frame cursor
+    /// as action responses. No request is retried after submission.
+    pub async fn run_with_options(
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        options: StdinApplicationOptions,
+    ) -> std::process::ExitCode {
         #[cfg(unix)]
         {
-            cli::run(root).await
+            cli::run(root, options).await
         }
         #[cfg(not(unix))]
         {
-            let _ = root;
+            let _ = (root, options);
             eprintln!("agentview: the stdin daemon runner requires Unix domain sockets on a Unix platform");
             std::process::ExitCode::FAILURE
         }
@@ -142,29 +206,85 @@ impl StdinApplication {
         &mut self,
         call: CommandCall,
     ) -> Result<StdinResponse, StdinApplicationError> {
+        self.submit_projection(call).await?.into_response()
+    }
+
+    async fn submit_projection(
+        &mut self,
+        call: CommandCall,
+    ) -> Result<StdinProjectionResponse, StdinApplicationError> {
         let sender = self.sender.clone();
-        let response = self.receive(sender.submit(call)).await?;
-        let (ok, result) = match response.outcome {
+        let mut response = self.receive(sender.submit_frame(vec![call])).await?;
+        let (_, outcome) = response.outcomes.pop().expect("one submitted action");
+        let (ok, result) = match outcome {
             CommandOutcome::Output(value) => (true, value),
             CommandOutcome::Rejected { code, message } => {
                 (false, json!({"code": code, "message": message}))
             }
         };
-        Ok(StdinResponse {
+        Ok(StdinProjectionResponse {
             ok,
             result: Some(result),
-            view: render(&response.projection)?,
+            projection: response.projection,
+        })
+    }
+
+    /// Execute one complete frame in order and render its final view once.
+    /// Ordinary action rejections are retained alongside successful outcomes;
+    /// dropping the waiter leaves the accepted frame running to completion.
+    /// An empty frame observes current state without clearing its feedback.
+    pub async fn submit_frame(
+        &mut self,
+        calls: Vec<CommandCall>,
+    ) -> Result<StdinResponse, StdinApplicationError> {
+        self.submit_frame_projection(calls).await?.into_response()
+    }
+
+    async fn submit_frame_projection(
+        &mut self,
+        calls: Vec<CommandCall>,
+    ) -> Result<StdinProjectionResponse, StdinApplicationError> {
+        if calls.is_empty() {
+            return self.observe_projection().await;
+        }
+        let sender = self.sender.clone();
+        let response = self.receive(sender.submit_frame(calls)).await?;
+        let mut ok = true;
+        let results = response
+            .outcomes
+            .into_iter()
+            .map(|(call, outcome)| {
+                let (accepted, result) = match outcome {
+                    CommandOutcome::Output(value) => (true, value),
+                    CommandOutcome::Rejected { code, message } => {
+                        (false, json!({"code": code, "message": message}))
+                    }
+                };
+                ok &= accepted;
+                json!({"action": call.name(), "ok": accepted, "result": result})
+            })
+            .collect();
+        Ok(StdinProjectionResponse {
+            ok,
+            result: Some(Value::Array(results)),
+            projection: response.projection,
         })
     }
 
     /// Observe prepared state without invoking a callback or clearing feedback.
     pub async fn observe(&mut self) -> Result<StdinResponse, StdinApplicationError> {
+        self.observe_projection().await?.into_response()
+    }
+
+    async fn observe_projection(
+        &mut self,
+    ) -> Result<StdinProjectionResponse, StdinApplicationError> {
         let sender = self.sender.clone();
         let projection = self.receive(sender.observe()).await?;
-        Ok(StdinResponse {
+        Ok(StdinProjectionResponse {
             ok: true,
             result: None,
-            view: render(&projection)?,
+            projection,
         })
     }
 
@@ -174,14 +294,24 @@ impl StdinApplication {
         code: impl Into<String>,
         message: impl Into<String>,
     ) -> Result<StdinResponse, StdinApplicationError> {
+        self.feedback_projection(code, message)
+            .await?
+            .into_response()
+    }
+
+    async fn feedback_projection(
+        &mut self,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<StdinProjectionResponse, StdinApplicationError> {
         let sender = self.sender.clone();
         let projection = self
             .receive(sender.feedback(code.into(), message.into()))
             .await?;
-        Ok(StdinResponse {
+        Ok(StdinProjectionResponse {
             ok: false,
             result: None,
-            view: render(&projection)?,
+            projection,
         })
     }
 
@@ -251,6 +381,9 @@ async fn drive(
             if !application.has_command_wait() {
                 return Err(StdinApplicationError::MissingWait);
             }
+            if let ControlFlow::Break(_) = application.wait_for_command_request().await? {
+                return Ok(());
+            }
             if let ControlFlow::Break(_) = application.prepare().await? {
                 return Ok(());
             }
@@ -270,13 +403,23 @@ async fn drive(
 }
 
 fn render(projection: &RenderedProjection) -> Result<String, StdinApplicationError> {
+    render_items(projection.nodes().iter().flat_map(|node| node.items()))
+}
+
+fn render_items<'a>(
+    items: impl IntoIterator<Item = &'a CanonicalInputItem>,
+) -> Result<String, StdinApplicationError> {
     let mut sections = Vec::new();
-    for item in projection.nodes().iter().flat_map(|node| node.items()) {
+    for item in items {
         match item {
             CanonicalInputItem::Instruction { pom, .. }
             | CanonicalInputItem::Message { pom, .. } => sections.push(render_pom_document(pom)?),
             _ => return Err(StdinApplicationError::UnsupportedViewItem),
         }
     }
-    Ok(format!("{}\n", sections.join("\n\n")))
+    Ok(if sections.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", sections.join("\n\n"))
+    })
 }

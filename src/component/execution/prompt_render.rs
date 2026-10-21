@@ -19,11 +19,18 @@ pub(crate) fn render_projection_prompt(
         .map(|node| node.items().len())
         .sum();
     let mut sections = Vec::with_capacity(capacity);
+    let mut ephemeral = Vec::new();
     for node in projection.nodes() {
-        for item in node.items() {
-            sections.push(render_prompt_item(item)?);
+        for (index, item) in node.items().iter().enumerate() {
+            let section = render_prompt_item(item)?;
+            if node.is_ephemeral_item(index) {
+                ephemeral.push(section);
+            } else {
+                sections.push(section);
+            }
         }
     }
+    sections.extend(ephemeral);
     Ok(sections.join("\n\n"))
 }
 
@@ -94,26 +101,4 @@ fn render_pom(pom: &crate::pom::ResolvedDocument) -> Result<String, ProviderFaul
             "provider-neutral prompt renderer could not render canonical POM",
         )
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{render_prompt_item, ASSISTANT_OUTPUT_INTERRUPTED_MARKER};
-    use crate::transcript::CanonicalInputItem;
-
-    #[test]
-    fn interrupted_text_renders_with_the_standard_marker() {
-        let rendered = render_prompt_item(&CanonicalInputItem::interrupted_assistant_text(
-            "visible partial",
-            None,
-        ))
-        .unwrap();
-
-        assert_eq!(
-            rendered,
-            format!(
-                "## Assistant\n\nvisible partial\n\n## User\n\n{ASSISTANT_OUTPUT_INTERRUPTED_MARKER}"
-            )
-        );
-    }
 }

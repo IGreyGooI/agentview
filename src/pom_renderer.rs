@@ -39,10 +39,12 @@ pub enum PomRenderError {
 
 /// Renders a slot-free POM document to Markdown + XML-shaped prompt text.
 ///
-/// XML organizes the prompt for the model; it is not a serialization format for
-/// an XML parser. Data text and attribute values receive no escaping. XML keeps
-/// its structural indentation; explicitly authored Markdown nodes apply their
-/// own formatting and escaping.
+/// POM is not XML. Tag-shaped notation organizes the prompt for the model and
+/// need not be valid XML. Data text and attribute values receive no XML escaping.
+/// Code must not parse this output; inspect the typed POM or projection instead.
+/// Unit tests must verify structured data and behavior, not rendered prompts.
+/// Tagged nodes keep their structural indentation; explicitly authored Markdown
+/// nodes apply their own formatting and escaping.
 pub fn render_pom_document(document: &ResolvedDocument) -> Result<String, PomRenderError> {
     Renderer.render_block_children(document.children(), false)
 }

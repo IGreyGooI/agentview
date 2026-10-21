@@ -4,7 +4,10 @@
 //! coverage proofs. It never retains a Component projection, shared canonical
 //! history, semantic diff baseline, or ToolOutput staging.
 
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashSet},
+};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -107,6 +110,10 @@ struct PendingWireCall {
 }
 
 impl ResponsesFrameRequestState {
+    pub(super) fn is_compacted(&self) -> bool {
+        self.compaction_instructions.is_some()
+    }
+
     /// The source is from the previous accepted window. Keep the newest item
     /// and any unresolved call/partial tail outside the closed prefix.
     pub(super) fn compaction_source(&self) -> Option<CompactionSource> {
@@ -166,12 +173,32 @@ impl ResponsesFrameRequestState {
         Ok(Some(state))
     }
 
+    #[cfg(test)]
     pub(super) fn prepare(
         previous: Option<&Self>,
         frame: &Frame,
         encoder: &CodexHttpV1Encoder,
         max_serialized_request_body_bytes: usize,
     ) -> Result<PreparedResponsesFrameRequest, ResponsesFrameRequestFault> {
+        Self::prepare_with_measurements(
+            previous,
+            frame,
+            encoder,
+            max_serialized_request_body_bytes,
+            &mut None,
+        )
+    }
+
+    /// Collect the exact serialized size before the existing context gate,
+    /// including when that gate rejects. Measurements never retain body text.
+    pub(super) fn prepare_with_measurements(
+        previous: Option<&Self>,
+        frame: &Frame,
+        encoder: &CodexHttpV1Encoder,
+        max_serialized_request_body_bytes: usize,
+        request_body_bytes: &mut Option<usize>,
+    ) -> Result<PreparedResponsesFrameRequest, ResponsesFrameRequestFault> {
+        *request_body_bytes = None;
         let all_items = ordered_frame_items(frame);
         let system = frame_system_instructions(frame, encoder)?;
 
@@ -196,14 +223,36 @@ impl ResponsesFrameRequestState {
         state.revision = frame.revision();
         state.last_output_index = None;
 
+        // Ephemeral prompts are the last input of this exact request. Keep them
+        // outside the accepted wire window, canonical proofs, and compaction
+        // source so a later request cannot replay an earlier prompt value.
+        let request_input = if frame.submission().ephemeral().is_empty() {
+            Cow::Borrowed(state.wire_input.as_slice())
+        } else {
+            let mut input = state.wire_input.clone();
+            for item in frame.submission().ephemeral() {
+                let (instructions, values) = encoder
+                    .lower_canonical_item(item)
+                    .map_err(ResponsesFrameRequestFault::Encoding)?
+                    .into_parts();
+                if instructions.is_some() {
+                    return Err(ResponsesFrameRequestFault::UnexpectedSystemItem);
+                }
+                input.extend(values);
+            }
+            Cow::Owned(input)
+        };
+
         let request_body = encoder
             .encode_frame_request_bounded(
-                &state.wire_input,
+                &request_input,
                 &state.instructions,
                 frame.submission().tools().definitions(),
                 max_serialized_request_body_bytes,
             )
             .map_err(ResponsesFrameRequestFault::Encoding)?;
+
+        *request_body_bytes = Some(request_body.len());
 
         let constraints = &frame.prepared_profile().constraints;
         let limit = constraints
@@ -554,13 +603,13 @@ mod tests {
             TargetIdentity, ToolCatalog,
         },
         component::execution::ToolDefinition,
-        pom::{Document, TextNode, XmlNode},
+        pom::Document,
         pom_resolution::resolve_system_document,
         provider::codex_http_v1::{
             CodexFunctionTool, CodexHttpV1Encoder, CodexHttpV1Error, CodexHttpV1Options,
         },
         transcript::{
-            AssistantPhase, CanonicalInputItem, InstructionAuthority,
+            AssistantPhase, CanonicalInputItem, ConversationRole, InstructionAuthority,
             ASSISTANT_OUTPUT_INTERRUPTED_MARKER,
         },
     };
@@ -720,15 +769,65 @@ mod tests {
         )
     }
 
+    fn frame_with_ephemeral(
+        sequence: u64,
+        base: Option<FrameRevision>,
+        replay: Vec<CanonicalInputItem>,
+        staged_inputs: Vec<CanonicalInputItem>,
+        projection: Vec<CanonicalInputItem>,
+        ephemeral: Vec<CanonicalInputItem>,
+    ) -> Frame {
+        let submission = FrameSubmission::from_compiled(
+            replay,
+            staged_inputs,
+            ProjectionSubmission::new(projection),
+            ToolCatalog::new(Vec::new()).unwrap(),
+            Vec::new(),
+        )
+        .with_ephemeral(ephemeral);
+        let (continuity, basis) = match base {
+            Some(base) => (
+                TargetContinuity::Accepted {
+                    epoch: epoch(),
+                    revision: base,
+                },
+                FrameBasis::DeltaFrom(base),
+            ),
+            None => (
+                TargetContinuity::FullRequired { epoch: epoch() },
+                FrameBasis::Full,
+            ),
+        };
+        Frame::from_compiled(
+            revision(sequence),
+            target(),
+            epoch(),
+            continuity,
+            profile(),
+            basis,
+            submission,
+        )
+        .unwrap()
+    }
+
+    fn ephemeral_user(text: &str) -> CanonicalInputItem {
+        CanonicalInputItem::message(
+            ConversationRole::User,
+            resolve_system_document(Document::from_raw_text(text)),
+        )
+    }
+
+    fn ephemeral_developer(text: &str) -> CanonicalInputItem {
+        CanonicalInputItem::instruction(
+            InstructionAuthority::Developer,
+            resolve_system_document(Document::from_raw_text(text)),
+        )
+    }
+
     fn system(text: &str) -> CanonicalInputItem {
-        let node = XmlNode::try_build("system", |children| {
-            children.text(TextNode::new(text));
-            Ok(())
-        })
-        .unwrap();
         CanonicalInputItem::instruction(
             InstructionAuthority::System,
-            resolve_system_document(Document::from_xml(node)),
+            resolve_system_document(Document::from_raw_text(text)),
         )
     }
 
@@ -763,7 +862,7 @@ mod tests {
             ResponsesFrameRequestState::prepare(None, &frame, &encoder(), 64 * 1024).unwrap();
         let body = body(&prepared.request_body);
 
-        assert_eq!(body["instructions"], "<system>policy</system>");
+        assert_eq!(body["instructions"], "policy");
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
         assert_eq!(body["input"][0]["content"][0]["text"], "authored");
         assert_eq!(body["tools"][0]["name"], "lookup");
@@ -853,6 +952,182 @@ mod tests {
         assert_eq!(input[2]["content"][0]["text"], "answer");
         assert_eq!(input[3]["content"][0]["text"], "next");
         assert_eq!(prepared.state.accepted_prefix().item_count(), 3);
+    }
+
+    #[test]
+    fn ephemeral_prompts_repeat_last_without_retaining_old_values_or_losing_tool_history() {
+        let authored = CanonicalInputItem::assistant_text("authored", None);
+        let initial = frame_with_ephemeral(
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+            vec![system("policy"), authored.clone()],
+            vec![
+                ephemeral_developer("current policy"),
+                ephemeral_user("temporary A"),
+            ],
+        );
+        let first =
+            ResponsesFrameRequestState::prepare(None, &initial, &encoder(), 64 * 1024).unwrap();
+        let first_input = input(&first.request_body);
+        assert_eq!(first_input.len(), 3);
+        assert_eq!(first_input[0]["content"][0]["text"], "authored");
+        assert_eq!(first_input[1]["role"], "developer");
+        assert_eq!(first_input[1]["content"][0]["text"], "current policy");
+        assert_eq!(first_input[2]["role"], "user");
+        assert_eq!(first_input[2]["content"][0]["text"], "temporary A");
+        assert_eq!(first.state.wire_input(), &first_input[..1]);
+        assert_eq!(first.state.accepted_prefix().item_count(), 1);
+
+        let mut state = first.state;
+        let reasoning = json!({"type":"reasoning", "encrypted_content":"opaque"});
+        state
+            .append_private_output(0, PrivateOutputKind::Reasoning, reasoning.clone())
+            .unwrap();
+        let call = CanonicalInputItem::tool_call("call-1", "lookup", "{}").unwrap();
+        let call_wire = json!({
+            "type":"function_call", "call_id":"call-1", "name":"lookup", "arguments":"{}"
+        });
+        state
+            .append_public_output(1, &call, call_wire.clone())
+            .unwrap();
+        let result = CanonicalInputItem::tool_result("call-1", "found").unwrap();
+        let updated = CanonicalInputItem::assistant_text("updated", None);
+        let second = frame_with_ephemeral(
+            2,
+            Some(revision(1)),
+            vec![call.clone()],
+            vec![result.clone()],
+            vec![updated.clone()],
+            vec![
+                ephemeral_developer("current policy"),
+                ephemeral_user("temporary A"),
+            ],
+        );
+        let second =
+            ResponsesFrameRequestState::prepare(Some(&state), &second, &encoder(), 64 * 1024)
+                .unwrap();
+        let second_input = input(&second.request_body);
+        assert_eq!(second_input.len(), 7);
+        assert_eq!(second_input[0], first_input[0]);
+        assert_eq!(second_input[1], reasoning);
+        assert_eq!(second_input[2], call_wire);
+        assert_eq!(second_input[3]["type"], "function_call_output");
+        assert_eq!(second_input[3]["call_id"], "call-1");
+        assert_eq!(second_input[3]["output"], "found");
+        assert_eq!(second_input[4]["content"][0]["text"], "updated");
+        assert_eq!(&second_input[5..], &first_input[1..]);
+        assert_eq!(second.state.wire_input(), &second_input[..5]);
+        assert_eq!(second.state.accepted_prefix().item_count(), 4);
+        assert_eq!(second.state.accepted_prefix(), second.state.wire_coverage());
+
+        let changed = frame_with_ephemeral(
+            3,
+            Some(revision(2)),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![ephemeral_user("temporary B")],
+        );
+        let changed = ResponsesFrameRequestState::prepare(
+            Some(&second.state),
+            &changed,
+            &encoder(),
+            64 * 1024,
+        )
+        .unwrap();
+        let changed_input = input(&changed.request_body);
+        assert_eq!(&changed_input[..5], &second_input[..5]);
+        assert_eq!(changed_input.len(), 6);
+        assert_eq!(changed_input[5]["content"][0]["text"], "temporary B");
+        assert_eq!(
+            changed.state.accepted_prefix(),
+            second.state.accepted_prefix()
+        );
+
+        // A Full recovery also proves only retained input, irrespective of the
+        // transient values used for the earlier requests.
+        let recovered = frame_with_ephemeral(
+            4,
+            None,
+            vec![authored, call, result, updated],
+            Vec::new(),
+            vec![system("policy")],
+            vec![ephemeral_user("temporary B")],
+        );
+        let recovered = ResponsesFrameRequestState::prepare(
+            Some(&changed.state),
+            &recovered,
+            &encoder(),
+            64 * 1024,
+        )
+        .unwrap();
+        assert_eq!(input(&recovered.request_body), changed_input);
+        let removed = delta(5, revision(4), Vec::new(), Vec::new(), Vec::new());
+        let removed = ResponsesFrameRequestState::prepare(
+            Some(&recovered.state),
+            &removed,
+            &encoder(),
+            64 * 1024,
+        )
+        .unwrap();
+        assert_eq!(input(&removed.request_body), second_input[..5]);
+    }
+
+    #[test]
+    fn ephemeral_prompts_are_excluded_from_parallel_compaction_sources_and_candidates() {
+        let initial = frame_with_ephemeral(
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+            vec![
+                system("policy"),
+                CanonicalInputItem::assistant_text("old context", None),
+                CanonicalInputItem::assistant_text("tail", None),
+            ],
+            vec![ephemeral_user("request-only-secret")],
+        );
+        let first =
+            ResponsesFrameRequestState::prepare(None, &initial, &encoder(), 64 * 1024).unwrap();
+        let first_input = input(&first.request_body);
+        let source = first.state.compaction_source().unwrap();
+        assert_eq!(source.input, first_input[..1]);
+        assert_eq!(source.instructions, "policy");
+
+        let next = frame_with_ephemeral(
+            2,
+            Some(revision(1)),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![ephemeral_user("request-only-secret")],
+        );
+        let summary = json!({"type":"message", "role":"assistant", "content":"Summary"});
+        let compacted = first
+            .state
+            .with_parallel_compaction(&source, std::slice::from_ref(&summary), &next, &encoder())
+            .unwrap()
+            .unwrap();
+        let next =
+            ResponsesFrameRequestState::prepare(Some(&compacted), &next, &encoder(), 64 * 1024)
+                .unwrap();
+        assert_eq!(
+            input(&next.request_body),
+            vec![
+                summary.clone(),
+                first_input[1].clone(),
+                first_input[2].clone(),
+            ]
+        );
+        assert_eq!(
+            next.state.wire_input(),
+            &[summary.clone(), first_input[1].clone()]
+        );
+        assert_eq!(next.state.compaction_source().unwrap().input, vec![summary]);
+        assert_eq!(next.state.accepted_prefix(), first.state.accepted_prefix());
+        assert_eq!(next.state.wire_coverage(), first.state.wire_coverage());
     }
 
     #[test]
@@ -1019,10 +1294,7 @@ mod tests {
         let recovered =
             ResponsesFrameRequestState::prepare(Some(&state), &same, &encoder(), 64 * 1024)
                 .unwrap();
-        assert_eq!(
-            body(&recovered.request_body)["instructions"],
-            "<system>stable</system>"
-        );
+        assert_eq!(body(&recovered.request_body)["instructions"], "stable");
         assert_eq!(input(&recovered.request_body)[0]["type"], "compaction");
 
         let changed = full(
@@ -1115,10 +1387,7 @@ mod tests {
         let initial =
             ResponsesFrameRequestState::prepare(None, &initial, &encoder(), 64 * 1024).unwrap();
         assert!(initial.state.compaction_instructions.is_none());
-        assert_eq!(
-            body(&initial.request_body)["instructions"],
-            "<system>old</system>"
-        );
+        assert_eq!(body(&initial.request_body)["instructions"], "old");
 
         let delta_item = CanonicalInputItem::assistant_text("delta", None);
         let unchanged = delta(
@@ -1135,10 +1404,7 @@ mod tests {
             64 * 1024,
         )
         .unwrap();
-        assert_eq!(
-            body(&unchanged.request_body)["instructions"],
-            "<system>old</system>"
-        );
+        assert_eq!(body(&unchanged.request_body)["instructions"], "old");
 
         let replacement_item = CanonicalInputItem::assistant_text("replacement", None);
         let replaced = full(
@@ -1154,10 +1420,7 @@ mod tests {
             64 * 1024,
         )
         .unwrap();
-        assert_eq!(
-            body(&replaced.request_body)["instructions"],
-            "<system>new</system>"
-        );
+        assert_eq!(body(&replaced.request_body)["instructions"], "new");
 
         let cleared = full(
             4,
@@ -1199,7 +1462,6 @@ mod tests {
             ResponsesFrameRequestState::prepare(Some(&initial.state), &empty, &encoder, 64 * 1024)
                 .unwrap();
         assert!(tool_names(&empty.request_body).is_empty());
-        assert!(!String::from_utf8_lossy(&empty.request_body).contains("configured_only"));
 
         let changed = frame(
             revision(3),
@@ -1349,6 +1611,42 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_prompt_bytes_count_towards_the_serialized_request_limit() {
+        let retained_only = full(1, Vec::new(), Vec::new(), Vec::new());
+        let retained_limit =
+            ResponsesFrameRequestState::prepare(None, &retained_only, &encoder(), usize::MAX)
+                .unwrap()
+                .request_body
+                .len();
+        let frame = frame_with_ephemeral(
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![ephemeral_user("request-only prompt")],
+        );
+        let prepared =
+            ResponsesFrameRequestState::prepare(None, &frame, &encoder(), usize::MAX).unwrap();
+        assert!(prepared.request_body.len() > retained_limit);
+        assert!(prepared.state.wire_input().is_empty());
+        assert_eq!(prepared.state.accepted_prefix().item_count(), 0);
+        assert!(matches!(
+            ResponsesFrameRequestState::prepare(None, &frame, &encoder(), retained_limit),
+            Err(ResponsesFrameRequestFault::Encoding(
+                CodexHttpV1Error::SerializedRequestBodyLimit
+            ))
+        ));
+        assert!(ResponsesFrameRequestState::prepare(
+            None,
+            &frame,
+            &encoder(),
+            prepared.request_body.len(),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn estimated_context_window_includes_output_reserve_and_is_inclusive() {
         let make_frame = |window, reserve| {
             let mut profile = profile();
@@ -1370,7 +1668,8 @@ mod tests {
                     )]),
                     ToolCatalog::new(Vec::new()).unwrap(),
                     Vec::new(),
-                ),
+                )
+                .with_ephemeral(vec![ephemeral_user("request-only context")]),
             )
             .unwrap()
         };

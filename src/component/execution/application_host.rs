@@ -256,6 +256,14 @@ where
 {
     let prepared = components.render()?;
     let (projection, preparations, bindings) = prepared.into_execution_parts();
+    if projection.nodes().iter().any(|node| {
+        node.items()
+            .iter()
+            .enumerate()
+            .any(|(index, _)| node.is_ephemeral_item(index))
+    }) {
+        return Err(ApplicationHostFault::EphemeralPromptsUnsupported);
+    }
     if preparations.command_wait()?.is_some() || bindings.has_cli_commands() {
         return Err(ApplicationHostFault::CliCommandsUnsupported);
     }
@@ -449,6 +457,8 @@ where
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ApplicationHostFault {
+    #[error("ephemeral prompts require Application<P> with ReactionPort and are unsupported by ApplicationHost")]
+    EphemeralPromptsUnsupported,
     #[error("CLI commands and command waits require Application<P> and are unsupported by ApplicationHost")]
     CliCommandsUnsupported,
     #[error("XML action callbacks require Application<P> with ReactionPort and are unsupported by ApplicationHost")]
@@ -513,6 +523,23 @@ mod tests {
         await_bindings_with_lanes, finish_lane, ApplicationHost, ApplicationHostFault,
         CompletedLane, EngineObservation, EngineObserver, ReactionLane, ReactionLifecycle,
     };
+
+    #[component]
+    fn ephemeral_application(_props: (), _events: EventInput<ProviderEvent>) -> Component {
+        view! {
+            #[user(ephemeral, repeat)]
+            "Only for the current request."
+        }
+    }
+
+    #[test]
+    fn legacy_host_rejects_ephemeral_before_provider_execution() {
+        let mut components = ComponentHost::new(ephemeral_application, ());
+        assert!(matches!(
+            super::prepare_component_reaction(&mut components),
+            Err(ApplicationHostFault::EphemeralPromptsUnsupported)
+        ));
+    }
 
     #[derive(Debug, Default)]
     struct RecordingSink {

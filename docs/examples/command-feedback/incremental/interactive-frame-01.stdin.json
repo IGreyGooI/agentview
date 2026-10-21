@@ -1,0 +1,5 @@
+{
+  "action": "record",
+  "input": {"text": "first interactive note"}
+}
+{"action":"inspect","input":{}}

@@ -1,0 +1,5 @@
+error: the `ephemeral` placement argument requires `repeat`
+ --> tests/ui/component_target/fail_developer_ephemeral_without_repeat.rs:5:9
+  |
+5 |         #[developer(ephemeral)]
+  |         ^^^^^^^^^^^^^^^^^^^^^^^

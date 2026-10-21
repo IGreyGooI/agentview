@@ -138,7 +138,8 @@ fn full_document_fallback(
 }
 
 fn document_removal(previous: XmlNode) -> XmlNode {
-    operation_node("remove", previous)
+    let identity = previous.removal_identity().cloned().unwrap_or(previous);
+    operation_node("remove", identity)
 }
 
 pub(crate) fn diff_xml_nodes(current: &XmlNode, previous: &XmlNode) -> Option<XmlNode> {
@@ -327,7 +328,13 @@ fn diff_keyed(current: &XmlNode, previous: &XmlNode, key: &XmlName) -> Option<Xm
                     .iter()
                     .any(|(current_key, _)| current_key == key)
             })
-            .map(|(_, item)| operation_node("remove", item.clone())),
+            .map(|(identity, item)| {
+                let mut removed = XmlNode::new(item.name().clone());
+                removed
+                    .push_attribute(key.clone(), identity.clone())
+                    .expect("a keyed identity is the only removal attribute");
+                operation_node("remove", removed)
+            }),
     );
     operations.extend(current_items.iter().filter_map(|(key, item)| {
         previous_items
@@ -463,13 +470,18 @@ fn map_entries(node: &XmlNode) -> Option<Vec<(ContentNode, XmlNode)>> {
 }
 
 fn collection_delta(current: &XmlNode, operations: Vec<XmlNode>) -> Option<XmlNode> {
-    if operations.is_empty() {
-        return None;
-    }
+    let mut operations = operations.into_iter();
+    let mut group = operations.next()?;
     let mut delta = delta_node(current.name().clone());
     for operation in operations {
-        delta.push(MixedContent::xml(operation));
+        if group.name() == operation.name() {
+            group.extend_children(operation.into_children());
+        } else {
+            delta.push(MixedContent::xml(group));
+            group = operation;
+        }
     }
+    delta.push(MixedContent::xml(group));
     Some(delta)
 }
 
@@ -513,10 +525,7 @@ fn xml_name(value: &str) -> XmlName {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        pom::{InlineChildren, InlineContent, ParagraphNode, RawTextNode, TextNode},
-        pom_renderer::render_pom_document,
-    };
+    use crate::pom::{InlineChildren, InlineContent, ParagraphNode, RawTextNode, TextNode};
 
     fn xml(name: &str, text: &str) -> XmlNode {
         let mut node = XmlNode::new(xml_name(name));
@@ -563,10 +572,6 @@ mod tests {
         operation
     }
 
-    fn rendered(document: &ResolvedDocument) -> String {
-        render_pom_document(document).expect("test POM renders")
-    }
-
     fn apply_removals(previous: &ResolvedDocument, patch: &ResolvedDocument) -> Vec<XmlNode> {
         let mut roots = xml_roots(previous).into_iter().cloned().collect::<Vec<_>>();
         for operation in xml_roots(patch) {
@@ -594,10 +599,6 @@ mod tests {
         let patch = diff_resolved_documents(&current, &previous).expect("XML removal patch");
 
         assert_eq!(patch, xml_document([remove(xml("policy", "read only"))]));
-        assert_eq!(
-            rendered(&patch),
-            "<remove>\n  <policy>read only</policy>\n</remove>"
-        );
         assert!(apply_removals(&previous, &patch).is_empty());
     }
 
@@ -609,7 +610,6 @@ mod tests {
         let patch = diff_resolved_documents(&current, &previous).expect("changed root patch");
 
         assert_eq!(patch, current);
-        assert_eq!(rendered(&patch), "<status priority=\"high\">done</status>");
     }
 
     #[test]
@@ -630,10 +630,6 @@ mod tests {
         assert_eq!(
             patch,
             xml_document([remove(xml("policy", "old")), xml("context", "new")])
-        );
-        assert_eq!(
-            rendered(&patch),
-            "<remove>\n  <policy>old</policy>\n</remove>\n\n<context>new</context>"
         );
     }
 
@@ -692,10 +688,6 @@ mod tests {
             children.extend(text.children().clone());
             ResolvedDocument::new(children)
         });
-        assert_eq!(
-            rendered(&patch),
-            "<remove>\n  <context>structured</context>\n</remove>\n\nplain context"
-        );
     }
 
     #[test]
@@ -719,8 +711,6 @@ mod tests {
         let patch = diff_resolved_documents(&current, &previous)
             .expect("changed raw text produces the complete current document");
         assert_eq!(patch, current);
-        assert_eq!(rendered(&patch), "<context>new</context>");
-        assert!(!rendered(&patch).contains("<remove>"));
 
         assert_eq!(
             diff_resolved_documents(&empty_document(), &previous),

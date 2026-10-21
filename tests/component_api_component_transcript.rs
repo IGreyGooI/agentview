@@ -4,11 +4,14 @@
     reason = "this compatibility test intentionally exercises legacy component transcript routing"
 )]
 
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::*;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentview::{
     component::{execution::ProviderEvent, prelude::*, ComponentHost},
-    pom_renderer::render_pom_document,
     transcript::{CanonicalInputItem, CanonicalTranscript, ConversationRole, InstructionAuthority},
 };
 
@@ -31,14 +34,8 @@ where
         .expect("node-ordered projection lowers to a canonical transcript")
 }
 
-fn rendered(item: &CanonicalInputItem) -> String {
-    let pom = match item {
-        CanonicalInputItem::Instruction { pom, .. } | CanonicalInputItem::Message { pom, .. } => {
-            pom
-        }
-        other => panic!("expected POM item, got {other:?}"),
-    };
-    render_pom_document(pom).unwrap()
+fn document(item: &CanonicalInputItem) -> agentview::pom::ResolvedDocument {
+    item_document(item)
 }
 
 #[component]
@@ -78,6 +75,9 @@ async fn component_host_lowers_system_developer_and_default_user_to_canonical_it
     let input = render_application(oracle_application, TurnProps);
 
     assert_eq!(input.items().len(), 3);
+    let task = document(&input.items()[2]);
+    assert!(task.has_field("chess_task", "Choose a move & explain."));
+    assert!(task.has_attribute("turn_id", "turn-7"));
     assert!(matches!(
         &input.items()[0],
         CanonicalInputItem::Instruction {
@@ -100,16 +100,12 @@ async fn component_host_lowers_system_developer_and_default_user_to_canonical_it
         }
     ));
     assert_eq!(
-        rendered(&input.items()[0]),
-        "<chess_rules>Play legal chess.</chess_rules>"
+        document(&input.items()[0]),
+        text_element("chess_rules", "Play legal chess.")
     );
     assert_eq!(
-        rendered(&input.items()[1]),
-        "<chess_reply_protocol>Return exactly one move.</chess_reply_protocol>"
-    );
-    assert_eq!(
-        rendered(&input.items()[2]),
-        "<chess_task turn_id=\"turn-7\">Choose a move & explain.</chess_task>"
+        document(&input.items()[1]),
+        text_element("chess_reply_protocol", "Return exactly one move.")
     );
 }
 
@@ -146,38 +142,11 @@ async fn outer_system_placement_overrides_descendants_and_seals_one_instruction(
         }
     ));
     assert_eq!(
-        rendered(&input.items()[0]),
-        "<user_default>user</user_default>\n\n<developer_default>developer</developer_default>"
-    );
-}
-
-#[component]
-fn escaping_application(_props: TurnProps, _events: EventInput<ProviderEvent>) -> Component {
-    view! {
-        stable_system()
-
-        "root * < &"
-
-        escaped {
-            data: "\"&<>",
-            nested { "<&>" }
-        }
-    }
-}
-
-#[tokio::test]
-async fn canonical_renderer_preserves_xml_text_and_attributes() {
-    let input = render_application(escaping_application, TurnProps);
-
-    assert_eq!(input.items().len(), 2);
-    assert_eq!(
-        rendered(&input.items()[1]),
-        concat!(
-            "root \\* \\< \\&\n\n",
-            "<escaped data=\"\"&<>\">\n",
-            "  <nested><&></nested>\n",
-            "</escaped>"
-        )
+        document(&input.items()[0]),
+        combine([
+            text_element("user_default", "user"),
+            text_element("developer_default", "developer")
+        ])
     );
 }
 
@@ -218,19 +187,12 @@ async fn formatted_xml_text_and_dynamic_attributes_preserve_their_values() {
     let input = render_application(dynamic_pom_application, TurnProps);
 
     assert_eq!(ATTRIBUTE_EVALUATIONS.load(Ordering::SeqCst), 1);
+    let task = document(&input.items()[1]);
+    assert!(task.has_attribute("priority", "3"));
+    assert!(task.has_attribute("label", "clock 4.2s"));
+    assert!(task.has_field("instruction", "Choose e2e4 & hold <center>"));
+    assert!(task.has_field("clock", "4.2s"));
     assert_eq!(input.items().len(), 2);
-    assert_eq!(
-        rendered(&input.items()[1]),
-        concat!(
-            "Turn turn-7: Choose e2e4 \\& hold \\<center\\>\n\n",
-            "Literal {slot} for turn-7\n\n",
-            "Clock: `4.2s`\n\n",
-            "<chess_task priority=\"3\" label=\"clock 4.2s\">\n",
-            "  <instruction>Choose e2e4 & hold <center></instruction>\n",
-            "  <clock>4.2s</clock>\n",
-            "</chess_task>"
-        )
-    );
 }
 
 fn dynamic_root_inline_component() -> Component {
@@ -259,16 +221,16 @@ fn dynamic_root_application(_props: TurnProps, _events: EventInput<ProviderEvent
 #[tokio::test]
 async fn dynamic_root_expressions_preserve_component_and_pom_structure() {
     let input = render_application(dynamic_root_application, TurnProps);
+    assert_eq!(
+        document(&input.items()[1]),
+        combine([
+            text_element("inline", "component"),
+            text_element("dynamic_note", "typed & structured"),
+            text_element("dynamic_note", "optional"),
+        ])
+    );
 
     assert_eq!(input.items().len(), 2);
-    assert_eq!(
-        rendered(&input.items()[1]),
-        concat!(
-            "<inline>component</inline>\n\n",
-            "<dynamic_note>typed & structured</dynamic_note>\n\n",
-            "<dynamic_note>optional</dynamic_note>"
-        )
-    );
 }
 
 fn selected_routes_prompt(_text: EventInput<TextTurnEvent>) -> Component {
@@ -291,8 +253,8 @@ async fn provider_event_selects_typed_child_routes_without_prompt_output() {
 
     assert_eq!(input.items().len(), 2);
     assert_eq!(
-        rendered(&input.items()[1]),
-        "<selected_routes>ready</selected_routes>"
+        document(&input.items()[1]),
+        text_element("selected_routes", "ready")
     );
 }
 
@@ -327,10 +289,10 @@ fn signal_read_application(_props: TurnProps, _events: EventInput<ProviderEvent>
 #[tokio::test]
 async fn signal_read_projects_owned_values_into_canonical_prompt_output() {
     let input = render_application(signal_read_application, TurnProps);
+    let state = document(&input.items()[1]);
+    assert!(state.has_field("reducer_state", "ready"));
+    assert!(state.has_attribute("selected_move", "e2e4"));
+    assert!(state.has_attribute("diagnostic", "none"));
 
     assert_eq!(input.items().len(), 2);
-    assert_eq!(
-        rendered(&input.items()[1]),
-        "<reducer_state selected_move=\"e2e4\" diagnostic=\"none\">ready</reducer_state>"
-    );
 }

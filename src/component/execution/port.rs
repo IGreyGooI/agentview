@@ -126,6 +126,7 @@ pub struct RenderedProjectionNode {
     diffs: Vec<RenderedProjectionDiffMarker>,
     diff_templates: Vec<RenderedProjectionItemTemplate>,
     repeat_items: Vec<usize>,
+    ephemeral_items: Vec<usize>,
 }
 
 impl RenderedProjectionNode {
@@ -136,6 +137,7 @@ impl RenderedProjectionNode {
             diffs: Vec::new(),
             diff_templates: Vec::new(),
             repeat_items: Vec::new(),
+            ephemeral_items: Vec::new(),
         }
     }
 
@@ -151,16 +153,36 @@ impl RenderedProjectionNode {
             diffs,
             diff_templates,
             repeat_items: Vec::new(),
+            ephemeral_items: Vec::new(),
         }
     }
 
     pub(crate) fn with_repeat_items(mut self, repeat_items: Vec<usize>) -> Self {
         self.repeat_items = repeat_items;
+        self.ensure_ephemeral_repeats();
         self
+    }
+
+    pub(crate) fn with_ephemeral_items(mut self, ephemeral_items: Vec<usize>) -> Self {
+        self.ephemeral_items = ephemeral_items;
+        self.ensure_ephemeral_repeats();
+        self
+    }
+
+    fn ensure_ephemeral_repeats(&mut self) {
+        for &item_index in &self.ephemeral_items {
+            if !self.repeat_items.contains(&item_index) {
+                self.repeat_items.push(item_index);
+            }
+        }
     }
 
     pub(crate) fn repeats_item(&self, item_index: usize) -> bool {
         self.repeat_items.contains(&item_index)
+    }
+
+    pub(crate) fn is_ephemeral_item(&self, item_index: usize) -> bool {
+        self.ephemeral_items.contains(&item_index)
     }
 
     pub fn identity(&self) -> &str {
@@ -198,6 +220,15 @@ impl RenderedProjectionNode {
                 )
             {
                 return Err(RenderedProjectionError::InvalidRepeatItem {
+                    identity: self.identity.clone(),
+                    item_index,
+                });
+            }
+        }
+        let mut ephemeral = HashSet::with_capacity(self.ephemeral_items.len());
+        for &item_index in &self.ephemeral_items {
+            if !ephemeral.insert(item_index) || !repeated.contains(&item_index) {
+                return Err(RenderedProjectionError::InvalidEphemeralItem {
                     identity: self.identity.clone(),
                     item_index,
                 });
@@ -379,6 +410,10 @@ pub enum RenderedProjectionError {
     InvalidDiffTemplate { identity: String, message: String },
     #[error("rendered projection node `{identity}` has an invalid repeat item index {item_index}")]
     InvalidRepeatItem { identity: String, item_index: usize },
+    #[error(
+        "rendered projection node `{identity}` has an invalid ephemeral item index {item_index}"
+    )]
+    InvalidEphemeralItem { identity: String, item_index: usize },
     #[error("rendered projection contains duplicate or empty native tool name `{name}`")]
     DuplicateNativeToolName { name: String },
 }
@@ -2018,8 +2053,8 @@ mod projection_validation_tests {
     };
 
     use super::{
-        RenderedProjection, RenderedProjectionDiffMarker, RenderedProjectionFragment,
-        RenderedProjectionItemTemplate, RenderedProjectionNode,
+        RenderedProjection, RenderedProjectionDiffMarker, RenderedProjectionError,
+        RenderedProjectionFragment, RenderedProjectionItemTemplate, RenderedProjectionNode,
     };
 
     fn item() -> CanonicalInputItem {
@@ -2034,6 +2069,39 @@ mod projection_validation_tests {
             diff_index,
             authored: Document::new(BlockChildren::new()),
             complete: ResolvedDocument::new(BlockChildren::new()),
+        }
+    }
+
+    #[test]
+    fn ephemeral_item_metadata_requires_unique_user_or_developer_indexes() {
+        let node = RenderedProjectionNode::new("component", vec![item(), item()])
+            .with_ephemeral_items(vec![1])
+            .with_repeat_items(vec![0]);
+        assert!(node.repeats_item(0));
+        assert!(node.repeats_item(1));
+        assert!(!node.is_ephemeral_item(0));
+        assert!(node.is_ephemeral_item(1));
+        assert!(RenderedProjection::from_nodes(vec![node]).is_ok());
+
+        let duplicate =
+            RenderedProjectionNode::new("component", vec![item()]).with_ephemeral_items(vec![0, 0]);
+        assert!(matches!(
+            RenderedProjection::from_nodes(vec![duplicate]),
+            Err(RenderedProjectionError::InvalidEphemeralItem { item_index: 0, .. })
+        ));
+
+        for invalid in [
+            RenderedProjectionNode::new("component", vec![item()]).with_ephemeral_items(vec![1]),
+            RenderedProjectionNode::new(
+                "component",
+                vec![CanonicalInputItem::message(
+                    ConversationRole::Assistant,
+                    ResolvedDocument::new(BlockChildren::new()),
+                )],
+            )
+            .with_ephemeral_items(vec![0]),
+        ] {
+            assert!(RenderedProjection::from_nodes(vec![invalid]).is_err());
         }
     }
 
