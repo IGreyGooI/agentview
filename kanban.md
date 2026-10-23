@@ -34,3 +34,19 @@
   verify both final-write convergence and the no-handoff limit failure.
 - [x] Superseded changed-key readiness invalidation and `A -> B -> A` retry
   coverage: `use_preparation` has no key or cross-operation readiness cache.
+- [x] Record durable history for each retained stdin daemon lifetime across
+  client connections and foreground CLI invocations (implementation `a7c22a2`).
+  `history --daemon [latest|SESSION_ID]` reads sessions without starting a daemon
+  or replaying actions. CLI run/session IDs link the daemon records with raw
+  foreground histories; complete results and views retain execution order
+  independently of each connection's view diff. Execution outcomes and socket
+  writes are separate; a successful write does not confirm a client read.
+  Accepted or pending requests are not completed actions: `request_not_executed`
+  records a known rejection, while missing execution outcomes remain unknown.
+  Missing session completion preserves already recorded results. See
+  [Stdin Actions](HELP.md#stdin-actions), the
+  [runtime contract](docs/engine.md#skill--cli-frontend), and
+  [daemon history process tests](tests/component_api_daemon_history.rs).
+  Validation: 32 focused stdin tests and 8 process tests passed; packaged
+  Semantic Memory CLI evidence is in
+  [daemon history verification](../forgotten-city/artifacts/daemon-history-20261023T093343Z/README.md).
