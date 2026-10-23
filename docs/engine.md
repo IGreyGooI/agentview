@@ -1350,8 +1350,9 @@ cleanup 完成并释放 socket 后才确认 stop；已提交但响应失败的�
 生命周期请求与动作串行处理；尚未结束的 async action 会阻塞后续 stop/restart，可能使其 transport
 超时而 daemon 仍然运行。当前 runner 不提供越过动作队列的取消通道。
 
-标准 runner 自动为每次前台 stdin interaction 和 `start` / `status` / `stop` / `restart`
-调用创建唯一的本地 run ID。记录属于前台调用，不属于 daemon 或某个业务会话；不同 socket 的调用
+标准 runner 分别保留前台 stdio history 和 daemon request/result history。前台层自动为每次 stdin
+interaction 和 `start` / `status` / `stop` / `restart` 调用创建唯一的本地 run ID。这份原始字节记录
+属于前台调用，不属于 daemon 或某个业务会话；不同 socket 的调用
 可以保存在同一 binary 的 history root，`session.json` 记录该次调用的 executable、socket、invocation、
 进程、起止时间和退出状态。默认位置为 `$XDG_STATE_HOME/agentview-<executable-name>/history`，
 未设置时回退到 `$HOME/.local/state/agentview-<executable-name>/history`；每个 run 独占子目录。
@@ -1365,6 +1366,43 @@ stdio。读取只访问本地文件，不连接或启动 daemon，不 dispatch �
 interaction ID，不能假定 `latest` 仍指向该交互。缺少完成记录表示 run 尚未结束或被中断，不能据此
 推断动作失败。stdio history 独立于 canonical history、FrameSession baseline 和业务持久化；
 它保留当时交付的 Full / Delta 字节，不提供会话恢复或动作重试。
+
+daemon 层为每次持有 socket lock 的 daemon 生命周期创建独立 session ID，覆盖该生命周期内所有
+客户端连接和多次前台调用。默认位置为同一 application state root 下的
+`daemon-history/SESSION_ID`，包含 `session.json` 和 `events.jsonl`；metadata 记录 executable、
+socket、daemon pid、起止时间和结束原因。全局 event sequence 表示记录顺序，`connection_id` 和
+`request_id` 标识连接与请求；中央执行队列另以 `execution_index` 记录实际处理顺序，不能把客户端
+到达时间或各连接输出时间当作执行顺序。请求中的可选 `cli_run_id` 是客户端提供的关联信息，
+不参与执行授权或排序。前台 metadata 的 `daemon_session_ids` 记录收到响应的 daemon 会话；
+一次 `restart` 可关联旧会话的 stop 和新会话的 observe。客户端、daemon 和 history reader 可以
+使用不同的 `XDG_STATE_HOME`，只有实际找到匹配记录时才提供本地 raw history 路径。
+
+`request_accepted` 必须持久化后才能入队，`execution_started` 必须持久化后才能 dispatch。
+成功执行后的 `execution_completed` 保留完整 `StdinResponse`，包括 `ok`、完整 JSON result 和
+prepared projection 的完整 view；它在各连接的 private Frame diff 之前记录，不以某条连接的
+Delta 作为共享会话历史。`execution_failed` 保留执行错误；它不承诺已开始的业务副作用被回滚。
+队列关闭或 stop 后清理的已接收请求若确定未执行，则记录 `request_not_executed`。
+只有已接收记录、缺少执行终态的请求仍是结果未知，不能根据客户端断开或缺少回包推断没有执行。
+缺少 session 的 `finished` 只表示未记录生命周期结束，daemon 可能仍运行或被中断，不否定此前
+已持久化的执行结果。
+
+执行结果与投递结果分别记录。`delivery_written` 仅表示响应字节全部写入 socket，不确认客户端
+已读取；其 `response_error` 可说明写出的是错误响应。`delivery_failed` 记录 socket 写入失败，
+不覆盖此前的执行终态，也不触发动作重放。正常 stop 的执行完成在 Application cleanup 成功后
+记录；socket 释放和停止确认仍遵守既有生命周期约定。daemon 等待连接处理收尾后才记录
+`finished`，因此 stop 响应与 session 结束事件是不同的事实。
+
+daemon history 在挂载 Application 前创建。接收或开始执行的记录失败时不 dispatch 该请求；
+业务执行后持久化结果失败则明确报告副作用可能已经发生，并停止继续处理业务请求。recorder
+写入失败后拒绝继续追加，避免在不完整 JSONL 后追加事件；后续动作也必须通过执行前的记录检查。
+响应失败、history 失败和前台超时都不自动重连重放已提交的请求。这些记录提供诊断事实，不是
+业务数据库事务、会话恢复或动作重试协议。
+
+`history --daemon` 列出最近 20 个 daemon session；`history --daemon latest` 或
+`history --daemon SESSION_ID` 连续显示指定生命周期内所有连接的请求、执行和投递事件。读取
+同样只访问本地文件，不启动 daemon、不执行动作、不创建记录。viewer 从结构化事件取出完整
+view 作为不透明文本显示，不解析 POM 或修改任一连接的 baseline。读取忽略末尾尚未写完的 JSONL
+记录，保留之前完整事件；history ID 必须限制在对应 history root 内。
 
 调用者先读取初始 view，再一次写入完整预期批次及末尾换行，等待该批反馈的 view 后再写下一批。
 开启 idle refresh 时，外部状态变化也可无输入地主动交付 view；观察保留既有反馈，新的 action batch

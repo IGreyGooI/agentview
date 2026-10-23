@@ -22,6 +22,7 @@ use tokio::{
 };
 
 use super::super::CommandCall;
+use super::daemon_history::{EventKind, History};
 use super::{StdinApplication, StdinDelivery, StdinProjectionResponse, StdinResponse};
 use crate::component::authoring::Component;
 
@@ -32,6 +33,8 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub(super) struct Response {
     pub output: StdinResponse,
     pub daemon_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,8 +47,19 @@ pub(super) enum Operation {
     Feedback { message: String },
 }
 
+/// Flattening preserves the legacy Operation wire format. Old clients simply
+/// omit the optional foreground run association.
+#[derive(Debug, Serialize, Deserialize)]
+struct SubmittedOperation<T> {
+    #[serde(flatten)]
+    operation: T,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cli_run_id: Option<String>,
+}
+
 struct Request {
     pub operation: Operation,
+    pub request_id: Option<u64>,
     pub reply: oneshot::Sender<Result<PreparedResponse, String>>,
 }
 
@@ -53,6 +67,8 @@ struct Request {
 struct PreparedResponse {
     output: StdinProjectionResponse,
     daemon_pid: u32,
+    daemon_session_id: Option<String>,
+    request_id: Option<u64>,
 }
 
 type ShutdownReply = (
@@ -64,35 +80,56 @@ type ShutdownReply = (
 /// application effects may already have happened when its response is lost.
 pub(super) struct Connection {
     stream: BufReader<UnixStream>,
+    cli_run_id: Option<String>,
 }
 
 impl Connection {
-    pub(super) async fn connect(socket: &Path, autostart: bool) -> Result<Option<Self>> {
+    pub(super) async fn connect_for_run(
+        socket: &Path,
+        autostart: bool,
+        cli_run_id: Option<&str>,
+    ) -> Result<Option<Self>> {
         Ok(connect(socket, autostart).await?.map(|stream| Self {
             stream: BufReader::new(stream),
+            cli_run_id: cli_run_id.map(str::to_owned),
         }))
     }
 
     pub(super) async fn request(&mut self, operation: &Operation) -> Result<Response> {
-        exchange(&mut self.stream, operation).await
+        exchange_for_run(&mut self.stream, operation, self.cli_run_id.as_deref()).await
     }
 }
 
-pub(super) async fn request(
+pub(super) async fn request_for_run(
     socket: &Path,
     operation: &Operation,
     autostart: bool,
+    cli_run_id: Option<&str>,
 ) -> Result<Option<Response>> {
-    let Some(mut connection) = Connection::connect(socket, autostart).await? else {
+    let Some(mut connection) = Connection::connect_for_run(socket, autostart, cli_run_id).await?
+    else {
         return Ok(None);
     };
     connection.request(operation).await.map(Some)
 }
 
+#[cfg(test)]
 async fn exchange(stream: &mut BufReader<UnixStream>, operation: &Operation) -> Result<Response> {
+    exchange_for_run(stream, operation, None).await
+}
+
+async fn exchange_for_run(
+    stream: &mut BufReader<UnixStream>,
+    operation: &Operation,
+    cli_run_id: Option<&str>,
+) -> Result<Response> {
     // Connect retries precede submission. Never replay a submitted action after
     // a write or response failure: it may already have changed application state.
-    timeout(IO_TIMEOUT, write_json(stream.get_mut(), operation))
+    let submitted = SubmittedOperation {
+        operation,
+        cli_run_id: cli_run_id.map(str::to_owned),
+    };
+    timeout(IO_TIMEOUT, write_json(stream.get_mut(), &submitted))
         .await
         .context(
             "command write timed out; inspect application state before retrying the action",
@@ -248,8 +285,10 @@ pub(super) async fn serve(
         _lock: lock,
     };
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    let history = History::create(&env::current_exe()?, socket)
+        .context("create daemon history before mounting application")?;
     let (sender, receiver) = mpsc::channel(16);
-    let mut application = tokio::spawn(run(receiver, root));
+    let mut application = tokio::spawn(run_with_history(receiver, root, Some(history.clone())));
     let mut clients = JoinSet::new();
     let mut application_finished = false;
     let outcome = loop {
@@ -264,8 +303,9 @@ pub(super) async fn serve(
                     Err(error) => break Err(error.into()),
                 };
                 let sender = sender.clone();
+                let history = history.clone();
                 clients.spawn(async move {
-                    if let Err(error) = handle_client(stream, sender).await {
+                    if let Err(error) = handle_client_with_history(stream, sender, Some(history)).await {
                         eprintln!("agentview client: {error:#}");
                     }
                 });
@@ -280,15 +320,19 @@ pub(super) async fn serve(
     };
     drop(listener);
     drop(sender);
+    let normal_stop = matches!(&outcome, Ok(Some(_)));
+    let mut outcome = outcome;
     if !application_finished {
         clients.abort_all();
         while clients.join_next().await.is_some() {}
-        joined_application(application.await)?;
+        if let Err(error) = joined_application(application.await) {
+            outcome = Err(error);
+        }
     }
     // Release the listening endpoint and lock before acknowledging shutdown,
     // so an immediately following CLI invocation can start a fresh session.
     drop(socket_owner);
-    let outcome = match outcome {
+    let mut outcome = match outcome {
         Ok(Some((reply, response))) => {
             let _ = reply.send(Ok(response));
             Ok(())
@@ -298,8 +342,19 @@ pub(super) async fn serve(
     };
     // In particular, let the shutdown response reach its client after cleanup.
     while let Some(result) = clients.join_next().await {
-        result.context("client task failed")?;
+        if let Err(error) = result {
+            outcome = Err(anyhow::Error::from(error).context("client task failed"));
+        }
     }
+    history
+        .finish(if outcome.is_err() {
+            "failed"
+        } else if normal_stop {
+            "stopped"
+        } else {
+            "interrupted"
+        })
+        .context("finish daemon history")?;
     outcome
 }
 
@@ -313,7 +368,53 @@ fn joined_application(
     }
 }
 
+#[cfg(test)]
 async fn handle_client(stream: UnixStream, sender: mpsc::Sender<Request>) -> Result<()> {
+    handle_client_with_history(stream, sender, None).await
+}
+
+async fn handle_client_with_history(
+    stream: UnixStream,
+    sender: mpsc::Sender<Request>,
+    history: Option<History>,
+) -> Result<()> {
+    let connection_id = match &history {
+        Some(history) => history
+            .open_connection()
+            .context("record daemon connection")?,
+        None => 0,
+    };
+    let mut cli_run_id = None;
+    let result = handle_requests(
+        stream,
+        sender,
+        history.as_ref(),
+        connection_id,
+        &mut cli_run_id,
+    )
+    .await;
+    if let Some(history) = &history {
+        history
+            .record(EventKind::ConnectionClosed {
+                connection_id,
+                cli_run_id,
+                reason: match &result {
+                    Ok(()) => "closed".to_owned(),
+                    Err(error) => format!("{error:#}"),
+                },
+            })
+            .context("record daemon connection closure")?;
+    }
+    result
+}
+
+async fn handle_requests(
+    stream: UnixStream,
+    sender: mpsc::Sender<Request>,
+    history: Option<&History>,
+    connection_id: u64,
+    cli_run_id: &mut Option<String>,
+) -> Result<()> {
     let mut stream = BufReader::new(stream);
     let mut delivery = StdinDelivery::new()?;
     loop {
@@ -330,22 +431,69 @@ async fn handle_client(stream: UnixStream, sender: mpsc::Sender<Request>) -> Res
         let operation = tokio::select! {
             biased;
             _ = sender.closed() => return Ok(()),
-            operation = timeout(IO_TIMEOUT, read_json::<Operation>(&mut stream)) => {
+            operation = timeout(IO_TIMEOUT, read_json::<SubmittedOperation<Operation>>(&mut stream)) => {
                 operation.context("command read timed out")?
             }
         };
-        let stopping = matches!(&operation, Ok(Operation::Stop));
+        let stopping = matches!(
+            &operation,
+            Ok(SubmittedOperation {
+                operation: Operation::Stop,
+                ..
+            })
+        );
+        let mut request_id = None;
         let prepared: Result<PreparedResponse, String> = match operation {
-            Ok(operation) => {
+            Ok(submitted) => {
+                *cli_run_id = submitted.cli_run_id;
+                if let Some(history) = history {
+                    request_id = Some(
+                        history
+                            .accept_request(
+                                connection_id,
+                                cli_run_id.clone(),
+                                serde_json::to_value(&submitted.operation)?,
+                            )
+                            .context(
+                                "record request before execution; request was not submitted",
+                            )?,
+                    );
+                }
                 let (reply, received) = oneshot::channel();
-                match sender.send(Request { operation, reply }).await {
+                match sender
+                    .send(Request {
+                        operation: submitted.operation,
+                        request_id,
+                        reply,
+                    })
+                    .await
+                {
                     Ok(()) => received
                         .await
                         .unwrap_or_else(|_| Err("Application stopped".to_owned())),
-                    Err(_) => Err("Application stopped".to_owned()),
+                    Err(_) => {
+                        if let (Some(history), Some(request_id)) = (history, request_id) {
+                            history.record(EventKind::RequestNotExecuted {
+                                request_id,
+                                message: "Application stopped before accepting this request into its execution queue".to_owned(),
+                            }).context("record request rejected by the closed execution queue")?;
+                        }
+                        Err("Application stopped before this request executed".to_owned())
+                    }
                 }
             }
-            Err(error) => Err(format!("invalid command: {error}")),
+            Err(error) => {
+                let message = format!("invalid command: {error}");
+                if let Some(history) = history {
+                    history
+                        .record(EventKind::ProtocolRejected {
+                            connection_id,
+                            message: message.clone(),
+                        })
+                        .context("record rejected daemon protocol message")?;
+                }
+                Err(message)
+            }
         };
         let (response, commit): (Result<Response, String>, _) = match prepared {
             Ok(prepared) => match delivery.prepare(prepared.output) {
@@ -353,6 +501,7 @@ async fn handle_client(stream: UnixStream, sender: mpsc::Sender<Request>) -> Res
                     Ok(Response {
                         output,
                         daemon_pid: prepared.daemon_pid,
+                        daemon_session_id: prepared.daemon_session_id,
                     }),
                     Some(commit),
                 ),
@@ -361,9 +510,27 @@ async fn handle_client(stream: UnixStream, sender: mpsc::Sender<Request>) -> Res
             Err(error) => (Err(error), None),
         };
         let close = stopping || response.is_err();
-        timeout(IO_TIMEOUT, write_json(stream.get_mut(), &response))
+        let written = timeout(IO_TIMEOUT, write_json(stream.get_mut(), &response))
             .await
-            .context("response write timed out")??;
+            .context("response write timed out")
+            .and_then(|result| result);
+        if let (Some(history), Some(request_id)) = (history, request_id) {
+            history
+                .record(match &written {
+                    Ok(()) => EventKind::DeliveryWritten {
+                        request_id,
+                        connection_id,
+                        response_error: response.as_ref().err().cloned(),
+                    },
+                    Err(error) => EventKind::DeliveryFailed {
+                        request_id,
+                        connection_id,
+                        message: format!("{error:#}"),
+                    },
+                })
+                .context("record socket write outcome; inspect daemon history before retrying")?;
+        }
+        written?;
         if let Some(commit) = commit {
             // No await between successful delivery and baseline publication.
             delivery.commit(commit);
@@ -391,13 +558,29 @@ async fn write_json(stream: &mut UnixStream, value: &impl Serialize) -> Result<(
     Ok(())
 }
 
+#[cfg(test)]
 async fn run(
+    receiver: mpsc::Receiver<Request>,
+    root: impl Fn() -> Component + Send + Sync + 'static,
+) -> Result<Option<ShutdownReply>> {
+    run_with_history(receiver, root, None).await
+}
+
+async fn run_with_history(
     mut receiver: mpsc::Receiver<Request>,
     root: impl Fn() -> Component + Send + Sync + 'static,
+    history: Option<History>,
 ) -> Result<Option<ShutdownReply>> {
     let mut application = StdinApplication::mount(root)?;
     let operation = async {
-        while let Some(Request { operation, reply }) = receiver.recv().await {
+        while let Some(Request { operation, request_id, reply }) = receiver.recv().await {
+            if let (Some(history), Some(request_id)) = (&history, request_id) {
+                if let Err(error) = history.start_execution(request_id) {
+                    let message = format!("daemon history unavailable; this request was not executed: {error}");
+                    let _ = reply.send(Err(message.clone()));
+                    return Err(anyhow::anyhow!(message));
+                }
+            }
             let stopping = matches!(&operation, Operation::Stop);
             let response = match operation {
                 Operation::Action { call } => application.submit_projection(call).await,
@@ -412,14 +595,29 @@ async fn run(
             let response = response.map(|output| PreparedResponse {
                 output,
                 daemon_pid: std::process::id(),
+                daemon_session_id: history.as_ref().map(|history| history.id().to_owned()),
+                request_id,
             });
             match response {
                 Ok(response) if stopping => return Ok(Some((reply, response))),
                 Ok(response) => {
+                    if let Err(error) = record_execution_completed(history.as_ref(), &response) {
+                        let _ = reply.send(Err(format!("{error:#}")));
+                        return Err(error);
+                    }
                     let _ = reply.send(Ok(response));
                 }
                 Err(error) => {
-                    let _ = reply.send(Err(error.to_string()));
+                    let mut message = error.to_string();
+                    if let (Some(history), Some(request_id)) = (&history, request_id) {
+                        if let Err(recording) = history.record(EventKind::ExecutionFailed {
+                            request_id,
+                            message: message.clone(),
+                        }) {
+                            message = format!("{message}; could not persist the execution failure: {recording}; effects may have occurred, inspect state before retrying");
+                        }
+                    }
+                    let _ = reply.send(Err(message));
                     return Err(anyhow::Error::from(error));
                 }
             }
@@ -427,11 +625,61 @@ async fn run(
         Ok(None)
     }
     .await;
+    // Once this owner exits its execution loop, no remaining queue entry can
+    // run. Distinguish that known outcome from requests interrupted by a crash.
+    receiver.close();
+    let mut rejection_failure = None;
+    while let Some(Request {
+        request_id, reply, ..
+    }) = receiver.recv().await
+    {
+        let mut message = "Application stopped before this request executed".to_owned();
+        if let (Some(history), Some(request_id)) = (&history, request_id) {
+            if let Err(error) = history.record(EventKind::RequestNotExecuted {
+                request_id,
+                message: message.clone(),
+            }) {
+                message = format!("{message}; could not persist the queue rejection: {error}");
+                rejection_failure.get_or_insert(error);
+            }
+        }
+        let _ = reply.send(Err(message));
+    }
     let cleanup = application.shutdown().await;
+    if let Some(recording) = rejection_failure {
+        let error =
+            anyhow::Error::from(recording).context("could not persist rejected queued requests");
+        if let Ok(Some((reply, _))) = operation {
+            let _ = reply.send(Err(format!("{error:#}")));
+        }
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => {
+                Err(error.context(format!("Application shutdown also failed: {cleanup}")))
+            }
+        };
+    }
     match (operation, cleanup) {
+        (Ok(Some((reply, response))), Ok(())) => {
+            if let Err(error) = record_execution_completed(history.as_ref(), &response) {
+                let _ = reply.send(Err(format!("{error:#}")));
+                return Err(error);
+            }
+            Ok(Some((reply, response)))
+        }
         (Ok(reply), Ok(())) => Ok(reply),
-        (Ok(Some((reply, _))), Err(error)) => {
-            let _ = reply.send(Err(format!("Application shutdown failed: {error}")));
+        (Ok(Some((reply, response))), Err(error)) => {
+            let mut message = format!("Application shutdown failed: {error}");
+            if let (Some(history), Some(request_id)) = (&history, response.request_id) {
+                if let Err(recording) = history.record(EventKind::ExecutionFailed {
+                    request_id,
+                    message: message.clone(),
+                }) {
+                    message =
+                        format!("{message}; could not persist the shutdown failure: {recording}");
+                }
+            }
+            let _ = reply.send(Err(message));
             Err(error.into())
         }
         (Ok(None), Err(error)) => Err(error.into()),
@@ -440,6 +688,27 @@ async fn run(
             Err(error.context(format!("Application shutdown also failed: {cleanup}")))
         }
     }
+}
+
+fn record_execution_completed(
+    history: Option<&History>,
+    response: &PreparedResponse,
+) -> Result<()> {
+    if let (Some(history), Some(request_id)) = (history, response.request_id) {
+        // The retained projection is a complete observation, before any private
+        // connection cursor lowers it to a Delta. Rendering never parses POM.
+        let output = StdinResponse {
+            ok: response.output.ok,
+            result: response.output.result.clone(),
+            view: super::render(&response.output.projection).context(
+                "could not record the complete observation after execution; effects may have occurred, inspect state before retrying",
+            )?,
+        };
+        history.record(EventKind::ExecutionCompleted { request_id, output }).context(
+            "could not persist the result after execution; effects may have occurred, inspect state and daemon history before retrying",
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -509,7 +778,9 @@ mod tests {
         let expected_result = result.clone();
         let (sender, mut receiver) = mpsc::channel::<Request>(1);
         let application = tokio::spawn(async move {
-            let Request { operation, reply } = receiver.recv().await.unwrap();
+            let Request {
+                operation, reply, ..
+            } = receiver.recv().await.unwrap();
             match operation {
                 Operation::Frame { calls } => {
                     assert_eq!(
@@ -543,6 +814,8 @@ mod tests {
                         projection,
                     },
                     daemon_pid: 42,
+                    daemon_session_id: None,
+                    request_id: None,
                 }))
                 .unwrap();
             assert!(receiver.recv().await.is_none());
@@ -576,6 +849,7 @@ mod tests {
                         ],
                     },
                     reply: frame_reply,
+                    request_id: None,
                 })
                 .await
                 .unwrap();
@@ -586,6 +860,7 @@ mod tests {
                         call: CommandCall::new("work", json!({})),
                     },
                     reply: next_reply,
+                    request_id: None,
                 })
                 .await
                 .unwrap();
@@ -682,5 +957,204 @@ mod tests {
         })
         .await
         .expect("a lost response leaves the daemon available for inspection");
+    }
+
+    #[test]
+    fn foreground_association_preserves_legacy_operation_messages() {
+        let legacy: SubmittedOperation<Operation> =
+            serde_json::from_value(json!({"kind":"observe"})).unwrap();
+        assert!(matches!(legacy.operation, Operation::Observe));
+        assert!(legacy.cli_run_id.is_none());
+        let associated: SubmittedOperation<Operation> = serde_json::from_value(json!({
+            "kind":"action", "call":{"action":"work","input":{}}, "cli_run_id":"frontend-run"
+        }))
+        .unwrap();
+        assert!(matches!(associated.operation, Operation::Action { .. }));
+        assert_eq!(associated.cli_run_id.as_deref(), Some("frontend-run"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn isolated_history() -> (History, PathBuf) {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).unwrap();
+        let directory = env::temp_dir().join(format!(
+            "agentview-daemon-io-failure-{:032x}",
+            u128::from_be_bytes(random)
+        ));
+        let history = History::create_in(
+            &directory,
+            Path::new("/tmp/example"),
+            Path::new("/tmp/example.socket"),
+        )
+        .unwrap();
+        (history, directory)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn history_failure_before_execution_prevents_callback_effects() {
+        let (history, directory) = isolated_history();
+        let connection_id = history.open_connection().unwrap();
+        let request_id = history
+            .accept_request(connection_id, None, json!({"kind":"action"}))
+            .unwrap();
+        history.fail_writes_for_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let root_calls = calls.clone();
+        let (sender, receiver) = mpsc::channel(16);
+        let application = tokio::spawn(run_with_history(
+            receiver,
+            move || transport_actions(root_calls.clone(), Duration::ZERO),
+            Some(history.clone()),
+        ));
+        let (reply, received) = oneshot::channel();
+        sender
+            .send(Request {
+                operation: Operation::Action {
+                    call: CommandCall::new("work", json!({})),
+                },
+                request_id: Some(request_id),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(received.await.unwrap().is_err());
+        drop(sender);
+        assert!(application.await.unwrap().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let events: Vec<super::super::daemon_history::Event> =
+            fs::read_to_string(history.path().join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ExecutionStarted { .. })));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn history_failure_after_execution_leaves_the_outcome_unknown_and_does_not_replay() {
+        let (history, directory) = isolated_history();
+        let connection_id = history.open_connection().unwrap();
+        let request_id = history
+            .accept_request(connection_id, None, json!({"kind":"action"}))
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let root_calls = calls.clone();
+        let (sender, receiver) = mpsc::channel(16);
+        let application = tokio::spawn(run_with_history(
+            receiver,
+            move || transport_actions(root_calls.clone(), Duration::from_millis(50)),
+            Some(history.clone()),
+        ));
+        let (reply, received) = oneshot::channel();
+        sender
+            .send(Request {
+                operation: Operation::Action {
+                    call: CommandCall::new("work", json!({})),
+                },
+                request_id: Some(request_id),
+                reply,
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        history.fail_writes_for_test();
+        assert!(received.await.unwrap().is_err());
+        drop(sender);
+        assert!(application.await.unwrap().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events: Vec<super::super::daemon_history::Event> =
+            fs::read_to_string(history.path().join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ExecutionStarted { .. })));
+        assert!(!events.iter().any(|event| matches!(
+            event.kind,
+            EventKind::ExecutionCompleted { .. } | EventKind::ExecutionFailed { .. }
+        )));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_records_queued_requests_as_not_executed() {
+        let (history, directory) = isolated_history();
+        let connection_id = history.open_connection().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let root_calls = calls.clone();
+        let (sender, receiver) = mpsc::channel(16);
+        let mut replies = Vec::new();
+        let mut ids = Vec::new();
+        for operation in [
+            Operation::Action {
+                call: CommandCall::new("work", json!({})),
+            },
+            Operation::Stop,
+            Operation::Action {
+                call: CommandCall::new("work", json!({})),
+            },
+        ] {
+            let request_id = history
+                .accept_request(
+                    connection_id,
+                    None,
+                    serde_json::to_value(&operation).unwrap(),
+                )
+                .unwrap();
+            let (reply, received) = oneshot::channel();
+            sender
+                .send(Request {
+                    operation,
+                    request_id: Some(request_id),
+                    reply,
+                })
+                .await
+                .unwrap();
+            replies.push(received);
+            ids.push(request_id);
+        }
+        let application = tokio::spawn(run_with_history(
+            receiver,
+            move || transport_actions(root_calls.clone(), Duration::ZERO),
+            Some(history.clone()),
+        ));
+        let (reply, response) = application.await.unwrap().unwrap().unwrap();
+        reply.send(Ok(response)).unwrap();
+        let mut replies = replies.into_iter();
+        assert!(replies.next().unwrap().await.unwrap().is_ok());
+        assert!(replies.next().unwrap().await.unwrap().is_ok());
+        assert!(replies.next().unwrap().await.unwrap().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events: Vec<super::super::daemon_history::Event> =
+            fs::read_to_string(history.path().join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::ExecutionStarted { request_id, .. } => Some(request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, ids[..2]);
+        assert!(events.iter().any(|event| matches!(event.kind, EventKind::RequestNotExecuted { request_id, .. } if request_id == ids[2])));
+        drop(sender);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

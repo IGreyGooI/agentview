@@ -52,6 +52,8 @@ struct SessionMetadata {
     started_at_unix_ms: u64,
     ended_at_unix_ms: Option<u64>,
     exit_code: Option<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    daemon_session_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +79,9 @@ enum EventKind {
     },
     Finished {
         exit_code: u8,
+    },
+    DaemonSession {
+        daemon_session_id: String,
     },
 }
 
@@ -149,6 +154,7 @@ impl State {
 
 struct Shared {
     directory: PathBuf,
+    id: String,
     state: Mutex<State>,
 }
 
@@ -200,6 +206,7 @@ impl History {
             started_at_unix_ms,
             ended_at_unix_ms: None,
             exit_code: None,
+            daemon_session_ids: Vec::new(),
         };
         let mut state = State {
             metadata,
@@ -216,6 +223,7 @@ impl History {
         Ok(Self {
             shared: Arc::new(Shared {
                 directory,
+                id: state.metadata.id.clone(),
                 state: Mutex::new(state),
             }),
         })
@@ -223,6 +231,31 @@ impl History {
 
     pub(super) fn path(&self) -> &Path {
         &self.shared.directory
+    }
+
+    pub(super) fn id(&self) -> &str {
+        &self.shared.id
+    }
+
+    pub(super) fn record_daemon_session(&self, daemon_session_id: &str) -> io::Result<()> {
+        let mut state = self.lock()?;
+        state.ensure_open()?;
+        if state
+            .metadata
+            .daemon_session_ids
+            .iter()
+            .any(|id| id == daemon_session_id)
+        {
+            return Ok(());
+        }
+        state.event(EventKind::DaemonSession {
+            daemon_session_id: daemon_session_id.to_owned(),
+        })?;
+        state
+            .metadata
+            .daemon_session_ids
+            .push(daemon_session_id.to_owned());
+        write_metadata(self.path(), &state.metadata)
     }
 
     pub(super) fn record_input(&self, bytes: &[u8]) -> io::Result<()> {

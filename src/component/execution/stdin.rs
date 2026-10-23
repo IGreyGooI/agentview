@@ -22,6 +22,8 @@ mod cli;
 #[cfg(unix)]
 mod daemon;
 #[cfg(unix)]
+mod daemon_history;
+#[cfg(unix)]
 mod delivery;
 #[cfg(unix)]
 mod history;

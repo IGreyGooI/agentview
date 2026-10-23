@@ -613,8 +613,8 @@ The runner automatically records each foreground stdin interaction and each
 `APP history` to list the most recent 20 runs, `APP history latest` to read the
 newest, or `APP history ID` to read a selected chronological stdin/stdout/stderr
 transcript. These commands read local files without contacting or starting a
-daemon, executing actions, or creating another history record. Help and the
-internal daemon also create no records. Lifecycle commands have their own IDs;
+daemon, executing actions, or creating another history record. Help also creates
+no record. Lifecycle commands have their own IDs;
 after `stop`, select the interaction's ID rather than assuming `latest` is it.
 
 History lives in `$XDG_STATE_HOME/agentview-<executable-name>/history`, falling
@@ -623,6 +623,26 @@ back to `$HOME/.local/state/agentview-<executable-name>/history`. Each run conta
 `events.jsonl` with timestamps, event order, and stream byte ranges. History
 preserves the actual delivered Full and Delta views; reading it does not rebuild
 views or replay effects. See [recorded CLI runs](docs/command-feedback-delivery.md#inspect-recorded-cli-runs).
+
+Each daemon lifetime also has a session ID and a durable request/result history
+across all connected CLI invocations. Use `APP history --daemon` to list sessions,
+`APP history --daemon latest` for the newest, or `APP history --daemon SESSION_ID`
+for a selected session. Files live in the adjacent `daemon-history` directory,
+with `session.json` and `events.jsonl`. Events identify client connections and CLI
+run IDs, accepted requests, their execution order, complete application views and
+results, socket writes or write failures, and recorded shutdown. The first CLI
+view exposes its daemon session ID; a foreground run records every daemon session
+it contacted, including both lifetimes during `restart`.
+
+Daemon records describe execution; foreground raw history preserves each client's
+actual stdin/stdout/stderr, including its independent view diffs. The daemon
+viewer links raw run directories available in the reader's state directory;
+clients can use another `XDG_STATE_HOME`. A successful socket write does not
+confirm that the client read the response. Requests explicitly recorded as not
+executed have a known outcome; requests without a recorded execution outcome are
+unconfirmed. Missing session completion means the daemon
+may still be running or was interrupted; completed request results remain known.
+History readers ignore a final incomplete JSONL event and never execute actions.
 
 For embedding in a custom transport, `mount` exposes the same application owner
 without the CLI or daemon. Its methods return complete snapshots; incremental

@@ -160,7 +160,7 @@ status. The other forms display stdin, stdout, and stderr in recorded event orde
 with stream labels and relative times. A lifecycle command has its own run ID;
 after stopping the daemon, use the interaction's ID to inspect its transcript.
 History reads local files without connecting to a daemon or dispatching actions.
-Reading history, help, and the internal daemon create no history records.
+Reading history and help create no history records.
 
 The root is `$XDG_STATE_HOME/agentview-<executable-name>/history`, falling back to
 `$HOME/.local/state/agentview-<executable-name>/history`. Each run directory holds
@@ -174,6 +174,35 @@ These files preserve what the frontend actually read and delivered, including
 incremental views and diagnostics. Reading them never re-executes input, rebuilds
 a current view, or changes a Frame delivery baseline. Treat POM as opaque text;
 use the event records and byte ranges when examining the recording programmatically.
+
+The daemon separately records one session across all of its client connections:
+
+```sh
+target/debug/examples/command_feedback_cli history --daemon
+target/debug/examples/command_feedback_cli history --daemon latest
+target/debug/examples/command_feedback_cli history --daemon SESSION_ID
+```
+
+These commands read `daemon-history/SESSION_ID/session.json` and `events.jsonl`
+under the same application state root. The first view exposes the daemon session
+ID, and each foreground run's metadata associates it with the daemon sessions it
+contacted. A restart associates its foreground run with both the old session and
+the new one. Daemon history events include client connection IDs, CLI run IDs,
+accepted operations, execution order, complete application views and results,
+response socket writes or failures, and recorded session completion. The viewer
+prints the stored complete view as opaque text, independently of each connection's
+diff cursor. It also shows raw CLI history paths found in the reader's state root;
+another client's raw files may live under a different `XDG_STATE_HOME`.
+
+Request acceptance order and execution order are separate recorded facts. A
+successful socket write records that all response bytes were written; it does not
+confirm the client read them. An execution result remains recorded even when its
+response write fails. A `request_not_executed` event records a known outcome when
+the closed queue or stop prevents execution. A request without a recorded execution
+outcome remains unconfirmed. If session completion is absent, the daemon may still be running or was
+interrupted; previously recorded execution results remain available. The reader
+ignores an incomplete final JSONL line while retaining every complete earlier
+event. It never starts a daemon or replays recorded actions.
 
 ## Run the examples
 

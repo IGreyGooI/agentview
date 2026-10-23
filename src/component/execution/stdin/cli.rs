@@ -1,6 +1,7 @@
 //! Process frontend for the retained stdin application.
 
 use std::{
+    collections::BTreeSet,
     env,
     fs::{self, File},
     io::{self, BufRead, Read, Seek, SeekFrom, Write},
@@ -14,7 +15,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{sleep_until, Instant};
 
 use super::super::CommandCall;
-use super::daemon::{self, request, Operation, Response};
+use super::daemon::{self, Operation, Response};
+use super::daemon_history;
 use super::history::{self, History, HistoryReader, HistoryWriter, Stream};
 use super::StdinApplicationOptions;
 use crate::component::authoring::Component;
@@ -30,6 +32,7 @@ enum Invocation {
     Stop,
     Restart,
     History(Option<String>),
+    DaemonHistory(Option<String>),
 }
 
 impl Invocation {
@@ -42,7 +45,7 @@ impl Invocation {
             Self::Status => "status",
             Self::Stop => "stop",
             Self::Restart => "restart",
-            Self::History(_) => "history",
+            Self::History(_) | Self::DaemonHistory(_) => "history",
         }
     }
 }
@@ -96,6 +99,10 @@ async fn invoke(
         show_history(&executable, selection.as_deref())?;
         return Ok(true);
     }
+    if let Invocation::DaemonHistory(selection) = &invocation {
+        show_daemon_history(&executable, selection.as_deref())?;
+        return Ok(true);
+    }
     if !matches!(invocation, Invocation::Daemon) {
         *history = Some(History::create(&executable, &socket, invocation.name())?);
     }
@@ -114,7 +121,7 @@ async fn invoke(
         shell_quote(&socket)?
     );
     match invocation {
-        Invocation::Help | Invocation::History(_) => {
+        Invocation::Help | Invocation::History(_) | Invocation::DaemonHistory(_) => {
             unreachable!("read-only command returned before session setup")
         }
         Invocation::Daemon => daemon::serve(&socket, root).await?,
@@ -128,42 +135,54 @@ async fn invoke(
             .await;
         }
         Invocation::Start | Invocation::Restart => {
+            let history = history.as_ref().expect("foreground history");
             if matches!(invocation, Invocation::Restart) {
-                request(&socket, &Operation::Stop, false).await?;
+                request_recorded(&socket, &Operation::Stop, false, history).await?;
             }
-            let response = request(&socket, &Operation::Observe, true)
+            let response = request_recorded(&socket, &Operation::Observe, true, history)
                 .await?
                 .context("daemon did not start")?;
-            print_view(
-                Some(&response),
-                &command,
-                true,
-                true,
-                history.as_ref().expect("foreground history"),
-            )?;
+            print_view(Some(&response), &command, true, true, history)?;
         }
         Invocation::Status => {
-            let response = request(&socket, &Operation::Observe, false).await?;
+            let history = history.as_ref().expect("foreground history");
+            let response = request_recorded(&socket, &Operation::Observe, false, history).await?;
             print_view(
                 response.as_ref(),
                 &command,
                 response.is_some(),
                 true,
-                history.as_ref().expect("foreground history"),
+                history,
             )?;
         }
         Invocation::Stop => {
-            let response = request(&socket, &Operation::Stop, false).await?;
-            print_view(
-                response.as_ref(),
-                &command,
-                false,
-                true,
-                history.as_ref().expect("foreground history"),
-            )?;
+            let history = history.as_ref().expect("foreground history");
+            let response = request_recorded(&socket, &Operation::Stop, false, history).await?;
+            print_view(response.as_ref(), &command, false, true, history)?;
         }
     }
     Ok(true)
+}
+
+async fn request_recorded(
+    socket: &Path,
+    operation: &Operation,
+    autostart: bool,
+    history: &History,
+) -> Result<Option<Response>> {
+    let response =
+        daemon::request_for_run(socket, operation, autostart, Some(history.id())).await?;
+    if let Some(response) = &response {
+        record_daemon_session(history, response)?;
+    }
+    Ok(response)
+}
+
+fn record_daemon_session(history: &History, response: &Response) -> Result<()> {
+    if let Some(session_id) = &response.daemon_session_id {
+        history.record_daemon_session(session_id)?;
+    }
+    Ok(())
 }
 
 fn help() -> String {
@@ -174,7 +193,7 @@ fn help() -> String {
                 .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "app".to_owned());
-    let usage = "APP [--socket PATH] [start|status|stop|restart|history [latest|ID]|help]\n\n\
+    let usage = "APP [--socket PATH] [start|status|stop|restart|history [--daemon] [latest|ID]|help]\n\n\
 No subcommand: print the initial view, then read action JSON objects and print one resulting view per frame.\n\
 Input format: {\"action\":\"<action name>\",\"input\":{}}\n\
 Multiple top-level objects may span lines; no enclosing array or wrapper is needed.\n\
@@ -190,6 +209,7 @@ A missing daemon starts automatically. Application state survives EOF.\n\n\
   stop     Stop the daemon, await cleanup, and show the final view\n\
   restart  Stop the daemon and show a fresh session (discards the old state)\n\
   history  List recent CLI runs; history latest or history ID reads their transcript\n\
+           history --daemon lists daemon sessions; add latest or ID for their complete request/result history\n\
   help     Show this usage without starting a daemon\n\n\
 stdout carries one view per frame with every action result in its feedback; diagnostics use stderr.\n\
 The first view is complete; later views may omit ordinary unchanged content. Repeated content is delivered in full.\n\
@@ -200,6 +220,7 @@ Exit codes: 0 callbacks completed, 2 invalid/disabled input, 1 transport/runtime
 Business acceptance or refusal is expressed by the callback's JSON result.\n\
 Foreground interactions and lifecycle commands automatically save raw stdin, stdout, stderr, and a timed event log.\n\
 History lives in $XDG_STATE_HOME/agentview-APP/history, or $HOME/.local/state/agentview-APP/history.\n\
+Daemon sessions use the adjacent daemon-history directory and span foreground CLI invocations.\n\
 Reading history does not start a daemon or execute actions.\n\
 Use --socket PATH for independent sessions. State lasts until the daemon stops.\n\
 Default socket: $XDG_RUNTIME_DIR/agentview-APP/socket, or\n\
@@ -249,7 +270,15 @@ fn write_view(
     if include_context {
         writeln!(view, "<daemon status=\"{status}\">{message}</daemon>\n")?;
         if let Some(response) = response {
-            writeln!(view, "<session daemon_pid=\"{}\" />", response.daemon_pid)?;
+            if let Some(session_id) = &response.daemon_session_id {
+                writeln!(
+                    view,
+                    "<session daemon_pid=\"{}\" daemon_session_id=\"{session_id}\" />",
+                    response.daemon_pid
+                )?;
+            } else {
+                writeln!(view, "<session daemon_pid=\"{}\" />", response.daemon_pid)?;
+            }
             writeln!(
                 view,
                 "<connection command=\"{command}\" input=\"action JSON objects; final newline + 100 ms input idle, or EOF\" output=\"one view with all frame feedback\" />\n"
@@ -272,8 +301,8 @@ async fn interact(
     history: History,
 ) -> Result<bool> {
     let stdin = HistoryReader::new(super::input::stdin()?, history.clone());
-    let mut stdout = HistoryWriter::new(io::stdout(), history, Stream::Stdout);
-    interact_io(socket, command, options, stdin, &mut stdout).await
+    let mut stdout = HistoryWriter::new(io::stdout(), history.clone(), Stream::Stdout);
+    interact_io(socket, command, options, stdin, &mut stdout, &history).await
 }
 
 async fn interact_io(
@@ -282,12 +311,14 @@ async fn interact_io(
     options: StdinApplicationOptions,
     mut stdin: impl AsyncRead + Unpin,
     stdout: &mut impl Write,
+    history: &History,
 ) -> Result<bool> {
     let mut frames = FrameInput::default();
-    let mut connection = daemon::Connection::connect(socket, true)
+    let mut connection = daemon::Connection::connect_for_run(socket, true, Some(history.id()))
         .await?
         .context("daemon did not start")?;
     let initial = connection.request(&Operation::Observe).await?;
+    record_daemon_session(history, &initial)?;
     write_view(stdout, Some(&initial), command, true, true)?;
     let mut succeeded = true;
     loop {
@@ -309,6 +340,7 @@ async fn interact_io(
         // Framing idle limits only input collection, never callback execution.
         let idle_refresh = matches!(&operation, Operation::Observe);
         let response = connection.request(&operation).await?;
+        record_daemon_session(history, &response)?;
         succeeded &= response.output.ok;
         if !idle_refresh || !response.output.view.is_empty() {
             write_view(stdout, Some(&response), command, true, false)?;
@@ -343,12 +375,16 @@ fn saved_runs(directory: &Path) -> Result<Vec<(PathBuf, serde_json::Value)>> {
         }
         let path = entry.path();
         let metadata = path.join("session.json");
-        if metadata.is_file() {
-            runs.push((
-                path,
-                serde_json::from_slice::<serde_json::Value>(&fs::read(metadata)?)?,
-            ));
+        match fs::symlink_metadata(&metadata) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
         }
+        runs.push((
+            path,
+            serde_json::from_slice::<serde_json::Value>(&fs::read(metadata)?)?,
+        ));
     }
     runs.sort_by(|left, right| {
         right.1["started_at_unix_ms"]
@@ -384,22 +420,202 @@ fn show_history(executable: &Path, selection: Option<&str>) -> Result<()> {
         }
         return Ok(());
     };
+    let path = selected_history_directory(&directory, selection, "CLI runs")?;
+    print_history(&path, &mut stdout)
+}
+
+fn validate_history_id(id: &str) -> Result<()> {
+    let mut components = Path::new(id).components();
+    ensure!(
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none(),
+        "history ID must be a single ID"
+    );
+    Ok(())
+}
+
+fn selected_history_directory(directory: &Path, selection: &str, kind: &str) -> Result<PathBuf> {
     let path = if selection == "latest" {
         saved_runs(&directory)?
             .into_iter()
             .next()
             .map(|(path, _)| path)
-            .context("no recorded CLI runs")?
+            .with_context(|| format!("no recorded {kind}"))?
     } else {
-        let mut components = Path::new(selection).components();
-        ensure!(
-            matches!(components.next(), Some(std::path::Component::Normal(_)))
-                && components.next().is_none(),
-            "history ID must be a single run ID"
-        );
+        validate_history_id(selection)?;
         directory.join(selection)
     };
-    print_history(&path, &mut stdout)
+    ensure!(
+        fs::symlink_metadata(&path)?.file_type().is_dir(),
+        "history ID must name a directory inside its history root"
+    );
+    let canonical_root = directory.canonicalize()?;
+    let canonical_path = path.canonicalize()?;
+    ensure!(
+        canonical_path.parent() == Some(canonical_root.as_path()),
+        "history ID must stay inside its history root"
+    );
+    Ok(path)
+}
+
+fn open_history_file(path: &Path, name: &str) -> Result<File> {
+    let file = path.join(name);
+    ensure!(
+        fs::symlink_metadata(&file)?.file_type().is_file(),
+        "history files must be regular files"
+    );
+    Ok(File::open(file)?)
+}
+
+fn local_cli_history(cli_history: &Path, run_id: &str) -> Option<PathBuf> {
+    let path = selected_history_directory(cli_history, run_id, "CLI runs").ok()?;
+    let metadata: serde_json::Value =
+        serde_json::from_reader(open_history_file(&path, "session.json").ok()?).ok()?;
+    (metadata["id"].as_str() == Some(run_id)).then_some(path)
+}
+
+fn show_daemon_history(executable: &Path, selection: Option<&str>) -> Result<()> {
+    let directory = daemon_history::root_for(executable)?;
+    let mut stdout = io::stdout().lock();
+    let Some(selection) = selection else {
+        writeln!(stdout, "Daemon history: {}", directory.display())?;
+        let sessions = saved_runs(&directory)?;
+        if sessions.is_empty() {
+            writeln!(stdout, "No recorded daemon sessions.")?;
+        }
+        for (path, session) in sessions.into_iter().take(20) {
+            let status = session["outcome"]
+                .as_str()
+                .map(|outcome| format!("finished={outcome}"))
+                .unwrap_or_else(|| "no recorded end".to_owned());
+            writeln!(
+                stdout,
+                "{}  pid={}  {}  {}",
+                session["id"].as_str().unwrap_or_default(),
+                session["pid"],
+                status,
+                path.display()
+            )?;
+        }
+        return Ok(());
+    };
+    let path = selected_history_directory(&directory, selection, "daemon sessions")?;
+    print_daemon_history(&path, &history::root_for(executable)?, &mut stdout)
+}
+
+fn visit_jsonl_events(
+    mut reader: impl BufRead,
+    mut visit: impl FnMut(serde_json::Value) -> Result<()>,
+) -> Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 || !line.ends_with(b"\n") {
+            // An active or interrupted writer can leave an uncommitted tail.
+            return Ok(());
+        }
+        visit(serde_json::from_slice(&line)?)?;
+    }
+}
+
+fn print_daemon_history(path: &Path, cli_history: &Path, stdout: &mut impl Write) -> Result<()> {
+    let session: serde_json::Value =
+        serde_json::from_reader(open_history_file(path, "session.json")?)?;
+    writeln!(
+        stdout,
+        "Daemon session: {}\nPID: {}\nSocket: {}\nFiles: {}",
+        session["id"].as_str().unwrap_or_default(),
+        session["pid"],
+        session["socket"].as_str().unwrap_or_default(),
+        path.display()
+    )?;
+    writeln!(
+        stdout,
+        "\nExecution order is recorded by execution_index. Delivery events report socket writes; client reads are unconfirmed."
+    )?;
+    let events = io::BufReader::new(open_history_file(path, "events.jsonl")?);
+    let mut cli_runs = BTreeSet::new();
+    let mut unfinished_requests = BTreeSet::new();
+    let mut finished = false;
+    visit_jsonl_events(events, |mut event| {
+        let sequence = event["sequence"]
+            .as_u64()
+            .context("missing daemon history event sequence")?;
+        let kind = event["kind"]
+            .as_str()
+            .context("missing daemon history event kind")?
+            .to_owned();
+        let elapsed_us = event["elapsed_us"].as_u64().unwrap_or_default();
+        writeln!(
+            stdout,
+            "\n--- event {sequence} +{}.{:06}s {kind} ---",
+            elapsed_us / 1_000_000,
+            elapsed_us % 1_000_000
+        )?;
+        if let Some(run_id) = event["cli_run_id"].as_str() {
+            if cli_runs.insert(run_id.to_owned()) {
+                writeln!(stdout, "CLI run: {}", serde_json::to_string(run_id)?)?;
+                // Clients may use another XDG_STATE_HOME than the daemon or
+                // this reader. Only link a raw recording found in this state root.
+                if let Some(raw_history) = local_cli_history(cli_history, run_id) {
+                    writeln!(stdout, "Raw history: {}", raw_history.display())?;
+                }
+            }
+        }
+        if matches!(
+            kind.as_str(),
+            "request_accepted"
+                | "execution_completed"
+                | "execution_failed"
+                | "request_not_executed"
+        ) {
+            let request_id = event["request_id"]
+                .as_u64()
+                .context("missing daemon history request ID")?;
+            if kind == "request_accepted" {
+                unfinished_requests.insert(request_id);
+            } else {
+                unfinished_requests.remove(&request_id);
+            }
+        }
+        // The structured output identifies its view. Rendered POM remains
+        // opaque; display the saved complete view without parsing or rebuilding.
+        let view = if kind == "execution_completed" {
+            event["output"]
+                .as_object_mut()
+                .and_then(|output| output.remove("view"))
+        } else {
+            None
+        };
+        serde_json::to_writer_pretty(&mut *stdout, &event)?;
+        writeln!(stdout)?;
+        if let Some(view) = view {
+            let view = view.as_str().context("daemon history view must be text")?;
+            writeln!(stdout, "\n--- complete application view ---")?;
+            stdout.write_all(view.as_bytes())?;
+            writeln!(stdout)?;
+        }
+        finished |= kind == "finished";
+        Ok(())
+    })?;
+    if !unfinished_requests.is_empty() {
+        writeln!(
+            stdout,
+            "\nRequests without a recorded execution outcome: {}. Their outcomes are unconfirmed.",
+            unfinished_requests
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
+    }
+    if !finished {
+        writeln!(
+            stdout,
+            "\nNo recorded end; the daemon may still be running or was interrupted."
+        )?;
+    }
+    Ok(())
 }
 
 struct HistorySpan {
@@ -442,6 +658,13 @@ fn print_history(path: &Path, stdout: &mut impl Write) -> Result<()> {
         session["socket"].as_str().unwrap_or_default(),
         path.display()
     )?;
+    if let Some(sessions) = session["daemon_session_ids"].as_array() {
+        for session_id in sessions {
+            if let Some(session_id) = session_id.as_str() {
+                writeln!(stdout, "Daemon session: {session_id}")?;
+            }
+        }
+    }
     let mut events = io::BufReader::new(File::open(path.join("events.jsonl"))?);
     let mut pending: Option<HistorySpan> = None;
     let mut line = Vec::new();
@@ -576,7 +799,11 @@ fn parse_cli() -> Result<(PathBuf, Invocation)> {
         .iter()
         .map(|arg| arg.to_str().context("command arguments must be UTF-8"))
         .collect::<Result<Vec<_>>>()?;
-    let invocation = match args.as_slice() {
+    Ok((socket, parse_invocation(&args)?))
+}
+
+fn parse_invocation(args: &[&str]) -> Result<Invocation> {
+    let invocation = match args {
         [] => Invocation::Interact,
         ["help" | "--help" | "-h"] => Invocation::Help,
         ["__daemon"] => Invocation::Daemon,
@@ -585,10 +812,14 @@ fn parse_cli() -> Result<(PathBuf, Invocation)> {
         ["stop"] => Invocation::Stop,
         ["restart"] => Invocation::Restart,
         ["history"] => Invocation::History(None),
+        ["history", "--daemon"] => Invocation::DaemonHistory(None),
+        ["history", "--daemon", selection] => {
+            Invocation::DaemonHistory(Some((*selection).to_owned()))
+        }
         ["history", selection] => Invocation::History(Some((*selection).to_owned())),
         _ => anyhow::bail!("unexpected daemon command\n\n{}", help()),
     };
-    Ok((socket, invocation))
+    Ok(invocation)
 }
 
 fn default_socket() -> Result<PathBuf> {
@@ -617,11 +848,96 @@ fn shell_quote(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_frame, invalid_action_message, CommandCall, FrameInput, Operation, FRAME_IDLE,
+        decode_frame, invalid_action_message, local_cli_history, open_history_file,
+        parse_invocation, selected_history_directory, visit_jsonl_events, CommandCall, FrameInput,
+        Invocation, Operation, FRAME_IDLE,
     };
     use serde_json::json;
-    use std::time::Duration;
+    use std::{fs, time::Duration};
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn daemon_history_has_a_separate_read_only_invocation() {
+        assert!(matches!(
+            parse_invocation(&["history", "--daemon"]).unwrap(),
+            Invocation::DaemonHistory(None)
+        ));
+        for selection in ["latest", "1792744082822-session"] {
+            assert!(matches!(
+                parse_invocation(&["history", "--daemon", selection]).unwrap(),
+                Invocation::DaemonHistory(Some(id)) if id == selection
+            ));
+            assert!(matches!(
+                parse_invocation(&["history", selection]).unwrap(),
+                Invocation::History(Some(id)) if id == selection
+            ));
+        }
+        assert!(parse_invocation(&["history", "--daemon", "latest", "extra"]).is_err());
+    }
+
+    #[test]
+    fn history_selection_and_raw_links_stay_inside_their_state_root() {
+        let directory = std::env::temp_dir().join(format!(
+            "av-cli-history-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = directory.join("history");
+        let run = root.join("run-id");
+        let outside = directory.join("outside");
+        fs::create_dir_all(&run).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(run.join("session.json"), br#"{"id":"run-id"}"#).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        std::os::unix::fs::symlink(run.join("session.json"), run.join("events.jsonl")).unwrap();
+
+        assert_eq!(
+            selected_history_directory(&root, "run-id", "runs").unwrap(),
+            run
+        );
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "run-id/../run-id",
+            "/tmp",
+            "linked",
+        ] {
+            assert!(selected_history_directory(&root, invalid, "runs").is_err());
+        }
+        assert!(open_history_file(&run, "events.jsonl").is_err());
+        assert_eq!(local_cli_history(&root, "run-id"), Some(run.clone()));
+        assert!(local_cli_history(&root, "missing").is_none());
+        fs::write(run.join("session.json"), br#"{"id":"other-run"}"#).unwrap();
+        assert!(local_cli_history(&root, "run-id").is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn jsonl_reader_preserves_complete_events_and_ignores_an_uncommitted_tail() {
+        let expected = vec![
+            json!({"sequence": 0, "kind": "request_accepted", "operation": {"kind": "observe"}}),
+            json!({"sequence": 1, "kind": "execution_completed", "output": {"ok": true, "result": null, "view": "opaque <view> & \\n"}}),
+        ];
+        let mut bytes = Vec::new();
+        for event in &expected {
+            serde_json::to_writer(&mut bytes, event).unwrap();
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(br#"{"sequence":2,"kind":"execution_"#);
+        let mut events = Vec::new();
+        visit_jsonl_events(bytes.as_slice(), |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(events, expected);
+        assert!(visit_jsonl_events(&b"{invalid}\n"[..], |_| Ok(())).is_err());
+    }
 
     #[tokio::test]
     async fn eof_submits_large_multiline_actions_as_one_frame() {
