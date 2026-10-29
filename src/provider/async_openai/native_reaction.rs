@@ -16,9 +16,10 @@ use serde_json::{Map, Value};
 
 use crate::{
     component::execution::reaction::{
-        Frame, ProviderFact, ProviderFactStream, ProviderOutputKey, ProviderToolCall, ReactionPort,
-        ReactionPortFault, ResettableReactionPort, SubmitFault, TargetContinuity,
-        TargetDeclaration,
+        ForkableReactionPort, Frame, FrameBasis, ProviderFact, ProviderFactStream,
+        ProviderOutputKey, ProviderToolCall, ReactionPort, ReactionPortFault,
+        ReactionPortFaultCode, ReactionPortFaultReason, ResettableReactionPort, SubmitFault,
+        TargetContinuity, TargetDeclaration,
     },
     transcript::{AssistantPhase, CanonicalInputItem},
 };
@@ -507,6 +508,108 @@ impl ResettableReactionPort for AsyncOpenAiResponsesProvider {
     }
 }
 
+#[async_trait]
+impl ForkableReactionPort for AsyncOpenAiResponsesProvider {
+    async fn fork(&mut self) -> Result<Self, ReactionPortFault> {
+        // Read-only validation keeps ordinary fork failures and cancellation
+        // from changing the source declaration or its private continuation.
+        self.ensure_frame_native_mode().map_err(|_| {
+            ReactionPortFault::terminal(
+                ReactionPortFaultCode::Rejected,
+                ReactionPortFaultReason::ForkSnapshotUnavailable,
+            )
+        })?;
+        let declaration = self.frame_native_snapshot_declaration()?;
+        if self.reaction_frame.as_ref().is_some_and(|state| {
+            // An unsubmitted fork retains its source's revision under a new
+            // target. A same-target FullRequired window instead needs recovery
+            // from an interrupted or failed request before it can branch.
+            let retained_target =
+                TargetDeclaration::resume(state.revision(), declaration.profile().clone())
+                    .identity();
+            !state.is_forkable()
+                || matches!(
+                    declaration.continuity(),
+                    TargetContinuity::FullRequired { .. }
+                ) && retained_target == declaration.identity()
+        }) {
+            return Err(ReactionPortFault::retryable(
+                ReactionPortFaultCode::Rejected,
+                ReactionPortFaultReason::ForkNotReady,
+            ));
+        }
+        let reaction_target =
+            ResponsesReactionTarget::new(declaration.profile().clone()).map_err(|_| {
+                ReactionPortFault::terminal(
+                    ReactionPortFaultCode::Internal,
+                    ReactionPortFaultReason::ForkSnapshotUnavailable,
+                )
+            })?;
+        Ok(Self {
+            client: self.client.clone(),
+            config: self.config.clone(),
+            identity: self.identity.clone(),
+            encoder: self.encoder.clone(),
+            read_timeout: self.read_timeout,
+            max_response_body_bytes: self.max_response_body_bytes,
+            max_sse_event_bytes: self.max_sse_event_bytes,
+            max_output_text_bytes: self.max_output_text_bytes,
+            max_responses_serialized_request_body_bytes: self
+                .max_responses_serialized_request_body_bytes,
+            #[cfg(feature = "legacy-provider-port")]
+            artifact_binding: None,
+            #[cfg(feature = "legacy-provider-port")]
+            continuation: None,
+            #[cfg(feature = "legacy-provider-port")]
+            tool_outputs: Arc::new(Mutex::new(super::ToolOutputStaging::default())),
+            response_usage_observer: self.response_usage_observer.clone(),
+            request_observer: self.request_observer.clone(),
+            observer: self.observer.clone(),
+            compaction_observer: self.compaction_observer.clone(),
+            observation_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            execution_mode: ResponsesExecutionMode::FrameNative,
+            reaction_target,
+            reaction_frame: self.reaction_frame.clone(),
+            parallel_compaction: self.parallel_compaction.fork(),
+            parallel_compaction_enabled: self.parallel_compaction_enabled,
+            forced_compaction_enabled: self.forced_compaction_enabled,
+        })
+    }
+
+    fn validate_fork_frame(&self, frame: &Frame) -> Result<(), ReactionPortFault> {
+        let incompatible = || {
+            ReactionPortFault::terminal(
+                ReactionPortFaultCode::Rejected,
+                ReactionPortFaultReason::ForkSnapshotIncompatible,
+            )
+        };
+        let declaration = self.frame_native_snapshot_declaration()?;
+        if !matches!(frame.basis(), FrameBasis::Full) {
+            return Err(incompatible());
+        }
+        frame
+            .check_handoff_precondition(&declaration)
+            .map_err(|_| incompatible())?;
+        // Prepare only a local candidate: no observation, transport poll,
+        // compaction policy evaluation, or worker launch occurs here.
+        ResponsesFrameRequestState::prepare_with_measurements(
+            self.reaction_frame.as_ref(),
+            frame,
+            &self.encoder,
+            self.max_responses_serialized_request_body_bytes,
+            &mut None,
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            let fault = port_fault(error.failure_class(), format!("{error:?}"));
+            ReactionPortFault::terminal(
+                fault.code(),
+                ReactionPortFaultReason::ForkSnapshotIncompatible,
+            )
+        })
+    }
+}
+
 impl AsyncOpenAiResponsesProvider {
     async fn reject_frame_preparation(
         &self,
@@ -603,6 +706,16 @@ impl AsyncOpenAiResponsesProvider {
             self.reaction_target.record_fault(fault);
             return Err(fault);
         }
+        Ok(declaration)
+    }
+
+    fn frame_native_snapshot_declaration(&self) -> Result<TargetDeclaration, ReactionPortFault> {
+        if self.observation_failed.load(Ordering::Acquire) {
+            return Err(observation_fault());
+        }
+        self.ensure_frame_native_mode()?;
+        let declaration = self.reaction_target.declaration()?;
+        validate_native_frame_state(&declaration, self.reaction_frame.as_ref())?;
         Ok(declaration)
     }
 }
@@ -1356,11 +1469,11 @@ mod tests {
     use crate::{
         component::execution::{
             reaction::{
-                Frame, FrameBasis, FrameRevision, FrameSubmission, ProjectionSubmission,
-                ProviderFact, ProviderOutputKey, ProviderToolCall, ReactionPort,
-                ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason,
-                ResettableReactionPort, SubmitFault, TargetContinuity, TargetDeclaration,
-                TargetEpoch, ToolCatalog,
+                ForkableReactionPort, Frame, FrameBasis, FrameRevision, FrameSubmission,
+                ProjectionSubmission, ProviderFact, ProviderOutputKey, ProviderToolCall,
+                ReactionPort, ReactionPortFaultCode, ReactionPortFaultKind,
+                ReactionPortFaultReason, ResettableReactionPort, SubmitFault, TargetContinuity,
+                TargetDeclaration, TargetEpoch, ToolCatalog,
             },
             ProviderIdentity,
         },
@@ -2245,6 +2358,407 @@ mod tests {
             .into_iter()
             .map(|event| format!("data: {event}\n\n"))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn fork_retains_reasoning_and_closed_tools_with_independent_continuations() {
+        use crate::transcript::CanonicalInputItem;
+
+        let (base, shutdown, server) = spawn_sse_sequence_server(vec![
+            encode_sse(plaintext_reasoning_and_tool_events()),
+            completed_text_sse(),
+            completed_text_sse(),
+            completed_text_sse(),
+        ])
+        .await;
+        let audit = Arc::new(Audit::default());
+        let mut parent = provider(&base, None)
+            .with_parallel_compaction(|_: &super::CompactionContext| false)
+            .with_observer(audit.clone());
+        let initial = parent.declare().unwrap();
+        let facts = parent
+            .submit(full_frame(&initial))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(facts.into_iter().all(|fact| fact.is_ok()));
+
+        let pending = parent.declare().unwrap();
+        assert_eq!(
+            parent.fork().await.err().unwrap().reason(),
+            ReactionPortFaultReason::ForkNotReady
+        );
+        assert_eq!(parent.declare().unwrap(), pending);
+
+        let mut history = vec![
+            CanonicalInputItem::tool_call("call_1", "lookup", "{}").unwrap(),
+            CanonicalInputItem::tool_result("call_1", "lookup succeeded").unwrap(),
+        ];
+        let facts = parent
+            .submit(full_frame_with_replay(&pending, 2, history.clone()))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(facts.into_iter().all(|fact| fact.is_ok()));
+        history.push(CanonicalInputItem::assistant_text("hello", None));
+
+        let accepted = parent.declare().unwrap();
+        let source_revision = parent.reaction_frame.as_ref().unwrap().revision();
+        let observation_count = audit.events.lock().unwrap().len();
+        let mut child = parent.fork().await.unwrap();
+        let forked = child.declare().unwrap();
+        assert_ne!(forked.identity(), accepted.identity());
+        assert_eq!(forked.profile(), accepted.profile());
+        assert!(matches!(
+            forked.continuity(),
+            TargetContinuity::FullRequired { .. }
+        ));
+        assert_eq!(parent.declare().unwrap(), accepted);
+        assert_eq!(
+            child.reaction_frame.as_ref().unwrap().revision(),
+            source_revision
+        );
+        assert!(!Arc::ptr_eq(
+            &parent.observation_failed,
+            &child.observation_failed
+        ));
+
+        let first_child = full_frame_with_replay(&forked, 1, history.clone());
+        child.validate_fork_frame(&first_child).unwrap();
+        let mut grandchild = child.fork().await.unwrap();
+        let grandchild_declaration = grandchild.declare().unwrap();
+        assert_ne!(grandchild_declaration.identity(), forked.identity());
+        grandchild
+            .validate_fork_frame(&full_frame_with_replay(
+                &grandchild_declaration,
+                1,
+                history.clone(),
+            ))
+            .unwrap();
+        grandchild.shutdown().await;
+        let prepared = ResponsesFrameRequestState::prepare(
+            child.reaction_frame.as_ref(),
+            &first_child,
+            &child.encoder,
+            child.max_responses_serialized_request_body_bytes,
+        )
+        .unwrap();
+        let request: Value = serde_json::from_slice(&prepared.request_body).unwrap();
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(
+            input[0]["content"],
+            json!([{
+                "type":"reasoning_text", "text":"private-reasoning-sentinel"
+            }])
+        );
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["output"], "lookup succeeded");
+        assert_eq!(input[3]["content"][0]["text"], "hello");
+
+        let incompatible = full_frame_with_replay(
+            &forked,
+            1,
+            vec![CanonicalInputItem::assistant_text("wrong prefix", None)],
+        );
+        assert_eq!(
+            child
+                .validate_fork_frame(&incompatible)
+                .unwrap_err()
+                .reason(),
+            ReactionPortFaultReason::ForkSnapshotIncompatible
+        );
+        assert_eq!(audit.events.lock().unwrap().len(), observation_count);
+        assert_eq!(child.declare().unwrap(), forked);
+        assert!(!child.parallel_compaction.has_attempt());
+
+        let mut parent_history = history.clone();
+        parent_history.push(CanonicalInputItem::assistant_text(
+            "parent continuation",
+            None,
+        ));
+        history.push(CanonicalInputItem::assistant_text(
+            "child continuation",
+            None,
+        ));
+        let parent_frame = full_frame_with_replay(&accepted, 3, parent_history);
+        let child_frame = full_frame_with_replay(&forked, 1, history);
+        let parent_revision = parent_frame.revision();
+        let child_revision = child_frame.revision();
+        let (parent_facts, child_facts) = tokio::join!(
+            async {
+                parent
+                    .submit(parent_frame)
+                    .await
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await
+            },
+            async {
+                child
+                    .submit(child_frame)
+                    .await
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await
+            },
+        );
+        assert!(parent_facts.into_iter().all(|fact| fact.is_ok()));
+        assert!(child_facts.into_iter().all(|fact| fact.is_ok()));
+        let requests: Vec<Value> = audit
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                OpenAiResponsesObservation::Request { body, .. } => {
+                    Some(serde_json::from_slice(body).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 4);
+        let branch_inputs: Vec<_> = requests[2..]
+            .iter()
+            .map(|request| {
+                request["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert!(branch_inputs.contains(&"parent continuation"));
+        assert!(branch_inputs.contains(&"child continuation"));
+        assert_eq!(
+            parent.reaction_frame.as_ref().unwrap().revision(),
+            parent_revision
+        );
+        assert_eq!(
+            child.reaction_frame.as_ref().unwrap().revision(),
+            child_revision
+        );
+        assert_ne!(parent_revision, child_revision);
+
+        let parent_after = parent.declare().unwrap();
+        child
+            .observation_failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(child.declare().is_err());
+        child.shutdown().await;
+        assert_eq!(parent.declare().unwrap(), parent_after);
+        parent.shutdown().await;
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_preflight_preserves_installed_compaction_and_rejects_system_changes() {
+        use crate::{
+            pom::Document,
+            pom_resolution::resolve_system_document,
+            transcript::{CanonicalInputItem, InstructionAuthority},
+        };
+
+        let (base, shutdown, server) = spawn_sse_server(compacted_text_sse()).await;
+        let audit = Arc::new(Audit::default());
+        let mut parent = provider(&base, None).with_observer(audit.clone());
+        let initial = parent.declare().unwrap();
+        let facts = parent
+            .submit(full_frame(&initial))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(facts.into_iter().all(|fact| fact.is_ok()));
+        let source = parent.declare().unwrap();
+        let mut child = parent.fork().await.unwrap();
+        let forked = child.declare().unwrap();
+        let frame = full_frame_with_replay(
+            &forked,
+            1,
+            vec![CanonicalInputItem::assistant_text("answer", None)],
+        );
+        let observation_count = audit.events.lock().unwrap().len();
+        child.validate_fork_frame(&frame).unwrap();
+        let prepared = ResponsesFrameRequestState::prepare(
+            child.reaction_frame.as_ref(),
+            &frame,
+            &child.encoder,
+            usize::MAX,
+        )
+        .unwrap();
+        let request: Value = serde_json::from_slice(&prepared.request_body).unwrap();
+        assert_eq!(request["input"][0]["type"], "compaction");
+        assert_eq!(
+            request["input"][0]["encrypted_content"],
+            "opaque-compaction-secret"
+        );
+
+        let system = CanonicalInputItem::instruction(
+            InstructionAuthority::System,
+            resolve_system_document(Document::from_raw_text("changed policy")),
+        );
+        let changed = Frame::from_compiled(
+            frame.revision(),
+            frame.target(),
+            frame.epoch(),
+            frame.prepared_against().clone(),
+            frame.prepared_profile().clone(),
+            FrameBasis::Full,
+            FrameSubmission::from_compiled(
+                frame.submission().replay().to_vec(),
+                Vec::new(),
+                ProjectionSubmission::new(vec![system]),
+                ToolCatalog::new(Vec::new()).unwrap(),
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            child.validate_fork_frame(&changed).unwrap_err().reason(),
+            ReactionPortFaultReason::ForkSnapshotIncompatible
+        );
+        assert_eq!(audit.events.lock().unwrap().len(), observation_count);
+        assert_eq!(parent.declare().unwrap(), source);
+        assert_eq!(child.declare().unwrap(), forked);
+        assert!(child.reaction_frame.as_ref().unwrap().is_compacted());
+        parent.shutdown().await;
+        child.shutdown().await;
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_unsettled_or_terminal_sessions_without_changing_the_source() {
+        let mut parent = provider("http://127.0.0.1:1", None);
+        let initial = parent.declare().unwrap();
+        let stream = parent.submit(full_frame(&initial)).await.unwrap();
+        drop(stream);
+        let unsettled = parent.declare().unwrap();
+        assert_eq!(
+            parent.fork().await.err().unwrap().reason(),
+            ReactionPortFaultReason::ForkNotReady
+        );
+        assert_eq!(parent.declare().unwrap(), unsettled);
+
+        let terminal = super::port_fault(
+            super::OpenAiFailureClass::Authentication,
+            "private diagnostic",
+        );
+        parent.reaction_target.record_fault(terminal);
+        assert_eq!(parent.fork().await.err().unwrap(), terminal);
+        assert_eq!(parent.declare().unwrap_err(), terminal);
+        parent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fork_preflight_checks_wire_budgets_without_observation_or_compaction() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let observed = evaluations.clone();
+        let audit = Arc::new(Audit::default());
+        let mut parent = provider("http://127.0.0.1:1", Some(1))
+            .with_parallel_compaction(move |_: &super::CompactionContext| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                true
+            })
+            .with_forced_compaction()
+            .with_observer(audit.clone());
+        let source = parent.declare().unwrap();
+        let mut child = parent.fork().await.unwrap();
+        let forked = child.declare().unwrap();
+        let fault = child.validate_fork_frame(&full_frame(&forked)).unwrap_err();
+        assert_eq!(fault.code(), ReactionPortFaultCode::Limit);
+        assert_eq!(
+            fault.reason(),
+            ReactionPortFaultReason::ForkSnapshotIncompatible
+        );
+        assert!(audit.events.lock().unwrap().is_empty());
+        assert_eq!(evaluations.load(Ordering::Relaxed), 0);
+        assert!(child.reaction_frame.is_none());
+        assert!(!child.parallel_compaction.has_attempt());
+        assert_eq!(child.declare().unwrap(), forked);
+        assert_eq!(parent.declare().unwrap(), source);
+        child.shutdown().await;
+        parent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fork_keeps_settled_interrupted_history_with_explicit_assistant_status() {
+        use crate::transcript::CanonicalInputItem;
+
+        let (base, shutdown, server) = spawn_sse_server(completed_text_sse()).await;
+        let mut parent = provider(&base, None);
+        parent.encoder = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap()
+            .with_explicit_assistant_status(),
+        );
+        let initial = parent.declare().unwrap();
+        let interrupted = CanonicalInputItem::interrupted_assistant_text("prior partial", None);
+        let facts = parent
+            .submit(full_frame_with_replay(
+                &initial,
+                1,
+                vec![interrupted.clone()],
+            ))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(facts.into_iter().all(|fact| fact.is_ok()));
+        let mut child = parent.fork().await.unwrap();
+        let forked = child.declare().unwrap();
+        let frame = full_frame_with_replay(
+            &forked,
+            1,
+            vec![
+                interrupted,
+                CanonicalInputItem::assistant_text("hello", None),
+            ],
+        );
+        child.validate_fork_frame(&frame).unwrap();
+        let prepared = ResponsesFrameRequestState::prepare(
+            child.reaction_frame.as_ref(),
+            &frame,
+            &child.encoder,
+            usize::MAX,
+        )
+        .unwrap();
+        let request: Value = serde_json::from_slice(&prepared.request_body).unwrap();
+        assert_eq!(request["input"][0]["status"], "incomplete");
+        assert_eq!(request["input"][0]["content"][0]["text"], "prior partial");
+        assert_eq!(request["input"][1]["role"], "user");
+        assert_eq!(request["input"][2]["status"], "completed");
+        child.shutdown().await;
+        parent.shutdown().await;
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[cfg(feature = "legacy-provider-port")]
+    #[tokio::test]
+    async fn fork_rejects_legacy_mode_without_changing_the_source() {
+        let mut parent = provider("http://127.0.0.1:1", None);
+        parent.execution_mode = super::ResponsesExecutionMode::Legacy;
+        let source = parent.reaction_target.declaration().unwrap();
+        assert_eq!(
+            parent.fork().await.err().unwrap().reason(),
+            ReactionPortFaultReason::ForkSnapshotUnavailable
+        );
+        assert_eq!(parent.execution_mode, super::ResponsesExecutionMode::Legacy);
+        assert_eq!(parent.reaction_target.declaration().unwrap(), source);
+        assert!(parent.reaction_frame.is_none());
+        parent.shutdown().await;
     }
 
     #[tokio::test]

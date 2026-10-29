@@ -50,7 +50,9 @@ demonstrate interactivity. Error handling is one part of this experience; see
 | Resend current policy or context on every submitted frame | `#[developer(repeat)]` or `#[user(repeat)]` |
 | Send current context every frame without retaining its prompt in history | `#[developer(ephemeral, repeat)]` or `#[user(ephemeral, repeat)]` |
 | Declare an authored assistant message | `#[assistant]` on ordinary POM or a Component call |
+| Export the complete current view as a prompt with empty external model history | `projection.render_prompt()?` or `app.current_projection().render_prompt()?` |
 | Run an application | `Application::mount(...)`, then `app.run().await` |
+| Branch the current model history into an independent application | `app.fork(root).await`, or `fork_with_commands(root, input)` with a new inbox; requires `ForkableReactionPort` |
 | Wait for required business inputs | `use_preparation` inside the owning Component |
 | End normal application work | `use_application_exit`, then owner calls `shutdown()` |
 | Drive a single model turn | `app.react().await` |
@@ -117,6 +119,110 @@ Authored assistant messages compare against the previous complete projection. Ch
 messages send their complete current POM; omission sends no deletion patch, and reappearance sends
 the message again. Existing `#[diff]` field strategies can also be combined with `#[assistant]`.
 Provider output remains a separate canonical fact even when it has identical rendered text.
+
+## Export a Prompt Without Model History
+
+`RenderedProjection::render_prompt()` returns `Result<String, PromptExportError>` for a caller that
+wants to send the current view to an external model with empty model history. The prompt includes
+the normalized current System, complete ordinary POM, any tool calls/results explicitly declared in
+the current projection, and the complete native tool catalog with names, descriptions, input schemas,
+and strict flags. Current ephemeral prompts come last. Only the current projection supplies content;
+runtime conversation history and provider-private context are not read.
+Provider-private projection extensions return `PromptExportError::UnsupportedProviderExtension`.
+
+For a synchronously rendered Component, export directly from its render:
+
+```rust
+let prompt: String = host.render()?.projection().render_prompt()?;
+```
+
+[`export_prompt`](examples/export_prompt.rs) demonstrates a typed Component and `NativeToolCall`,
+prints the plain prompt, and requires no model API or credentials:
+
+```bash
+cargo run --no-default-features --example export_prompt
+```
+
+`ProjectionSnapshot::render_prompt()` forwards to the latest committed projection. It can therefore
+export an older view when `is_dirty()` is true. Export itself performs no preparation or reconcile.
+For fresh application preparation, explicitly prepare and handle normal application exit first:
+
+```rust
+if let std::ops::ControlFlow::Continue(()) = app.prepare().await? {
+    let prompt: String = app.current_projection().render_prompt()?;
+    // Pass prompt to the caller's external model API.
+}
+```
+
+Preparation does not freeze subsequent business writes. Export does not create or submit a Frame,
+advance history, invoke a model, or execute tools. The caller chooses how to send the String and
+handle the model's response. Applications must still admit actions through their normal runtime
+path and deliver actual results in a subsequent observation. Treat the exported prompt as model
+input; consume typed POM and structured tools in application code and tests.
+
+## Forking an Application
+
+With a `ForkableReactionPort`, `parent.fork(root).await` preserves the parent's accepted
+conversation and the matching provider context in an independent Application. The native Responses
+port supports it. Export an owned typed business snapshot and initialize fresh Signals in the child
+root; snapshot consistency across business tasks or external stores belongs to the application.
+
+```rust
+use agentview::component::{
+    execution::{Application, ApplicationFault, ForkableReactionPort},
+    prelude::*,
+};
+
+#[derive(Clone)]
+struct BusinessSnapshot {
+    total: i64,
+}
+
+#[component]
+fn restored_counter(snapshot: BusinessSnapshot) -> Component {
+    let state = use_signal(move || snapshot);
+    let total = state.with(|state| state.total).expect("mounted snapshot");
+    view! {
+        #[system_once]
+        "Use the current counter state."
+        counter { value: total, }
+    }
+}
+
+async fn start_branch<P: ForkableReactionPort>(
+    parent: &mut Application<P>,
+    snapshot: BusinessSnapshot,
+) -> Result<Application<P>, ApplicationFault> {
+    parent.fork(move || restored_counter(snapshot.clone())).await
+}
+```
+
+The source must have no exit request, pending mount retirement, command in progress, or streaming
+recovery. Its tool calls must be closed and its staged tool results empty. A returned `react()`
+can still leave a result or cancellation fallback waiting for the next Frame; the source driver
+must deliver that work normally before forking. Fork does not submit a Frame, consume reaction
+demand, or run preparation. Successful child mounting starts its newly declared Component tasks.
+
+The child root explicitly declares its System snapshot and current ephemeral context. Omitting
+System declares a clear; retained provider artifacts can reject an incompatible snapshot.
+Historical raw ephemeral prompts are excluded from inherited history. The child
+establishes its own delivery baseline on its first Full. Use `fork_with_commands(root, input)` for
+a new `CommandInput`; the parent's inbox and current command are not inherited.
+
+Each owner drives its own `run()` or `react()` and consumes its own `shutdown()`. Pass child
+progress and outcomes through explicit business messages, then render them in the receiving
+Application's next submitted Frame so its model can act on them. The offline
+[`application_fork`](examples/application_fork.rs) example shows shared history, independent
+business snapshots, progress delivery while child work is pending, and a parent action based on
+the completed result. Run or test it without API credentials:
+
+```bash
+cargo run --no-default-features --example application_fork
+cargo test --no-default-features --example application_fork
+```
+
+See [the runtime fork contract](docs/engine.md#保留历史的-application-fork) for ownership,
+compatibility checks, and failure cleanup.
 
 ## Existing Prompt Strings
 

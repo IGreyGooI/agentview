@@ -13,7 +13,7 @@ use std::{
     },
 };
 
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 
 use super::{
     admission::{
@@ -26,9 +26,9 @@ use super::{
     port::{ProviderEvent, RenderedProjection, ToolOutput},
     projection_diff::ProjectionReconciliationFault,
     reaction::{
-        ProviderFactStream, ReactionPort, ReactionPortFault, ReactionPortFaultCode,
-        ReactionPortFaultKind, ReactionPortFaultReason, ResettableReactionPort, SubmitFault,
-        TargetDeclaration, TargetDeclarationInvariantFault,
+        ForkableReactionPort, ProviderFactStream, ReactionPort, ReactionPortFault,
+        ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason,
+        ResettableReactionPort, SubmitFault, TargetDeclaration, TargetDeclarationInvariantFault,
     },
     streaming::{StreamingSupervisor, StreamingToolRecoveryStatus},
 };
@@ -59,6 +59,7 @@ fn render_root(root: RootFactory, events: EventInput<ProviderEvent>) -> Componen
 const APPLICATION_READY: u8 = 0;
 const APPLICATION_TERMINATED_AFTER_TASK_PANIC: u8 = 2;
 const APPLICATION_TERMINATED_AFTER_CONTEXT_RESET: u8 = 3;
+const APPLICATION_TERMINATED_AFTER_FORK_PANIC: u8 = 4;
 const MAX_PREPARATION_WAVES: usize = 16;
 
 fn consume_supervised_task_panic(application_state: &Arc<AtomicU8>, monitor: &TaskPanicMonitor) {
@@ -91,6 +92,11 @@ fn application_terminal_state_fault(
             stage,
             ApplicationFaultCode::Protocol,
             ApplicationFaultReason::InvalidModelContextReset,
+        )),
+        APPLICATION_TERMINATED_AFTER_FORK_PANIC => Some(ApplicationFault::terminal(
+            stage,
+            ApplicationFaultCode::Internal,
+            ApplicationFaultReason::ForkCleanup,
         )),
         _ => Some(ApplicationFault::terminal(
             stage,
@@ -176,6 +182,63 @@ enum SubmissionAttempt {
     Exited(ExitReason),
 }
 
+enum ForkResource<P: ForkableReactionPort> {
+    Port(P),
+    Application(Box<Application<P>>),
+}
+
+/// Retain partial child cleanup when the fork waiter is cancelled or unwinds.
+struct ForkCandidate<'a, P: ForkableReactionPort> {
+    resource: Option<ForkResource<P>>,
+    cleanups: &'a mut Vec<tokio::task::JoinHandle<()>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl<P: ForkableReactionPort> ForkCandidate<'_, P> {
+    fn port_mut(&mut self) -> &mut P {
+        match self.resource.as_mut().expect("owned fork candidate") {
+            ForkResource::Port(port) => port,
+            ForkResource::Application(application) => &mut application.port,
+        }
+    }
+
+    fn take_port(&mut self) -> P {
+        match self.resource.take().expect("owned fork port") {
+            ForkResource::Port(port) => port,
+            ForkResource::Application(_) => unreachable!("fork candidate is still a port"),
+        }
+    }
+
+    fn application_mut(&mut self) -> &mut Application<P> {
+        match self.resource.as_mut().expect("owned fork candidate") {
+            ForkResource::Application(application) => application,
+            ForkResource::Port(_) => unreachable!("fork candidate has been mounted"),
+        }
+    }
+
+    fn take_application(&mut self) -> Application<P> {
+        match self.resource.take().expect("owned fork application") {
+            ForkResource::Application(application) => *application,
+            ForkResource::Port(_) => unreachable!("fork candidate has been mounted"),
+        }
+    }
+}
+
+impl<P: ForkableReactionPort> Drop for ForkCandidate<'_, P> {
+    fn drop(&mut self) {
+        if let Some(resource) = self.resource.take() {
+            self.cleanups.push(self.runtime.spawn(async move {
+                match resource {
+                    ForkResource::Port(mut port) => port.shutdown().await,
+                    ForkResource::Application(application) => {
+                        (*application).shutdown_failed_fork().await;
+                    }
+                }
+            }));
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ReactionCancellationControl {
     suppressed: Arc<AtomicBool>,
@@ -254,6 +317,7 @@ pub struct Application<P: ReactionPort> {
     state: Arc<AtomicU8>,
     streaming: StreamingSupervisor,
     command_input: Option<CommandInput>,
+    fork_cleanups: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl<P: ReactionPort> Drop for Application<P> {
@@ -293,6 +357,15 @@ impl ProjectionSnapshot<'_> {
 
     pub const fn is_prepared(&self) -> bool {
         self.prepared
+    }
+
+    /// Export this complete current view as a standalone prompt with no history.
+    ///
+    /// Does not reconcile dirty state or run preparation. Call
+    /// [`Application::prepare`] first when a fresh prepared view is needed.
+    /// See [`RenderedProjection::render_prompt`] for the exported content.
+    pub fn render_prompt(&self) -> Result<String, super::PromptExportError> {
+        self.projection.render_prompt()
     }
 }
 
@@ -357,12 +430,26 @@ impl<P: ReactionPort> Application<P> {
             .profile()
             .validate()
             .map_err(ApplicationFault::invalid_profile)?;
+        let session = FrameSession::new(&declaration).map_err(|source| {
+            ApplicationFault::from_session(ApplicationFaultStage::Declaration, source)
+        })?;
+        let mut application =
+            Self::unmounted(Arc::new(root), port, command_input, declaration, session);
+        application.bootstrap(|_, _| Ok(()))?;
+        Ok(application)
+    }
 
+    fn unmounted(
+        root: RootFactory,
+        port: P,
+        command_input: Option<CommandInput>,
+        declaration: TargetDeclaration,
+        session: FrameSession,
+    ) -> Self {
         let (driver_demand, demand_handle) = DriverDemand::new();
         let application_exit = ApplicationExitControl::new();
         let tasks = MountTaskSupervisor::new();
         let task_handle = tasks.handle();
-        let root: RootFactory = Arc::new(root);
         let mut application = Self {
             components: ComponentHost::new_with_application_capabilities(
                 render_root,
@@ -375,32 +462,35 @@ impl<P: ReactionPort> Application<P> {
             driver_demand,
             application_exit,
             tasks,
-            session: FrameSession::new(&declaration).map_err(|source| {
-                ApplicationFault::from_session(ApplicationFaultStage::Declaration, source)
-            })?,
+            session,
             declaration,
             port,
             state: Arc::new(AtomicU8::new(APPLICATION_READY)),
             streaming: StreamingSupervisor::default(),
             command_input,
+            fork_cleanups: Vec::new(),
         };
         if let Some(input) = &application.command_input {
             application
                 .components
                 .set_command_prefix(input.prefix().to_owned());
         }
-        let committed = application
-            .components
-            .begin_managed_render()
-            .map_err(|source| {
-                ApplicationFault::from_component(ApplicationFaultStage::Bootstrap, source)
-            })?;
+        application
+    }
+
+    fn bootstrap(
+        &mut self,
+        validate: impl FnOnce(&Self, &RenderedProjection) -> Result<(), ApplicationFault>,
+    ) -> Result<(), ApplicationFault> {
+        let committed = self.components.begin_managed_render().map_err(|source| {
+            ApplicationFault::from_component(ApplicationFaultStage::Bootstrap, source)
+        })?;
         debug_assert!(committed.retired_mounts().is_empty());
-        let published = application.components.publish_managed_render(committed);
-        let (_rendered, task_starts) = published.into_parts();
-        application.start_task_batch(ApplicationFaultStage::Bootstrap, task_starts)?;
-        application.check_task_panic(ApplicationFaultStage::Bootstrap)?;
-        Ok(application)
+        let published = self.components.publish_managed_render(committed);
+        let (rendered, task_starts) = published.into_parts();
+        validate(self, rendered.projection())?;
+        self.start_task_batch(ApplicationFaultStage::Bootstrap, task_starts)?;
+        self.check_task_panic(ApplicationFaultStage::Bootstrap)
     }
 
     /// Obtain an application-scoped handle that can wake a blocked preparation
@@ -469,8 +559,43 @@ impl<P: ReactionPort> Application<P> {
     }
 
     /// Fence the mounted tree, abort and await every Component-owned task, then
-    /// stop and join port-owned background work.
+    /// stop and join port-owned background work. Owned failed-fork cleanups are
+    /// joined even when the ordinary shutdown path unwinds.
     pub async fn shutdown(mut self) -> Result<(), ApplicationFault> {
+        let outcome = AssertUnwindSafe(self.shutdown_inner()).catch_unwind().await;
+        let mut cleanup_panic = None;
+        let mut cleanup_fault = None;
+        while !self.fork_cleanups.is_empty() {
+            // A cleanup panic must not detach the remaining owned handles.
+            // Keep the original shutdown panic until every child is drained.
+            match AssertUnwindSafe(self.complete_fork_cleanups())
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(fault)) => {
+                    cleanup_fault.get_or_insert(fault);
+                }
+                Err(payload) => {
+                    cleanup_panic.get_or_insert(payload);
+                }
+            }
+        }
+        let result = match outcome {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        };
+        if let Some(payload) = cleanup_panic {
+            resume_unwind(payload);
+        }
+        result?;
+        match cleanup_fault {
+            Some(fault) => Err(fault),
+            None => Ok(()),
+        }
+    }
+
+    async fn shutdown_inner(&mut self) -> Result<(), ApplicationFault> {
         self.application_exit.close();
         if let Some(input) = &mut self.command_input {
             input.close();
@@ -506,6 +631,7 @@ impl<P: ReactionPort> Application<P> {
         if panic_already_consumed {
             let _ = self.tasks.shutdown().await;
             self.port.shutdown().await;
+            self.complete_fork_cleanups().await?;
             mount_fence?;
             return Err(task_panic_terminal_fault(ApplicationFaultStage::Reaction));
         }
@@ -527,6 +653,7 @@ impl<P: ReactionPort> Application<P> {
         };
         drop(shutdown);
         self.port.shutdown().await;
+        self.complete_fork_cleanups().await?;
         if monitor.status() == TaskSupervisorStatus::Panicked {
             consume_supervised_task_panic(&application_state, &monitor);
             return Err(task_panic_terminal_fault(ApplicationFaultStage::Reaction));
@@ -534,7 +661,64 @@ impl<P: ReactionPort> Application<P> {
         mount_fence?;
         result.map_err(|source| {
             ApplicationFault::from_task_supervisor(ApplicationFaultStage::Reaction, source)
-        })
+        })?;
+        if self.state.load(Ordering::Acquire) == APPLICATION_TERMINATED_AFTER_FORK_PANIC {
+            return Err(application_terminal_state_fault(
+                ApplicationFaultStage::Fork,
+                APPLICATION_TERMINATED_AFTER_FORK_PANIC,
+            )
+            .expect("fork terminal state has a classified fault"));
+        }
+        Ok(())
+    }
+
+    async fn complete_fork_cleanups(&mut self) -> Result<(), ApplicationFault> {
+        while let Some(cleanup) = self.fork_cleanups.last_mut() {
+            // Await by reference: cancelling this waiter leaves the cleanup
+            // task owned by the Application and running on its original runtime.
+            let result = cleanup.await;
+            self.fork_cleanups.pop();
+            if let Err(error) = result {
+                self.state
+                    .store(APPLICATION_TERMINATED_AFTER_FORK_PANIC, Ordering::Release);
+                if error.is_panic() {
+                    resume_unwind(error.into_panic());
+                }
+                return Err(ApplicationFault::terminal(
+                    ApplicationFaultStage::Fork,
+                    ApplicationFaultCode::Internal,
+                    ApplicationFaultReason::ForkCleanup,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// An unpublished child has no reaction or streaming effects. Drain it
+    /// completely before transporting a late child-task panic to its owner.
+    async fn shutdown_failed_fork(mut self) {
+        self.application_exit.close();
+        if let Some(input) = &mut self.command_input {
+            input.close();
+        }
+        let _ = self.components.fence_all_mounts();
+        self.pending_render.take();
+        let monitor = self.tasks.panic_monitor();
+        let _ = self.tasks.shutdown().await;
+        let task_panic = monitor.take_payload();
+        let port_shutdown = AssertUnwindSafe(self.port.shutdown()).catch_unwind().await;
+        let nested_cleanup = AssertUnwindSafe(self.complete_fork_cleanups())
+            .catch_unwind()
+            .await;
+        if let Some(payload) = task_panic {
+            resume_unwind(payload);
+        }
+        if let Err(payload) = port_shutdown {
+            resume_unwind(payload);
+        }
+        if let Err(payload) = nested_cleanup {
+            resume_unwind(payload);
+        }
     }
 
     /// Return the latest committed complete projection without reconciling.
@@ -1172,6 +1356,188 @@ impl<P: ReactionPort> Application<P> {
     }
 }
 
+impl<P: ForkableReactionPort> Application<P> {
+    /// Fork the settled model history into an independently mounted application.
+    ///
+    /// Capture an owned business snapshot in `root`; hook values and running
+    /// tasks are not copied. The child retains canonical history and provider
+    /// context, establishes its own baseline with a first Full, and is driven
+    /// explicitly by its owner. Pending tool results, streaming recovery,
+    /// unfinished mount retirement, commands, or application exit reject a fork.
+    pub async fn fork(
+        &mut self,
+        root: impl Fn() -> Component + Send + Sync + 'static,
+    ) -> Result<Self, ApplicationFault> {
+        self.fork_with_input(root, None).await
+    }
+
+    /// Fork with a new, independently owned command inbox.
+    pub async fn fork_with_commands(
+        &mut self,
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        input: CommandInput,
+    ) -> Result<Self, ApplicationFault> {
+        self.fork_with_input(root, Some(input)).await
+    }
+
+    async fn fork_with_input(
+        &mut self,
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        input: Option<CommandInput>,
+    ) -> Result<Self, ApplicationFault> {
+        let stage = ApplicationFaultStage::Fork;
+        let state = Arc::clone(&self.state);
+        let monitor = self.tasks.panic_monitor();
+        begin_outer_driver_boundary(&state, &monitor)
+            .map_err(|fault| application_fault_from_outer_driver_boundary(stage, fault))?;
+        let preflight = tokio::runtime::Handle::try_current()
+            .map_err(|_| ApplicationFault::fork_not_ready())
+            .and_then(|runtime| {
+                self.tasks
+                    .handle()
+                    .preflight()
+                    .map_err(|fault| ApplicationFault::from_task_supervisor(stage, fault))?;
+                Ok(runtime)
+            });
+        begin_outer_driver_boundary(&state, &monitor)
+            .map_err(|fault| application_fault_from_outer_driver_boundary(stage, fault))?;
+        let runtime = preflight?;
+
+        let mut fork = Box::pin(
+            AssertUnwindSafe(self.fork_inner(root, input, runtime.clone())).catch_unwind(),
+        );
+        let outcome = tokio::select! {
+            biased;
+            task = monitor.wait() => {
+                drop_driver_future_before_panic_arbitration(fork, &monitor);
+                return match task {
+                    Ok(()) => {
+                        consume_supervised_task_panic(&state, &monitor);
+                        Err(task_panic_terminal_fault(stage))
+                    }
+                    Err(fault) => Err(ApplicationFault::from_task_supervisor(stage, fault)),
+                };
+            }
+            result = &mut fork => result,
+        };
+        drop_driver_future_before_panic_arbitration(fork, &monitor);
+        let result = match outcome {
+            Ok(result) => result,
+            Err(payload) => {
+                if monitor.status() == TaskSupervisorStatus::Panicked {
+                    consume_supervised_task_panic(&state, &monitor);
+                }
+                state.store(APPLICATION_TERMINATED_AFTER_FORK_PANIC, Ordering::Release);
+                resume_unwind(payload);
+            }
+        };
+        match result {
+            Ok(child) => {
+                let mut candidate = ForkCandidate {
+                    resource: Some(ForkResource::Application(Box::new(child))),
+                    cleanups: &mut self.fork_cleanups,
+                    runtime,
+                };
+                begin_outer_driver_boundary(&state, &monitor)
+                    .map_err(|fault| application_fault_from_outer_driver_boundary(stage, fault))?;
+                Ok(candidate.take_application())
+            }
+            Err(fault) => {
+                begin_outer_driver_boundary(&state, &monitor)
+                    .map_err(|fault| application_fault_from_outer_driver_boundary(stage, fault))?;
+                Err(fault)
+            }
+        }
+    }
+
+    async fn fork_inner(
+        &mut self,
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        input: Option<CommandInput>,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, ApplicationFault> {
+        self.complete_fork_cleanups().await?;
+        if self.application_exit.reason().is_some()
+            || self.pending_render.is_some()
+            || self.streaming.pending()
+            || self
+                .command_input
+                .as_ref()
+                .is_some_and(CommandInput::has_pending)
+            || !self.session.can_fork()
+        {
+            return Err(ApplicationFault::fork_not_ready());
+        }
+
+        let port = self
+            .port
+            .fork()
+            .await
+            .map_err(|fault| ApplicationFault::from_port(ApplicationFaultStage::Fork, fault))?;
+        let state = Arc::clone(&self.state);
+        let monitor = self.tasks.panic_monitor();
+        let exit = self.application_exit.clone();
+        let mut candidate = ForkCandidate {
+            resource: Some(ForkResource::Port(port)),
+            cleanups: &mut self.fork_cleanups,
+            runtime,
+        };
+        let result = (|| {
+            let stage = ApplicationFaultStage::Fork;
+            begin_outer_driver_boundary(&state, &monitor)
+                .map_err(|fault| application_fault_from_outer_driver_boundary(stage, fault))?;
+            if exit.reason().is_some() {
+                return Err(ApplicationFault::fork_not_ready());
+            }
+            let declaration = candidate
+                .port_mut()
+                .declare()
+                .map_err(|fault| ApplicationFault::from_port(stage, fault))?;
+            declaration.validate().map_err(|fault| ApplicationFault {
+                stage,
+                ..ApplicationFault::invalid_declaration(fault)
+            })?;
+            declaration
+                .profile()
+                .validate()
+                .map_err(|fault| ApplicationFault {
+                    stage,
+                    ..ApplicationFault::invalid_profile(fault)
+                })?;
+            let session = self
+                .session
+                .fork(&declaration)
+                .map_err(|fault| ApplicationFault::from_session(stage, fault))?;
+            let root: RootFactory = Arc::new(move |_events| root());
+            let child = Self::unmounted(root, candidate.take_port(), input, declaration, session);
+            candidate.resource = Some(ForkResource::Application(Box::new(child)));
+            candidate.application_mut().bootstrap(|child, projection| {
+                let prepared = child
+                    .session
+                    .prepare(&child.declaration, projection)
+                    .map_err(|fault| ApplicationFault::from_session(stage, fault))?;
+                let (frame, _) = prepared.into_parts();
+                child
+                    .port
+                    .validate_fork_frame(&frame)
+                    .map_err(|fault| ApplicationFault::from_port(stage, fault))?;
+                begin_outer_driver_boundary(&state, &monitor)
+                    .map_err(|fault| application_fault_from_outer_driver_boundary(stage, fault))?;
+                if exit.reason().is_some() {
+                    return Err(ApplicationFault::fork_not_ready());
+                }
+                Ok(())
+            })?;
+            Ok(candidate.take_application())
+        })();
+        drop(candidate);
+        if result.is_err() {
+            self.complete_fork_cleanups().await?;
+        }
+        result
+    }
+}
+
 impl<P: ResettableReactionPort> Application<P> {
     /// Forget model interaction history and rebuild from the next complete
     /// Component projection. The mounted tree, tasks, Signals, and pending
@@ -1540,6 +1906,7 @@ pub enum ApplicationFaultStage {
     PostReconcile,
     StreamingRecovery,
     ModelContextReset,
+    Fork,
 }
 
 /// Closed, payload-free cause for an Application failure.
@@ -1558,6 +1925,9 @@ pub enum ApplicationFaultReason {
     ReplayReplacementUnsupported,
     InvalidModelContextReset,
     ModelContextBusy,
+    ForkNotReady,
+    ForkSnapshotIncompatible,
+    ForkCleanup,
     AmbiguousProjectionProvenance,
     RevisionExhausted,
     PendingToolCall,
@@ -1599,6 +1969,15 @@ pub struct ApplicationFault {
 }
 
 impl ApplicationFault {
+    const fn fork_not_ready() -> Self {
+        Self {
+            stage: ApplicationFaultStage::Fork,
+            kind: ApplicationFaultKind::Retryable,
+            code: ApplicationFaultCode::Rejected,
+            reason: ApplicationFaultReason::ForkNotReady,
+        }
+    }
+
     pub(super) const fn streaming_recovery() -> Self {
         Self {
             stage: ApplicationFaultStage::StreamingRecovery,
@@ -1693,6 +2072,11 @@ impl ApplicationFault {
 
     fn from_session(stage: ApplicationFaultStage, fault: FrameSessionFault) -> Self {
         let (code, reason) = match fault {
+            FrameSessionFault::ForkNotReady => return Self::fork_not_ready(),
+            FrameSessionFault::ForkSnapshotIncompatible => (
+                ApplicationFaultCode::Rejected,
+                ApplicationFaultReason::ForkSnapshotIncompatible,
+            ),
             FrameSessionFault::NamespaceExhausted => (
                 ApplicationFaultCode::Exhausted,
                 ApplicationFaultReason::NamespaceExhausted,
@@ -1944,6 +2328,10 @@ impl From<ReactionAdmissionFault> for ApplicationFault {
         Self::from_admission(fault)
     }
 }
+
+#[cfg(test)]
+#[path = "application_fork_tests.rs"]
+mod fork_tests;
 
 #[cfg(test)]
 mod tests {

@@ -34,7 +34,7 @@ pub mod prelude {
     )]
     #[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
     pub use super::authoring::{EventInput, EventListener};
-    pub use super::execution::ProviderEvent;
+    pub use super::execution::{ForkableReactionPort, ProviderEvent};
     pub use super::SignalAccessError;
     pub use crate::llm_call::TextTurnEvent;
     pub use crate::pom::{

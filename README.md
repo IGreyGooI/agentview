@@ -142,6 +142,32 @@ shutdown_result?;
 For text admission and state publication, see
 [`signal_reaction`](examples/signal_reaction.rs).
 
+### Exporting A Prompt Without Model History
+
+`RenderedProjection::render_prompt()` returns a `String` containing the complete current view for
+an external model with empty history:
+
+```rust,ignore
+let prompt: String = host.render()?.projection().render_prompt()?;
+```
+
+The export includes current System instructions, ordinary POM, tool records declared in the
+projection, native tool names/descriptions/schemas/strict flags, and current ephemeral context last.
+It only reads the projection; it does not submit a Frame, call a model, or execute an action.
+For an Application, `current_projection().render_prompt()` reads the latest committed snapshot,
+which may be dirty. Explicitly call `prepare().await` and handle normal exit when fresh preparation
+is required.
+
+[`export_prompt`](examples/export_prompt.rs) prints a tiny Component's prompt without credentials
+or a model SDK. The caller can pass that String to its own decision API:
+
+```bash
+cargo run --no-default-features --example export_prompt
+```
+
+See [HELP.md: Export a Prompt Without Model History](HELP.md#export-a-prompt-without-model-history)
+for contents, freshness, and response handling.
+
 ### Preparation Before Model Work
 
 Use `use_preparation` for work required before the next Frame: waiting for an
@@ -160,6 +186,46 @@ The runnable support example uses the live OpenAI Responses provider. Its
 deterministic provider fixtures live under `tests/examples`; see [the
 walkthrough](docs/preparation-examples.md) for the data flow, caching, retry
 behavior, and how these boundaries map to services.
+
+### Forking An Application
+
+For a `ForkableReactionPort`, `parent.fork(root).await` creates an independent
+Application with the shared conversation history and matching provider context.
+The native Responses port supports it. Capture an owned business snapshot in the
+new root so it creates its own Signals and handlers:
+
+```rust,ignore
+let snapshot = exported.lock().unwrap().clone();
+let mut child = parent.fork(move || restored_root(snapshot.clone())).await?;
+let (parent_turn, child_turn) = tokio::join!(parent.react(), child.react());
+let (parent_cleanup, child_cleanup) = tokio::join!(parent.shutdown(), child.shutdown());
+parent_turn?;
+child_turn?;
+parent_cleanup?;
+child_cleanup?;
+```
+
+Fork requires closed tool calls and empty staged results, plus no source exit,
+pending command, mount retirement, or streaming recovery. A completed tool may
+still need the source's next Frame to deliver its result before forking. The
+child explicitly declares System and current ephemeral context; historical raw
+ephemeral prompts are excluded. `fork_with_commands(root, input)` accepts a new
+command inbox. Each owner has its own driver, exit, and shutdown; exchange results
+through business state and deliver them in the receiving model's next Frame.
+
+[`application_fork`](examples/application_fork.rs) is an offline demonstration of
+the actual Responses port against a deterministic local SSE fixture. The parent
+observes child progress while its comparison is pending, receives the completed
+report, accepts the cheaper plan, and receives the action feedback. No API
+credentials or live model requests are needed:
+
+```bash
+cargo run --no-default-features --example application_fork
+cargo test --no-default-features --example application_fork
+```
+
+See [HELP.md: Forking an Application](HELP.md#forking-an-application) for the
+snapshot and lifecycle contract.
 
 ### Business History
 
@@ -277,7 +343,7 @@ Chat Completions is retained as a private compatibility implementation.
 
 ## Live Examples
 
-Runnable examples use the OpenAI Responses API, so `cargo run` makes
+The live examples below use the OpenAI Responses API, so `cargo run` makes
 token-bearing requests. Set `OPENAI_API_KEY` in the environment or `.env`.
 `AGENTVIEW_MODEL` defaults to `gpt-5.6-terra`; `OPENAI_BASE_URL` defaults to
 `https://api.openai.com/v1`.
@@ -288,9 +354,10 @@ When present, `.env` entries override existing values with the same name,
 including Cargo-injected certificate defaults. Without `.env`, the examples use
 the launching process environment unchanged.
 
-Repository convention: executable examples use configured real credentials and
-demonstrate end-to-end behavior. Test implementations and mock fixtures belong
-under `tests/`; example files retain only `#[cfg(test)]` module links to them.
+Live examples use configured real credentials and demonstrate end-to-end behavior;
+their deterministic test implementations and fixtures live under `tests/`.
+The offline `application_fork` demonstration uses its local SSE fixture under
+`examples/support/` for both its executable and example test.
 
 `OPENAI_BASE_URL` is the versioned API base and must end in `/v1`; do not set
 it to a `/responses` endpoint. For a gateway with a custom TLS certificate,
@@ -421,9 +488,10 @@ Reuse [`prompt_debug.rs`](examples/support/prompt_debug.rs) by creating
 
 ## Deterministic Tests
 
-Test implementations and fixtures live under `tests/`, rather than being a
-runtime provider choice in the examples. Examples with deterministic behavioral
-coverage can be run without API credentials:
+The live examples' deterministic test implementations and fixtures live under
+`tests/`. The offline `application_fork` demonstration uses its local SSE fixture
+for both `cargo run` and its example test. These behavioral tests need no API
+credentials:
 
 ```bash
 cargo test --no-default-features --example frame_agent
@@ -431,6 +499,7 @@ cargo test --no-default-features --example frame_plugin
 cargo test --no-default-features --example signal_reaction
 cargo test --no-default-features --example debug_prompt
 cargo test --no-default-features --example support_preparation
+cargo test --no-default-features --example application_fork
 cargo test --no-default-features --test component_runtime_visual_acceptance
 ```
 

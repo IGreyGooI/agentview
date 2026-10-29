@@ -436,7 +436,7 @@ fn validate_history_id(id: &str) -> Result<()> {
 
 fn selected_history_directory(directory: &Path, selection: &str, kind: &str) -> Result<PathBuf> {
     let path = if selection == "latest" {
-        saved_runs(&directory)?
+        saved_runs(directory)?
             .into_iter()
             .next()
             .map(|(path, _)| path)

@@ -110,6 +110,25 @@ struct PendingWireCall {
 }
 
 impl ResponsesFrameRequestState {
+    /// Only closed, sealed wire windows can become an independent session.
+    /// Live stream state is never stored here, and its recovery fence is
+    /// checked separately by the port before copying this snapshot.
+    pub(super) fn is_forkable(&self) -> bool {
+        self.pending_calls.is_empty()
+            && self.wire_input.iter().all(|item| {
+                match item.get("status").and_then(Value::as_str) {
+                    Some("in_progress") => false,
+                    // Canonical interrupted assistant text is closed history,
+                    // encoded with its explicit interruption boundary. It is
+                    // distinct from an unfinished provider-private artifact.
+                    Some("incomplete") => {
+                        item.get("type").and_then(Value::as_str) == Some("message")
+                    }
+                    _ => true,
+                }
+            })
+    }
+
     pub(super) fn is_compacted(&self) -> bool {
         self.compaction_instructions.is_some()
     }

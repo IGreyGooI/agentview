@@ -20,6 +20,7 @@ mod frame;
 mod integration;
 mod port;
 mod projection_diff;
+mod prompt_export;
 #[cfg(feature = "legacy-provider-port")]
 mod prompt_render;
 mod stdin;
@@ -111,12 +112,14 @@ pub(crate) use projection_diff::ProjectionAppendPolicy;
 pub(crate) use projection_diff::{
     ProjectionDiffState, ProjectionReconciliationState, ReconciledProjectionPlan,
 };
+pub use prompt_export::PromptExportError;
 pub use reaction::{
-    ContextWindow, Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameProfile,
-    FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact, ProviderFactStream,
-    ProviderOutputKey, ProviderToolCall, ProviderToolCallError, ReactionPort, ReactionPortFault,
-    ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason, ResettableReactionPort,
-    SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
+    ContextWindow, ForkableReactionPort, Frame, FrameBasis, FrameCapabilities, FrameConstraints,
+    FrameProfile, FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact,
+    ProviderFactStream, ProviderOutputKey, ProviderToolCall, ProviderToolCallError, ReactionPort,
+    ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason,
+    ResettableReactionPort, SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch,
+    TargetIdentity, ToolCatalog,
 };
 pub use stdin::{StdinApplication, StdinApplicationError, StdinApplicationOptions, StdinResponse};
 pub use streaming::{StreamingToolRecoveryReport, StreamingToolRecoveryStatus};

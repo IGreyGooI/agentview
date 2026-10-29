@@ -690,6 +690,9 @@ pub enum ReactionPortFaultCode {
 pub enum ReactionPortFaultReason {
     Declaration,
     RequestPreparation,
+    ForkNotReady,
+    ForkSnapshotUnavailable,
+    ForkSnapshotIncompatible,
     Transport,
     Authentication,
     Authorization,
@@ -794,6 +797,33 @@ pub trait ReactionPort: Send {
     /// after active reactions have ended. Ports without background work need
     /// no implementation; Drop alone only provides best-effort cancellation.
     async fn shutdown(&mut self) {}
+}
+
+/// Optional capability for copying a settled model session into an independent
+/// target, preserving provider-private context for the same canonical history.
+///
+/// A successful fork keeps the source declaration and continuation unchanged.
+/// The child has a fresh [`TargetIdentity`], the same [`FrameProfile`], and
+/// [`TargetContinuity::FullRequired`]. Its first Full must validate and retain
+/// the source canonical prefix, including every required private causal
+/// artifact. Running requests, tool lanes, workers, and mutable cursors are not
+/// shared with the child. Configuration needed by later work is retained.
+///
+/// Failure or cancellation must leave the source usable and unchanged. Any
+/// partially created child resources must be cleaned up even if the caller
+/// drops the fork future.
+#[async_trait]
+pub trait ForkableReactionPort: ReactionPort + Sized + 'static {
+    async fn fork(&mut self) -> Result<Self, ReactionPortFault>;
+
+    /// Checks a candidate first Full before the child's Component tasks start.
+    ///
+    /// Validate its exact target, canonical prefix, provider-private proofs,
+    /// System compatibility, and wire budgets using the same rules as submit.
+    /// This is a side-effect-free preflight: it must not submit, commit input,
+    /// advance continuation, or start background work. The actual submission
+    /// still checks its handoff precondition when the child later reacts.
+    fn validate_fork_frame(&self, frame: &Frame) -> Result<(), ReactionPortFault>;
 }
 
 /// Optional port capability for starting a new model-context lineage without

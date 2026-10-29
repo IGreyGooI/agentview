@@ -171,7 +171,7 @@ Component Runtime 是业务权威，拥有：
 - retained provider-event handler slots；
 - 每次 render/reaction generation 的 private dispatch bindings。
 
-Signal 写入立即成为业务事实。Engine 不 fork 或回滚 Component state。业务需要事务性时，应在业务
+Signal 写入立即成为业务事实。Engine 不自动复制或回滚 Component state。业务需要事务性时，应在业务
 Component 内先校验，再一次性写入自洽的新状态。
 
 `RenderedProjection` 始终是完整值，不是 patch。Runtime 可以跳过 clean subtree 的重复执行并复用
@@ -237,6 +237,70 @@ owner仍需完成业务stop/ack并调用consuming shutdown，shutdown及Applicat
 outer-boundary仲裁：mount fence、supervisor `Closed`和已经终结的Application均fail closed，fresh Component task
 panic保留原payload并优先unwind。
 
+### 保留历史的 Application fork
+
+`ForkableReactionPort: ReactionPort + Sized + 'static` 是可选能力：
+
+```rust
+#[async_trait]
+pub trait ForkableReactionPort: ReactionPort + Sized + 'static {
+    async fn fork(&mut self) -> Result<Self, ReactionPortFault>;
+    fn validate_fork_frame(&self, frame: &Frame) -> Result<(), ReactionPortFault>;
+}
+
+impl<P: ForkableReactionPort> Application<P> {
+    pub async fn fork(
+        &mut self,
+        root: impl Fn() -> Component + Send + Sync + 'static,
+    ) -> Result<Self, ApplicationFault>;
+
+    pub async fn fork_with_commands(
+        &mut self,
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        input: CommandInput,
+    ) -> Result<Self, ApplicationFault>;
+}
+```
+
+fork 将 private FrameSession 与 port 的同一历史分支点成对复制，返回独立 Application；
+每个实例继续固定一个 logical target 并保持 single-flight。业务 owner 导出 owned typed snapshot，
+由新的 root 初始化自己的 Signals；框架不复制任意 hook value、handler、正在运行的 future 或
+外部副作用。`&mut Application` 不冻结 Component tasks 或外部业务状态，snapshot 一致性由业务保证。
+
+子应用继承已接纳 canonical history、对应的 provider wire history、required private reasoning
+与已安装 compaction artifact。它获得新的 target identity、FrameSession namespace 和 revision
+sequence，port 首次声明 FullRequired。继承 checkpoint 只提供历史归属证明，不能授权新 mount 的
+Delta；第一次 successful Full handoff 才建立子 delivery baseline。现有 scope transition、
+AmbiguousProjectionProvenance、exact canonical prefix 与 System/compaction binding 校验均保留。
+子 root 显式声明 System；省略仍表示 clear。历史 ephemeral 原始 prompt 不进入继承的 canonical/wire history，当前 ephemeral
+内容由子 root 声明；已保留的模型输出与工具事实继续继承。
+
+fork 只允许源应用无退出请求、无未完成 mount retirement/正在处理的 command、无 streaming
+recovery，canonical 工具调用已闭合且 ToolOutput staging 为空。reaction 返回不保证这个条件：
+已完成工具结果和取消 fallback 仍可能等待下一次 handoff。拒绝 fork 不提交 Frame、不消费 receipt
+或 reaction demand、不运行 preparation。源任务 panic 保留原 payload 并优先传播；fork await
+期间新增的退出请求在子任务启动前重新检查。
+
+port 的 fork 不改变源 cursor、continuation 或后台工作；子 port 不共享可变 delivery/failure 状态、
+worker、候选安装状态或 monitor。HTTP client、显式 observer sinks 与线程安全 compaction policy
+可以共享；policy 对象的内部状态因此也可共享，但每个 port 的 policy 替换、worker 和安装独立。
+普通构造失败和取消不损坏源应用。不可分支的 port 无需实现该能力。
+
+`validate_fork_frame()` 在子 Component tasks 启动前，对初始 Full 检查 target/profile、canonical
+prefix、私有 artifact、System 和 wire budget；它不 submit、commit 或启动 compaction。当前初始
+projection 可以含 preparation；这次检查不运行 hooks，也不能替代实际 reaction 的重新校验。
+调用需要当前 Tokio runtime。成功 fork 按 mount 规则启动新的 Component tasks，driver 仍由宿主显式推进。
+
+部分创建的子资源由独立 cleanup task 持有，取消 fork waiter 不取消清理。父应用持有 cleanup
+完成句柄；后续 fork 与 consuming shutdown 等待它们完成，后者即使遇到 panic 也先 drain 其拥有的
+fork cleanup，再传播原始 shutdown panic。未发布子应用的 cleanup 先 fence mounts、
+join tasks、shutdown port，再传播未消费的子任务 panic；普通 failed-child cleanup 不阻塞父应用
+正常 reaction。直接或 supervised panic 后沿用 Application 不可复用契约。
+
+分支后的输出、动作和退出请求不自动合并。业务通过显式消息或共享服务交换结果，再在接收方后续
+submitted Frame 中交付结果、失败、进度和可继续操作的状态。每个 owner 独立完成 shutdown。
+接口背景与验证场景见 [application-fork-design.md](application-fork-design.md)。
+
 ### private FrameSession
 
 FrameSession 原子持有两类不同状态：
@@ -301,6 +365,9 @@ pub enum ReactionPortFaultReason {
     StreamTimeout,
     OutputLimit,
     Other,
+    ForkNotReady,
+    ForkSnapshotUnavailable,
+    ForkSnapshotIncompatible,
 }
 
 pub struct ReactionPortFault {
@@ -338,6 +405,7 @@ pub enum ApplicationFaultStage {
     Binding,
     ToolOutput,
     PostReconcile,
+    Fork,
 }
 
 #[non_exhaustive]
@@ -352,6 +420,9 @@ pub enum ApplicationFaultReason {
     AcceptedRevisionInNewEpoch,
     ContinuityResetWithoutEpochAdvance,
     ReplayReplacementUnsupported,
+    ForkNotReady,
+    ForkSnapshotIncompatible,
+    ForkCleanup,
     AmbiguousProjectionProvenance,
     RevisionExhausted,
     PendingToolCall,
@@ -526,6 +597,26 @@ private checkpoint保存最近一次成功handoff的snapshot。首次非空、�
 accepted baseline。prepare、Pending、pre-handoff Err都不推进snapshot；successful handoff与Frame revision
 及其他commit candidate同步原子提交，post-handoff stream fault不回滚。port只应用这个Full/Delta结果，
 不得从private history推断System replacement。
+
+### 无模型历史的 prompt 导出
+
+`RenderedProjection::render_prompt() -> Result<String, PromptExportError>` 从当前完整 typed projection
+导出模型可读的 prompt String，外部模型历史固定为空。内容依次包含 normalized 当前 System、完整
+ordinary POM（包括 projection 显式声明的当前 native ToolCall/ToolResult 记录）、完整 native tool
+catalog 的名称、描述、参数 schema 和 strict 标志，最后追加完整当前 ephemeral prompts。它不读取
+`FrameSession` 的 canonical history、staged inputs 或 provider-private continuation；业务判断需要的
+过去事实必须由当前 projection 明确声明。projection 中的 provider-private extension 无法导出，返回
+`PromptExportError::UnsupportedProviderExtension`。
+
+`ProjectionSnapshot::render_prompt()` 转发到该 snapshot 的 projection，保留 latest committed snapshot
+的语义。dirty snapshot 仍能导出，但可能落后于更新后的业务状态；导出不隐式 prepare 或 reconcile。
+需要 fresh preparation 时，owner 显式调用 `app.prepare().await` 并处理正常退出，再读取和导出当前
+snapshot。完成 preparation 不冻结后续业务写入。
+
+导出是只读格式转换：不创建或提交 Frame、不推进 session/history、不调用模型、不执行 action。
+返回值供调用方自己的模型 API 使用；模型响应的接纳、动作执行和结果反馈仍使用既有 runtime
+契约。该 String 是面向模型的视图，应用代码和测试不得解析或快照它，仍应读取 typed POM、projection
+和结构化工具描述。
 
 ### Component preparation
 
@@ -1703,7 +1794,8 @@ worker 必须完成配置的审计回执后才能发布 Ready；回执错误使�
 
 - Chess、裁判或其他业务领域规则；
 - 某个ToolCall的业务schema和执行实现；
-- concurrent multi-target writers、multi-checkpoint delta、fork或durable session recovery；
+- 同一 Application 内的 concurrent multi-target writers、multi-checkpoint delta 或 durable session recovery；
+- 任意 mounted hook/future 的透明 clone、自动业务 snapshot 或分支历史自动 merge；
 - public mutable history/session API；
 - framework-owned AgentLoop、public Reactor trait或Component-owned scheduling policy；
 - task retry/backoff、durable jobs、unbounded coroutine inbox或resource/action最终API；

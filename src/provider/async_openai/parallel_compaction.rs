@@ -67,6 +67,8 @@ pub struct CompactionContext {
 /// Synchronous, bounded admission policy, evaluated before transport handoff.
 /// Returning true permits a background attempt; closure, size and lifecycle
 /// checks still apply. User panics propagate on the caller's stack.
+/// Forked Responses ports share this policy object, including any interior
+/// state; each port owns its own worker, candidates, and monitor.
 pub trait CompactionPolicy: Send + Sync {
     fn should_compact(&self, context: &CompactionContext) -> bool;
 }
@@ -236,7 +238,7 @@ impl Drop for Attempt {
 }
 
 pub(super) struct ParallelCompaction {
-    policy: Box<dyn CompactionPolicy>,
+    policy: Arc<dyn CompactionPolicy>,
     status: watch::Sender<ParallelCompactionStatus>,
     attempt: Option<Attempt>,
     last_source: Option<[u8; 32]>,
@@ -314,17 +316,27 @@ impl CompactionTransport {
 
 impl ParallelCompaction {
     pub(super) fn new(policy: impl CompactionPolicy + 'static) -> Self {
+        Self::with_policy(Arc::new(policy))
+    }
+
+    fn with_policy(policy: Arc<dyn CompactionPolicy>) -> Self {
         let (status, _) = watch::channel(ParallelCompactionStatus {
             attempt: 0,
             phase: ParallelCompactionPhase::Idle,
             fault: None,
         });
         Self {
-            policy: Box::new(policy),
+            policy,
             status,
             attempt: None,
             last_source: None,
         }
+    }
+
+    /// Reuse the explicit policy without copying speculative work, source
+    /// admission bookkeeping, or the parent's monitor lifecycle.
+    pub(super) fn fork(&self) -> Self {
+        Self::with_policy(Arc::clone(&self.policy))
     }
 
     pub(super) fn monitor(&self) -> ParallelCompactionMonitor {
@@ -338,7 +350,7 @@ impl ParallelCompaction {
     }
 
     pub(super) fn replace_policy(&mut self, policy: impl CompactionPolicy + 'static) {
-        self.policy = Box::new(policy);
+        self.policy = Arc::new(policy);
     }
 
     pub(super) fn has_attempt(&self) -> bool {
@@ -1189,6 +1201,78 @@ mod tests {
             cancelled: false,
         });
         compaction
+    }
+
+    #[test]
+    fn fork_reuses_custom_policy_and_starts_an_independent_monitor_and_admission_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let observed = evaluations.clone();
+        let mut parent = ParallelCompaction::new(move |_: &CompactionContext| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            true
+        });
+        parent.last_source = Some(source().fingerprint);
+        parent.phase(ParallelCompactionPhase::Installed);
+        let child = parent.fork();
+        assert!(Arc::ptr_eq(&parent.policy, &child.policy));
+        assert_eq!(
+            child.monitor().status().phase,
+            ParallelCompactionPhase::Idle
+        );
+        assert_eq!(child.monitor().status().attempt, 0);
+        assert!(child.attempt.is_none());
+        assert!(child.last_source.is_none());
+        let request =
+            child.prepare_request(Some(source()), CompactionMode::Background(&context(4, 100)));
+        assert!(request.source.is_some());
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+        parent.phase(ParallelCompactionPhase::Failed);
+        assert_eq!(
+            child.monitor().status().phase,
+            ParallelCompactionPhase::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_does_not_copy_or_cancel_a_live_parent_worker() {
+        struct OnDrop(Arc<Semaphore>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.add_permits(1);
+            }
+        }
+        let dropped = Arc::new(Semaphore::new(0));
+        let guard = OnDrop(dropped.clone());
+        let (started, started_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            started.send(()).unwrap();
+            std::future::pending().await
+        });
+        let mut parent = with_task(task);
+        started_rx.await.unwrap();
+        let mut child = parent.fork();
+        assert!(parent.has_attempt());
+        assert!(!child.has_attempt());
+        assert_eq!(
+            child.monitor().status().phase,
+            ParallelCompactionPhase::Idle
+        );
+        child.shutdown().await;
+        assert_eq!(dropped.available_permits(), 0);
+        assert!(parent.has_attempt());
+        assert!(!parent
+            .attempt
+            .as_ref()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .is_finished());
+        parent.shutdown().await;
+        assert_eq!(dropped.available_permits(), 1);
     }
 
     #[test]

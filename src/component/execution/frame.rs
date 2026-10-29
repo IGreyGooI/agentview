@@ -293,6 +293,37 @@ impl FrameSession {
         })
     }
 
+    /// Copies a settled model history into an independent target lineage.
+    ///
+    /// The inherited checkpoint remains reconciliation evidence for the old
+    /// execution scope. It is not an accepted delivery baseline for this target;
+    /// the fresh mount scope applies the normal provenance fence on first Full.
+    pub(super) fn fork(&self, declaration: &TargetDeclaration) -> Result<Self, FrameSessionFault> {
+        if !self.can_fork() {
+            return Err(FrameSessionFault::ForkNotReady);
+        }
+        if declaration.validate().is_err()
+            || declaration.identity() == self.target_delivery.identity
+            || declaration.profile() != &self.target_delivery.profile
+            || !matches!(
+                declaration.continuity(),
+                TargetContinuity::FullRequired { .. }
+            )
+        {
+            return Err(FrameSessionFault::ForkSnapshotIncompatible);
+        }
+
+        let mut fork = Self::new(declaration)?;
+        fork.canonical_history.transcript = self.canonical_history.transcript.clone();
+        fork.target_delivery.checkpoint = self.target_delivery.checkpoint.clone();
+        Ok(fork)
+    }
+
+    /// A fork cannot copy tool lanes or deliver their staged results implicitly.
+    pub(super) fn can_fork(&self) -> bool {
+        self.can_reset_model_context()
+    }
+
     pub(super) fn prepare(
         &self,
         declaration: &TargetDeclaration,
@@ -940,6 +971,12 @@ pub(super) enum FrameSessionFault {
     ReplayReplacementUnsupported,
     #[error("model context reset did not establish a higher epoch requiring Full")]
     InvalidModelContextReset,
+    #[error("model history has pending tool calls or staged tool outputs at the fork boundary")]
+    ForkNotReady,
+    #[error(
+        "fork snapshot did not establish an independent Full-required target with the same profile"
+    )]
+    ForkSnapshotIncompatible,
     #[error(transparent)]
     ProjectionReconciliation(#[from] ProjectionReconciliationFault),
     #[error("Frame revision identity space is exhausted")]
@@ -1115,6 +1152,7 @@ mod tests {
         test_support::{document, element, text_element},
         transcript::{
             AssistantPhase, CanonicalInputItem, CanonicalTranscript, InstructionAuthority,
+            ProviderExtension,
         },
     };
 
@@ -1232,6 +1270,237 @@ mod tests {
         let revision = frame.revision();
         session.commit(commit);
         revision
+    }
+
+    fn fork_declaration(profile: FrameProfile) -> TargetDeclaration {
+        TargetDeclaration::full(
+            TargetIdentity::new(NonZeroU128::new(42).unwrap()),
+            epoch(1),
+            profile,
+        )
+    }
+
+    #[test]
+    fn fork_keeps_causal_history_and_establishes_an_independent_full_lineage() {
+        let profile = profile(true);
+        let declaration = full(profile.clone(), 3);
+        let mut parent = FrameSession::new(&declaration).unwrap();
+        let parent_view = scoped_projection(&["parent state"], 1);
+        let parent_head = commit_first(&mut parent, &declaration, &parent_view);
+        for item in [
+            CanonicalInputItem::assistant_text("observed result", None),
+            CanonicalInputItem::tool_call("completed-call", "lookup", "{}").unwrap(),
+            CanonicalInputItem::tool_result("completed-call", "lookup result").unwrap(),
+        ] {
+            parent.canonical_history.transcript =
+                parent.canonical_history.transcript.appended(item).unwrap();
+        }
+        let common_history = parent.canonical_history.transcript.clone();
+        let parent_sequence = parent.target_delivery.next_sequence;
+
+        let child_declaration = fork_declaration(profile.clone());
+        let mut child = parent.fork(&child_declaration).unwrap();
+        assert_eq!(child.canonical_history.transcript, common_history);
+        assert_ne!(
+            child.target_delivery.namespace,
+            parent.target_delivery.namespace
+        );
+        assert_eq!(child.target_delivery.next_sequence, NonZeroU64::new(1));
+        assert_eq!(child.target_delivery.committed_revision, None);
+        assert!(child.can_fork());
+
+        let child_view = scoped_projection(&["parent state"], 2);
+        let prepared = child.prepare(&child_declaration, &child_view).unwrap();
+        assert_eq!(prepared.frame.basis(), FrameBasis::Full);
+        assert_eq!(prepared.frame.target(), child_declaration.identity());
+        assert_eq!(prepared.frame.submission().replay(), common_history.items());
+        assert_eq!(
+            prepared.frame.submission().projection().items(),
+            &[CanonicalInputItem::assistant_text("parent state", None)]
+        );
+        assert!(prepared.frame.submission().staged_inputs().is_empty());
+        assert_eq!(
+            prepared.frame.revision(),
+            FrameRevision::new(
+                child.target_delivery.namespace,
+                child_declaration.identity(),
+                epoch(1),
+                NonZeroU64::new(1).unwrap(),
+            )
+        );
+        let (frame, commit) = prepared.into_parts();
+        let child_head = frame.revision();
+        child.commit(commit);
+
+        let child_output = CanonicalInputItem::assistant_text("child result", None);
+        child.canonical_history.transcript = child
+            .canonical_history
+            .transcript
+            .appended(child_output.clone())
+            .unwrap();
+        let child_next = child
+            .prepare(
+                &TargetDeclaration::resume(child_head, profile.clone()),
+                &child_view,
+            )
+            .unwrap();
+        assert_eq!(child_next.frame.basis(), FrameBasis::DeltaFrom(child_head));
+        assert_eq!(child_next.frame.submission().replay(), &[child_output]);
+        assert_eq!(parent.canonical_history.transcript, common_history);
+        assert_eq!(parent.target_delivery.next_sequence, parent_sequence);
+        let parent_next = parent
+            .prepare(
+                &TargetDeclaration::resume(parent_head, profile),
+                &parent_view,
+            )
+            .unwrap();
+        assert_eq!(
+            parent_next.frame.basis(),
+            FrameBasis::DeltaFrom(parent_head)
+        );
+        assert_eq!(
+            parent_next.frame.submission().replay(),
+            &common_history.items()[1..]
+        );
+    }
+
+    #[test]
+    fn fork_preserves_provider_provenance_across_the_new_mount_and_later_frames() {
+        let histories = [
+            vec![CanonicalInputItem::assistant_text("provider result", None)],
+            vec![CanonicalInputItem::provider_extension(
+                ProviderExtension::new(
+                    "test",
+                    "causal-artifact",
+                    1,
+                    serde_json::json!({
+                        "receipt": "provider-owned"
+                    }),
+                )
+                .unwrap(),
+            )],
+            vec![
+                CanonicalInputItem::tool_call("completed-call", "lookup", "{}").unwrap(),
+                CanonicalInputItem::tool_result("completed-call", "result").unwrap(),
+            ],
+        ];
+        for items in histories {
+            for checkpointed in [false, true] {
+                let profile = profile(true);
+                let declaration = full(profile.clone(), 1);
+                let mut parent = FrameSession::new(&declaration).unwrap();
+                let empty = scoped_projection(&[], 1);
+                let first_head = commit_first(&mut parent, &declaration, &empty);
+                for item in &items {
+                    parent.canonical_history.transcript = parent
+                        .canonical_history
+                        .transcript
+                        .appended(item.clone())
+                        .unwrap();
+                }
+                if checkpointed {
+                    let claimed =
+                        RenderedProjection::from_nodes(vec![RenderedProjectionNode::new(
+                            "root",
+                            items.clone(),
+                        )])
+                        .unwrap()
+                        .with_execution_scope(empty.execution_scope().unwrap());
+                    commit_first(
+                        &mut parent,
+                        &TargetDeclaration::resume(first_head, profile.clone()),
+                        &claimed,
+                    );
+                }
+
+                let child_declaration = fork_declaration(profile.clone());
+                let mut child = parent.fork(&child_declaration).unwrap();
+                let child_view = scoped_projection(&["new child state"], 2);
+                let redeclared = RenderedProjection::from_nodes(vec![RenderedProjectionNode::new(
+                    "root",
+                    items.clone(),
+                )])
+                .unwrap()
+                .with_execution_scope(child_view.execution_scope().unwrap());
+                assert!(matches!(
+                    child.prepare(&child_declaration, &redeclared),
+                    Err(FrameSessionFault::ProjectionReconciliation(
+                        ProjectionReconciliationFault::AmbiguousProjectionProvenance
+                    ))
+                ));
+
+                let child_head = commit_first(&mut child, &child_declaration, &child_view);
+                assert!(matches!(
+                    child.prepare(&TargetDeclaration::resume(child_head, profile), &redeclared),
+                    Err(FrameSessionFault::ProjectionReconciliation(
+                        ProjectionReconciliationFault::AmbiguousProjectionProvenance
+                    ))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn fork_rejects_reused_target_changed_profile_or_accepted_child_without_mutating_parent() {
+        let profile = profile(true);
+        let declaration = full(profile.clone(), 1);
+        let mut parent = FrameSession::new(&declaration).unwrap();
+        let parent_head = commit_first(&mut parent, &declaration, &projection(Some("retained")));
+        let history = parent.canonical_history.transcript.clone();
+        let next_sequence = parent.target_delivery.next_sequence;
+        let mut changed_profile = profile.clone();
+        changed_profile.capabilities = FrameCapabilities::NONE;
+        let accepted_child = TargetDeclaration::resume(
+            FrameRevision::new(
+                NonZeroU128::new(999).unwrap(),
+                fork_declaration(profile.clone()).identity(),
+                epoch(1),
+                NonZeroU64::new(1).unwrap(),
+            ),
+            profile.clone(),
+        );
+        for incompatible in [
+            declaration,
+            fork_declaration(changed_profile),
+            accepted_child,
+        ] {
+            assert!(matches!(
+                parent.fork(&incompatible),
+                Err(FrameSessionFault::ForkSnapshotIncompatible)
+            ));
+        }
+        assert_eq!(parent.canonical_history.transcript, history);
+        assert_eq!(parent.target_delivery.committed_revision, Some(parent_head));
+        assert_eq!(parent.target_delivery.next_sequence, next_sequence);
+        assert!(parent.fork(&fork_declaration(profile)).is_ok());
+    }
+
+    #[test]
+    fn fork_rejects_canonical_open_tools_without_discarding_history() {
+        let profile = profile(true);
+        let mut session = FrameSession::new(&full(profile.clone(), 1)).unwrap();
+        session.canonical_history.transcript =
+            CanonicalTranscript::try_from_items(vec![CanonicalInputItem::tool_call(
+                "pending-call",
+                "lookup",
+                "{}",
+            )
+            .unwrap()])
+            .unwrap();
+        let history = session.canonical_history.transcript.clone();
+        assert!(!session.can_fork());
+        assert!(matches!(
+            session.fork(&fork_declaration(profile.clone())),
+            Err(FrameSessionFault::ForkNotReady)
+        ));
+        assert_eq!(session.canonical_history.transcript, history);
+        session.canonical_history.transcript = session
+            .canonical_history
+            .transcript
+            .appended(CanonicalInputItem::tool_result("pending-call", "done").unwrap())
+            .unwrap();
+        assert!(session.can_fork());
+        assert!(session.fork(&fork_declaration(profile)).is_ok());
     }
 
     #[test]
@@ -2342,6 +2611,11 @@ mod tests {
         }
         let resume = TargetDeclaration::resume(head, profile);
         assert!(!session.can_reset_model_context());
+        assert!(!session.can_fork());
+        assert!(matches!(
+            session.fork(&fork_declaration(resume.profile().clone())),
+            Err(FrameSessionFault::ForkNotReady)
+        ));
         let prepared = session.prepare(&resume, &complete).unwrap();
         assert_eq!(prepared.frame.submission().staged_inputs().len(), 1);
         assert_eq!(
@@ -2379,6 +2653,9 @@ mod tests {
                 if call_id == "call-7" && content == "result"
         ));
         assert!(session.can_reset_model_context());
+        assert!(session
+            .fork(&fork_declaration(resume.profile().clone()))
+            .is_ok());
     }
 
     #[test]
@@ -2410,6 +2687,11 @@ mod tests {
             "Tool execution was cancelled; its outcome is unknown.",
         )
         .unwrap();
+        assert!(!session.can_fork());
+        assert!(matches!(
+            session.fork(&fork_declaration(resume.profile().clone())),
+            Err(FrameSessionFault::ForkNotReady)
+        ));
         let prepared = session.prepare(&resume, &complete).unwrap();
         assert_eq!(
             prepared.frame.submission().staged_inputs(),
@@ -2437,6 +2719,9 @@ mod tests {
             .unwrap()
             .0
             .is_empty());
+        assert!(session
+            .fork(&fork_declaration(resume.profile().clone()))
+            .is_ok());
     }
 
     #[test]

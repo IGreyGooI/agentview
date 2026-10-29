@@ -512,7 +512,10 @@ async fn one_session_orders_connections_and_links_foreground_runs_to_complete_re
         .any(|event| { event["kind"] == "request_accepted" && event["cli_run_id"] == start_run }));
     for (run, text) in [(first, "cli first"), (second, "cli second")] {
         assert_eq!(accepted(&record, text)["cli_run_id"], run);
-        assert_eq!(fixture.foreground_daemon_ids(&run), [session.clone()]);
+        assert_eq!(
+            fixture.foreground_daemon_ids(&run).as_slice(),
+            std::slice::from_ref(&session)
+        );
     }
     assert!(accepted(&record, "left connection")["cli_run_id"].is_null());
     assert_ne!(

@@ -418,6 +418,12 @@ fn has_loopback_host(url: &Url) -> bool {
 }
 
 /// OpenAI Responses implementation of the execution runtime's provider port.
+///
+/// Implements [`ForkableReactionPort`](crate::component::execution::reaction::ForkableReactionPort)
+/// for closed Frame-native sessions. Forks retain wire history and private
+/// reasoning/compaction artifacts with independent target and worker state.
+/// HTTP clients, observer callbacks, and the explicit compaction policy object
+/// are shared; any interior policy state is consequently shared too.
 pub struct AsyncOpenAiResponsesProvider {
     client: reqwest::Client,
     config: OpenAIConfig,

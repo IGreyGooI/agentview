@@ -35,6 +35,10 @@ Accepted cursor；相同模型或相同连接配置不代表相同 logical targe
 后台应用只得到显式提供的任务、规则和业务上下文。它不自动继承主应用完整 transcript，
 其 assistant output 和工具记录也不自动并入主应用 transcript。
 
+需要从现有交互历史分支时，使用[保留历史的 Application Fork](application-fork-design.md)。
+`Application::fork()` 成对复制 FrameSession 和 port，再从显式业务 snapshot 重新 mount；
+Responses port 已支持该可选能力。普通 `mount()` 继续遵守本文的历史隔离规则。
+
 共享业务数据放在明确的业务服务、数据库或外层拥有的状态句柄中，各应用只获得任务所需的能力。
 它们可以使用相同 Component 定义构建不同实例，但这不会共享 hook state。跨应用资源冲突、
 版本检查和副作用幂等由该业务数据 owner 负责；应用隔离不等于共享数据库自动获得事务性。
