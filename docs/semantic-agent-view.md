@@ -935,11 +935,12 @@ effects, so a later snapshot failure cannot replay the same action.
 
 Both resolvers return opaque, slot-free `ResolvedDocument`; only that type can
 be passed to `render_pom_document`. The renderer emits canonical Markdown plus
-XML-shaped prompt text and owns Markdown escaping, list syntax, code fences/spans,
+XML-shaped prompt text and owns list syntax, code fences/spans,
 mixed content layout, and error reporting. Prompt XML is read by the LLM, not an
-XML parser: data text and attributes receive no XML entities or Markdown escaping.
+XML parser: all text and attributes receive no XML entities or Markdown escaping,
+including text in explicit Markdown nodes. Leading whitespace is not entity-encoded.
 XML retains its structural indentation. JSON retains its required escaping. Explicit Markdown nodes
-retain their formatting rules; empty paragraphs, zero-item lists, and empty code
+add their declared formatting; empty paragraphs, zero-item lists, and empty code
 spans fail rather than falling back to raw markup.
 
 The streaming demo authors workflow prose with paragraph views that contain

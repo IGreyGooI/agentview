@@ -252,18 +252,20 @@ System strings use the existing System snapshot rules.
 
 Quoted `"{system}"` remains a formatted paragraph with inline validation. Use `{ system }` or
 `{ format!("{system}") }` for a complete multiline prompt. Explicit Markdown nodes retain their
-Markdown validation and escaping. Low-level callers can use `Document::from_raw_text(...)`.
+validation and declared formatting; their text is not escaped. Low-level callers can use
+`Document::from_raw_text(...)`.
 
 POM is not XML. Its tag-shaped notation organizes a view for the LLM; the rendered prompt
 is not a machine-readable serialization format and need not be valid XML. Code must not parse
 it, including extracting fields with regular expressions or string splitting. Read typed POM,
 projection items, or structured action descriptors instead.
 
-POM data text, raw text, and attribute values receive no XML entity escaping, including `<`,
-`>`, `&`, quotes, and backslashes. Tagged nodes retain their structural indentation, including
+POM data text, raw text, and attribute values receive no XML or Markdown escaping, including
+text in explicit Markdown nodes. `<`, `>`, `&`, quotes, backslashes, underscores, and existing
+entity text are preserved. Tagged nodes retain their structural indentation, including
 nested multiline content; the source text's relative indentation and line endings remain.
-Pure data fields receive no Markdown escaping. Code spans and code blocks inside tagged nodes
-likewise preserve their bodies. Explicit Markdown nodes still supply their declared formatting.
+Code spans and code blocks inside tagged nodes likewise preserve their bodies. Explicit
+Markdown nodes supply their declared formatting without escaping or entity-encoding their text.
 JSON values and provider requests retain the escaping required by JSON. Model-produced XML
 actions have their own input parser and validation contract.
 

@@ -40,11 +40,11 @@ pub enum PomRenderError {
 /// Renders a slot-free POM document to Markdown + XML-shaped prompt text.
 ///
 /// POM is not XML. Tag-shaped notation organizes the prompt for the model and
-/// need not be valid XML. Data text and attribute values receive no XML escaping.
+/// need not be valid XML. Text and attribute values receive no XML or Markdown escaping.
 /// Code must not parse this output; inspect the typed POM or projection instead.
 /// Unit tests must verify structured data and behavior, not rendered prompts.
 /// Tagged nodes keep their structural indentation; explicitly authored Markdown
-/// nodes apply their own formatting and escaping.
+/// nodes add their declared formatting while preserving their text verbatim.
 pub fn render_pom_document(document: &ResolvedDocument) -> Result<String, PomRenderError> {
     Renderer.render_block_children(document.children(), false)
 }
@@ -110,7 +110,7 @@ impl Renderer {
 
     fn render_heading(&self, node: &HeadingNode) -> Result<String, PomRenderError> {
         let marker = "#".repeat(usize::from(node.level().number()));
-        let body = self.render_inline_children(node.children(), false)?;
+        let body = self.render_inline_children(node.children())?;
         Ok(format!("{marker} {body}"))
     }
 
@@ -118,23 +118,15 @@ impl Renderer {
         if node.children().is_empty() {
             return Err(PomRenderError::InvalidEmptyParagraph);
         }
-        self.render_inline_children(node.children(), true)
-            .map(|rendered| encode_rendered_indentation(&rendered))
+        self.render_inline_children(node.children())
     }
 
-    fn render_inline_children(
-        &self,
-        children: &InlineChildren,
-        starts_block: bool,
-    ) -> Result<String, PomRenderError> {
+    fn render_inline_children(&self, children: &InlineChildren) -> Result<String, PomRenderError> {
         let mut rendered = String::new();
-        let mut at_block_start = starts_block;
 
         for content in children.iter() {
             let next = match content {
-                ContentRef::Node(ContentNode::Text(node)) => {
-                    self.escape_markdown_text(node.value(), at_block_start)
-                }
+                ContentRef::Node(ContentNode::Text(node)) => node.value().to_owned(),
                 ContentRef::Node(ContentNode::Markdown(MarkdownNode::Strong(node))) => {
                     self.render_strong(node)?
                 }
@@ -159,7 +151,6 @@ impl Renderer {
                 }
             };
 
-            at_block_start = next.ends_with('\n');
             rendered.push_str(&next);
         }
 
@@ -167,7 +158,7 @@ impl Renderer {
     }
 
     fn render_strong(&self, node: &StrongNode) -> Result<String, PomRenderError> {
-        let body = self.render_inline_children(node.children(), false)?;
+        let body = self.render_inline_children(node.children())?;
         let Some(core_start) = body.find(|ch: char| !ch.is_whitespace()) else {
             return Err(PomRenderError::InvalidStrongContent);
         };
@@ -405,35 +396,6 @@ impl Renderer {
             multiline: has_block || units.len() > 1,
         })
     }
-
-    fn escape_markdown_text(&self, raw: &str, block_start: bool) -> String {
-        let ordered_delimiter = block_start.then(|| ordered_list_delimiter(raw)).flatten();
-        let block_marker = block_start.then(|| block_marker(raw)).flatten();
-        let encoded_indent = block_start.then(|| encoded_indentation(raw)).flatten();
-        let mut rendered = String::with_capacity(raw.len());
-
-        for (index, ch) in raw.char_indices() {
-            if encoded_indent == Some(index) {
-                match ch {
-                    ' ' => rendered.push_str("&#32;"),
-                    '\t' => rendered.push_str("&#9;"),
-                    _ => unreachable!("only leading indentation is encoded"),
-                }
-                continue;
-            }
-
-            let markdown_control = matches!(
-                ch,
-                '\\' | '`' | '*' | '_' | '[' | ']' | '#' | '<' | '>' | '&'
-            );
-            if markdown_control || block_marker == Some(index) || ordered_delimiter == Some(index) {
-                rendered.push('\\');
-            }
-            rendered.push(ch);
-        }
-
-        rendered
-    }
 }
 
 struct RenderedMixed {
@@ -505,67 +467,4 @@ fn indent_continuation_lines(value: &str, indent: &str, indent_first: bool) -> S
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn ordered_list_delimiter(raw: &str) -> Option<usize> {
-    let indent = leading_spaces(raw);
-    if indent > 3 {
-        return None;
-    }
-    let candidate = raw.get(indent..)?;
-    let digit_count = candidate.bytes().take_while(u8::is_ascii_digit).count();
-    if digit_count == 0 {
-        return None;
-    }
-    let delimiter = candidate.as_bytes().get(digit_count).copied()?;
-    if !matches!(delimiter, b'.' | b')') {
-        return None;
-    }
-    let following = candidate.as_bytes().get(digit_count + 1).copied();
-    if following.is_none_or(|byte| byte.is_ascii_whitespace()) {
-        Some(indent + digit_count)
-    } else {
-        None
-    }
-}
-
-fn block_marker(raw: &str) -> Option<usize> {
-    let indent = leading_spaces(raw);
-    if indent > 3 {
-        return None;
-    }
-    let first = raw.as_bytes().get(indent).copied()?;
-    matches!(first, b'>' | b'-' | b'+' | b'~').then_some(indent)
-}
-
-fn encoded_indentation(raw: &str) -> Option<usize> {
-    let mut columns = 0;
-    for byte in raw.bytes() {
-        match byte {
-            b' ' => columns += 1,
-            b'\t' => columns += 4 - (columns % 4),
-            _ => break,
-        }
-        if columns >= 4 {
-            return Some(0);
-        }
-    }
-    None
-}
-
-fn leading_spaces(raw: &str) -> usize {
-    raw.bytes().take_while(|byte| *byte == b' ').count()
-}
-
-fn encode_rendered_indentation(rendered: &str) -> String {
-    let Some(index) = encoded_indentation(rendered) else {
-        return rendered.to_owned();
-    };
-    debug_assert_eq!(index, 0);
-
-    match rendered.as_bytes().first() {
-        Some(b' ') => format!("&#32;{}", &rendered[1..]),
-        Some(b'\t') => format!("&#9;{}", &rendered[1..]),
-        _ => rendered.to_owned(),
-    }
 }

@@ -109,7 +109,7 @@ legacy `ApplicationHost` 和直接 legacy `ProviderPort` 提交不具备该保�
 原文中的 `<tag>` 不构成 POM XML，不能被 XML diff 或 slot 扫描解释。显式 `#[diff]` 不会将原文
 拆成字符或行级 patch；`repeat` 仍完整发送当前值。System 保持独立的 replace/clear 路径。
 
-quoted 文本模板和显式 Markdown 节点仍按 Markdown inline 上下文校验与转义。
+quoted 文本模板和显式 Markdown 节点保留其 inline 上下文校验和声明的格式，正文不做 Markdown 转义。
 根级字符串适配不改变 `String` 的字段编码，也不放宽 `TextNode` 的 block 转换约束。底层 API
 通过 `Document::from_raw_text(...)` 构造同样的原文内容。
 
@@ -121,12 +121,12 @@ POM 不是 XML。`XmlNode` 等类型名和标签形状只表达 POM 的结构，
 身份或状态。需要这些信息时，直接访问 typed POM、projection、Frame 或结构化 action descriptor。
 diff 和状态判断在结构化数据上完成，渲染文本不提供机器解析契约。
 
-POM 正文、原文 block 和属性值保留原始内容，不添加 XML 实体转义，也不因 XML 字符合法性拒绝正文。
-纯数据字段不添加 Markdown 转义；`<`、`>`、`&`、引号、反斜杠和已有实体文本均直接保留。
+POM 正文、原文 block 和属性值保留原始内容，不添加 XML 实体或 Markdown 转义，也不因 XML 字符合法性拒绝正文。
+显式 Markdown 节点和 quoted 文本模板也遵守同一规则；`<`、`>`、`&`、引号、反斜杠、下划线和已有实体文本均直接保留。
 标签结构继续按既有规则作层级缩进，包括嵌套的多行内容；正文自身的相对缩进和 CR/LF 保留。
 标签节点内显式 code span / code block 的正文同样不做实体转义。
-显式 Markdown 节点继续提供其声明的格式及必要的 Markdown 转义。JSON 数据及 Provider request
-仍使用 JSON 自身必要的转义，不再叠加 XML 或纯数据 Markdown 转义。
+显式 Markdown 节点只提供其声明的格式，不给正文添加反斜杠，也不将行首空格或制表符编码成实体。
+JSON 数据及 Provider request 仍使用 JSON 自身必要的转义，不再叠加 XML 或 Markdown 转义。
 该规则只适用于发给模型的提示词；模型输出中的 XML 动作仍按既有 parser 和校验规则处理。
 
 Unit test 不验证 prompt 渲染，不断言最终字符串、渲染片段、排版或 prompt snapshot/golden，
@@ -1785,7 +1785,8 @@ worker 必须完成配置的审计回执后才能发布 Ready；回执错误使�
     projection 之后发送完整当前 ephemeral prompts，保持其 projection traversal 相对顺序；原始
     prompt 不进入 canonical history、provider retained context、continuation baseline 或 compaction。
     它们的消失不发送删除 POM，模型输出和工具事实保持正常保留，legacy execution 明确拒绝。
-34. POM 不是 XML；渲染数据不做 XML 转义，渲染结果不得由代码反向解析。代码消费结构化数据，
+34. POM 不是 XML；所有渲染正文及属性值不做 XML 或 Markdown 转义，包括显式 Markdown 节点。
+    渲染结果不得由代码反向解析。代码消费结构化数据，
     unit test 验证结构、状态与行为，不验证 prompt 渲染。
 
 ## 13. 非目标

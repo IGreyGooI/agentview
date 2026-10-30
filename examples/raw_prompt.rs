@@ -1,5 +1,5 @@
-//! Markdown strings carry instructions; XML nodes carry structured state.
-//! Raw strings preserve literal XML examples, while XML node text is escaped.
+//! Raw strings carry complete prompts; typed nodes add declared structure.
+//! All POM text, including Markdown paragraphs and tagged data, stays unescaped.
 //!
 //! Run `cargo run --no-default-features --example raw_prompt`; no credentials are needed.
 
@@ -29,9 +29,18 @@ Escape XML special characters in the response text.
 fn existing_prompt(system: String) -> Component {
     let request = String::from("## Request\n\nSay hello.\n");
     let recipient = "Mina <ops> & team";
+    let identifiers =
+        r"conversation_history, other_sessions, current_input: *literal* [text] <data> & \path";
+    let indentation = "    leading spaces and\ta tab stay literal";
     view! {
         #[system_once]
         { system }
+
+        #[developer]
+        "{identifiers}"
+
+        #[developer]
+        "{indentation}"
 
         #[user]
         { request }
@@ -59,6 +68,10 @@ fn main() -> anyhow::Result<()> {
                 authority: InstructionAuthority::System,
                 pom,
             } => ("system", pom),
+            CanonicalInputItem::Instruction {
+                authority: InstructionAuthority::Developer,
+                pom,
+            } => ("developer", pom),
             CanonicalInputItem::Message {
                 role: ConversationRole::User,
                 pom,
@@ -67,6 +80,7 @@ fn main() -> anyhow::Result<()> {
         };
         writeln!(stdout, "[{role}]")?;
         stdout.write_all(render_pom_document(pom)?.as_bytes())?;
+        writeln!(stdout)?;
     }
     Ok(())
 }

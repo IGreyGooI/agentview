@@ -11,7 +11,8 @@ presents the updated view so the model can choose its next step. Feedback covers
 successful actions, ongoing work, and mistakes throughout the interaction.
 
 The Prompt Object Model (POM) is not XML. Its rendered prompt is a view for the
-LLM: data requires no XML escaping, and code must not parse the result. Consume
+LLM: text and attributes receive no XML or Markdown escaping, including text in
+explicit Markdown nodes, and code must not parse the result. Consume
 typed POM and structured projections directly. Unit tests verify structure,
 state, and behavior; they must not verify prompt rendering. See the
 [POM contract](docs/semantic-agent-view.md) for the authoring boundary.
@@ -453,8 +454,9 @@ target/agentview-debug/run-<timestamp>-<pid>-<attempt>/0001/prompt.txt
 `projection.json` contains the committed Component nodes, typed POM items, diff
 markers, native tool definitions, and projection revision/readiness metadata.
 `projection.txt` shows the same nodes as model-facing prompt text produced by
-`render_pom_document`. POM is not XML: its tag-shaped notation requires no XML
-escaping and does not promise valid XML. Rendered prompts must not be parsed by
+`render_pom_document`. POM is not XML: its text and attributes receive no XML or
+Markdown escaping, including text in explicit Markdown nodes, and it does not promise
+valid XML. Rendered prompts must not be parsed by
 code; use the typed projection or `projection.json` for structured inspection.
 Its scope is `current_component_requirements`: the complete
 content the Components currently require the model to receive. Earlier states,

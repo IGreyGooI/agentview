@@ -4,8 +4,9 @@ Read [HELP.md](HELP.md) before authoring or reviewing Components.
 [docs/engine.md](docs/engine.md) is the authoritative runtime contract.
 
 POM is not XML. Its rendered prompt is a view for the LLM, not a machine-readable
-serialization format. Do not XML-escape its data or parse rendered prompts in
-application code or tests. Code must consume typed POM, projections, and structured
+serialization format. Do not XML-escape or Markdown-escape its text or attribute
+values, including text in explicit Markdown nodes. Do not parse rendered prompts
+in application code or tests. Code must consume typed POM, projections, and structured
 protocol data directly. Unit tests must verify those structures, state transitions,
 and behavior, not prompt rendering, exact prompt strings, or prompt snapshots.
 
