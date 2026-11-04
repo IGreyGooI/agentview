@@ -51,7 +51,7 @@ fn notebook(answer: Arc<Mutex<String>>) -> Component {
     let invalid_state = state.clone();
     let confirm_invalid_state = state.clone();
 
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let answer = Arc::clone(&answer);
         async move {
             if let TextTurnEvent::TextComplete(text) = event {
@@ -69,11 +69,11 @@ fn notebook(answer: Arc<Mutex<String>>) -> Component {
             XmlStreamingToolCall {
                 element: XmlToolElement::text("note"),
                 description: "Save a note. Write its text between <note> and </note>.",
-                on_open: move |_: Arc<()>| open_state.update(|book| book.opens += 1),
-                on_delta: move |text: String| {
+                on_open: move |_ctx, _: Arc<()>| open_state.update(|book| book.opens += 1),
+                on_delta: move |_ctx, text: String| {
                     delta_state.update(|book| book.streamed_text.push_str(&text))
                 },
-                on_complete: move |text: String| {
+                on_complete: move |_ctx, text: String| {
                     complete_state.update(|book| {
                         if count != 0 || text.trim().is_empty() {
                             book.feedback = "Ignored: add nonempty notes before confirming the notebook.".to_owned();
@@ -83,7 +83,7 @@ fn notebook(answer: Arc<Mutex<String>>) -> Component {
                         }
                     })
                 },
-                on_invalid: move |diagnostic: XmlCallbackDiagnostic| {
+                on_invalid: move |_ctx, diagnostic: XmlCallbackDiagnostic| {
                     invalid_state.update(|book| book.feedback = diagnostic.to_string())
                 },
             }
@@ -98,7 +98,7 @@ fn notebook(answer: Arc<Mutex<String>>) -> Component {
                         |count, _| Ok(*count),
                     ),
                 description: "Confirm the saved notes using the saved_count from the latest notebook view.",
-                on_complete: move |count: usize| {
+                on_complete: move |_ctx, count: usize| {
                     state.update(|book| {
                         if book.notes.is_empty() || count != book.notes.len() {
                             book.feedback = "Ignored: confirm must match the current saved_count.".to_owned();
@@ -108,7 +108,7 @@ fn notebook(answer: Arc<Mutex<String>>) -> Component {
                         }
                     })
                 },
-                on_invalid: move |diagnostic: XmlCallbackDiagnostic| {
+                on_invalid: move |_ctx, diagnostic: XmlCallbackDiagnostic| {
                     confirm_invalid_state.update(|book| book.feedback = diagnostic.to_string())
                 },
             }
@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
         Application::mount(move || notebook(Arc::clone(&component_answer)), provider)?;
     let operation = tokio::time::timeout(Duration::from_secs(120), async {
         for step in 1..=3 {
-            let _ = application.react().await?;
+            let _ = application.react()?.await?;
             let mut view = String::new();
             for item in application
                 .current_projection()

@@ -89,7 +89,7 @@ pub(crate) fn chess_actions(
     let resign_reason = resign.reason;
     let event_state = state;
     let event_attempt_state = attempt_state;
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let state = event_state.clone();
         let attempt_state = event_attempt_state.clone();
         let component_turn_executions = Arc::clone(&component_turn_executions);

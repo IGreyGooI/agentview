@@ -33,7 +33,7 @@ impl ReactionPort for NativePort {
 
 #[component]
 fn root() -> Component {
-    use_provider_event_handler(ProviderEvent::TEXT, |_event| async {
+    use_provider_event_handler(ProviderEvent::TEXT, |_ctx, _event| async {
         Ok::<(), Infallible>(())
     });
     view! { native_consumer { "mounted" } }

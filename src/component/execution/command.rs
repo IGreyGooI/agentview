@@ -1,6 +1,13 @@
 //! Application-owned external command input. It is independent of provider facts.
 
-use std::{collections::VecDeque, fmt};
+use std::{
+    collections::VecDeque,
+    fmt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use serde::{
     de::{self, MapAccess, Visitor},
@@ -14,6 +21,7 @@ use crate::component::authoring::command_feedback::{
     CommandFeedbackView, CommandResultView, InputFeedbackView,
 };
 use crate::component::signal::HookMount;
+use crate::component::EventContext;
 
 /// An external invocation, decoded by a CLI or another application adapter.
 ///
@@ -282,7 +290,26 @@ pub struct CommandInput {
     reserved: Option<QueuedCommand>,
     pending: Option<PendingCommand>,
     prefix: String,
-    new_feedback_frame: bool,
+    feedback_delivery: Arc<FeedbackDelivery>,
+}
+
+#[derive(Default)]
+struct FeedbackDelivery {
+    issued: AtomicU64,
+    delivered: AtomicU64,
+}
+
+/// Acknowledges only the command feedback actually present in a prepared Frame.
+pub(super) struct CommandFeedbackReceipt {
+    delivery: Arc<FeedbackDelivery>,
+    version: u64,
+}
+impl CommandFeedbackReceipt {
+    pub(super) fn commit(&self) {
+        self.delivery
+            .delivered
+            .fetch_max(self.version, Ordering::AcqRel);
+    }
 }
 
 impl CommandInput {
@@ -296,7 +323,7 @@ impl CommandInput {
                 reserved: None,
                 pending: None,
                 prefix: String::new(),
-                new_feedback_frame: true,
+                feedback_delivery: Arc::new(FeedbackDelivery::default()),
             },
         )
     }
@@ -312,11 +339,25 @@ impl CommandInput {
     }
 
     pub(crate) fn finish_feedback_frame(&mut self) {
-        self.new_feedback_frame = true;
+        self.feedback_receipt().commit();
+    }
+
+    pub(super) fn feedback_receipt(&self) -> CommandFeedbackReceipt {
+        CommandFeedbackReceipt {
+            delivery: self.feedback_delivery.clone(),
+            version: self.feedback_delivery.issued.load(Ordering::Acquire),
+        }
     }
 
     pub(crate) fn take_new_feedback_frame(&mut self) -> bool {
-        std::mem::take(&mut self.new_feedback_frame)
+        let previous = self
+            .feedback_delivery
+            .issued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |version| {
+                version.checked_add(1)
+            })
+            .expect("command feedback identity space exhausted");
+        self.feedback_delivery.delivered.load(Ordering::Acquire) >= previous
     }
 
     pub(crate) fn belongs_to(&self, mount: &HookMount) -> bool {
@@ -504,39 +545,45 @@ impl Drop for CommandInput {
 #[derive(Clone, Default)]
 pub(crate) struct CommandFeedback {
     sequence: u64,
-    records: Vec<(u64, String, CommandOutcome)>,
-    input_feedback: Option<(String, String)>,
+    records: Vec<(EventContext, u64, String, CommandOutcome)>,
+    input_feedback: Option<(EventContext, String, String)>,
 }
 
 impl CommandFeedback {
-    pub(crate) fn record(&mut self, call: &CommandCall, outcome: CommandOutcome, new_frame: bool) {
+    pub(crate) fn record(
+        &mut self,
+        context: EventContext,
+        call: &CommandCall,
+        outcome: CommandOutcome,
+        new_frame: bool,
+    ) {
         self.input_feedback = None;
         self.sequence = self.sequence.saturating_add(1);
         if new_frame {
             self.records.clear();
         }
         self.records
-            .push((self.sequence, call.name().to_owned(), outcome));
+            .push((context, self.sequence, call.name().to_owned(), outcome));
     }
 
-    pub(crate) fn input_feedback(&mut self, code: String, message: String) {
-        self.input_feedback = Some((code, message));
+    pub(crate) fn input_feedback(&mut self, context: EventContext, code: String, message: String) {
+        self.input_feedback = Some((context, code, message));
     }
 
     pub(crate) fn snapshot(&self) -> CommandFeedbackView {
         CommandFeedbackView {
             sequence: self.sequence,
-            input_feedback: self
-                .input_feedback
-                .as_ref()
-                .map(|(code, text)| InputFeedbackView {
+            input_feedback: self.input_feedback.as_ref().map(|(context, code, text)| {
+                InputFeedbackView {
+                    origin: context.into(),
                     code: code.clone(),
                     text: text.clone(),
-                }),
+                }
+            }),
             records: self
                 .records
                 .iter()
-                .map(|(sequence, command, outcome)| {
+                .map(|(context, sequence, command, outcome)| {
                     let (status, code, text) = match outcome {
                         CommandOutcome::Output(value) => ("completed", None, value.to_string()),
                         CommandOutcome::Rejected { code, message } => {
@@ -544,6 +591,7 @@ impl CommandFeedback {
                         }
                     };
                     CommandResultView {
+                        origin: context.into(),
                         sequence: *sequence,
                         command: command.clone(),
                         status,
@@ -553,5 +601,37 @@ impl CommandFeedback {
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod feedback_receipt_tests {
+    use super::CommandInput;
+
+    #[test]
+    fn handoff_acknowledges_only_the_feedback_in_its_prepared_frame() {
+        let (_sender, mut input) = CommandInput::channel(1);
+        assert!(input.take_new_feedback_frame());
+        let old = input.feedback_receipt();
+        assert!(!input.take_new_feedback_frame());
+        old.commit();
+        // A later preparation appended feedback after this Frame was compiled.
+        assert!(!input.take_new_feedback_frame());
+        let current = input.feedback_receipt();
+        current.commit();
+        assert!(input.take_new_feedback_frame());
+        // A duplicated or late older acknowledgement cannot clear newer results.
+        old.commit();
+        assert!(!input.take_new_feedback_frame());
+    }
+
+    #[test]
+    fn rejected_or_temporary_frames_do_not_acknowledge_main_feedback() {
+        let (_sender, mut input) = CommandInput::channel(1);
+        assert!(input.take_new_feedback_frame());
+        let _uncommitted = input.feedback_receipt();
+        assert!(!input.take_new_feedback_frame());
+        input.finish_feedback_frame();
+        assert!(input.take_new_feedback_frame());
     }
 }

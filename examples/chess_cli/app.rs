@@ -28,7 +28,7 @@ pub(super) fn chess_application() -> Component {
             name: "move",
             description: "Play a legal move for the current side. Choose uci from legal_moves.",
             enabled: game.with(GameState::can_move).expect("mounted chess state"),
-            on_call: move |input: MoveInput| {
+            on_call: move |_ctx, input: MoveInput| {
                 played_game.update(|game| game.play(&input.uci))
             },
         }
@@ -36,12 +36,12 @@ pub(super) fn chess_application() -> Component {
             name: "undo",
             description: "Undo the most recent move.",
             enabled: game.with(GameState::can_undo).expect("mounted chess state"),
-            on_call: move || undone_game.update(GameState::undo),
+            on_call: move |_ctx| undone_game.update(GameState::undo),
         }
         Action {
             name: "new",
             description: "Start a new game and discard the current move history.",
-            on_call: move || new_game.update(GameState::new_game),
+            on_call: move |_ctx| new_game.update(GameState::new_game),
         }
     }
 }

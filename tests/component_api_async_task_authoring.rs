@@ -14,13 +14,13 @@ struct DriftProps {
 #[component]
 fn public_hook_kind_drift(props: DriftProps) -> Component {
     if props.alternate {
-        use_provider_event_handler(ProviderEvent::TEXT, |_event| {
+        use_provider_event_handler(ProviderEvent::TEXT, |_ctx, _event| {
             ready(Ok::<(), Infallible>(()))
         });
         let _signal = use_signal(|| 2_u64);
     } else {
         let _signal = use_signal(|| 1_u64);
-        use_provider_event_handler(ProviderEvent::TEXT, |_event| {
+        use_provider_event_handler(ProviderEvent::TEXT, |_ctx, _event| {
             ready(Ok::<(), Infallible>(()))
         });
     }

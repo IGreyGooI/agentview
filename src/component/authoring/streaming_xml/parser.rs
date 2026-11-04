@@ -2,6 +2,7 @@ use std::{collections::HashMap, str, sync::Arc};
 
 use quick_xml::{events::Event, reader::Reader, XmlVersion};
 
+use crate::component::{EventContext, EventSource};
 use crate::llm_call::TextTurnEvent;
 use crate::stream_parser::XmlElement;
 
@@ -51,14 +52,17 @@ impl StreamingXmlPhase {
 
 pub(crate) enum ParsedContractEvent {
     Decoded {
+        context: EventContext,
         listener_index: usize,
         value: String,
     },
     Invalid {
+        context: EventContext,
         listener_index: usize,
         diagnostic: XmlContractDiagnostic,
     },
     Lifecycle {
+        context: EventContext,
         listener_index: usize,
         phase: StreamingXmlPhase,
         element: XmlElement,
@@ -126,6 +130,7 @@ impl MountedStreamingRoute {
 
     pub(crate) fn dispatch_root<Root>(
         &mut self,
+        context: &EventContext,
         root: &Root,
     ) -> Result<Vec<ParsedContractEvent>, StreamingXmlDispatchFault>
     where
@@ -143,10 +148,13 @@ impl MountedStreamingRoute {
                     .map_or("unknown", |registration| registration.identity),
             },
         )?;
-        self.on_text(event)
+        self.on_text(context, event)
     }
 
-    pub(crate) fn finish(&mut self) -> Result<Vec<ParsedContractEvent>, StreamingXmlDispatchFault> {
+    pub(crate) fn finish(
+        &mut self,
+        context: &EventContext,
+    ) -> Result<Vec<ParsedContractEvent>, StreamingXmlDispatchFault> {
         if self.finished {
             return Err(StreamingXmlDispatchFault::RouteAlreadyFinished);
         }
@@ -159,7 +167,7 @@ impl MountedStreamingRoute {
             let Some(tracked) = &frame.tracked else {
                 continue;
             };
-            self.push_incomplete_events(tracked.target_index, true, &mut events);
+            self.push_incomplete_events(context, tracked.target_index, true, &mut events);
         }
         let pending = self.pending.trim_start();
         let pending_is_tracked_close = self.namespace_stack.iter().rev().any(|frame| {
@@ -167,7 +175,7 @@ impl MountedStreamingRoute {
         });
         if !pending_is_tracked_close {
             if let Some(target_index) = self.incomplete_target() {
-                self.push_incomplete_events(target_index, false, &mut events);
+                self.push_incomplete_events(context, target_index, false, &mut events);
             }
         }
         self.finished = true;
@@ -176,6 +184,7 @@ impl MountedStreamingRoute {
 
     fn on_text(
         &mut self,
+        context: &EventContext,
         event: &TextTurnEvent,
     ) -> Result<Vec<ParsedContractEvent>, StreamingXmlDispatchFault> {
         if self.finished || self.text_complete {
@@ -197,9 +206,9 @@ impl MountedStreamingRoute {
                 appended
             }
         };
-        let mut events = self.process_pending()?;
+        let mut events = self.process_pending(context)?;
         if appended {
-            self.push_stream_events(&mut events);
+            self.push_stream_events(context, &mut events);
         }
         Ok(events)
     }
@@ -217,7 +226,10 @@ impl MountedStreamingRoute {
         Ok(!chunk.is_empty())
     }
 
-    fn process_pending(&mut self) -> Result<Vec<ParsedContractEvent>, StreamingXmlDispatchFault> {
+    fn process_pending(
+        &mut self,
+        context: &EventContext,
+    ) -> Result<Vec<ParsedContractEvent>, StreamingXmlDispatchFault> {
         let mut events = Vec::new();
         let mut cursor = 0;
         loop {
@@ -239,6 +251,7 @@ impl MountedStreamingRoute {
                 ScanCompletion::RawLessThan(next_start) => {
                     let malformed_prefix = self.pending[cursor..cursor + next_start].to_owned();
                     self.record_malformed_lexical_target(
+                        context,
                         lexical_element_name(&malformed_prefix),
                         &mut events,
                     );
@@ -248,7 +261,7 @@ impl MountedStreamingRoute {
             };
             let markup = self.pending[cursor..cursor + length].to_owned();
             let markup_start = self.pending_offset + cursor;
-            self.process_markup(&markup, markup_start, &mut events)?;
+            self.process_markup(context, &markup, markup_start, &mut events)?;
             cursor += length;
         }
         self.pending.drain(..cursor);
@@ -258,6 +271,7 @@ impl MountedStreamingRoute {
 
     fn process_markup(
         &mut self,
+        context: &EventContext,
         markup: &str,
         markup_start: usize,
         events: &mut Vec<ParsedContractEvent>,
@@ -278,6 +292,7 @@ impl MountedStreamingRoute {
                         let content =
                             self.raw_output[tracked.content_start..markup_start].to_owned();
                         self.push_lifecycle_events(
+                            context,
                             tracked.target_index,
                             StreamingXmlPhase::Complete,
                             &tracked.attributes,
@@ -289,6 +304,7 @@ impl MountedStreamingRoute {
                 }
             }
             self.record_malformed_lexical_target(
+                context,
                 parsed_name
                     .as_deref()
                     .or_else(|| lexical_element_name(markup)),
@@ -301,7 +317,7 @@ impl MountedStreamingRoute {
         let parsed = match parse_start(markup) {
             Ok(parsed) => parsed,
             Err(ParseStartFault::Malformed) => {
-                self.record_malformed_lexical_target(lexical_name, events);
+                self.record_malformed_lexical_target(context, lexical_name, events);
                 return Ok(());
             }
             Err(ParseStartFault::AttributeLimit { maximum, observed }) => {
@@ -343,7 +359,7 @@ impl MountedStreamingRoute {
             .collect::<HashMap<_, _>>();
 
         if let Some(target_index) = target_index {
-            self.push_start_events(target_index, &parsed, &attributes, events);
+            self.push_start_events(context, target_index, &parsed, &attributes, events);
         }
 
         if !parsed.empty {
@@ -362,37 +378,40 @@ impl MountedStreamingRoute {
 
     fn push_start_events(
         &self,
+        parent: &EventContext,
         target_index: usize,
         parsed: &ParsedStart,
         attributes: &HashMap<String, String>,
         events: &mut Vec<ParsedContractEvent>,
     ) {
+        self.push_lifecycle_events(
+            parent,
+            target_index,
+            StreamingXmlPhase::Open,
+            attributes,
+            String::new(),
+            events,
+        );
         let target = &self.targets[target_index];
-        for registration in &target.registrations {
-            if matches!(
-                registration.kind,
-                StreamingRegistrationKind::Lifecycle { open: true, .. }
-            ) {
-                events.push(lifecycle_event(
-                    registration,
-                    StreamingXmlPhase::Open,
-                    target.element,
-                    attributes,
-                    String::new(),
-                ));
-            }
-        }
+        let context = parent.child(EventSource::ParsedXml);
         for registration in &target.registrations {
             match registration.kind {
                 StreamingRegistrationKind::EmptyToolCall { attribute } if parsed.empty => {
-                    events.push(tool_call_event(registration, attribute, &parsed.attributes));
+                    events.push(tool_call_event(
+                        context.clone(),
+                        registration,
+                        attribute,
+                        &parsed.attributes,
+                    ));
                 }
                 StreamingRegistrationKind::EmptyToolCall { .. } => events.push(invalid_event(
+                    context.clone(),
                     registration,
                     "target element must use empty-element syntax",
                 )),
                 StreamingRegistrationKind::Lifecycle { complete: true, .. } if parsed.empty => {
                     events.push(lifecycle_event(
+                        context.clone(),
                         registration,
                         StreamingXmlPhase::Complete,
                         target.element,
@@ -407,6 +426,7 @@ impl MountedStreamingRoute {
 
     fn push_lifecycle_events(
         &self,
+        parent: &EventContext,
         target_index: usize,
         phase: StreamingXmlPhase,
         attributes: &HashMap<String, String>,
@@ -414,6 +434,7 @@ impl MountedStreamingRoute {
         events: &mut Vec<ParsedContractEvent>,
     ) {
         let target = &self.targets[target_index];
+        let context = parent.child(EventSource::ParsedXml);
         for registration in &target.registrations {
             let interested = match registration.kind {
                 StreamingRegistrationKind::Lifecycle {
@@ -430,6 +451,7 @@ impl MountedStreamingRoute {
             };
             if interested {
                 events.push(lifecycle_event(
+                    context.clone(),
                     registration,
                     phase,
                     target.element,
@@ -440,7 +462,7 @@ impl MountedStreamingRoute {
         }
     }
 
-    fn push_stream_events(&self, events: &mut Vec<ParsedContractEvent>) {
+    fn push_stream_events(&self, context: &EventContext, events: &mut Vec<ParsedContractEvent>) {
         for (index, frame) in self.namespace_stack.iter().enumerate() {
             let Some(tracked) = &frame.tracked else {
                 continue;
@@ -456,6 +478,7 @@ impl MountedStreamingRoute {
                 continue;
             }
             self.push_lifecycle_events(
+                context,
                 tracked.target_index,
                 StreamingXmlPhase::Stream,
                 &tracked.attributes,
@@ -467,6 +490,7 @@ impl MountedStreamingRoute {
 
     fn record_malformed_lexical_target(
         &mut self,
+        parent: &EventContext,
         lexical_name: Option<&str>,
         events: &mut Vec<ParsedContractEvent>,
     ) {
@@ -483,9 +507,14 @@ impl MountedStreamingRoute {
         let Some(index) = self.targets_by_element.get(name).copied() else {
             return;
         };
+        let context = parent.child(EventSource::ParsedXml);
         for registration in &self.targets[index].registrations {
             if registration_receives_invalid(registration) {
-                events.push(invalid_event(registration, "malformed XML target element"));
+                events.push(invalid_event(
+                    context.clone(),
+                    registration,
+                    "malformed XML target element",
+                ));
             }
         }
     }
@@ -527,11 +556,13 @@ impl MountedStreamingRoute {
 
     fn push_incomplete_events(
         &self,
+        parent: &EventContext,
         target_index: usize,
         lifecycle_only: bool,
         events: &mut Vec<ParsedContractEvent>,
     ) {
         let target = &self.targets[target_index];
+        let context = parent.child(EventSource::ParsedXml);
         for registration in &target.registrations {
             if lifecycle_only
                 && !matches!(
@@ -543,6 +574,7 @@ impl MountedStreamingRoute {
             }
             if registration_receives_invalid(registration) {
                 events.push(ParsedContractEvent::Invalid {
+                    context: context.clone(),
                     listener_index: registration.listener_index,
                     diagnostic: XmlContractDiagnostic::IncompleteElement {
                         contract: registration.identity,
@@ -561,6 +593,7 @@ struct NamespaceFrame {
 }
 
 fn tool_call_event(
+    context: EventContext,
     registration: &ContractRegistration,
     required_attribute: Option<&'static str>,
     attributes: &[ParsedAttribute],
@@ -571,6 +604,7 @@ fn tool_call_event(
             for attribute in attributes {
                 if attribute.name != required {
                     return invalid_event(
+                        context,
                         registration,
                         format!("unknown attribute `{}`", attribute.name),
                     );
@@ -579,17 +613,24 @@ fn tool_call_event(
             }
             match value {
                 Some(value) => ParsedContractEvent::Decoded {
+                    context,
                     listener_index: registration.listener_index,
                     value,
                 },
-                None => invalid_event(registration, format!("missing attribute `{required}`")),
+                None => invalid_event(
+                    context,
+                    registration,
+                    format!("missing attribute `{required}`"),
+                ),
             }
         }
         None if attributes.is_empty() => ParsedContractEvent::Decoded {
+            context,
             listener_index: registration.listener_index,
             value: String::new(),
         },
         None => invalid_event(
+            context,
             registration,
             format!("unknown attribute `{}`", attributes[0].name),
         ),
@@ -597,6 +638,7 @@ fn tool_call_event(
 }
 
 fn lifecycle_event(
+    context: EventContext,
     registration: &ContractRegistration,
     phase: StreamingXmlPhase,
     tag: &'static str,
@@ -604,6 +646,7 @@ fn lifecycle_event(
     content: String,
 ) -> ParsedContractEvent {
     ParsedContractEvent::Lifecycle {
+        context,
         listener_index: registration.listener_index,
         phase,
         element: XmlElement {
@@ -635,10 +678,12 @@ fn incomplete_close_prefix(pending: &str, element: &str) -> bool {
 }
 
 fn invalid_event(
+    context: EventContext,
     registration: &ContractRegistration,
     detail: impl Into<String>,
 ) -> ParsedContractEvent {
     ParsedContractEvent::Invalid {
+        context,
         listener_index: registration.listener_index,
         diagnostic: XmlContractDiagnostic::MalformedElement {
             contract: registration.identity,

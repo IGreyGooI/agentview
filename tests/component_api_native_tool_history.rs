@@ -315,7 +315,7 @@ fn repeated_tool_application(props: RepeatedToolProps) -> Component {
     view! {
         redraw_state { "{redraw_value}" }
         {
-            NativeToolCall::named("add").on_call(move |call| {
+            NativeToolCall::named("add").on_call(move |_ctx, call| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async move {
                     let content = format!("result:{}", call.call_id());
@@ -351,12 +351,20 @@ async fn native_tool_component_keeps_each_same_argument_call_once_across_rerende
             .expect("mount native tool application");
 
     assert!(matches!(
-        application.react().await.expect("first tool reaction"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("first tool reaction"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     assert!(matches!(
-        application.react().await.expect("second tool reaction"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("second tool reaction"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     rerender
@@ -369,9 +377,10 @@ async fn native_tool_component_keeps_each_same_argument_call_once_across_rerende
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("explicit rerender reaction"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -418,7 +427,7 @@ fn round_history_application(props: RoundHistoryProps) -> Component {
     view! {
         round_history_state { "{redraw_value}" }
         {
-            NativeToolCall::named("rounds").on_call(|call| async move {
+            NativeToolCall::named("rounds").on_call(|_ctx, call| async move {
                 let content = format!("result:{}", call.call_id());
                 Ok::<_, Infallible>(call.output(content))
             })
@@ -455,8 +464,12 @@ async fn native_tool_component_retains_only_the_latest_two_provider_response_rou
             .expect("mount round history application");
 
     assert!(matches!(
-        application.react().await.expect("first provider response"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("first provider response"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     let after_first_round = native_log(application.current_projection().projection(), "rounds");
     assert_eq!(after_first_round.len(), 4);
@@ -497,17 +510,22 @@ async fn native_tool_component_retains_only_the_latest_two_provider_response_rou
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("tool-free provider response"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     let after_tool_free_response =
         native_log(application.current_projection().projection(), "rounds");
     assert_eq!(after_tool_free_response, after_first_round);
 
     assert!(matches!(
-        application.react().await.expect("second provider response"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("second provider response"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     let after_second_round = native_log(application.current_projection().projection(), "rounds");
     assert_eq!(after_second_round.len(), 6);
@@ -531,8 +549,12 @@ async fn native_tool_component_retains_only_the_latest_two_provider_response_rou
     );
 
     assert!(matches!(
-        application.react().await.expect("third provider response"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("third provider response"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     let after_third_round = native_log(application.current_projection().projection(), "rounds");
     assert_eq!(after_third_round.len(), 4);
@@ -557,8 +579,12 @@ async fn native_tool_component_retains_only_the_latest_two_provider_response_rou
     }
 
     assert!(matches!(
-        application.react().await.expect("post-prune continuation"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("post-prune continuation"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     let frames = capture.frames();
     assert_eq!(frames.len(), 5);
@@ -608,8 +634,8 @@ async fn reset_model_context_replays_the_retained_native_tool_component_rounds_i
         "handoff third completed tool result",
     ] {
         assert!(matches!(
-            application.react().await.expect(description),
-            ControlFlow::Continue(())
+            application.react().unwrap().await.expect(description),
+            agentview::component::execution::ReactionOutcome::Completed
         ));
     }
 
@@ -617,8 +643,12 @@ async fn reset_model_context_replays_the_retained_native_tool_component_rounds_i
         .reset_model_context()
         .expect("completed native tool rounds allow a context reset");
     assert!(matches!(
-        application.react().await.expect("full reset handoff"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("full reset handoff"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     let frames = capture.frames();
@@ -685,8 +715,8 @@ async fn native_tool_history_continues_after_reset_without_duplicate_later_round
         "handoff second completed tool result",
     ] {
         assert!(matches!(
-            application.react().await.expect(description),
-            ControlFlow::Continue(())
+            application.react().unwrap().await.expect(description),
+            agentview::component::execution::ReactionOutcome::Completed
         ));
     }
 
@@ -696,25 +726,28 @@ async fn native_tool_history_continues_after_reset_without_duplicate_later_round
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("reset Full accepts a later native tool round"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("later native tool result is submitted after reset"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     force_full.store(true, Ordering::SeqCst);
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("a later provider-required Full replays native history once"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     application
@@ -723,9 +756,10 @@ async fn native_tool_history_continues_after_reset_without_duplicate_later_round
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("second reset replays the current retained window"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     let frames = capture.frames();
@@ -810,7 +844,7 @@ fn parallel_tool_application(props: ParallelToolProps) -> Component {
     view! {
         parallel_context { "component order is intentionally second then first" }
         {
-            NativeToolCall::named("second").on_call(move |call| {
+            NativeToolCall::named("second").on_call(move |_ctx, call| {
                 second_calls.fetch_add(1, Ordering::SeqCst);
                 let started = Arc::clone(&second_started);
                 let release = release_second
@@ -832,7 +866,7 @@ fn parallel_tool_application(props: ParallelToolProps) -> Component {
             })
         }
         {
-            NativeToolCall::named("first").on_call(move |call| {
+            NativeToolCall::named("first").on_call(move |_ctx, call| {
                 first_calls.fetch_add(1, Ordering::SeqCst);
                 let started = Arc::clone(&first_started);
                 let release = release_first
@@ -881,7 +915,10 @@ async fn parallel_native_tool_results_follow_provider_ordinals_not_tree_or_compl
     let second_started = props.second_started.notified();
     tokio::pin!(first_started);
     tokio::pin!(second_started);
-    let mut reaction = Box::pin(application.react());
+    let reaction_control = application.react().unwrap();
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
             result = &mut reaction => panic!("reaction completed before both tool lanes started: {result:?}"),
@@ -918,15 +955,19 @@ async fn parallel_native_tool_results_follow_provider_ordinals_not_tree_or_compl
             .await
             .expect("parallel reaction settles")
             .expect("parallel reaction succeeds"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     drop(reaction);
 
     assert_eq!(props.first_calls.load(Ordering::SeqCst), 1);
     assert_eq!(props.second_calls.load(Ordering::SeqCst), 1);
     assert!(matches!(
-        application.react().await.expect("continuation reaction"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("continuation reaction"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     let frames = capture.frames();
@@ -969,7 +1010,7 @@ fn same_tool_parallel_application(props: SameToolParallelProps) -> Component {
     let release_second = Arc::clone(&props.release_second);
     let second_finished = Arc::clone(&props.second_finished);
 
-    NativeToolCall::named("parallel").on_call(move |call| {
+    NativeToolCall::named("parallel").on_call(move |_ctx, call| {
         calls.fetch_add(1, Ordering::SeqCst);
         let call_id = call.call_id().to_owned();
         let (started, release, finished, content) = match call_id.as_str() {
@@ -1050,7 +1091,10 @@ async fn same_native_tool_parallel_reverse_completion_continues_after_context_re
     let second_started = props.second_started.notified();
     tokio::pin!(first_started);
     tokio::pin!(second_started);
-    let mut reaction = Box::pin(application.react());
+    let reaction_control = application.react().unwrap();
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
             result = &mut reaction => panic!("reaction completed before the first same-tool lane started: {result:?}"),
@@ -1087,7 +1131,7 @@ async fn same_native_tool_parallel_reverse_completion_continues_after_context_re
             .await
             .expect("same-tool parallel reaction settles")
             .expect("same-tool parallel reaction succeeds"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     drop(reaction);
 
@@ -1095,9 +1139,10 @@ async fn same_native_tool_parallel_reverse_completion_continues_after_context_re
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("same-tool parallel result continuation"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     application
@@ -1106,16 +1151,18 @@ async fn same_native_tool_parallel_reverse_completion_continues_after_context_re
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("same-tool reset Full replays both completed calls"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("same-tool reset continuation has no pending calls"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     let frames = capture.frames();
@@ -1178,7 +1225,7 @@ fn conditional_tool_application(props: ConditionalToolProps) -> Component {
         view! {
             conditional_context { "tool mounted" }
             {
-                NativeToolCall::named("vanishing").on_call(move |call| {
+                NativeToolCall::named("vanishing").on_call(move |_ctx, call| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     async move { Ok::<_, Infallible>(call.output("vanishing-result")) }
                 })
@@ -1214,8 +1261,12 @@ async fn unmounting_a_native_tool_keeps_accepted_history_in_later_replay() {
     )
     .expect("mount conditional native tool");
 
-    let _ = application.react().await.expect("tool reaction");
-    let _ = application.react().await.expect("tool output continuation");
+    let _ = application.react().unwrap().await.expect("tool reaction");
+    let _ = application
+        .react()
+        .unwrap()
+        .await
+        .expect("tool output continuation");
     let normal_delta = capture.frames();
     assert_call_is_replayed_and_result_is_staged(
         &normal_delta[1],
@@ -1231,7 +1282,11 @@ async fn unmounting_a_native_tool_keeps_accepted_history_in_later_replay() {
         .set(false)
         .expect("mounted signal accepts a write");
     force_full.store(true, Ordering::SeqCst);
-    let _ = application.react().await.expect("unmounted continuation");
+    let _ = application
+        .react()
+        .unwrap()
+        .await
+        .expect("unmounted continuation");
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(application
@@ -1269,7 +1324,7 @@ fn cancelled_tool_application(props: CancelledToolProps) -> Component {
     view! {
         cancelled_context { "pending tool" }
         {
-            NativeToolCall::named("pending").on_call(move |call| {
+            NativeToolCall::named("pending").on_call(move |_ctx, call| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 let started = Arc::clone(&started);
                 async move {
@@ -1301,7 +1356,10 @@ async fn cancelled_native_tool_appends_fallback_to_its_component_log_before_reco
 
     let started_wait = started.notified();
     tokio::pin!(started_wait);
-    let mut cancelled = Box::pin(application.react());
+    let cancelled_control = application.react().unwrap();
+    let mut cancelled = Box::pin(std::future::IntoFuture::into_future(
+        cancelled_control.clone(),
+    ));
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
             result = &mut cancelled => panic!("reaction completed before pending tool started: {result:?}"),
@@ -1310,13 +1368,29 @@ async fn cancelled_native_tool_appends_fallback_to_its_component_log_before_reco
     })
     .await
     .expect("pending native tool starts");
+    cancelled_control.interrupt().unwrap();
     drop(cancelled);
+    assert_eq!(
+        cancelled_control.await.unwrap(),
+        agentview::component::execution::ReactionOutcome::Interrupted
+    );
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(application.current_projection().is_dirty());
+    assert_eq!(
+        native_log(application.current_projection().projection(), "pending"),
+        vec![
+            tool_call("call-pending", "pending"),
+            tool_result("call-pending", CANCELLED_TOOL_OUTPUT)
+        ],
+        "awaiting interruption includes the cancellation feedback reconcile"
+    );
     assert!(matches!(
-        application.react().await.expect("fallback continuation"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("fallback continuation"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     let frames = capture.frames();
@@ -1367,16 +1441,28 @@ async fn typed_native_tool_component_records_successful_and_invalid_argument_cal
         Application::mount(typed_add_application, port).expect("mount typed native tool");
 
     assert!(matches!(
-        application.react().await.expect("valid typed tool call"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("valid typed tool call"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     assert!(matches!(
-        application.react().await.expect("invalid typed tool call"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("invalid typed tool call"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     assert!(matches!(
-        application.react().await.expect("typed tool continuation"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("typed tool continuation"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     let frames = capture.frames();
@@ -1452,15 +1538,20 @@ async fn unicode_named_tool_executes_stages_results_and_continues_after_context_
         .expect("mount Unicode-named native tool");
 
     assert!(matches!(
-        application.react().await.expect("first Unicode tool call"),
-        ControlFlow::Continue(())
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("first Unicode tool call"),
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("first Unicode tool result continuation"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     application
@@ -1469,23 +1560,26 @@ async fn unicode_named_tool_executes_stages_results_and_continues_after_context_
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("reset Full accepts a later Unicode tool call"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("later Unicode tool result continuation"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     assert!(matches!(
         application
             .react()
+            .unwrap()
             .await
             .expect("post-reset Unicode continuation"),
-        ControlFlow::Continue(())
+        agentview::component::execution::ReactionOutcome::Completed
     ));
 
     let frames = capture.frames();
@@ -1574,7 +1668,7 @@ fn callback_counter_application(props: CallbackCounterProps) -> Component {
         NativeToolCall {
             name: "adjust",
             description: "Adjust the mounted counter.",
-            on_call: move |input: CounterAdjustment| {
+            on_call: move |_ctx, input: CounterAdjustment| {
                 sync_calls.fetch_add(1, Ordering::SeqCst);
                 sync_counter.update(|value| {
                     *value += input.amount;
@@ -1585,7 +1679,7 @@ fn callback_counter_application(props: CallbackCounterProps) -> Component {
         NativeToolCall {
             name: "adjust_async",
             description: "Adjust the same counter asynchronously.",
-            on_call: move |input: CounterAdjustment| {
+            on_call: move |_ctx, input: CounterAdjustment| {
                 let counter = counter.clone();
                 let async_calls = Arc::clone(&async_calls);
                 async move {
@@ -1632,6 +1726,7 @@ async fn native_callback_infers_schema_and_rejects_invalid_arguments_before_invo
 
     let _ = application
         .react()
+        .unwrap()
         .await
         .expect("invalid calls retain feedback");
     let projection = application.current_projection();
@@ -1654,6 +1749,7 @@ async fn native_callback_infers_schema_and_rejects_invalid_arguments_before_invo
     assert_eq!(tools[0].input_schema(), tools[1].input_schema());
     let _ = application
         .react()
+        .unwrap()
         .await
         .expect("deliver invalid argument results");
 
@@ -1715,7 +1811,11 @@ async fn native_callbacks_deliver_state_and_results_and_refresh_captures_between
     .expect("mount callback counter");
 
     for _ in 0..4 {
-        let _ = application.react().await.expect("counter interaction");
+        let _ = application
+            .react()
+            .unwrap()
+            .await
+            .expect("counter interaction");
     }
 
     let frames = capture.frames();
@@ -1759,14 +1859,14 @@ fn no_argument_callback_application(props: CallbackCounterProps) -> Component {
         counter_state { value { "{current}" } }
         NativeToolCall {
             name: "increment",
-            on_call: move || {
+            on_call: move |_ctx| {
                 sync_calls.fetch_add(1, Ordering::SeqCst);
                 sync_counter.update(|value| { *value += 1; *value })
             },
         }
         NativeToolCall {
             name: "increment_async",
-            on_call: move || {
+            on_call: move |_ctx| {
                 let counter = counter.clone();
                 let calls = async_calls.clone();
                 async move {
@@ -1819,7 +1919,7 @@ async fn zero_argument_native_callbacks_reject_input_fields_and_deliver_sync_and
         );
     }
     for _ in 0..3 {
-        let _ = app.react().await.unwrap();
+        let _ = app.react().unwrap().await.unwrap();
     }
 
     assert_eq!(props.sync_calls.load(Ordering::SeqCst), 1);

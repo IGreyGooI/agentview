@@ -130,7 +130,7 @@ fn native_tool_lifecycle_application(
         { projection }
         {
             NativeToolCall::named("lifecycle_lookup")
-                .on_call(|call| async move {
+                .on_call(|_ctx, call| async move {
                     Ok::<_, Infallible>(call.output("lifecycle-tool-result"))
                 })
         }
@@ -2840,7 +2840,7 @@ fn dispatch_probe_root(props: DispatchProbeProps, events: EventInput<ProviderEve
         {
             EventListener::observe("responses.dispatch-probe", "v1")
                 .listen_to(text)
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let delta_notify = Arc::clone(&delta_notify);
                     let complete_count = Arc::clone(&complete_count);
                     let complete_notify = Arc::clone(&complete_notify);

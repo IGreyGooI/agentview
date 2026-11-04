@@ -409,7 +409,7 @@ async fn play_game<P, O>(
     observer: &mut O,
 ) -> PlayResult
 where
-    P: ReactionPort,
+    P: ReactionPort + 'static,
     O: GameObserver,
 {
     let mut board = Board::default();
@@ -791,7 +791,7 @@ pub(crate) async fn run_provider_game_with_observer_until<P, O>(
     observer: &mut O,
 ) -> anyhow::Result<GameEvidence>
 where
-    P: ReactionPort,
+    P: ReactionPort + 'static,
     O: GameObserver,
 {
     run_provider_game(
@@ -814,7 +814,7 @@ async fn run_provider_game<P, O>(
     observer: &mut O,
 ) -> anyhow::Result<GameEvidence>
 where
-    P: ReactionPort,
+    P: ReactionPort + 'static,
     O: GameObserver,
 {
     validate_limits(limits)?;
@@ -1091,7 +1091,7 @@ impl<P> CountingProvider<P> {
 #[async_trait]
 impl<P> ReactionPort for CountingProvider<P>
 where
-    P: ReactionPort,
+    P: ReactionPort + 'static,
 {
     fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
         self.inner.declare()

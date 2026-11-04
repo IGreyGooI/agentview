@@ -856,6 +856,10 @@ pub(super) struct PreparedFrame {
 }
 
 impl PreparedFrame {
+    pub(super) fn revision(&self) -> super::reaction::FrameRevision {
+        self.frame.revision()
+    }
+
     pub(super) fn into_parts(self) -> (Frame, FrameCommitCandidate) {
         (self.frame, self.commit)
     }

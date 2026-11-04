@@ -8,24 +8,26 @@ pub mod execution;
 mod host;
 
 mod identity;
+pub(crate) mod provenance;
 mod signal;
 mod task;
 
 pub use host::{ComponentHost, ComponentHostFault, ComponentHostId, PreparedRender};
 pub(crate) use identity::ComponentId;
+pub use provenance::{ApplicationId, EventContext, EventId, EventSource, ReactionId, ReactionKind};
 pub use signal::SignalAccessError;
 
 /// Curated imports for Component authors.
 pub mod prelude {
     pub use super::authoring::streaming_attempt::*;
     pub use super::authoring::{
-        spawn, use_application_exit, use_coroutine, use_future, use_preparation,
-        use_provider_event_handler, use_reaction_completion, use_reaction_request, use_signal,
-        use_wait_for_command, Action, ApplicationExitError, ApplicationExitHandle, CliCommand,
-        Command, CommandArgument, CommandDefinition, Component, Coroutine, CoroutineInbox,
-        CoroutineSendError, ExitReason, NativeTool, NativeToolCall, ProviderEventSelector,
-        ReactionRequest, ReactionRequestError, Signal, SpawnError, StreamingXml, StreamingXmlTag,
-        ToolError, XmlContractDiagnostic, XmlStreamingToolCall,
+        spawn, use_application_exit, use_application_id, use_coroutine, use_future,
+        use_preparation, use_provider_event_handler, use_reaction_completion, use_reaction_request,
+        use_signal, use_wait_for_command, Action, ApplicationExitError, ApplicationExitHandle,
+        CliCommand, Command, CommandArgument, CommandDefinition, Component, Coroutine,
+        CoroutineInbox, CoroutineSendError, ExitReason, NativeTool, NativeToolCall,
+        ProviderEventSelector, ReactionRequest, ReactionRequestError, Signal, SpawnError,
+        StreamingXml, StreamingXmlTag, ToolError, XmlContractDiagnostic, XmlStreamingToolCall,
     };
     #[cfg(feature = "legacy-provider-port")]
     #[allow(
@@ -35,7 +37,10 @@ pub mod prelude {
     #[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
     pub use super::authoring::{EventInput, EventListener};
     pub use super::execution::{ForkableReactionPort, ProviderEvent};
-    pub use super::SignalAccessError;
+    pub use super::{
+        ApplicationId, EventContext, EventId, EventSource, ReactionId, ReactionKind,
+        SignalAccessError,
+    };
     pub use crate::llm_call::TextTurnEvent;
     pub use crate::pom::{
         BlockBuilder, BlockChildren, BlockContent, CodeBlockNode, CodeSpanNode, ContentContext,

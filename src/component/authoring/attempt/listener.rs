@@ -9,7 +9,7 @@ use crate::component::authoring::{
         XmlStreamingToolCallDeclaration,
     },
 };
-use crate::stream_parser::XmlElement;
+use crate::{component::EventContext, stream_parser::XmlElement};
 
 use super::ComponentAttemptFault;
 
@@ -60,6 +60,7 @@ impl MountedListener {
 
     pub(super) async fn dispatch_root<Root>(
         &mut self,
+        context: EventContext,
         root: &Root,
     ) -> Result<bool, ComponentAttemptFault>
     where
@@ -67,7 +68,7 @@ impl MountedListener {
     {
         match &mut self.declaration {
             MountedListenerDeclaration::Event(declaration) => declaration
-                .dispatch_root(root)
+                .dispatch_root(context, root)
                 .await
                 .map_err(ComponentAttemptFault::listener_dispatch),
             MountedListenerDeclaration::StreamingToolCall(_)
@@ -77,6 +78,7 @@ impl MountedListener {
 
     pub(super) async fn dispatch_streaming_decoded(
         &mut self,
+        context: EventContext,
         decoded: Option<String>,
         invalid: Option<XmlContractDiagnostic>,
     ) -> Result<(), ComponentAttemptFault> {
@@ -87,11 +89,11 @@ impl MountedListener {
         };
         match (decoded, invalid) {
             (Some(value), None) => streaming
-                .dispatch_decoded(&value)
+                .dispatch_decoded(context, &value)
                 .await
                 .map_err(ComponentAttemptFault::streaming_input),
             (None, Some(diagnostic)) => streaming
-                .dispatch_invalid(diagnostic)
+                .dispatch_invalid(context, diagnostic)
                 .await
                 .map_err(ComponentAttemptFault::streaming_input),
             _ => Err(ComponentAttemptFault::RuntimeInvariant {
@@ -102,6 +104,7 @@ impl MountedListener {
 
     pub(super) async fn dispatch_streaming_phase(
         &mut self,
+        context: EventContext,
         phase: StreamingXmlPhase,
         element: XmlElement,
     ) -> Result<(), ComponentAttemptFault> {
@@ -111,22 +114,23 @@ impl MountedListener {
             });
         };
         streaming
-            .dispatch_phase(phase, element)
+            .dispatch_phase(context, phase, element)
             .await
             .map_err(ComponentAttemptFault::streaming_input)
     }
 
     pub(super) async fn dispatch_streaming_invalid(
         &mut self,
+        context: EventContext,
         diagnostic: XmlContractDiagnostic,
     ) -> Result<(), ComponentAttemptFault> {
         match &mut self.declaration {
             MountedListenerDeclaration::StreamingToolCall(streaming) => streaming
-                .dispatch_invalid(diagnostic)
+                .dispatch_invalid(context, diagnostic)
                 .await
                 .map_err(ComponentAttemptFault::streaming_input),
             MountedListenerDeclaration::StreamingTag(streaming) => streaming
-                .dispatch_invalid(diagnostic)
+                .dispatch_invalid(context, diagnostic)
                 .await
                 .map_err(ComponentAttemptFault::streaming_input),
             MountedListenerDeclaration::Event(_) => Err(ComponentAttemptFault::RuntimeInvariant {

@@ -6,7 +6,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
-    component::{execution::CommandOutcome, signal::HookMount},
+    component::{execution::CommandOutcome, signal::HookMount, EventContext},
     pom::{DiffSlot, DiffStrategy, Document, MixedContent, RawTextNode, XmlName, XmlNode},
 };
 
@@ -127,7 +127,8 @@ impl CommandDefinition {
 /// A CLI action declared beside the Component state it operates on.
 ///
 /// `view! { CliCommand { command: ..., enabled: ..., on_call: ... } }`
-/// binds a typed synchronous callback. Collection happens during tree traversal;
+/// binds a typed synchronous callback receiving `EventContext` before its input.
+/// Collection happens during tree traversal;
 /// callbacks run only when the application's command barrier dispatches input.
 pub struct CliCommand;
 
@@ -170,13 +171,14 @@ impl<Descriptor, Callback> CliCommandProps<Descriptor, Callback> {
 impl<Input: DeserializeOwned + 'static> CliCommandProps<Command<Input>> {
     /// Bind a synchronous action. An `Ok` value is the command's serializable
     /// business outcome; `Err` reports a runtime handler fault. Invalid input is
-    /// rejected before invoking the callback. Captures never become arguments.
+    /// rejected before invoking the callback. Context and captures never become
+    /// arguments in the command input.
     pub fn on_call<Handler, Output, Error>(
         self,
         mut handler: Handler,
     ) -> CliCommandProps<Command<Input>, CliCommandCallback>
     where
-        Handler: FnMut(Input) -> Result<Output, Error> + Send + 'static,
+        Handler: FnMut(EventContext, Input) -> Result<Output, Error> + Send + 'static,
         Output: Serialize,
         Error: fmt::Display,
     {
@@ -184,7 +186,7 @@ impl<Input: DeserializeOwned + 'static> CliCommandProps<Command<Input>> {
             command: self.command,
             enabled: self.enabled,
             invoke: CliCommandCallback {
-                invoke: Box::new(move |input| {
+                invoke: Box::new(move |context, input| {
                     let input = match decode_input::<Input>(input) {
                         Ok(input) => input,
                         Err(message) => {
@@ -196,14 +198,13 @@ impl<Input: DeserializeOwned + 'static> CliCommandProps<Command<Input>> {
                             });
                         }
                     };
-                    let output =
-                        handler(input)
-                            .map_err(|error| error.to_string())
-                            .and_then(|output| {
-                                serde_json::to_value(output)
-                                    .map(CommandOutcome::Output)
-                                    .map_err(|error| error.to_string())
-                            });
+                    let output = handler(context, input)
+                        .map_err(|error| error.to_string())
+                        .and_then(|output| {
+                            serde_json::to_value(output)
+                                .map(CommandOutcome::Output)
+                                .map_err(|error| error.to_string())
+                        });
                     Box::pin(std::future::ready(output))
                 }),
             },
@@ -220,7 +221,8 @@ pub struct CliCommandCallback {
 pub(crate) type CommandFuture =
     Pin<Box<dyn Future<Output = Result<CommandOutcome, String>> + Send + 'static>>;
 
-pub(crate) type CommandCallback = Box<dyn FnMut(Value) -> CommandFuture + Send + 'static>;
+pub(crate) type CommandCallback =
+    Box<dyn FnMut(EventContext, Value) -> CommandFuture + Send + 'static>;
 
 impl<Input> CliCommandProps<Command<Input>, CliCommandCallback> {
     pub fn build(self) -> Component {
@@ -285,7 +287,11 @@ impl CliCommandDeclaration {
         self.task_context = task_context;
     }
 
-    pub(crate) async fn invoke(&mut self, input: Value) -> Result<CommandOutcome, String> {
+    pub(crate) async fn invoke(
+        &mut self,
+        event_context: EventContext,
+        input: Value,
+    ) -> Result<CommandOutcome, String> {
         let Some(_permit) = self.mount.as_ref().and_then(HookMount::authorize) else {
             return Ok(CommandOutcome::Rejected {
                 code: "command_unavailable".to_owned(),
@@ -300,10 +306,10 @@ impl CliCommandDeclaration {
         }
         match self.task_context.clone() {
             Some(context) => {
-                let future = context.scope_sync(|| (self.invoke)(input));
+                let future = context.scope_sync(|| (self.invoke)(event_context, input));
                 context.scope(future).await
             }
-            None => (self.invoke)(input).await,
+            None => (self.invoke)(event_context, input).await,
         }
     }
 

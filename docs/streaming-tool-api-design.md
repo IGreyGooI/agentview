@@ -22,8 +22,8 @@ view! {
     XmlStreamingToolCall {
         element: XmlToolElement::text("say"),
         description: "Say a message; completed messages appear in the next view.",
-        on_delta: move |text: String| speaker.write(text),
-        on_complete: move |text: String| history.update(|items| items.push(text)),
+        on_delta: move |_context, text: String| speaker.write(text),
+        on_complete: move |_context, text: String| history.update(|items| items.push(text)),
     }
 }
 ```
@@ -35,6 +35,13 @@ control flow. The element supplies validation and decoding. Text drafts default 
 `Arc<Head>`, `on_delta` newly decoded text, and `on_complete` the valid completed value.
 `on_invalid` optionally receives diagnostics, which the declared action also retains
 in its next projection. The application renders successful outcomes and current state.
+
+Ordinary callbacks receive `EventContext` before their payload (`|context, value|`). Rich
+`XmlOpen`, `XmlTextDelta`, and `XmlComplete` events expose it through `event.context` alongside
+the existing attempt, occurrence, and sequence. Managed attempt, effect, settlement, publication,
+and recovery contexts expose `event_context()`. Retained emissions and diagnostics preserve the
+original context, including during asynchronous recovery. Provenance is runtime metadata and
+adds no model input fields. See [the provenance contract](engine.md#event-provenance).
 
 All ordinary XML actions in one prepared application share a strict parser and must
 have distinct names. They execute in source order directly in the current reaction,

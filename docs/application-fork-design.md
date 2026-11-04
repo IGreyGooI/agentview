@@ -1,20 +1,34 @@
-# 保留历史的 Application Fork
+# Application 分支：切换 port 与保留历史
 
-状态：已实现 `Application::fork()`、`fork_with_commands()` 和 Responses port 支持。
+状态：已实现任意 port 的 `fork_to()` / `fork_to_with_commands()`，以及保留历史的
+`Application::fork()` / `fork_with_commands()` 和 Responses port 支持。
 [engine.md](engine.md) 是权威 runtime contract；本文记录接口、所有权与验证场景。
-可运行的[离线示例](../examples/application_fork.rs) 无需 API 凭证。
+两个模式均有无凭据离线示例：
+[`application_fork_to`](../examples/application_fork_to.rs) 与
+[`application_fork`](../examples/application_fork.rs)。
+
+本文的两个入口都创建新的 Application 和 Component mount。同一 Application 内共享组件树、
+动态发起 `Main` / `Temporary` 的方案见[异步 Reaction handles](parallel-reactions-design.md)。
+该方案已实现并沿用同一 `EventContext`；fork API 与本文的生命周期规则保持适用，发起 fork 时源应用须无活跃 reaction。
+
+| 操作 | 新应用的模型历史 | Port |
+| --- | --- | --- |
+| `fork_to(root, target)` | 空；业务状态由 root 显式恢复。 | 调用方提供新的任意 port，类型和 profile 可不同。 |
+| `fork(root)` | 继承分支点的历史及相应 provider 私有状态。 | 源 port 实现 `ForkableReactionPort`，创建同类型分支。 |
+
+第 1–7 节说明保留历史的 `fork`；[第 8 节](#8-任意-port-上的独立业务分支) 说明 `fork_to`。
 
 ## 1. 目标与边界
 
 从当前交互历史创建独立的 `Application`，让父应用与分支可以并行 reaction。
-每个 Application 内继续 single-flight；各自独立退出、取消和 shutdown。
+每个 Application 各自拥有主线和临时 reaction、退出、中断和 shutdown；fork 仅在源应用所有 reaction 空闲时执行。
 
 fork 保留分支点之前的 canonical history，以及使这些历史能够继续用于 provider 请求的私有状态。
 应用显式提供业务状态 snapshot，并通过新的 root 恢复它。Component tree、Signals、handlers 和
 任务作用域重新建立，不隐式复制任意 hook value、运行中的 future 或外部副作用。
 
 这为[并行后台 Application](background-applications-design.md) 增加一种保留历史的启动方式。
-现有 `mount()` 继续创建新模型会话；后台应用默认不继承父应用历史。
+`mount()` 和 `fork_to()` 创建新模型会话；后台应用默认不继承父应用历史。
 
 ## 2. 公共 API
 
@@ -45,7 +59,7 @@ root closure 捕获应用导出的 owned typed snapshot，作为新组件的初�
 输入；框架不暴露 mutable FrameSession 或 provider-private snapshot。命令分支接收新的输入通道，
 不复制父应用的 inbox 或正在处理的 command。
 
-`&mut Application` 保证 fork 不与该实例的 `prepare()`、`react()` 或其他 fork 重叠。
+`&mut Application` 仲裁 owner API，额外的空闲检查确保 fork 不与该实例已接纳的 reaction 重叠。
 它不会冻结独立运行的业务任务或外部数据库。多字段业务 snapshot 的一致性、版本以及与历史分支点
 的业务对应关系由业务 owner 保证；应传入拥有独立值的 snapshot，而不是父 mount 的 Signal handle。
 
@@ -88,7 +102,7 @@ fork 在 parent 的 outer driver boundary 检查之后进行。源应用须可�
 - canonical history 中的工具调用已闭合，ToolOutput staging 也为空；
 - provider 能给出真实且可分支的 continuation，私有因果数据完整。
 
-`react()` 已经返回不充分：工具 handler 的结果可能仍在 staging，等待下一 Frame handoff；取消时
+Reaction handle 已返回不表示本轮结束；即使 await 已完成，工具 handler 的结果仍可能在 staging，等待下一 Frame handoff；中断时
 生成的 unknown-outcome fallback 也可能尚未交付。这些状态在首版明确拒绝 fork，不隐式提交一帧、
 消费 receipt 或重跑操作。父应用由自己的 driver 正常继续，满足条件后再显式 fork。
 
@@ -171,4 +185,59 @@ fork 不复制或撤销已经发生的数据库、文件和其他外部副作用
 ```sh
 cargo run --no-default-features --example application_fork
 cargo test --no-default-features --example application_fork
+```
+
+## 8. 任意 port 上的独立业务分支
+
+`fork_to` 将显式业务 snapshot 交给新 root，并在调用方提供的新 target 上挂载子应用：
+
+```rust,ignore
+impl<P: ReactionPort> Application<P> {
+    pub async fn fork_to<Q: ReactionPort + 'static>(
+        &mut self,
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        target: Q,
+    ) -> Result<Application<Q>, ApplicationFault>;
+
+    pub async fn fork_to_with_commands<Q: ReactionPort + 'static>(
+        &mut self,
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        target: Q,
+        input: CommandInput,
+    ) -> Result<Application<Q>, ApplicationFault>;
+}
+```
+
+Q 可以使用不同 port 类型、模型和 profile。它必须是 fresh target，identity 与源 target 不同，
+首次声明 `FullRequired`；已有 Accepted continuation 不能作为这次新会话的输入。源 P 只需
+`ReactionPort`，不要求 `ForkableReactionPort` 或 `Clone`。初始化只读取新 target 的声明，不向
+源 port 请求声明或调用 provider fork/reset/submit，因此源模型不可用也可以切换 provider。
+
+新子应用的 FrameSession、canonical history、staged results、namespace、revision 序列和 diff
+baseline 全部从空状态建立。Component tree、hook state、Signals、handler bindings、preparation、
+tasks、exit、driver demand 和 command inbox 也独立建立。业务 snapshot 由 root closure 捕获，
+它的版本及一致性由调用方保证；框架不从父树复制 Signal 或任意 hook value。
+
+首次显式 reaction 交付 Full，内容来自子 root 的当前 System、业务 POM、工具声明和 ephemeral
+context。父 canonical transcript、staged results 及 provider-private history 均不导入。如果业务
+snapshot 中包含需要让子模型知道的记录，应在子 root 明确声明为当前视图。子输出和业务状态也不
+自动合并回源，接收方通过业务消息更新自己的后续 Frame。
+
+源需处于 healthy runtime 且没有退出请求。同一个源实例的 `&mut` driver ownership 仍串行；
+源待交付工具结果、command、mount retirement 和 streaming recovery 不影响这个独立 mount。
+它们保留在源应用，receipt、history 和 demand 不被消费。这个入口不读取源会话的 continuation，
+也不尝试修复源模型或清理源业务工作。源已终结、mount authority 关闭或 task panic 的检查继续有效。
+
+初始化在子 Component tasks 启动前按目标自己的 profile 预检初始 Full 预算，不 commit 或提交模型
+请求，也不执行 Component preparation；成功 mount 启动声明的 tasks。各 owner 独立驱动和 shutdown。
+失败或取消时，新 target 或部分子应用进入独立 cleanup owner；父应用保存其完成句柄，consuming
+shutdown 等待清理完成。业务代码已经发生的状态写入和副作用不回滚。
+
+验证关注不同 target/profile、空模型历史、首个 Full、源 staged results 保留、source port 不被调用、
+退出或 panic 拒绝、失败/取消清理，以及各自后续交互和 shutdown。
+[`application_fork_to`](../examples/application_fork_to.rs) 使用 `DebugProviderPort` 和另一种包装 port
+类型，展示显式 owned snapshot、初始化零提交与子首帧空 replay；Debug backend 不生成模型动作：
+
+```sh
+cargo run --no-default-features --example application_fork_to
 ```

@@ -187,6 +187,19 @@ impl ReactionPort for DebugProviderPort {
         self.target.clone()
     }
 
+    fn fork_temporary(&mut self) -> Result<Box<dyn ReactionPort>, ReactionPortFault> {
+        let declaration = ReactionPort::declare(self)?;
+        Ok(Box::new(Self {
+            capture: self.capture.clone(),
+            target: Ok(TargetDeclaration::full(
+                next_debug_target_identity(&NEXT_DEBUG_TARGET_ID)?,
+                TargetEpoch::new(NonZeroU64::MIN),
+                declaration.profile().clone(),
+            )),
+            execution_mode: DebugExecutionMode::FrameNative,
+        }))
+    }
+
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
         let declaration = self.target.clone().map_err(SubmitFault::Rejected)?;
         frame.check_handoff_precondition(&declaration)?;
@@ -248,6 +261,7 @@ mod tests {
     use std::task::Poll;
 
     use agentview_derive::view;
+    use futures::StreamExt;
 
     use super::*;
     use crate::component::execution::{
@@ -370,6 +384,54 @@ mod tests {
         assert!(capture.frame_snapshots().is_empty());
         assert_eq!(port.execution_mode, DebugExecutionMode::Unclaimed);
         assert_eq!(ReactionPort::declare(&mut port).unwrap(), declaration);
+    }
+
+    #[tokio::test]
+    async fn temporary_debug_targets_keep_the_source_baseline_independent() {
+        let (mut source, capture) = DebugProviderPort::new();
+        let initial = source.declare().unwrap();
+        let facts: Vec<_> = source
+            .submit(frame(&initial, 1))
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(facts.iter().all(Result::is_ok));
+        let accepted = source.declare().unwrap();
+        let mut checkpoint = source.fork_temporary().unwrap();
+        let mut first = checkpoint.fork_temporary().unwrap();
+        let mut second = checkpoint.fork_temporary().unwrap();
+        assert_eq!(capture.frame_snapshots().len(), 1);
+        let first_declaration = first.declare().unwrap();
+        let second_declaration = second.declare().unwrap();
+        assert_ne!(first_declaration.identity(), second_declaration.identity());
+        assert_ne!(first_declaration.identity(), accepted.identity());
+        assert_eq!(first_declaration.profile(), accepted.profile());
+        let (first_facts, second_facts) = tokio::join!(
+            async {
+                first
+                    .submit(frame(&first_declaration, 1))
+                    .await
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await
+            },
+            async {
+                second
+                    .submit(frame(&second_declaration, 1))
+                    .await
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await
+            },
+        );
+        assert!(first_facts.iter().all(Result::is_ok));
+        assert!(second_facts.iter().all(Result::is_ok));
+        assert_eq!(source.declare().unwrap(), accepted);
+        assert_eq!(capture.frame_snapshots().len(), 3);
+        first.shutdown().await;
+        second.shutdown().await;
+        checkpoint.shutdown().await;
     }
 
     #[tokio::test]

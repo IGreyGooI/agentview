@@ -281,7 +281,7 @@ mod tests {
     #[component]
     fn capture_retry_application(props: CaptureRetryProps) -> Component {
         let completions = Arc::clone(&props.completions);
-        use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+        use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
             let completions = Arc::clone(&completions);
             async move {
                 if let TextTurnEvent::TextComplete(text) = event {
@@ -312,7 +312,7 @@ mod tests {
         let mut application =
             Application::mount(move || capture_retry_application(props.clone()), provider).unwrap();
 
-        let fault = application.react().await.unwrap_err();
+        let fault = application.react().unwrap().await.unwrap_err();
         assert_eq!(fault.stage(), ApplicationFaultStage::Submit);
         assert_eq!(fault.kind(), ApplicationFaultKind::Retryable);
         assert_eq!(
@@ -323,7 +323,7 @@ mod tests {
         assert_eq!(capture.accepted_revision(), None);
         assert!(completions.lock().unwrap().is_empty());
 
-        assert!(application.react().await.unwrap().is_continue());
+        assert!(application.react().unwrap().await.unwrap().is_continue());
         assert_eq!(capture.submission_count(), 1);
         assert_eq!(capture.frames()[0].basis, FrameBasis::Full);
         assert!(capture.accepted_revision().is_some());

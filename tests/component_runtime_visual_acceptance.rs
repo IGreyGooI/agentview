@@ -123,7 +123,7 @@ fn acceptance_state(props: AcceptanceProps) -> Component {
         .expect("acceptance Signal export lock") = Some(state.clone());
     let current = state.with(Clone::clone).expect("mounted acceptance state");
     let completed_handlers = Arc::clone(&props.completed_handlers);
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let state = state.clone();
         let completed_handlers = Arc::clone(&completed_handlers);
         async move {
@@ -439,7 +439,7 @@ impl AcceptanceHarness {
         let requests_before = mock.request_count();
         let handlers_before = self.completed_handlers.load(Ordering::SeqCst);
         anyhow::ensure!(
-            application.react().await?.is_continue(),
+            application.react().unwrap().await?.is_continue(),
             "Responses application exited"
         );
         let request_delta = mock.request_count() - requests_before;
@@ -763,7 +763,7 @@ async fn run_error_application(
         Application::mount(move || acceptance_application(props.clone()), provider)?;
     let application_operation = AssertUnwindSafe(async {
         wait_for_task_start(&task_started).await?;
-        let operation_failed = application.react().await.is_err();
+        let operation_failed = application.react().unwrap().await.is_err();
         let request_received = if mock.request_count() == 1 {
             mock.next_request().await.is_ok()
         } else {

@@ -17,9 +17,9 @@ use agentview::{
     component::{
         execution::{
             Application, ApplicationFaultKind, ApplicationFaultReason, ContextWindow, Frame,
-            FrameCapabilities, FrameConstraints, FrameProfile, ProviderFact, ProviderFactStream,
-            ProviderOutputKey, ReactionPort, ReactionPortFault, SubmitFault, TargetDeclaration,
-            TargetEpoch, TargetIdentity,
+            FrameCapabilities, FrameConstraints, FrameProfile, FrameRevision, ProviderFact,
+            ProviderFactStream, ProviderOutputKey, ReactionPort, ReactionPortFault, SubmitFault,
+            TargetDeclaration, TargetEpoch, TargetIdentity,
         },
         prelude::*,
     },
@@ -30,7 +30,10 @@ use futures::StreamExt;
 use tokio::sync::Notify;
 
 #[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<Vec<CanonicalInputItem>>>>);
+struct Capture(
+    Arc<Mutex<Vec<Vec<CanonicalInputItem>>>>,
+    Arc<Mutex<Vec<FrameRevision>>>,
+);
 
 impl Capture {
     fn views(&self) -> Vec<agentview::pom::ResolvedDocument> {
@@ -94,6 +97,7 @@ impl ReactionPort for Port {
 
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
         frame.check_handoff_precondition(&self.declaration)?;
+        self.capture.1.lock().unwrap().push(frame.revision());
         self.capture
             .0
             .lock()
@@ -140,6 +144,7 @@ struct Notebook {
     notes: Vec<String>,
     streamed: String,
     events: Vec<String>,
+    origins: Vec<(&'static str, EventContext)>,
     diagnostics: Vec<XmlCallbackDiagnostic>,
     confirmations: Vec<usize>,
     show_say: bool,
@@ -167,27 +172,33 @@ fn say_action(state: Signal<Notebook>, observed: usize) -> Component {
         XmlStreamingToolCall {
             element: XmlToolElement::text("say"),
             description: "Save one note. Its decoded text becomes the note.",
-            on_open: move |_: Arc<()>| {
-                opens.update(|book| book.events.push(format!("open:{observed}")))
+            on_open: move |context, _: Arc<()>| {
+                opens.update(|book| {
+                    book.origins.push(("open", context));
+                    book.events.push(format!("open:{observed}"));
+                })
             },
-            on_delta: move |text: String| {
+            on_delta: move |context, text: String| {
                 let state = deltas.clone();
                 async move {
                     tokio::task::yield_now().await;
                     state.update(|book| {
+                        book.origins.push(("delta", context));
                         book.events.push(format!("delta:{text}"));
                         book.streamed.push_str(&text);
                     })
                 }
             },
-            on_complete: move |text: String| {
+            on_complete: move |context, text: String| {
                 state.update(|book| {
+                    book.origins.push(("complete", context));
                     book.events.push(format!("complete:{observed}:{text}"));
                     book.notes.push(text);
                 })
             },
-            on_invalid: move |diagnostic: XmlCallbackDiagnostic| {
+            on_invalid: move |context, diagnostic: XmlCallbackDiagnostic| {
                 invalid.update(|book| {
+                    book.origins.push(("invalid", context));
                     book.events.push(format!("invalid:{}", diagnostic.code));
                     book.diagnostics.push(diagnostic);
                 })
@@ -239,10 +250,10 @@ fn notebook(probe: NotebookProbe) -> Component {
                     |count, _| Ok(Confirmation { count: *count }),
                 ),
             description: "Confirm the number of notes currently saved.",
-            on_open: move |count: Arc<usize>| {
+            on_open: move |_ctx, count: Arc<usize>| {
                 confirm_open.update(|book| book.events.push(format!("confirm-open:{count}")))
             },
-            on_complete: move |value: Confirmation| {
+            on_complete: move |_ctx, value: Confirmation| {
                 state.update(|book| {
                     book.events.push(format!("confirm:{}", value.count));
                     if value.count == book.notes.len() {
@@ -250,7 +261,7 @@ fn notebook(probe: NotebookProbe) -> Component {
                     }
                 })
             },
-            on_invalid: move |diagnostic: XmlCallbackDiagnostic| {
+            on_invalid: move |_ctx, diagnostic: XmlCallbackDiagnostic| {
                 confirm_invalid.update(|book| {
                     book.events.push(format!("invalid:{}", diagnostic.code));
                     book.diagnostics.push(diagnostic);
@@ -275,7 +286,7 @@ async fn callbacks_preserve_source_order_skip_typos_and_deliver_feedback_for_the
         completed(),
     ]);
     let mut app = Application::mount(move || notebook(root_probe.clone()), port).unwrap();
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     let first = probe.snapshot();
     assert_eq!(first.notes, ["first & 中", "last"]);
     assert_eq!(first.streamed, "first & 中last");
@@ -305,8 +316,8 @@ async fn callbacks_preserve_source_order_skip_typos_and_deliver_feedback_for_the
         "callbacks across declared components execute in XML source order"
     );
 
-    let _ = app.react().await.unwrap();
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     assert_eq!(probe.snapshot().confirmations, [1, 2]);
     let views = capture.views();
     assert!(views[0].has_text("Save one note. Its decoded text becomes the note."));
@@ -327,6 +338,75 @@ async fn callbacks_preserve_source_order_skip_typos_and_deliver_feedback_for_the
         "the next submitted Frame exposes the skipped action"
     );
     assert!(views[2].has_field("confirmations", "2"));
+
+    let revisions = capture.1.lock().unwrap();
+    let source = &first.origins[0].1;
+    for (_, context) in &first.origins {
+        assert_eq!(context.application_id(), app.application_id());
+        assert_eq!(context.reaction_id(), source.reaction_id());
+        assert!(context.reaction_id().is_some());
+        assert_eq!(context.frame_revision(), Some(revisions[0]));
+        assert!(matches!(context.source(), EventSource::Xml { .. }));
+    }
+    for pair in first.origins.windows(2) {
+        assert_ne!(pair[0].1.event_id(), pair[1].1.event_id());
+        let EventSource::Xml {
+            sequence: before, ..
+        } = pair[0].1.source()
+        else {
+            unreachable!()
+        };
+        let EventSource::Xml {
+            sequence: after, ..
+        } = pair[1].1.source()
+        else {
+            unreachable!()
+        };
+        assert!(before < after);
+    }
+    let invalid = &first
+        .origins
+        .iter()
+        .find(|(phase, _)| *phase == "invalid")
+        .unwrap()
+        .1;
+    let invalid_items = views[1].elements("invalid");
+    let retained = invalid_items
+        .iter()
+        .find(|item| attribute(item, "code") == Some("unknown_element"))
+        .unwrap();
+    assert_eq!(
+        attribute(retained, "application_id"),
+        Some(app.application_id().to_string().as_str())
+    );
+    assert_eq!(
+        attribute(retained, "reaction_id"),
+        Some(invalid.reaction_id().unwrap().to_string().as_str())
+    );
+    assert_eq!(
+        attribute(retained, "event_id"),
+        Some(invalid.event_id().to_string().as_str())
+    );
+    let EventSource::Xml {
+        attempt,
+        occurrence,
+        sequence,
+    } = invalid.source()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        attribute(retained, "attempt"),
+        Some(attempt.get().to_string().as_str())
+    );
+    assert_eq!(
+        attribute(retained, "occurrence").map(str::to_owned),
+        occurrence.map(|id| id.get().to_string())
+    );
+    assert_eq!(
+        attribute(retained, "event_sequence"),
+        Some(sequence.to_string().as_str())
+    );
 }
 
 #[tokio::test]
@@ -338,7 +418,7 @@ async fn typed_attribute_errors_skip_callbacks_and_valid_following_actions_conti
         "<confirm count=\"0\"/><say>still works</say>",
     ]))]);
     let mut app = Application::mount(move || notebook(root_probe.clone()), port).unwrap();
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     let state = probe.snapshot();
     assert_eq!(state.notes, ["still works"]);
     assert_eq!(state.confirmations, [0]);
@@ -367,13 +447,13 @@ async fn rerender_refreshes_captures_and_unmount_removes_the_action() {
         Script::Finite(text_facts(&["<say>unmounted</say><confirm count=\"2\"/>"])),
     ]);
     let mut app = Application::mount(move || notebook(root_probe.clone()), port).unwrap();
-    let _ = app.react().await.unwrap();
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     let state = probe.snapshot();
     assert!(state.events.contains(&"complete:0:one".to_owned()));
     assert!(state.events.contains(&"complete:1:two".to_owned()));
     probe.signal().update(|book| book.show_say = false).unwrap();
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     let state = probe.snapshot();
     assert_eq!(state.notes, ["one", "two"]);
     assert_eq!(state.confirmations, [2]);
@@ -405,13 +485,13 @@ async fn commentary_is_not_executed_and_eof_reports_incomplete_actions() {
     facts.extend(text_facts(&["<say>kept</say><say>unfinished"]));
     let (port, capture) = Port::new([Script::Finite(facts), completed()]);
     let mut app = Application::mount(move || notebook(root_probe.clone()), port).unwrap();
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     let state = probe.snapshot();
     assert_eq!(state.notes, ["kept"]);
     assert_eq!(state.streamed, "keptunfinished");
     assert_eq!(state.diagnostics.len(), 1);
     assert_eq!(state.diagnostics[0].element.as_deref(), Some("say"));
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     assert!(capture.views()[1].has_field("saved_count", "1"));
     assert!(capture.views()[1].has_field(
         "feedback",
@@ -431,15 +511,15 @@ fn failing_callback(events: Arc<Mutex<Vec<String>>>) -> Component {
     view! {
         XmlStreamingToolCall {
             element: XmlToolElement::text("say"),
-            on_delta: move |text: String| {
+            on_delta: move |_ctx, text: String| {
                 events.lock().unwrap().push(format!("delta:{text}"));
                 Err::<(), _>("application callback failed")
             },
-            on_complete: move |text: String| {
+            on_complete: move |_ctx, text: String| {
                 completion.lock().unwrap().push(format!("complete:{text}"));
                 Ok::<(), Infallible>(())
             },
-            on_invalid: move |_: XmlCallbackDiagnostic| {
+            on_invalid: move |_ctx, _: XmlCallbackDiagnostic| {
                 invalid.lock().unwrap().push("invalid".to_owned());
                 Ok::<(), Infallible>(())
             },
@@ -458,6 +538,7 @@ async fn callback_failure_stops_later_buffered_events_and_remains_a_runtime_faul
         Application::mount(move || failing_callback(Arc::clone(&root_events)), port).unwrap();
     let error = app
         .react()
+        .unwrap()
         .await
         .expect_err("callback error is a reaction fault");
     assert_eq!(error.kind(), ApplicationFaultKind::Terminal);
@@ -490,7 +571,7 @@ fn pending_callback(probe: PendingProbe) -> Component {
         pending_state { "{text}" }
         XmlStreamingToolCall {
             element: XmlToolElement::text("say"),
-            on_delta: move |text: String| {
+            on_delta: move |_ctx, text: String| {
                 let state = delta_state.clone();
                 let probe = probe.clone();
                 async move {
@@ -503,7 +584,7 @@ fn pending_callback(probe: PendingProbe) -> Component {
                     Ok::<(), SignalAccessError>(())
                 }
             },
-            on_complete: move |text: String| {
+            on_complete: move |_ctx, text: String| {
                 state.update(|events| events.push(format!("complete:{text}")))
             },
         }
@@ -523,7 +604,10 @@ async fn cancellation_drops_callback_future_and_does_not_replay_buffered_complet
         Script::Finite(text_facts(&["<say>next</say>"])),
     ]);
     let mut app = Application::mount(move || pending_callback(root_probe.clone()), port).unwrap();
-    let mut reaction = Box::pin(app.react());
+    let reaction_control = app.react().unwrap();
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     tokio::time::timeout(Duration::from_secs(2), async {
         tokio::select! {
             result = &mut reaction => panic!("pending callback completed: {result:?}"),
@@ -532,11 +616,16 @@ async fn cancellation_drops_callback_future_and_does_not_replay_buffered_complet
     })
     .await
     .expect("callback starts before the buffered completion");
+    reaction_control.interrupt().unwrap();
     drop(reaction);
+    assert_eq!(
+        reaction_control.await.unwrap(),
+        agentview::component::execution::ReactionOutcome::Interrupted
+    );
     assert!(probe.dropped.load(Ordering::SeqCst));
     let state = probe.state.lock().unwrap().clone().unwrap();
     assert_eq!(state.with(Clone::clone).unwrap(), ["delta:pause"]);
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     assert_eq!(
         state.with(Clone::clone).unwrap(),
         ["delta:pause", "delta:next", "complete:next"]
@@ -553,7 +642,7 @@ fn ping_action(pings: Arc<Mutex<usize>>) -> Component {
         XmlStreamingToolCall {
             element: XmlToolElement::self_closing("ping"),
             description: "Record one ping without arguments.",
-            on_complete: move |(): ()| {
+            on_complete: move |_ctx, (): ()| {
                 *pings.lock().unwrap() += 1;
                 Ok::<(), Infallible>(())
             },
@@ -567,8 +656,8 @@ async fn self_closing_defaults_to_unit_and_invalid_input_has_feedback_without_a_
     let root_pings = Arc::clone(&pings);
     let (port, capture) = Port::new([Script::Finite(text_facts(&["<pign/><ping/>"])), completed()]);
     let mut app = Application::mount(move || ping_action(Arc::clone(&root_pings)), port).unwrap();
-    let _ = app.react().await.unwrap();
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     assert_eq!(*pings.lock().unwrap(), 1);
     assert!(capture.views()[1].has_attribute("element", "pign"));
     assert!(capture.views()[1].has_attribute("code", "unknown_element"));
@@ -592,7 +681,7 @@ fn spawning_action(probe: SpawnProbe) -> Component {
     view! {
         XmlStreamingToolCall {
             element: XmlToolElement::self_closing("start"),
-            on_open: move |_: Arc<()>| {
+            on_open: move |_ctx, _: Arc<()>| {
                 let probe = sync_probe.clone();
                 spawn(async move {
                     let _guard = PendingGuard(probe.sync_dropped);
@@ -600,7 +689,7 @@ fn spawning_action(probe: SpawnProbe) -> Component {
                     std::future::pending::<()>().await;
                 })
             },
-            on_complete: move |(): ()| {
+            on_complete: move |_ctx, (): ()| {
                 let probe = probe.clone();
                 let local = local.clone();
                 async move {
@@ -635,7 +724,7 @@ async fn callback_invocation_and_async_poll_have_mount_context_and_unmount_retir
     let root_probe = probe.clone();
     let (port, _) = Port::new([Script::Finite(text_facts(&["<start/>"])), completed()]);
     let mut app = Application::mount(move || spawning_root(root_probe.clone()), port).unwrap();
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         probe.sync_started.notified().await;
         probe.async_started.notified().await;
@@ -652,7 +741,7 @@ async fn callback_invocation_and_async_poll_have_mount_context_and_unmount_retir
         .unwrap()
         .set(false)
         .unwrap();
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     assert!(probe.sync_dropped.load(Ordering::SeqCst));
     assert!(probe.async_dropped.load(Ordering::SeqCst));
     assert!(
@@ -744,11 +833,11 @@ fn mixed_callbacks(probe: MixedProbe, duplicate: bool) -> Component {
             element: XmlToolElement::self_closing("pick")
                 .required_attribute::<u32>("value", "7")
                 .decode(|mut attrs| attrs.take_required::<u32>("value"), |value, _| Ok(*value)),
-            on_complete: move |value: u32| {
+            on_complete: move |_ctx, value: u32| {
                 probe.picks.lock().unwrap().push(value);
                 Ok::<(), Infallible>(())
             },
-            on_invalid: move |diagnostic: XmlCallbackDiagnostic| {
+            on_invalid: move |_ctx, diagnostic: XmlCallbackDiagnostic| {
                 probe.diagnostics.lock().unwrap().push(diagnostic);
                 Ok::<(), Infallible>(())
             },
@@ -766,7 +855,7 @@ async fn simple_and_managed_xml_actions_coexist_without_sibling_unknown_diagnost
     ]))]);
     let mut app =
         Application::mount(move || mixed_callbacks(root_probe.clone(), false), port).unwrap();
-    let _ = app.react().await.unwrap();
+    let _ = app.react().unwrap().await.unwrap();
     assert_eq!(*probe.picks.lock().unwrap(), [7]);
     assert_eq!(*probe.published.lock().unwrap(), ["managed value"]);
     assert!(probe.diagnostics.lock().unwrap().is_empty());
@@ -777,7 +866,7 @@ async fn duplicate_names_between_simple_and_managed_actions_fail_before_submissi
     let probe = MixedProbe::default();
     let (port, capture) = Port::new([completed()]);
     let result = match Application::mount(move || mixed_callbacks(probe.clone(), true), port) {
-        Ok(mut application) => application.react().await.map(|_| ()),
+        Ok(mut application) => application.react().unwrap().await.map(|_| ()),
         Err(error) => Err(error),
     };
     let error = result.expect_err("one action name cannot select direct and managed handlers");

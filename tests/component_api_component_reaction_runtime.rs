@@ -53,7 +53,7 @@ fn reaction_component(
         {
             EventListener::observe("test.component-reaction-output", "v1")
                 .listen_to(events.select(ProviderEvent::TEXT))
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let prefix = prefix.clone();
                     let writer = writer.clone();
                     async move {
@@ -156,7 +156,7 @@ fn post_reconcile_failure_component(
         {
             EventListener::observe("test.post-reconcile-failure", "v1")
                 .listen_to(events.select(ProviderEvent::TEXT))
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let output = output_writer.clone();
                     let fail_render = fail_render.clone();
                     async move {
@@ -224,7 +224,7 @@ fn replacing_output_component(
         {
             EventListener::observe("test.replace-component-output", "v1")
                 .listen_to(events.select(ProviderEvent::TEXT))
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let publisher = publisher.clone();
                     let secondary = secondary_writer.clone();
                     async move {
@@ -266,7 +266,7 @@ fn binding_failure_component(
         {
             EventListener::observe("test.partial-output-write", "v1")
                 .listen_to(first)
-                .on_event(move |_| {
+                .on_event(move |_ctx, _| {
                     let writer = writer.clone();
                     async move { writer.set(String::from("partial")) }
                 })
@@ -274,7 +274,7 @@ fn binding_failure_component(
         {
             EventListener::observe("test.partial-output-failure", "v1")
                 .listen_to(second)
-                .on_event(|_| async { Err::<(), _>(BindingFailure) })
+                .on_event(|_ctx, _| async { Err::<(), _>(BindingFailure) })
         }
     }
 }

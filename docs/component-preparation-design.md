@@ -7,7 +7,9 @@
 The original hook migration was implemented and verified on 2026-09-06. It
 replaces keyed `use_dependency` with operation-scoped `use_preparation` while
 preserving synchronous mount, explicit preparation, and the existing reaction
-lifecycle.
+lifecycle. `react()?` now returns an Application-owned
+[Reaction handle](parallel-reactions-design.md); its preparation still follows these
+operation-local rules, and dropping its waiter does not cancel the operation.
 
 ## Purpose
 
@@ -84,7 +86,7 @@ generation and lexical hook slot.
 - A later explicit `prepare()` or `react()` starts fresh and runs every active
   slot again, including slots that completed in an earlier successful, failed,
   or cancelled operation.
-- Therefore, `prepare().await?` followed by `react().await?` runs the active
+- Therefore, `prepare().await?` followed by `react()?.await?` runs the active
   preparations in both calls.
 - A pre-handoff continuity retry inside one `react()` keeps the same
   operation-local completion set and does not rerun preparations.

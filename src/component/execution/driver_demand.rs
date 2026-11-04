@@ -55,6 +55,16 @@ pub(crate) struct DriverDemand {
 }
 
 impl DriverDemand {
+    /// Publish aggregate recovery state without clearing another reaction's fence.
+    pub(crate) fn settle_reaction(&self, recovery_pending: bool, request: bool) {
+        let mut state = self.core.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.streaming_fenced = recovery_pending;
+        if state.active {
+            state.pending |= request;
+        }
+        drop(state);
+        self.core.changed.notify_waiters();
+    }
     pub(crate) fn set_streaming_fence(&self, fenced: bool) {
         self.core
             .state

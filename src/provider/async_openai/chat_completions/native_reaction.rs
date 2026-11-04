@@ -908,7 +908,7 @@ mod tests {
     #[component]
     fn retry_test_application(completions: Arc<AtomicUsize>) -> Component {
         let exit = use_application_exit();
-        use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+        use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
             let completions = completions.clone();
             async move {
                 if let TextTurnEvent::TextComplete(text) = event {
@@ -918,7 +918,7 @@ mod tests {
                 Ok::<(), String>(())
             }
         });
-        use_reaction_completion(move || async move {
+        use_reaction_completion(move |_ctx| async move {
             exit.request(ExitReason::Completed)?;
             Ok::<(), anyhow::Error>(())
         });

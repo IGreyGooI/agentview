@@ -6,11 +6,12 @@ use super::{
     authoring::{
         application_exit::ApplicationExitControl, Component, ComponentAttemptFault,
         ComponentRenderStage, InternalEventInput as EventInput, MountTaskStart, PreparationSet,
-        RenderBindings,
+        RenderBindings, RetainedModelHistory,
     },
     execution::{DriverDemandHandle, ProjectionExecutionScope, ProviderEvent, RenderedProjection},
     signal::{MountIdentity, SignalMountTransition, SignalRenderError, SignalRuntime},
     task::{MountTaskHandle, MountTaskSupervisorError},
+    ApplicationId, ReactionId,
 };
 
 static NEXT_COMPONENT_HOST_ID: AtomicU64 = AtomicU64::new(1);
@@ -49,6 +50,7 @@ impl ProjectionRevision {
 /// Long-lived owner of root props and retained Component signal slots.
 pub struct ComponentHost<Props> {
     id: ComponentHostId,
+    application_id: ApplicationId,
     mount_generation: u64,
     root: ComponentRoot<Props>,
     props: Props,
@@ -57,6 +59,8 @@ pub struct ComponentHost<Props> {
     tasks: Option<MountTaskHandle>,
     application_exit: Option<ApplicationExitControl>,
     command_prefix: String,
+    native_history_scope: Option<ReactionId>,
+    model_history: RetainedModelHistory,
     next_render_generation: u64,
     next_projection_revision: Option<ProjectionRevision>,
     current_projection_revision: Option<ProjectionRevision>,
@@ -128,6 +132,7 @@ impl<Props> ComponentHost<Props> {
             .unwrap_or_else(|_| panic!("ComponentHost identity space exhausted"));
         Self {
             id: ComponentHostId { instance },
+            application_id: ApplicationId::fresh(),
             mount_generation: 1,
             root,
             props,
@@ -136,6 +141,8 @@ impl<Props> ComponentHost<Props> {
             tasks,
             application_exit,
             command_prefix: String::new(),
+            native_history_scope: None,
+            model_history: RetainedModelHistory::default(),
             next_render_generation: 1,
             next_projection_revision: Some(ProjectionRevision::FIRST),
             current_projection_revision: None,
@@ -147,6 +154,25 @@ impl<Props> ComponentHost<Props> {
 
     pub fn id(&self) -> ComponentHostId {
         self.id
+    }
+
+    /// Identity supplied to this host's event callbacks and render hooks.
+    pub fn application_id(&self) -> ApplicationId {
+        self.application_id
+    }
+
+    /// Select protocol records for a main render or one temporary lineage.
+    /// Business Signals and mounted identities remain shared across selections.
+    pub(crate) fn set_reaction_history_scope(&mut self, lineage: Option<ReactionId>) {
+        if self.native_history_scope != lineage {
+            self.native_history_scope = lineage;
+            self.signals.mark_dirty();
+        }
+    }
+
+    /// Release only an abandoned temporary protocol lineage from mounted tools.
+    pub(crate) fn discard_temporary_history(&mut self, lineage: ReactionId) {
+        self.model_history.discard_temporary(lineage);
     }
 
     pub fn props(&self) -> &Props {
@@ -177,6 +203,7 @@ impl<Props> ComponentHost<Props> {
         self.mount_generation = next_mount_generation;
         self.props = next;
         self.current_projection_revision = None;
+        self.model_history = RetainedModelHistory::default();
         self.current_projection = None;
         self.current_projection_prepared = false;
         self.current_has_command_wait = false;
@@ -263,7 +290,7 @@ where
             .checked_add(1)
             .ok_or(ComponentHostFault::RenderGenerationExhausted)?;
 
-        let input = EventInput::new(generation);
+        let input = EventInput::for_application(generation, self.application_id);
         let origin = input.origin();
         let props = self.props.clone();
         let root = match self.root {
@@ -279,6 +306,7 @@ where
                 self.tasks.as_ref(),
                 self.application_exit.as_ref(),
                 &self.command_prefix,
+                self.native_history_scope,
             )?;
         if candidate.has_task_starts() {
             self.tasks
@@ -332,6 +360,7 @@ where
         } = committed;
         debug_assert_eq!(host_id, self.id);
         let projection_prepared = preparations.is_empty();
+        self.model_history = bindings.retained_model_history();
         mounts.activate();
         self.current_projection_revision = Some(projection_revision);
         self.current_projection = Some(projection.clone());
@@ -451,9 +480,135 @@ impl ComponentHostFault {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU128, NonZeroU64};
+
+    use crate::component::{authoring::NativeToolCall, EventSource, ReactionKind};
     use agentview_derive::{component, view};
 
     use super::*;
+
+    fn history_root(_: ()) -> Component {
+        NativeToolCall::named("work").on_call(|context, call| async move {
+            Ok::<_, std::convert::Infallible>(call.output(format!("{:?}", context.reaction_kind())))
+        })
+    }
+
+    #[tokio::test]
+    async fn shared_mount_renders_only_the_selected_native_history_lineage() {
+        use crate::{
+            component::{
+                execution::{FrameRevision, TargetEpoch, TargetIdentity, ToolCall},
+                provenance::EventScope,
+            },
+            transcript::CanonicalInputItem,
+        };
+
+        let mut host = ComponentHost::new_root(history_root, ());
+        let frame = FrameRevision::new(
+            NonZeroU128::new(1).unwrap(),
+            TargetIdentity::new(NonZeroU128::new(1).unwrap()),
+            TargetEpoch::new(NonZeroU64::new(1).unwrap()),
+            NonZeroU64::new(1).unwrap(),
+        );
+        let main_id = ReactionId::fresh();
+        let branch = ReactionId::fresh();
+        let (_, _, mut main) = host.render().unwrap().into_execution_parts();
+        let main_scope = EventScope::reaction(host.application_id(), main_id, frame);
+        main.set_event_scope(main_scope);
+        let (output, _) = main
+            .start_native_tool_record_with_context(
+                main_scope.event(EventSource::NativeTool {
+                    call_id: "shared".to_owned(),
+                    output: None,
+                    ordinal: None,
+                }),
+                ToolCall::new("shared", "work", "{}").unwrap(),
+            )
+            .unwrap();
+        output.await.unwrap();
+
+        host.set_reaction_history_scope(Some(branch));
+        assert!(host.is_dirty());
+        let (projection, _, mut temporary) = host.render().unwrap().into_execution_parts();
+        assert!(projection
+            .nodes()
+            .iter()
+            .flat_map(|node| node.items())
+            .next()
+            .is_none());
+        let temporary_scope = EventScope::reaction_with_kind(
+            host.application_id(),
+            branch,
+            ReactionKind::Temporary,
+            frame,
+        );
+        temporary.set_event_scope(temporary_scope);
+        let (output, _) = temporary
+            .start_native_tool_record_with_context(
+                temporary_scope.event(EventSource::NativeTool {
+                    call_id: "shared".to_owned(),
+                    output: None,
+                    ordinal: None,
+                }),
+                ToolCall::new("shared", "work", "{}").unwrap(),
+            )
+            .unwrap();
+        output.await.unwrap();
+
+        host.set_reaction_history_scope(None);
+        let main_projection = host.render().unwrap();
+        let main_items = main_projection
+            .projection()
+            .nodes()
+            .iter()
+            .flat_map(|node| node.items())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            main_items,
+            [
+                CanonicalInputItem::tool_call("shared", "work", "{}").unwrap(),
+                CanonicalInputItem::tool_result("shared", "Some(Main)").unwrap(),
+            ]
+        );
+        host.set_reaction_history_scope(Some(branch));
+        let branch_projection = host.render().unwrap();
+        let branch_items = branch_projection
+            .projection()
+            .nodes()
+            .iter()
+            .flat_map(|node| node.items())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            branch_items,
+            [
+                CanonicalInputItem::tool_call("shared", "work", "{}").unwrap(),
+                CanonicalInputItem::tool_result("shared", "Some(Temporary)").unwrap(),
+            ]
+        );
+        host.discard_temporary_history(branch);
+        let released = host.render().unwrap();
+        assert!(released
+            .projection()
+            .nodes()
+            .iter()
+            .flat_map(|node| node.items())
+            .next()
+            .is_none());
+        host.set_reaction_history_scope(None);
+        let retained_main = host.render().unwrap();
+        assert_eq!(
+            retained_main
+                .projection()
+                .nodes()
+                .iter()
+                .flat_map(|node| node.items())
+                .cloned()
+                .collect::<Vec<_>>(),
+            main_items,
+        );
+    }
 
     #[derive(Clone)]
     struct RevisionProps {

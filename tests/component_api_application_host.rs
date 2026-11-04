@@ -69,7 +69,7 @@ fn legacy_xml_callback_application(
         XmlStreamingToolCall {
             element: XmlToolElement::text("say"),
             description: "Speak the supplied text.",
-            on_complete: move |_text: String| {
+            on_complete: move |_ctx, _text: String| {
                 callback_calls.fetch_add(1, Ordering::SeqCst);
                 Ok::<(), Infallible>(())
             },
@@ -93,7 +93,7 @@ fn legacy_cli_application(
     view! {
         CliCommand {
             command: LEGACY_CLI_COMMAND,
-            on_call: move |_: LegacyNoInput| {
+            on_call: move |_ctx, _: LegacyNoInput| {
                 callback_calls.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, Infallible>(())
             },
@@ -155,7 +155,7 @@ fn handler_application(props: HandlerProps, events: EventInput<ProviderEvent>) -
         {
             EventListener::observe("test.values", "v1")
                 .listen_to(events.select(ProviderEvent::TEXT))
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let values = handler_values.clone();
                     async move {
                         let value = event_number(event);
@@ -290,7 +290,7 @@ fn ordered_handler_application(
         {
             EventListener::observe("test.order.first", "v1")
                 .listen_to(values)
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let log = Arc::clone(&first_log);
                     let started = Arc::clone(&first_started);
                     let release = Arc::clone(&first_release);
@@ -309,7 +309,7 @@ fn ordered_handler_application(
         {
             EventListener::observe("test.order.second", "v1")
                 .listen_to(second_values)
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let log = Arc::clone(&second_log);
                     async move {
                         let value = event_number(event);
@@ -346,21 +346,21 @@ fn streaming_handler_application(
                 .empty_element("value")
                 .required_attribute::<usize>("number")
                 .listen_to(text.clone())
-                .on_decoded(move |_| {
+                .on_decoded(move |_ctx, _| {
                     let decoded = Arc::clone(&decoded);
                     async move {
                         decoded.notify_one();
                         Ok::<(), Infallible>(())
                     }
                 })
-                .on_invalid(|_| async { Ok::<(), Infallible>(()) })
+                .on_invalid(|_ctx, _| async { Ok::<(), Infallible>(()) })
         }
         {
             XmlStreamingToolCall::contract("test.application-host.eof-diagnostic", "v1")
                 .empty_element("finish")
                 .listen_to(text)
-                .on_decoded(|| async { Ok::<(), Infallible>(()) })
-                .on_invalid(move |_| {
+                .on_decoded(|_ctx| async { Ok::<(), Infallible>(()) })
+                .on_invalid(move |_ctx, _| {
                     let finish_count = Arc::clone(&finish_count);
                     let finish_started = Arc::clone(&finish_started);
                     let finish_release = Arc::clone(&finish_release);
@@ -430,7 +430,7 @@ fn binding_drop_application(
         {
             EventListener::observe("test.binding-drop", "v1")
                 .listen_to(events.select(ProviderEvent::TEXT))
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let _keep_binding_alive = Arc::clone(&probe.drops);
                     let value = writer.clone();
                     async move { value.set(event_number(event)) }
@@ -470,7 +470,7 @@ fn faulting_handler_application(
         {
             EventListener::observe("test.fault.write", "v1")
                 .listen_to(first_route)
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let value = writer.clone();
                     async move { value.set(event_number(event)) }
                 })
@@ -478,7 +478,7 @@ fn faulting_handler_application(
         {
             EventListener::observe("test.fault.fail", "v1")
                 .listen_to(second_route)
-                .on_event(|_| async {
+                .on_event(|_ctx, _| async {
                     Err::<(), _>(HandlerFailure("handler failure sentinel"))
                 })
         }

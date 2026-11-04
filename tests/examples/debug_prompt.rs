@@ -92,7 +92,7 @@ fn retained_history_application(props: RetainedHistoryProps) -> Component {
         .expect("mounted retained-history state");
     let next_state = state.clone();
     let completions = Arc::clone(&props.completions);
-    use_reaction_completion(move || async move {
+    use_reaction_completion(move |_ctx| async move {
         if completions.fetch_add(1, Ordering::SeqCst) == 0 {
             next_state.set(SECOND_STATE.to_owned())?;
         }
@@ -241,14 +241,14 @@ async fn prepared_projection_and_exact_requests_are_captured_separately() -> any
     assert!(document.has_field("developer_context", "prepared <context> & state"));
     assert!(!document.has_field("developer_context", "pending"));
 
-    let reaction = application.react().await;
+    let reaction = application.react().unwrap().await;
     let server_body = server.next_request().await?;
     crate::capture_projection_before_reaction(&mut application, &run_dir, 2).await?;
     assert_eq!(server.request_count(), 1);
     let second_projection: serde_json::Value =
         serde_json::from_slice(&std::fs::read(run_dir.join("0002/projection.json"))?)?;
     assert_eq!(second_projection["nodes"], captured["nodes"]);
-    let second_reaction = application.react().await;
+    let second_reaction = application.react().unwrap().await;
     let second_body = server.next_request().await?;
     let shutdown = application.shutdown().await;
     let flushed = capture.finish().await;
@@ -329,7 +329,7 @@ async fn current_component_projection_excludes_retained_history_while_request_ke
             "first projection did not expose state A: {first_documents:#?}"
         );
 
-        let _ = application.react().await?;
+        let _ = application.react().unwrap().await?;
         let first_body = next_debug_request(&mut server).await?;
         anyhow::ensure!(
             completions.load(Ordering::SeqCst) == 1,
@@ -370,7 +370,7 @@ async fn current_component_projection_excludes_retained_history_while_request_ke
                 .any(|document| document.has_text(FIRST_STATE)),
             "second projection retained state A: {second_documents:#?}"
         );
-        let _ = application.react().await?;
+        let _ = application.react().unwrap().await?;
         let second_body = next_debug_request(&mut server).await?;
         anyhow::ensure!(
             completions.load(Ordering::SeqCst) == 2,

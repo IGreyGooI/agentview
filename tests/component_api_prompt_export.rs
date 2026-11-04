@@ -229,7 +229,7 @@ fn counter(calls: Arc<AtomicUsize>) -> Component {
         NativeToolCall {
             name: "adjust",
             description: "Add an integer amount and return the actual updated counter.",
-            on_call: move |input: Adjustment| {
+            on_call: move |_ctx, input: Adjustment| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 state.update(|value| {
                     *value += input.amount;
@@ -284,7 +284,7 @@ async fn interact(export: bool) -> Vec<Delivery> {
         export_without_effects(&application, &provider, &calls);
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(application.react().await.unwrap().is_continue());
+    assert!(application.react().unwrap().await.unwrap().is_continue());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     let expected_call = CanonicalInputItem::tool_call(CALL_ID, "adjust", ARGUMENTS).unwrap();
@@ -312,7 +312,7 @@ async fn interact(export: bool) -> Vec<Delivery> {
         export_without_effects(&application, &provider, &calls);
     }
 
-    assert!(application.react().await.unwrap().is_continue());
+    assert!(application.react().unwrap().await.unwrap().is_continue());
     assert_eq!(
         native_records(application.current_projection().projection()),
         expected_records
@@ -320,7 +320,7 @@ async fn interact(export: bool) -> Vec<Delivery> {
     if export {
         export_without_effects(&application, &provider, &calls);
     }
-    assert!(application.react().await.unwrap().is_continue());
+    assert!(application.react().unwrap().await.unwrap().is_continue());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let deliveries = {
         let frames = provider.frames.lock().unwrap();

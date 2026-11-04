@@ -342,7 +342,7 @@ fn counter(props: CounterProps) -> Component {
         NativeToolCall {
             name: "adjust",
             description: "Apply an integer adjustment and return its actual result.",
-            on_call: move |input: Adjustment| {
+            on_call: move |_ctx, input: Adjustment| {
                 let state = state.clone();
                 let calls = props.calls.clone();
                 let started = props.tool_started.clone();
@@ -661,7 +661,7 @@ fn command_counter(initial: i64) -> Component {
         Action {
             name: "adjust",
             description: "Adjust this application's counter.",
-            on_call: move |input: Adjustment| value.update(|value| { *value += input.amount; *value }),
+            on_call: move |_ctx, input: Adjustment| value.update(|value| { *value += input.amount; *value }),
         }
     }
 }

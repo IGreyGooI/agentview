@@ -772,6 +772,25 @@ pub trait ReactionPort: Send {
     /// Require capacity configuration before mounting; the profile stays stable.
     fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault>;
 
+    /// Copies a settled checkpoint into an independent temporary target.
+    ///
+    /// The source remains unchanged. The returned target has a fresh identity,
+    /// the same profile, and Full-required continuity; it retains the exact
+    /// canonical prefix and all required provider-private artifacts. Its
+    /// requests never advance the source continuation or store a new remote
+    /// response. A returned checkpoint can itself create independent siblings.
+    /// No network request, observer callback, or background task starts here.
+    ///
+    /// Application retains such a checkpoint separately before borrowing the
+    /// main port for a stream. Implementations must reject unfinished or
+    /// unavailable snapshots rather than clone mutable live request state.
+    fn fork_temporary(&mut self) -> Result<Box<dyn ReactionPort>, ReactionPortFault> {
+        Err(ReactionPortFault::retryable(
+            ReactionPortFaultCode::Unavailable,
+            ReactionPortFaultReason::ForkSnapshotUnavailable,
+        ))
+    }
+
     /// Hands one exact Frame to this target and returns its ordered fact stream.
     ///
     /// Encode [`FrameSubmission::ephemeral`] after all retained input, for this
@@ -797,6 +816,25 @@ pub trait ReactionPort: Send {
     /// after active reactions have ended. Ports without background work need
     /// no implementation; Drop alone only provides best-effort cancellation.
     async fn shutdown(&mut self) {}
+}
+
+#[async_trait]
+impl<P: ReactionPort + ?Sized> ReactionPort for Box<P> {
+    fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+        (**self).declare()
+    }
+
+    fn fork_temporary(&mut self) -> Result<Box<dyn ReactionPort>, ReactionPortFault> {
+        (**self).fork_temporary()
+    }
+
+    async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
+        (**self).submit(frame).await
+    }
+
+    async fn shutdown(&mut self) {
+        (**self).shutdown().await;
+    }
 }
 
 /// Optional capability for copying a settled model session into an independent

@@ -26,8 +26,11 @@ static NEXT_FAKE_UCI: AtomicU64 = AtomicU64::new(1);
 
 const BRIEF_THOUGHT: &str = "<thought>brief move evaluation</thought>";
 
-fn assert_continue(flow: ControlFlow<ExitReason>) {
-    assert_eq!(flow, ControlFlow::Continue(()));
+fn assert_continue(flow: impl Into<agentview::component::execution::ReactionOutcome>) {
+    assert_eq!(
+        flow.into(),
+        agentview::component::execution::ReactionOutcome::Completed
+    );
 }
 
 fn thought_then_choose_move(uci: &str) -> String {
@@ -222,7 +225,7 @@ fn stockfish_go_count(program: &FakeUciProgram) -> usize {
         .count()
 }
 
-fn mount_chess<P: ReactionPort>(
+fn mount_chess<P: ReactionPort + 'static>(
     config: ChessConfig,
     provider: P,
 ) -> (
@@ -248,11 +251,13 @@ fn mount_chess<P: ReactionPort>(
     (application, stop, cleanup_receiver)
 }
 
-fn current_chess_projection<P: ReactionPort>(application: &Application<P>) -> ResolvedDocument {
+fn current_chess_projection<P: ReactionPort + 'static>(
+    application: &Application<P>,
+) -> ResolvedDocument {
     pom::projection_document(application.current_projection().projection())
 }
 
-async fn shutdown_chess<P: ReactionPort>(
+async fn shutdown_chess<P: ReactionPort + 'static>(
     application: Application<P>,
     stop: watch::Sender<bool>,
     mut cleanup: watch::Receiver<Option<Result<(), ChessActorFailure>>>,
@@ -321,13 +326,13 @@ async fn move_publication_defers_stockfish_until_the_next_react_preparation() {
     let config = ChessConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 4).unwrap();
     let (mut application, stop, cleanup) = mount_chess(config, provider);
 
-    assert_continue(application.react().await.unwrap());
+    assert_continue(application.react().unwrap().await.unwrap());
 
     assert_eq!(capture.submission_count(), 1);
     assert_eq!(stockfish_go_count(&fake_uci), 0);
     assert!(current_chess_projection(&application).has_attribute("values", "e2e4"));
 
-    assert_continue(application.react().await.unwrap());
+    assert_continue(application.react().unwrap().await.unwrap());
 
     assert_eq!(capture.submission_count(), 2);
     assert_eq!(stockfish_go_count(&fake_uci), 1);
@@ -347,9 +352,13 @@ async fn cancelled_react_preparation_does_not_duplicate_stockfish_work() {
     let config = ChessConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 4).unwrap();
     let (mut application, stop, cleanup) = mount_chess(config, provider);
 
-    assert_continue(application.react().await.unwrap());
+    assert_continue(application.react().unwrap().await.unwrap());
 
-    let mut reaction = Box::pin(application.react());
+    let reaction_control = application.react().unwrap();
+
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             tokio::select! {
@@ -366,10 +375,15 @@ async fn cancelled_react_preparation_does_not_duplicate_stockfish_work() {
     })
     .await
     .expect("react preparation must reach the held Stockfish search");
+    reaction_control.interrupt().unwrap();
     drop(reaction);
+    assert_eq!(
+        reaction_control.await.unwrap(),
+        agentview::component::execution::ReactionOutcome::Interrupted
+    );
 
     fake_uci.release_first_go();
-    let flow = tokio::time::timeout(Duration::from_secs(1), application.react())
+    let flow = tokio::time::timeout(Duration::from_secs(1), application.react().unwrap())
         .await
         .expect("a retried react must finish after the held search")
         .unwrap();
@@ -438,14 +452,14 @@ async fn repeated_preparation_and_react_preparation_do_not_repeat_stockfish() {
     let config = ChessConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 4).unwrap();
     let (mut application, stop, cleanup) = mount_chess(config, provider);
 
-    assert_continue(application.react().await.unwrap());
+    assert_continue(application.react().unwrap().await.unwrap());
     assert_continue(application.prepare().await.unwrap());
     assert_eq!(stockfish_go_count(&fake_uci), 1);
 
     assert_continue(application.prepare().await.unwrap());
     assert_eq!(stockfish_go_count(&fake_uci), 1);
 
-    assert_continue(application.react().await.unwrap());
+    assert_continue(application.react().unwrap().await.unwrap());
     assert_eq!(capture.submission_count(), 2);
     assert_eq!(stockfish_go_count(&fake_uci), 1);
 
@@ -461,7 +475,7 @@ async fn stopping_before_terminal_preparation_does_not_report_completion() {
     let config = ChessConfig::new(fake_uci.path(), Duration::from_secs(2), 10, 1).unwrap();
     let (mut application, stop, mut cleanup) = mount_chess(config, provider);
 
-    assert_continue(application.react().await.unwrap());
+    assert_continue(application.react().unwrap().await.unwrap());
     stop_stockfish(&stop, &mut cleanup).await.unwrap();
 
     let prepared = application.prepare().await;

@@ -43,7 +43,7 @@ fn add_action(total: Signal<i64>) -> Component {
         Action {
             // Metadata appearing after on_call must be evaluated before the
             // callback takes ownership of its captures.
-            on_call: move |input: AddInput| {
+            on_call: move |_ctx, input: AddInput| {
                 total.update(|total| {
                     *total += input.delta;
                     json!({"total": *total, "observed": observed, "reason": input.reason})
@@ -65,7 +65,7 @@ fn counter() -> Component {
         counter { total { "{current}" } }
         add_action(total.clone())
         Action {
-            on_call: move || total.with(|total| json!({"total": *total})),
+            on_call: move |_ctx| total.with(|total| json!({"total": *total})),
             name: "inspect",
         }
     }
@@ -214,7 +214,7 @@ fn dynamic_action_names() -> Component {
     view! {
         Action {
             name: name,
-            on_call: move || generation.update(|generation| {
+            on_call: move |_ctx| generation.update(|generation| {
                 *generation += 1;
                 json!({"generation": *generation})
             }),
@@ -249,7 +249,7 @@ async fn action_input_schema_must_describe_an_object() {
             view! {
                 Action {
                     name: "invalid",
-                    on_call: |input: String| Ok::<_, Infallible>(input),
+                    on_call: |_ctx, input: String| Ok::<_, Infallible>(input),
                 }
             }
         },
@@ -287,7 +287,7 @@ fn async_counter(probe: AsyncProbe) -> Component {
         counter { total { "{current}" } }
         Action {
             name: "add",
-            on_call: move |input: AddInput| {
+            on_call: move |_ctx, input: AddInput| {
                 probe.calls.fetch_add(1, Ordering::SeqCst);
                 let probe = probe.clone();
                 let total = added_total.clone();
@@ -309,7 +309,7 @@ fn async_counter(probe: AsyncProbe) -> Component {
         }
         Action {
             name: "inspect",
-            on_call: move || {
+            on_call: move |_ctx| {
                 let total = total.clone();
                 async move {
                     tokio::task::yield_now().await;
@@ -450,7 +450,7 @@ fn scoped_action(probe: ScopeProbe) -> Component {
     view! {
         Action {
             name: "start",
-            on_call: move || {
+            on_call: move |_ctx| {
                 let sync_probe = probe.clone();
                 spawn(async move {
                     let _drop = CallbackDrop(sync_probe.sync_dropped);
@@ -486,7 +486,7 @@ fn scoped_application(probe: ScopeProbe) -> Component {
     };
     view! {
         { action }
-        Action { name: "inspect", on_call: || Ok::<_, Infallible>(true), }
+        Action { name: "inspect", on_call: |_ctx| Ok::<_, Infallible>(true), }
     }
 }
 

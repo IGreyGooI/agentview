@@ -191,7 +191,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 requested_context: frame
                     .requested_context_bytes()
                     .map(ContextEstimate::from_bytes),
-                provider_context: ContextEstimate::from_bytes(prepared.request_body.len()),
+                provider_context: ContextEstimate::from_bytes(prepared.context_bytes),
                 compactable_context: ContextEstimate::from_bytes(
                     source.as_ref().map_or(0, |source| source.input_bytes),
                 ),
@@ -281,6 +281,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         let max_response_body_bytes = self.max_response_body_bytes;
         let max_sse_event_bytes = self.max_sse_event_bytes;
         let max_output_text_bytes = self.max_output_text_bytes;
+        let cache_continuation = prepared.cache_continuation;
         let response_usage_observer = self.response_usage_observer.clone();
         let transport_started = std::time::Instant::now();
         let mut transport = Box::pin(client.execute(request));
@@ -364,7 +365,9 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .status = Some(status.as_u16());
             if !status.is_success() {
-                if capture_enabled {
+                let possible_cache_miss =
+                    cache_continuation && status == reqwest::StatusCode::BAD_REQUEST;
+                if capture_enabled || possible_cache_miss {
                     capture_error_response(
                         response,
                         &stream_capture,
@@ -372,6 +375,27 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                         max_response_body_bytes,
                     )
                     .await;
+                }
+                if possible_cache_miss {
+                    let missing = {
+                        let captured = stream_capture
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        serde_json::from_slice::<Value>(&captured.body).is_ok_and(|body| {
+                            body.pointer("/error/code").and_then(Value::as_str)
+                                == Some("InvalidParameter.PreviousResponseNotFound")
+                        })
+                    };
+                    if missing {
+                        // Ark's structured error means the remote prefix was
+                        // lost. Full replay can recover the retained local
+                        // context; all other admission errors keep their
+                        // ordinary terminal classification.
+                        return continuity.fail(port_fault(
+                            OpenAiFailureClass::UpstreamRetryable,
+                            "Ark previous response is no longer available",
+                        ));
+                    }
                 }
                 return continuity.fail(map_openai_fault(&OpenAiReactionFailure::http_status(
                     status,
@@ -480,6 +504,29 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         ))
     }
 
+    fn fork_temporary(&mut self) -> Result<Box<dyn ReactionPort>, ReactionPortFault> {
+        let mut child = self.fork_snapshot()?;
+        match child.reaction_frame.as_mut() {
+            Some(state) => state.make_temporary(&child.encoder).map_err(|_| {
+                ReactionPortFault::retryable(
+                    ReactionPortFaultCode::Rejected,
+                    ReactionPortFaultReason::ForkNotReady,
+                )
+            })?,
+            None if child.encoder.ark_caching_enabled() => {
+                return Err(ReactionPortFault::retryable(
+                    ReactionPortFaultCode::Rejected,
+                    ReactionPortFaultReason::ForkNotReady,
+                ));
+            }
+            None => {}
+        }
+        // Independent scratch must keep its frozen parent window intact.
+        child.parallel_compaction_enabled = false;
+        child.forced_compaction_enabled = false;
+        Ok(Box::new(child))
+    }
+
     async fn shutdown(&mut self) {
         self.parallel_compaction.shutdown().await;
     }
@@ -511,6 +558,45 @@ impl ResettableReactionPort for AsyncOpenAiResponsesProvider {
 #[async_trait]
 impl ForkableReactionPort for AsyncOpenAiResponsesProvider {
     async fn fork(&mut self) -> Result<Self, ReactionPortFault> {
+        self.fork_snapshot()
+    }
+
+    fn validate_fork_frame(&self, frame: &Frame) -> Result<(), ReactionPortFault> {
+        let incompatible = || {
+            ReactionPortFault::terminal(
+                ReactionPortFaultCode::Rejected,
+                ReactionPortFaultReason::ForkSnapshotIncompatible,
+            )
+        };
+        let declaration = self.frame_native_snapshot_declaration()?;
+        if !matches!(frame.basis(), FrameBasis::Full) {
+            return Err(incompatible());
+        }
+        frame
+            .check_handoff_precondition(&declaration)
+            .map_err(|_| incompatible())?;
+        // Prepare only a local candidate: no observation, transport poll,
+        // compaction policy evaluation, or worker launch occurs here.
+        ResponsesFrameRequestState::prepare_with_measurements(
+            self.reaction_frame.as_ref(),
+            frame,
+            &self.encoder,
+            self.max_responses_serialized_request_body_bytes,
+            &mut None,
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            let fault = port_fault(error.failure_class(), format!("{error:?}"));
+            ReactionPortFault::terminal(
+                fault.code(),
+                ReactionPortFaultReason::ForkSnapshotIncompatible,
+            )
+        })
+    }
+}
+
+impl AsyncOpenAiResponsesProvider {
+    fn fork_snapshot(&self) -> Result<Self, ReactionPortFault> {
         // Read-only validation keeps ordinary fork failures and cancellation
         // from changing the source declaration or its private continuation.
         self.ensure_frame_native_mode().map_err(|_| {
@@ -576,41 +662,6 @@ impl ForkableReactionPort for AsyncOpenAiResponsesProvider {
         })
     }
 
-    fn validate_fork_frame(&self, frame: &Frame) -> Result<(), ReactionPortFault> {
-        let incompatible = || {
-            ReactionPortFault::terminal(
-                ReactionPortFaultCode::Rejected,
-                ReactionPortFaultReason::ForkSnapshotIncompatible,
-            )
-        };
-        let declaration = self.frame_native_snapshot_declaration()?;
-        if !matches!(frame.basis(), FrameBasis::Full) {
-            return Err(incompatible());
-        }
-        frame
-            .check_handoff_precondition(&declaration)
-            .map_err(|_| incompatible())?;
-        // Prepare only a local candidate: no observation, transport poll,
-        // compaction policy evaluation, or worker launch occurs here.
-        ResponsesFrameRequestState::prepare_with_measurements(
-            self.reaction_frame.as_ref(),
-            frame,
-            &self.encoder,
-            self.max_responses_serialized_request_body_bytes,
-            &mut None,
-        )
-        .map(|_| ())
-        .map_err(|error| {
-            let fault = port_fault(error.failure_class(), format!("{error:?}"));
-            ReactionPortFault::terminal(
-                fault.code(),
-                ReactionPortFaultReason::ForkSnapshotIncompatible,
-            )
-        })
-    }
-}
-
-impl AsyncOpenAiResponsesProvider {
     async fn reject_frame_preparation(
         &self,
         frame: &Frame,
@@ -1345,6 +1396,13 @@ impl<S> NativeOpenAiStreamState<'_, S> {
         }
         let usage = validated_response_usage(payload).map_err(protocol_fault)?;
         observe_response_usage(&self.response_usage_observer, usage);
+        let response = &payload["response"];
+        self.frame_state.record_cached_response(
+            response["id"]
+                .as_str()
+                .expect("completed identity was validated"),
+            response.get("expire_at").and_then(Value::as_u64),
+        );
         self.response_completed = true;
         self.emissions
             .push_back(NativeEmission::Fact(ProviderFact::ReactionCompleted {
@@ -1536,6 +1594,815 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    fn ark_provider(base: &str) -> AsyncOpenAiResponsesProvider {
+        let mut provider = provider(base, None).without_parallel_compaction();
+        provider.encoder = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("test-model", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap()
+            .with_ark_caching(true),
+        );
+        provider
+    }
+
+    fn ark_user_input(text: &str) -> crate::transcript::CanonicalInputItem {
+        crate::transcript::CanonicalInputItem::message(
+            crate::transcript::ConversationRole::User,
+            crate::pom_resolution::resolve_system_document(crate::pom::Document::from_raw_text(
+                text,
+            )),
+        )
+    }
+
+    fn ark_frame(
+        declaration: &TargetDeclaration,
+        sequence: u64,
+        replay: Vec<crate::transcript::CanonicalInputItem>,
+        staged_inputs: Vec<crate::transcript::CanonicalInputItem>,
+        projection: Vec<crate::transcript::CanonicalInputItem>,
+        tools: ToolCatalog,
+    ) -> Frame {
+        let epoch = declaration.continuity().epoch();
+        let revision = FrameRevision::new(
+            NonZeroU128::new(700).unwrap(),
+            declaration.identity(),
+            epoch,
+            NonZeroU64::new(sequence).unwrap(),
+        );
+        let basis = match declaration.continuity() {
+            TargetContinuity::FullRequired { .. } => FrameBasis::Full,
+            TargetContinuity::Accepted { revision, .. } => FrameBasis::DeltaFrom(*revision),
+        };
+        Frame::from_compiled(
+            revision,
+            declaration.identity(),
+            epoch,
+            declaration.continuity().clone(),
+            declaration.profile().clone(),
+            basis,
+            FrameSubmission::from_compiled(
+                replay,
+                staged_inputs,
+                ProjectionSubmission::new(projection),
+                tools,
+                Vec::new(),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn ark_requests(audit: &Audit) -> Vec<Value> {
+        audit
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                OpenAiResponsesObservation::Request { body, .. } => {
+                    Some(serde_json::from_slice(body).unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ark_next_tool_sse() -> String {
+        let done = json!({
+            "id": "call_item_2",
+            "type": "function_call",
+            "status": "completed",
+            "call_id": "call_2",
+            "name": "lookup",
+            "arguments": "{\"page\":2}"
+        });
+        encode_sse([
+            json!({"type":"response.output_item.added","output_index":0,"item":{"id":"call_item_2","type":"function_call","status":"in_progress","call_id":"call_2","name":"lookup","arguments":""}}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"call_item_2","output_index":0,"delta":"{\"page\":2}"}),
+            json!({"type":"response.function_call_arguments.done","item_id":"call_item_2","output_index":0,"arguments":"{\"page\":2}"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":done.clone()}),
+            json!({"type":"response.completed","response":{"id":"resp_second_tool","status":"completed","output":[done]}}),
+        ])
+    }
+
+    async fn spawn_ark_response_sequence_server(
+        replies: Vec<(StatusCode, &'static str, String)>,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<Value>>>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        struct Sequence {
+            replies: Mutex<VecDeque<(StatusCode, &'static str, String)>>,
+            requests: Arc<Mutex<Vec<Value>>>,
+        }
+
+        async fn respond(
+            State(sequence): State<Arc<Sequence>>,
+            body: axum::body::Bytes,
+        ) -> impl IntoResponse {
+            sequence
+                .requests
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap());
+            let (status, content_type, body) = sequence
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("next response");
+            Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/responses", post(respond))
+            .with_state(Arc::new(Sequence {
+                replies: Mutex::new(VecDeque::from(replies)),
+                requests: requests.clone(),
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), requests, shutdown_tx, server)
+    }
+
+    #[tokio::test]
+    async fn temporary_ark_siblings_and_tool_continuation_keep_the_stored_parent() {
+        use crate::transcript::CanonicalInputItem;
+
+        let (base, requests, shutdown, server) = spawn_ark_response_sequence_server(vec![
+            (
+                StatusCode::OK,
+                "text/event-stream",
+                ark_compatible_text_sse(),
+            ),
+            (
+                StatusCode::OK,
+                "text/event-stream",
+                encode_sse(plaintext_reasoning_and_tool_events()),
+            ),
+            (StatusCode::OK, "text/event-stream", completed_text_sse()),
+            (StatusCode::OK, "text/event-stream", completed_text_sse()),
+            (StatusCode::OK, "text/event-stream", completed_text_sse()),
+        ])
+        .await;
+        let mut parent = ark_provider(&base);
+        assert_eq!(
+            parent.fork_temporary().err().unwrap().reason(),
+            ReactionPortFaultReason::ForkNotReady
+        );
+        let tools = ToolCatalog::new(vec!["lookup".into()]).unwrap();
+        let first_input = ark_user_input("main input");
+        let declaration = parent.declare().unwrap();
+        let initial = ark_frame(
+            &declaration,
+            1,
+            Vec::new(),
+            Vec::new(),
+            vec![first_input.clone()],
+            tools.clone(),
+        );
+        let facts: Vec<_> = parent
+            .submit(initial)
+            .await
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+            .await;
+        let output = facts
+            .iter()
+            .find_map(|fact| match fact {
+                ProviderFact::TextSealed { text, phase, .. } => {
+                    Some(CanonicalInputItem::assistant_text(text.clone(), *phase))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let accepted = parent.declare().unwrap();
+        let parent_revision = parent.reaction_frame.as_ref().unwrap().revision();
+        let parent_wire = parent.reaction_frame.as_ref().unwrap().clone();
+        let mut checkpoint = parent.fork_temporary().unwrap();
+        let mut child = checkpoint.fork_temporary().unwrap();
+        let mut sibling = checkpoint.fork_temporary().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let child_declaration = child.declare().unwrap();
+        let sibling_declaration = sibling.declare().unwrap();
+        assert_ne!(child_declaration.identity(), sibling_declaration.identity());
+        assert_ne!(child_declaration.identity(), accepted.identity());
+        let child_frame = ark_frame(
+            &child_declaration,
+            1,
+            vec![first_input.clone(), output.clone()],
+            Vec::new(),
+            vec![ark_user_input("temporary input")],
+            tools.clone(),
+        );
+        let child_facts: Vec<_> = child
+            .submit(child_frame)
+            .await
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+            .await;
+        let call = child_facts
+            .iter()
+            .find_map(|fact| match fact {
+                ProviderFact::ToolCall { call, .. } => Some(
+                    CanonicalInputItem::tool_call(
+                        call.call_id(),
+                        call.name(),
+                        call.raw_arguments(),
+                    )
+                    .unwrap(),
+                ),
+                _ => None,
+            })
+            .unwrap();
+        let sibling_frame = ark_frame(
+            &sibling_declaration,
+            1,
+            vec![first_input, output.clone()],
+            Vec::new(),
+            vec![ark_user_input("sibling input")],
+            tools.clone(),
+        );
+        let sibling_facts: Vec<_> = sibling.submit(sibling_frame).await.unwrap().collect().await;
+        assert!(sibling_facts.iter().all(Result::is_ok));
+        let child_accepted = child.declare().unwrap();
+        let child_next = ark_frame(
+            &child_accepted,
+            2,
+            vec![call],
+            vec![CanonicalInputItem::tool_result("call_1", "actual temporary result").unwrap()],
+            vec![ark_user_input("continue temporary")],
+            tools.clone(),
+        );
+        let continued: Vec<_> = child.submit(child_next).await.unwrap().collect().await;
+        assert!(continued.iter().all(Result::is_ok));
+        assert_eq!(parent.declare().unwrap(), accepted);
+        assert_eq!(
+            parent.reaction_frame.as_ref().unwrap().revision(),
+            parent_revision
+        );
+        assert_eq!(
+            parent.reaction_frame.as_ref().unwrap().wire_coverage(),
+            parent_wire.wire_coverage()
+        );
+        assert_eq!(
+            parent.reaction_frame.as_ref().unwrap().accepted_prefix(),
+            parent_wire.accepted_prefix()
+        );
+        let main = ark_frame(
+            &accepted,
+            2,
+            vec![output],
+            Vec::new(),
+            vec![ark_user_input("main continuation")],
+            tools,
+        );
+        let continued: Vec<_> = parent.submit(main).await.unwrap().collect().await;
+        assert!(continued.iter().all(Result::is_ok));
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 5);
+            for request in &requests[1..4] {
+                assert_eq!(request["previous_response_id"], "resp_ark_1");
+                assert_eq!(request["store"], false);
+                assert!(request.get("caching").is_none());
+                assert!(request.get("tools").is_none());
+            }
+            assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+            assert_eq!(requests[2]["input"].as_array().unwrap().len(), 1);
+            let scratch = requests[3]["input"].as_array().unwrap();
+            assert_eq!(scratch.len(), 5);
+            assert_eq!(scratch[1]["type"], "reasoning");
+            assert_eq!(scratch[2]["type"], "function_call");
+            assert_eq!(scratch[3]["type"], "function_call_output");
+            assert_eq!(scratch[3]["output"], "actual temporary result");
+            assert_eq!(requests[4]["previous_response_id"], "resp_ark_1");
+            assert_eq!(requests[4]["store"], true);
+            assert_eq!(requests[4]["input"].as_array().unwrap().len(), 1);
+        }
+        child.shutdown().await;
+        sibling.shutdown().await;
+        checkpoint.shutdown().await;
+        parent.shutdown().await;
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ark_caching_missing_remote_response_recovers_with_full_replay_without_observer() {
+        use crate::transcript::CanonicalInputItem;
+
+        let missing = json!({
+            "error": {
+                "code": "InvalidParameter.PreviousResponseNotFound",
+                "message": "The previous response is no longer available."
+            }
+        });
+        let (base, requests, shutdown, server) = spawn_ark_response_sequence_server(vec![
+            (
+                StatusCode::OK,
+                "text/event-stream",
+                ark_compatible_text_sse(),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                missing.to_string(),
+            ),
+            (StatusCode::OK, "text/event-stream", completed_text_sse()),
+        ])
+        .await;
+        let mut provider = ark_provider(&base);
+        assert!(provider.observer.is_none());
+        let initial = provider.declare().unwrap();
+        let tools = ToolCatalog::new(vec!["lookup".into()]).unwrap();
+        let first_input = ark_user_input("Inspect the retained context.");
+        let first = ark_frame(
+            &initial,
+            1,
+            Vec::new(),
+            Vec::new(),
+            vec![first_input.clone()],
+            tools.clone(),
+        );
+        let first: Vec<_> = provider.submit(first).await.unwrap().collect().await;
+        let first: Vec<_> = first.into_iter().map(Result::unwrap).collect();
+        assert!(matches!(
+            first.last(),
+            Some(ProviderFact::ReactionCompleted { .. })
+        ));
+        let previous_output = first
+            .iter()
+            .find_map(|fact| match fact {
+                ProviderFact::TextSealed { text, phase, .. } => {
+                    Some(CanonicalInputItem::assistant_text(text.clone(), *phase))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let next_input = ark_user_input("Inspect the next action.");
+        let accepted = provider.declare().unwrap();
+        let next = ark_frame(
+            &accepted,
+            2,
+            vec![previous_output.clone()],
+            Vec::new(),
+            vec![next_input.clone()],
+            tools.clone(),
+        );
+        let failed: Vec<_> = provider.submit(next).await.unwrap().collect().await;
+        let fault = match failed.as_slice() {
+            [Err(fault)] => *fault,
+            _ => panic!("missing cached response did not yield one fault: {failed:?}"),
+        };
+        assert_eq!(fault.kind(), ReactionPortFaultKind::Retryable);
+        assert_eq!(fault.code(), ReactionPortFaultCode::Unavailable);
+        assert_eq!(fault.reason(), ReactionPortFaultReason::UpstreamRejected);
+        let recovery = provider.declare().unwrap();
+        assert!(matches!(
+            recovery.continuity(),
+            TargetContinuity::FullRequired { epoch }
+                if *epoch > accepted.continuity().epoch()
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+
+        let next = ark_frame(
+            &recovery,
+            3,
+            vec![first_input, previous_output, next_input],
+            Vec::new(),
+            Vec::new(),
+            tools,
+        );
+        let recovered: Vec<_> = provider.submit(next).await.unwrap().collect().await;
+        let recovered: Vec<_> = recovered.into_iter().map(Result::unwrap).collect();
+        assert!(matches!(
+            recovered.last(),
+            Some(ProviderFact::ReactionCompleted {
+                primary_text: Some(_)
+            })
+        ));
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(requests[1]["previous_response_id"], "resp_ark_1");
+            assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+            assert!(requests[2].get("previous_response_id").is_none());
+            let replay = requests[2]["input"].as_array().unwrap();
+            assert_eq!(replay.len(), 3);
+            assert_eq!(replay[0], requests[0]["input"][0]);
+            assert_eq!(replay[1]["role"], "assistant");
+            assert_eq!(replay[2], requests[1]["input"][0]);
+            assert_eq!(requests[2]["tools"][0]["name"], "lookup");
+            assert_eq!(requests[2]["store"], true);
+            assert_eq!(requests[2]["caching"]["type"], "enabled");
+        }
+        assert!(matches!(
+            provider.declare().unwrap().continuity(),
+            TargetContinuity::Accepted { .. }
+        ));
+        provider.shutdown().await;
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ark_caching_unrelated_bad_request_and_initial_missing_response_remain_terminal() {
+        use crate::transcript::CanonicalInputItem;
+
+        for continue_cached_response in [false, true] {
+            let code = if continue_cached_response {
+                "InvalidParameter.SomeOtherField"
+            } else {
+                "InvalidParameter.PreviousResponseNotFound"
+            };
+            let error = json!({"error":{"code":code}});
+            let mut replies = Vec::new();
+            if continue_cached_response {
+                replies.push((StatusCode::OK, "text/event-stream", completed_text_sse()));
+            }
+            replies.push((
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                error.to_string(),
+            ));
+            let (base, requests, shutdown, server) =
+                spawn_ark_response_sequence_server(replies).await;
+            let mut provider = ark_provider(&base);
+            assert!(provider.observer.is_none());
+            let initial = provider.declare().unwrap();
+            let failing_frame = if continue_cached_response {
+                let first: Vec<_> = provider
+                    .submit(full_frame(&initial))
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await;
+                let first: Vec<_> = first.into_iter().map(Result::unwrap).collect();
+                assert!(matches!(
+                    first.last(),
+                    Some(ProviderFact::ReactionCompleted { .. })
+                ));
+                let accepted = provider.declare().unwrap();
+                ark_frame(
+                    &accepted,
+                    2,
+                    vec![CanonicalInputItem::assistant_text("hello", None)],
+                    Vec::new(),
+                    vec![ark_user_input("Continue using the current context.")],
+                    ToolCatalog::new(Vec::new()).unwrap(),
+                )
+            } else {
+                full_frame(&initial)
+            };
+            let failed: Vec<_> = provider
+                .submit(failing_frame)
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            let fault = match failed.as_slice() {
+                [Err(fault)] => *fault,
+                _ => panic!("bad request did not yield one fault: {failed:?}"),
+            };
+            assert_eq!(fault.kind(), ReactionPortFaultKind::Terminal);
+            assert_eq!(fault.code(), ReactionPortFaultCode::Rejected);
+            assert_eq!(fault.reason(), ReactionPortFaultReason::UpstreamRejected);
+            assert_eq!(provider.declare().unwrap_err(), fault);
+            {
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), if continue_cached_response { 2 } else { 1 });
+                assert_eq!(
+                    requests
+                        .last()
+                        .unwrap()
+                        .get("previous_response_id")
+                        .is_some(),
+                    continue_cached_response
+                );
+            }
+            provider.shutdown().await;
+            let _ = shutdown.send(());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ark_caching_uses_completed_response_id_for_the_next_delta_upload() {
+        use crate::transcript::{CanonicalInputItem, InstructionAuthority};
+
+        let (base, shutdown, server) =
+            spawn_sse_sequence_server(vec![ark_compatible_text_sse(), completed_text_sse()]).await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = ark_provider(&base).with_observer(audit.clone());
+        let initial = provider.declare().unwrap();
+        let system = CanonicalInputItem::instruction(
+            InstructionAuthority::System,
+            crate::pom_resolution::resolve_system_document(crate::pom::Document::from_raw_text(
+                "Use the current state and available actions.",
+            )),
+        );
+        let tools = ToolCatalog::new(vec!["lookup".into()]).unwrap();
+        let first = ark_frame(
+            &initial,
+            1,
+            Vec::new(),
+            Vec::new(),
+            vec![system, ark_user_input("Inspect the current state.")],
+            tools.clone(),
+        );
+        let first: Vec<_> = provider.submit(first).await.unwrap().collect().await;
+        let first: Vec<_> = first.into_iter().map(Result::unwrap).collect();
+        assert!(matches!(
+            first.last(),
+            Some(ProviderFact::ReactionCompleted {
+                primary_text: Some(_)
+            })
+        ));
+        let previous_output = first
+            .iter()
+            .find_map(|fact| match fact {
+                ProviderFact::TextSealed { text, phase, .. } => {
+                    Some(CanonicalInputItem::assistant_text(text.clone(), *phase))
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        let next_input = ark_user_input("Inspect the next available action.");
+        let expected_input = provider
+            .encoder
+            .lower_canonical_item(&next_input)
+            .unwrap()
+            .into_parts()
+            .1;
+        let accepted = provider.declare().unwrap();
+        let next = ark_frame(
+            &accepted,
+            2,
+            vec![previous_output],
+            Vec::new(),
+            vec![next_input],
+            tools,
+        );
+        let second: Vec<_> = provider.submit(next).await.unwrap().collect().await;
+        let second: Vec<_> = second.into_iter().map(Result::unwrap).collect();
+        assert!(matches!(
+            second.last(),
+            Some(ProviderFact::ReactionCompleted {
+                primary_text: Some(_)
+            })
+        ));
+
+        let requests = ark_requests(&audit);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].get("previous_response_id").is_none());
+        assert_eq!(requests[0]["input"][0]["role"], "system");
+        assert_eq!(requests[0]["input"][1]["role"], "user");
+        assert_eq!(requests[0]["tools"][0]["name"], "lookup");
+        assert_eq!(requests[1]["previous_response_id"], "resp_ark_1");
+        assert_eq!(requests[1]["input"], Value::Array(expected_input));
+        for request in &requests {
+            assert_eq!(request["store"], true);
+            assert_eq!(request["caching"]["type"], "enabled");
+            assert!(request.get("instructions").is_none());
+        }
+        assert!(requests[1].get("tools").is_none());
+        provider.shutdown().await;
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ark_caching_delivers_tool_feedback_then_accepts_the_next_action() {
+        use crate::transcript::CanonicalInputItem;
+
+        let (base, shutdown, server) = spawn_sse_sequence_server(vec![
+            reasoning_and_tool_sse(),
+            ark_next_tool_sse(),
+            completed_text_sse(),
+        ])
+        .await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = ark_provider(&base).with_observer(audit.clone());
+        let tools = ToolCatalog::new(vec!["lookup".into()]).unwrap();
+        let initial = provider.declare().unwrap();
+        let first = ark_frame(
+            &initial,
+            1,
+            Vec::new(),
+            Vec::new(),
+            vec![ark_user_input("Read both pages and report the result.")],
+            tools.clone(),
+        );
+        let first: Vec<_> = provider.submit(first).await.unwrap().collect().await;
+        let first: Vec<_> = first.into_iter().map(Result::unwrap).collect();
+        let first_call = match first.as_slice() {
+            [ProviderFact::ToolCall { call, .. }, ProviderFact::ReactionCompleted { primary_text: None }] =>
+            {
+                assert_eq!(call.call_id(), "call_1");
+                assert_eq!(call.name(), "lookup");
+                call.clone()
+            }
+            _ => panic!("first response did not expose the first tool action: {first:?}"),
+        };
+        let first_output = json!({"page": 1, "has_more": true}).to_string();
+        let accepted = provider.declare().unwrap();
+        let feedback = ark_frame(
+            &accepted,
+            2,
+            vec![CanonicalInputItem::tool_call(
+                first_call.call_id(),
+                first_call.name(),
+                first_call.raw_arguments(),
+            )
+            .unwrap()],
+            vec![CanonicalInputItem::tool_result(first_call.call_id(), &first_output).unwrap()],
+            Vec::new(),
+            tools.clone(),
+        );
+        let second: Vec<_> = provider.submit(feedback).await.unwrap().collect().await;
+        let second: Vec<_> = second.into_iter().map(Result::unwrap).collect();
+        let second_call = match second.as_slice() {
+            [ProviderFact::ToolCall { call, .. }, ProviderFact::ReactionCompleted { primary_text: None }] =>
+            {
+                assert_eq!(call.call_id(), "call_2");
+                assert_eq!(call.name(), "lookup");
+                assert_eq!(
+                    serde_json::from_str::<Value>(call.raw_arguments()).unwrap(),
+                    json!({"page": 2})
+                );
+                call.clone()
+            }
+            _ => panic!("feedback did not lead to the next tool action: {second:?}"),
+        };
+        let second_output = json!({"page": 2, "has_more": false}).to_string();
+        let accepted = provider.declare().unwrap();
+        let feedback = ark_frame(
+            &accepted,
+            3,
+            vec![CanonicalInputItem::tool_call(
+                second_call.call_id(),
+                second_call.name(),
+                second_call.raw_arguments(),
+            )
+            .unwrap()],
+            vec![CanonicalInputItem::tool_result(second_call.call_id(), &second_output).unwrap()],
+            Vec::new(),
+            tools,
+        );
+        let third: Vec<_> = provider.submit(feedback).await.unwrap().collect().await;
+        let third: Vec<_> = third.into_iter().map(Result::unwrap).collect();
+        assert!(third
+            .iter()
+            .any(|fact| matches!(fact, ProviderFact::TextSealed { .. })));
+        assert!(matches!(
+            third.last(),
+            Some(ProviderFact::ReactionCompleted {
+                primary_text: Some(_)
+            })
+        ));
+
+        let requests = ark_requests(&audit);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["tools"][0]["name"], "lookup");
+        for (index, response_id, call_id, output) in [
+            (1, "resp_reasoning_tool", "call_1", first_output),
+            (2, "resp_second_tool", "call_2", second_output),
+        ] {
+            assert_eq!(requests[index]["previous_response_id"], response_id);
+            assert_eq!(
+                requests[index]["input"],
+                json!([{"type":"function_call_output","call_id":call_id,"output":output}])
+            );
+            assert_eq!(requests[index]["store"], true);
+            assert_eq!(requests[index]["caching"]["type"], "enabled");
+            assert!(requests[index].get("tools").is_none());
+            assert!(requests[index].get("instructions").is_none());
+        }
+        provider.shutdown().await;
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ark_caching_context_reset_starts_a_new_remote_chain() {
+        let (base, shutdown, server) =
+            spawn_sse_sequence_server(vec![ark_compatible_text_sse(), completed_text_sse()]).await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = ark_provider(&base).with_observer(audit.clone());
+        let initial = provider.declare().unwrap();
+        let tools = ToolCatalog::new(vec!["lookup".into()]).unwrap();
+        let first = ark_frame(
+            &initial,
+            1,
+            Vec::new(),
+            Vec::new(),
+            vec![ark_user_input("Inspect the prior context.")],
+            tools.clone(),
+        );
+        let first: Vec<_> = provider.submit(first).await.unwrap().collect().await;
+        let first: Vec<_> = first.into_iter().map(Result::unwrap).collect();
+        assert!(matches!(
+            first.last(),
+            Some(ProviderFact::ReactionCompleted { .. })
+        ));
+        let accepted = provider.declare().unwrap();
+        let reset = provider.reset_model_context().unwrap();
+        assert!(matches!(
+            reset.continuity(),
+            TargetContinuity::FullRequired { epoch }
+                if *epoch > accepted.continuity().epoch()
+        ));
+        let replacement = ark_user_input("Inspect the replacement context.");
+        let expected_input = provider
+            .encoder
+            .lower_canonical_item(&replacement)
+            .unwrap()
+            .into_parts()
+            .1;
+        let next = ark_frame(&reset, 2, Vec::new(), Vec::new(), vec![replacement], tools);
+        let second: Vec<_> = provider.submit(next).await.unwrap().collect().await;
+        let second: Vec<_> = second.into_iter().map(Result::unwrap).collect();
+        assert!(matches!(
+            second.last(),
+            Some(ProviderFact::ReactionCompleted { .. })
+        ));
+        let requests = ark_requests(&audit);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["input"], Value::Array(expected_input));
+        assert_eq!(requests[1]["tools"][0]["name"], "lookup");
+        assert_eq!(requests[1]["store"], true);
+        assert_eq!(requests[1]["caching"]["type"], "enabled");
+        provider.shutdown().await;
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[cfg(feature = "legacy-provider-port")]
+    #[allow(
+        deprecated,
+        reason = "this test verifies Ark caching rejects legacy execution before handoff"
+    )]
+    #[tokio::test]
+    async fn ark_caching_rejects_legacy_before_handoff_and_preserves_native_use() {
+        let (base, shutdown, server) = spawn_sse_server(completed_text_sse()).await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = ark_provider(&base).with_observer(audit.clone());
+        let initial = provider.reaction_target.declaration().unwrap();
+        let error = match ProviderPort::execute(&mut provider, empty_projection()).await {
+            Err(error) => error,
+            Ok(_) => panic!("Ark caching was accepted by the legacy provider port"),
+        };
+        assert_eq!(
+            error.code(),
+            crate::component::execution::ProviderFaultCode::RequestPreparation
+        );
+        assert!(audit.events.lock().unwrap().is_empty());
+        assert_eq!(
+            provider.execution_mode,
+            super::ResponsesExecutionMode::Unclaimed
+        );
+        assert_eq!(provider.declare().unwrap(), initial);
+        let facts: Vec<_> = provider
+            .submit(full_frame(&initial))
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let facts: Vec<_> = facts.into_iter().map(Result::unwrap).collect();
+        assert!(matches!(
+            facts.last(),
+            Some(ProviderFact::ReactionCompleted { .. })
+        ));
+        assert_eq!(ark_requests(&audit).len(), 1);
+        provider.shutdown().await;
+        let _ = shutdown.send(());
+        server.await.unwrap();
     }
 
     #[tokio::test]

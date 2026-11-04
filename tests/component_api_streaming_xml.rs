@@ -75,13 +75,13 @@ fn response_contract(state: Signal<ContractState>) -> Component {
     XmlStreamingToolCall::contract("streaming-xml.selection", "v1")
         .empty_element("selection")
         .required_attribute::<u32>("value")
-        .on_decoded(move |value| {
+        .on_decoded(move |_ctx, value| {
             let state = decoded_state.clone();
             async move {
                 state.update(|state| reduce_contract(state, ContractAction::Decoded(value)))
             }
         })
-        .on_invalid(move |diagnostic| {
+        .on_invalid(move |_ctx, diagnostic| {
             let state = invalid_state.clone();
             async move {
                 state.update(|state| {
@@ -227,18 +227,18 @@ fn shared_hub_application(props: SharedHubProps, _events: EventInput<ProviderEve
             XmlStreamingToolCall::contract("streaming-xml.shared-selection", "v1")
                 .empty_element("selection")
                 .required_attribute::<u32>("value")
-                .on_decoded(move |value| {
+                .on_decoded(move |_ctx, value| {
                     let events = Arc::clone(&decoded_events);
                     async move {
                         events.lock().unwrap().push(format!("decoded:{value}"));
                         Ok::<(), Infallible>(())
                     }
                 })
-                .on_invalid(|_| async { Ok::<(), Infallible>(()) })
+                .on_invalid(|_ctx, _| async { Ok::<(), Infallible>(()) })
         }
         {
             StreamingXml::tag("selection")
-                .on_open(move |element| {
+                .on_open(move |_ctx, element| {
                     let events = Arc::clone(&open_events);
                     async move {
                         events.lock().unwrap().push(format!(
@@ -248,7 +248,7 @@ fn shared_hub_application(props: SharedHubProps, _events: EventInput<ProviderEve
                         Ok::<(), Infallible>(())
                     }
                 })
-                .on_complete(move |element| {
+                .on_complete(move |_ctx, element| {
                     let events = Arc::clone(&complete_events);
                     async move {
                         events.lock().unwrap().push(format!(

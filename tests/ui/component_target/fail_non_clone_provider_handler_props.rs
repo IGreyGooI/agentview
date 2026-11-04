@@ -8,7 +8,7 @@ struct NonCloneProps {
 
 #[component]
 fn provider_handler_component(props: NonCloneProps) -> Component {
-    use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
         let label = props.label.clone();
         async move {
             let _ = label;

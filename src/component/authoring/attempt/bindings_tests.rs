@@ -65,7 +65,7 @@ fn ordered_handlers(log: Arc<Mutex<Vec<String>>>, events: EventInput<TestEvent>)
         {
             EventListener::observe("test.order.first", "v1")
                 .listen_to(ticks.clone())
-                .on_event(move |tick| {
+                .on_event(move |_ctx, tick| {
                     let log = Arc::clone(&first_log);
                     async move {
                         log.lock().unwrap().push(format!("first:{tick}"));
@@ -78,7 +78,7 @@ fn ordered_handlers(log: Arc<Mutex<Vec<String>>>, events: EventInput<TestEvent>)
         {
             EventListener::observe("test.order.second", "v1")
                 .listen_to(ticks)
-                .on_event(move |tick| {
+                .on_event(move |_ctx, tick| {
                     let log = Arc::clone(&second_log);
                     async move {
                         log.lock().unwrap().push(format!("second:{tick}"));
@@ -103,7 +103,7 @@ async fn dispatch_awaits_matching_handlers_in_structural_order() {
 fn ordered_provider_handlers(log: Arc<Mutex<Vec<String>>>) -> Component {
     let first_log = Arc::clone(&log);
     let second_log = Arc::clone(&log);
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let log = Arc::clone(&first_log);
         async move {
             let TextTurnEvent::TextDelta(text) = event else {
@@ -115,7 +115,7 @@ fn ordered_provider_handlers(log: Arc<Mutex<Vec<String>>>) -> Component {
             Ok::<(), Infallible>(())
         }
     });
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let log = Arc::clone(&second_log);
         async move {
             let TextTurnEvent::TextDelta(text) = event else {
@@ -161,7 +161,7 @@ async fn provider_hook_handlers_are_awaited_in_hook_order() {
 
 #[component]
 fn normal_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
-    use_reaction_completion(move || {
+    use_reaction_completion(move |_ctx| {
         log.lock().unwrap().push(String::from("reaction:complete"));
         ready(Ok::<(), Infallible>(()))
     });
@@ -187,7 +187,7 @@ async fn normal_finish_invokes_reaction_completion_once() {
 #[component]
 fn empty_stream_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
     let completion_log = Arc::clone(&log);
-    use_reaction_completion(move || {
+    use_reaction_completion(move |_ctx| {
         completion_log
             .lock()
             .unwrap()
@@ -196,8 +196,8 @@ fn empty_stream_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
     });
     XmlStreamingToolCall::contract("test.empty-reaction", "v1")
         .empty_element("choice")
-        .on_decoded(|| ready(Ok::<(), Infallible>(())))
-        .on_invalid(move |diagnostic| {
+        .on_decoded(|_ctx| ready(Ok::<(), Infallible>(())))
+        .on_invalid(move |_ctx, diagnostic| {
             log.lock().unwrap().push(format!("invalid:{diagnostic:?}"));
             ready(Ok::<(), Infallible>(()))
         })
@@ -218,7 +218,7 @@ async fn empty_stream_without_text_complete_reaches_reaction_completion() {
 #[component]
 fn ordered_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
     let raw_log = Arc::clone(&log);
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let log = Arc::clone(&raw_log);
         async move {
             if matches!(event, TextTurnEvent::TextComplete(_)) {
@@ -229,7 +229,7 @@ fn ordered_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
     });
 
     let first_completion_log = Arc::clone(&log);
-    use_reaction_completion(move || async move {
+    use_reaction_completion(move |_ctx| async move {
         first_completion_log
             .lock()
             .unwrap()
@@ -242,7 +242,7 @@ fn ordered_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
         Ok::<(), Infallible>(())
     });
     let second_completion_log = Arc::clone(&log);
-    use_reaction_completion(move || {
+    use_reaction_completion(move |_ctx| {
         second_completion_log
             .lock()
             .unwrap()
@@ -256,17 +256,17 @@ fn ordered_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
         {
             XmlStreamingToolCall::contract("test.completion-decoded", "v1")
                 .empty_element("choice")
-                .on_decoded(move || {
+                .on_decoded(move |_ctx| {
                     decoded_log.lock().unwrap().push(String::from("decoded"));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_invalid(|_| ready(Ok::<(), Infallible>(())))
+                .on_invalid(|_ctx, _| ready(Ok::<(), Infallible>(())))
         }
         {
             XmlStreamingToolCall::contract("test.completion-eof", "v1")
                 .empty_element("unfinished")
-                .on_decoded(|| ready(Ok::<(), Infallible>(())))
-                .on_invalid(move |_| {
+                .on_decoded(|_ctx| ready(Ok::<(), Infallible>(())))
+                .on_invalid(move |_ctx, _| {
                     invalid_log.lock().unwrap().push(String::from("eof:invalid"));
                     ready(Ok::<(), Infallible>(()))
                 })
@@ -348,12 +348,12 @@ async fn empty_delta_without_text_complete_stays_a_protocol_fault() {
 
 #[component]
 fn failing_reaction_completion(log: Arc<Mutex<Vec<String>>>) -> Component {
-    use_reaction_completion(|| {
+    use_reaction_completion(|_ctx| {
         ready(Err::<(), _>(HandlerError(
             "reaction completion returned error",
         )))
     });
-    use_reaction_completion(move || {
+    use_reaction_completion(move |_ctx| {
         log.lock().unwrap().push(String::from("must-not-run"));
         ready(Ok::<(), Infallible>(()))
     });
@@ -383,7 +383,7 @@ async fn reaction_completion_error_stops_later_callbacks_and_faults_bindings_clo
 
 #[component]
 fn provider_order_leaf(label: String, log: Arc<Mutex<Vec<String>>>) -> Component {
-    use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
         let label = label.clone();
         let log = Arc::clone(&log);
         async move {
@@ -397,7 +397,7 @@ fn provider_order_leaf(label: String, log: Arc<Mutex<Vec<String>>>) -> Component
 #[component]
 fn provider_order_branch(log: Arc<Mutex<Vec<String>>>) -> Component {
     let branch_log = Arc::clone(&log);
-    use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
         let log = Arc::clone(&branch_log);
         async move {
             log.lock().unwrap().push(String::from("branch"));
@@ -412,7 +412,7 @@ fn provider_order_branch(log: Arc<Mutex<Vec<String>>>) -> Component {
 #[component]
 fn provider_order_root(log: Arc<Mutex<Vec<String>>>) -> Component {
     let parent_log = Arc::clone(&log);
-    use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
         let log = Arc::clone(&parent_log);
         async move {
             log.lock().unwrap().push(String::from("parent"));
@@ -448,7 +448,7 @@ async fn provider_handlers_follow_parent_sibling_and_nested_component_order() {
 #[component]
 fn synchronous_provider_signal_write() -> Component {
     let value = use_signal(|| 0_u32);
-    use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
         value.set(1).unwrap();
         ready(Ok::<(), Infallible>(()))
     });
@@ -476,7 +476,7 @@ async fn provider_handler_start_does_not_hold_the_mount_fence_during_user_code()
 #[component]
 fn captured_provider_handler(label: String, log: Arc<Mutex<Vec<String>>>) -> Component {
     let handler_label = label.clone();
-    use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
         let log = Arc::clone(&log);
         let label = handler_label.clone();
         async move {
@@ -522,7 +522,7 @@ fn provider_handler_before_failing_descendant(
     fail: bool,
     log: Arc<Mutex<Vec<String>>>,
 ) -> Component {
-    use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
         let label = label.clone();
         let log = Arc::clone(&log);
         async move {
@@ -595,7 +595,7 @@ enum ProviderHandlerFailure {
 
 #[component]
 fn failing_provider_handler(failure: ProviderHandlerFailure) -> Component {
-    use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
         if matches!(failure, ProviderHandlerFailure::InvocationPanic) {
             panic!("provider hook invocation panic");
         }
@@ -651,7 +651,7 @@ async fn provider_hook_returned_error_fails_dispatch_closed() {
 
 #[component]
 fn system_provider_handler() -> Component {
-    use_provider_event_handler(ProviderEvent::TEXT, |_event| {
+    use_provider_event_handler(ProviderEvent::TEXT, |_ctx, _event| {
         ready(Ok::<(), Infallible>(()))
     });
     view! {}
@@ -684,7 +684,7 @@ fn provider_handler_is_rejected_inside_system_once() {
 fn aliased_provider_handler_is_not_a_hook() -> Component {
     use crate::component::authoring::use_provider_event_handler as install_handler;
 
-    install_handler(ProviderEvent::TEXT, |_event| {
+    install_handler(ProviderEvent::TEXT, |_ctx, _event| {
         ready(Ok::<(), Infallible>(()))
     });
     view! {}
@@ -708,13 +708,13 @@ fn unsupported_provider_handler_alias_panics() {
 #[component]
 fn public_mixed_hook_order(alternate: bool) -> Component {
     if alternate {
-        use_provider_event_handler(ProviderEvent::TEXT, |_event| {
+        use_provider_event_handler(ProviderEvent::TEXT, |_ctx, _event| {
             ready(Ok::<(), Infallible>(()))
         });
         let _value = use_signal(|| 1_u32);
     } else {
         let _value = use_signal(|| 2_u32);
-        use_provider_event_handler(ProviderEvent::TEXT, |_event| {
+        use_provider_event_handler(ProviderEvent::TEXT, |_ctx, _event| {
             ready(Ok::<(), Infallible>(()))
         });
     }
@@ -919,7 +919,7 @@ fn signal_handler(log: Arc<Mutex<Vec<String>>>, events: EventInput<TestEvent>) -
         {
             EventListener::observe("test.signal", "v1")
                 .listen_to(events.select(TestEvent::TICK))
-                .on_event(move |next| {
+                .on_event(move |_ctx, next| {
                     let value = handler_value.clone();
                     let log = Arc::clone(&handler_log);
                     async move {
@@ -951,7 +951,7 @@ fn streaming_handlers(log: Arc<Mutex<Vec<String>>>, events: EventInput<TestEvent
         .empty_element("choice")
         .required_attribute::<u32>("value")
         .listen_to(events.select(TestEvent::TEXT))
-        .on_decoded(move |value| {
+        .on_decoded(move |_ctx, value| {
             let log = Arc::clone(&decoded_log);
             async move {
                 tokio::task::yield_now().await;
@@ -959,7 +959,7 @@ fn streaming_handlers(log: Arc<Mutex<Vec<String>>>, events: EventInput<TestEvent
                 Ok::<(), Infallible>(())
             }
         })
-        .on_invalid(move |diagnostic| {
+        .on_invalid(move |_ctx, diagnostic| {
             let log = Arc::clone(&invalid_log);
             async move {
                 log.lock().unwrap().push(format!("invalid:{diagnostic:?}"));
@@ -1010,11 +1010,11 @@ fn native_streaming_alternatives(log: Arc<Mutex<Vec<String>>>) -> Component {
             XmlStreamingToolCall::contract("test.native.choice", "v1")
                 .empty_element("choice")
                 .required_attribute::<u32>("value")
-                .on_decoded(move |value| {
+                .on_decoded(move |_ctx, value| {
                     choice_decoded.lock().unwrap().push(format!("choice:{value}"));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_invalid(move |diagnostic| {
+                .on_invalid(move |_ctx, diagnostic| {
                     choice_invalid
                         .lock()
                         .unwrap()
@@ -1025,14 +1025,14 @@ fn native_streaming_alternatives(log: Arc<Mutex<Vec<String>>>) -> Component {
         {
             XmlStreamingToolCall::contract("test.native.resign", "v1")
                 .empty_element("resign")
-                .on_decoded(move || {
+                .on_decoded(move |_ctx| {
                     resign_decoded
                         .lock()
                         .unwrap()
                         .push(String::from("resign"));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_invalid(move |diagnostic| {
+                .on_invalid(move |_ctx, diagnostic| {
                     resign_invalid
                         .lock()
                         .unwrap()
@@ -1050,11 +1050,11 @@ fn native_optional_attribute_free(log: Arc<Mutex<Vec<String>>>) -> Component {
 
     XmlStreamingToolCall::contract("test.native.optional-empty", "v1")
         .empty_element("resign")
-        .on_decoded(move || {
+        .on_decoded(move |_ctx| {
             decoded_log.lock().unwrap().push(String::from("decoded"));
             ready(Ok::<(), Infallible>(()))
         })
-        .on_invalid(move |diagnostic| {
+        .on_invalid(move |_ctx, diagnostic| {
             invalid_log
                 .lock()
                 .unwrap()
@@ -1075,7 +1075,7 @@ fn native_interleaved_streaming(log: Arc<Mutex<Vec<String>>>) -> Component {
             XmlStreamingToolCall::contract("test.native.interleaved-a", "v1")
                 .empty_element("a")
                 .required_attribute::<u32>("value")
-                .on_decoded(move |value| {
+                .on_decoded(move |_ctx, value| {
                     let log = Arc::clone(&a_decoded);
                     async move {
                         log.lock().unwrap().push(format!("a:{value}:start"));
@@ -1084,7 +1084,7 @@ fn native_interleaved_streaming(log: Arc<Mutex<Vec<String>>>) -> Component {
                         Ok::<(), Infallible>(())
                     }
                 })
-                .on_invalid(move |diagnostic| {
+                .on_invalid(move |_ctx, diagnostic| {
                     a_invalid.lock().unwrap().push(format!("a:invalid:{diagnostic:?}"));
                     ready(Ok::<(), Infallible>(()))
                 })
@@ -1092,11 +1092,11 @@ fn native_interleaved_streaming(log: Arc<Mutex<Vec<String>>>) -> Component {
         {
             XmlStreamingToolCall::contract("test.native.interleaved-b", "v1")
                 .empty_element("b")
-                .on_decoded(move || {
+                .on_decoded(move |_ctx| {
                     b_decoded.lock().unwrap().push(String::from("b"));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_invalid(move |diagnostic| {
+                .on_invalid(move |_ctx, diagnostic| {
                     b_invalid.lock().unwrap().push(format!("b:invalid:{diagnostic:?}"));
                     ready(Ok::<(), Infallible>(()))
                 })
@@ -1113,7 +1113,7 @@ fn native_streaming_lifecycle(log: Arc<Mutex<Vec<String>>>) -> Component {
     view! {
         {
             StreamingXml::tag("speak")
-                .on_open(move |element| {
+                .on_open(move |_ctx, element| {
                     open_log.lock().unwrap().push(format!(
                         "open:{}:{}",
                         element.attr("mood").unwrap_or_default(),
@@ -1121,21 +1121,21 @@ fn native_streaming_lifecycle(log: Arc<Mutex<Vec<String>>>) -> Component {
                     ));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_stream(move |element| {
+                .on_stream(move |_ctx, element| {
                     stream_log
                         .lock()
                         .unwrap()
                         .push(format!("stream:{}", element.content));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_complete(move |element| {
+                .on_complete(move |_ctx, element| {
                     complete_log
                         .lock()
                         .unwrap()
                         .push(format!("complete:{}", element.content));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_invalid(move |diagnostic| {
+                .on_invalid(move |_ctx, diagnostic| {
                     invalid_log
                         .lock()
                         .unwrap()
@@ -1159,22 +1159,22 @@ fn native_empty_lifecycle_order(log: Arc<Mutex<Vec<String>>>) -> Component {
     view! {
         {
             StreamingXml::tag("a")
-                .on_open(move |_| {
+                .on_open(move |_ctx, _| {
                     phase_logger("a", "open", Arc::clone(&a_open));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_complete(move |_| {
+                .on_complete(move |_ctx, _| {
                     phase_logger("a", "complete", Arc::clone(&a_complete));
                     ready(Ok::<(), Infallible>(()))
                 })
         }
         {
             StreamingXml::tag("b")
-                .on_open(move |_| {
+                .on_open(move |_ctx, _| {
                     phase_logger("b", "open", Arc::clone(&b_open));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_complete(move |_| {
+                .on_complete(move |_ctx, _| {
                     phase_logger("b", "complete", Arc::clone(&b_complete));
                     ready(Ok::<(), Infallible>(()))
                 })
@@ -1185,7 +1185,7 @@ fn native_empty_lifecycle_order(log: Arc<Mutex<Vec<String>>>) -> Component {
 #[component]
 fn native_unbounded_occurrences(log: Arc<Mutex<Vec<String>>>) -> Component {
     StreamingXml::tag("a")
-        .on_complete(move |_| {
+        .on_complete(move |_ctx, _| {
             log.lock().unwrap().push(String::from("a"));
             ready(Ok::<(), Infallible>(()))
         })
@@ -1198,7 +1198,7 @@ fn invalid_prefix_subscription(
     log: Arc<Mutex<Vec<String>>>,
 ) -> Component {
     StreamingXml::tag(tag)
-        .on_invalid(move |_| {
+        .on_invalid(move |_ctx, _| {
             log.lock().unwrap().push(label.to_owned());
             ready(Ok::<(), Infallible>(()))
         })
@@ -1221,24 +1221,24 @@ fn native_incomplete_prefix_order(log: Arc<Mutex<Vec<String>>>, reverse: bool) -
 }
 
 #[component]
-fn native_same_tag_fanout(log: Arc<Mutex<Vec<String>>>) -> Component {
+fn native_same_tag_fanout(log: Arc<Mutex<Vec<(String, EventContext)>>>) -> Component {
     let first = Arc::clone(&log);
     let second = log;
     view! {
         {
-            StreamingXml::tag("a").on_complete(move |_| {
+            StreamingXml::tag("a").on_complete(move |context, _| {
                 let first = Arc::clone(&first);
                 async move {
-                    first.lock().unwrap().push(String::from("first:start"));
+                    first.lock().unwrap().push((String::from("first:start"), context.clone()));
                     tokio::task::yield_now().await;
-                    first.lock().unwrap().push(String::from("first:end"));
+                    first.lock().unwrap().push((String::from("first:end"), context));
                     Ok::<(), Infallible>(())
                 }
             })
         }
         {
-            StreamingXml::tag("a").on_complete(move |_| {
-                second.lock().unwrap().push(String::from("second"));
+            StreamingXml::tag("a").on_complete(move |context, _| {
+                second.lock().unwrap().push((String::from("second"), context));
                 ready(Ok::<(), Infallible>(()))
             })
         }
@@ -1256,11 +1256,11 @@ fn native_shared_tool_call_and_lifecycle(log: Arc<Mutex<Vec<String>>>) -> Compon
             XmlStreamingToolCall::contract("test.native.shared", "v1")
                 .empty_element("choice")
                 .required_attribute::<u32>("value")
-                .on_decoded(move |value| {
+                .on_decoded(move |_ctx, value| {
                     decoded.lock().unwrap().push(format!("decoded:{value}"));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_invalid(move |diagnostic| {
+                .on_invalid(move |_ctx, diagnostic| {
                     invalid
                         .lock()
                         .unwrap()
@@ -1270,14 +1270,14 @@ fn native_shared_tool_call_and_lifecycle(log: Arc<Mutex<Vec<String>>>) -> Compon
         }
         {
             StreamingXml::tag("choice")
-                .on_open(move |element| {
+                .on_open(move |_ctx, element| {
                     open.lock().unwrap().push(format!(
                         "open:{}",
                         element.attr("value").unwrap_or_default()
                     ));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_complete(move |element| {
+                .on_complete(move |_ctx, element| {
                     complete
                         .lock()
                         .unwrap()
@@ -1294,13 +1294,13 @@ fn native_failing_lifecycle_order(log: Arc<Mutex<Vec<String>>>) -> Component {
     let b = log;
     view! {
         {
-            StreamingXml::tag("a").on_complete(move |_| {
+            StreamingXml::tag("a").on_complete(move |_ctx, _| {
                 a.lock().unwrap().push(String::from("a"));
                 ready(Err::<(), _>(HandlerError("lifecycle failure sentinel")))
             })
         }
         {
-            StreamingXml::tag("b").on_complete(move |_| {
+            StreamingXml::tag("b").on_complete(move |_ctx, _| {
                 b.lock().unwrap().push(String::from("b"));
                 ready(Ok::<(), Infallible>(()))
             })
@@ -1311,7 +1311,7 @@ fn native_failing_lifecycle_order(log: Arc<Mutex<Vec<String>>>) -> Component {
 #[component]
 fn invalid_streaming_tag() -> Component {
     StreamingXml::tag("not valid")
-        .on_complete(|_| ready(Ok::<(), Infallible>(())))
+        .on_complete(|_ctx, _| ready(Ok::<(), Infallible>(())))
         .into()
 }
 
@@ -1324,11 +1324,11 @@ fn native_nested_lifecycle(log: Arc<Mutex<Vec<String>>>) -> Component {
     view! {
         {
             StreamingXml::tag("outer")
-                .on_open(move |_| {
+                .on_open(move |_ctx, _| {
                     phase_logger("outer", "open", Arc::clone(&outer_open));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_complete(move |element| {
+                .on_complete(move |_ctx, element| {
                     outer_complete
                         .lock()
                         .unwrap()
@@ -1338,11 +1338,11 @@ fn native_nested_lifecycle(log: Arc<Mutex<Vec<String>>>) -> Component {
         }
         {
             StreamingXml::tag("inner")
-                .on_open(move |_| {
+                .on_open(move |_ctx, _| {
                     phase_logger("inner", "open", Arc::clone(&inner_open));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_complete(move |element| {
+                .on_complete(move |_ctx, element| {
                     inner_complete
                         .lock()
                         .unwrap()
@@ -1355,7 +1355,7 @@ fn native_nested_lifecycle(log: Arc<Mutex<Vec<String>>>) -> Component {
 
 #[component]
 fn raw_provider_log(log: Arc<Mutex<Vec<String>>>) -> Component {
-    use_provider_event_handler(ProviderEvent::TEXT, move |_| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _| {
         let log = Arc::clone(&log);
         async move {
             log.lock().unwrap().push(String::from("raw"));
@@ -1373,11 +1373,11 @@ fn native_streaming_before_raw(log: Arc<Mutex<Vec<String>>>) -> Component {
         {
             XmlStreamingToolCall::contract("test.native.phase", "v1")
                 .empty_element("a")
-                .on_decoded(move || {
+                .on_decoded(move |_ctx| {
                     decoded.lock().unwrap().push(String::from("xml"));
                     ready(Ok::<(), Infallible>(()))
                 })
-                .on_invalid(move |diagnostic| {
+                .on_invalid(move |_ctx, diagnostic| {
                     invalid.lock().unwrap().push(format!("invalid:{diagnostic:?}"));
                     ready(Ok::<(), Infallible>(()))
                 })
@@ -1734,17 +1734,22 @@ async fn native_same_tag_subscriptions_fan_out_in_mount_order() {
     let signals = SignalRuntime::new();
     let mut bindings = render_provider_handlers(native_same_tag_fanout(Arc::clone(&log)), &signals);
     assert_eq!(bindings.streaming_routes.len(), 1);
+    let parent = bindings.event_context(EventSource::Provider { output: None });
 
     bindings
-        .dispatch(ProviderEvent::Text(TextTurnEvent::TextComplete(
-            String::from("<a/><a/>"),
-        )))
+        .dispatch_with_context(
+            parent.clone(),
+            ProviderEvent::Text(TextTurnEvent::TextComplete(String::from("<a/><a/>"))),
+        )
         .await
         .unwrap();
     bindings.finish_normal().await.unwrap();
 
+    let log = log.lock().unwrap();
     assert_eq!(
-        *log.lock().unwrap(),
+        log.iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>(),
         [
             "first:start",
             "first:end",
@@ -1754,6 +1759,16 @@ async fn native_same_tag_subscriptions_fan_out_in_mount_order() {
             "second",
         ]
     );
+    for occurrence in log.chunks_exact(3) {
+        assert_eq!(occurrence[0].1, occurrence[1].1);
+        assert_eq!(occurrence[1].1, occurrence[2].1);
+        assert_eq!(occurrence[0].1.source(), &EventSource::ParsedXml);
+        assert_eq!(occurrence[0].1.caused_by(), Some(parent.event_id()));
+        assert_eq!(occurrence[0].1.application_id(), parent.application_id());
+        assert_eq!(occurrence[0].1.reaction_id(), parent.reaction_id());
+        assert_eq!(occurrence[0].1.frame_revision(), parent.frame_revision());
+    }
+    assert_ne!(log[0].1.event_id(), log[3].1.event_id());
 }
 
 #[tokio::test]
@@ -1903,14 +1918,16 @@ fn invocation_panic_handler(
 ) -> Component {
     EventListener::observe("test.panic.invocation", "v1")
         .listen_to(events.select(TestEvent::TICK))
-        .on_event(|_| -> Ready<Result<(), HandlerError>> { panic!("invocation panic sentinel") })
+        .on_event(|_ctx, _| -> Ready<Result<(), HandlerError>> {
+            panic!("invocation panic sentinel")
+        })
 }
 
 #[component]
 fn future_panic_handler(_log: Arc<Mutex<Vec<String>>>, events: EventInput<TestEvent>) -> Component {
     EventListener::observe("test.panic.future", "v1")
         .listen_to(events.select(TestEvent::TICK))
-        .on_event(|_| async {
+        .on_event(|_ctx, _| async {
             panic!("future panic sentinel");
             #[allow(unreachable_code)]
             Ok::<(), HandlerError>(())
@@ -1924,7 +1941,7 @@ fn returned_error_handler(
 ) -> Component {
     EventListener::observe("test.returned.error", "v1")
         .listen_to(events.select(TestEvent::TICK))
-        .on_event(|_| ready(Err::<(), _>(HandlerError("returned error sentinel"))))
+        .on_event(|_ctx, _| ready(Err::<(), _>(HandlerError("returned error sentinel"))))
 }
 
 #[component]
@@ -1942,7 +1959,7 @@ fn signal_write_before_later_failure(
         {
             EventListener::observe("test.signal.write", "v1")
                 .listen_to(ticks.clone())
-                .on_event(move |next| {
+                .on_event(move |_ctx, next| {
                     let value = writer_value.clone();
                     async move {
                         value.set(next)?;
@@ -1953,7 +1970,7 @@ fn signal_write_before_later_failure(
         {
             EventListener::observe("test.signal.later-failure", "v1")
                 .listen_to(ticks)
-                .on_event(|next| {
+                .on_event(|_ctx, next| {
                     if next == 2 {
                         panic!("later invocation panic sentinel");
                     }
@@ -2024,4 +2041,69 @@ async fn callback_returned_error_fails_the_generation_closed() {
         bindings.dispatch(TestEvent::Tick(2)).await,
         Err(ComponentAttemptFault::AttemptInactive)
     ));
+}
+
+#[component]
+fn legacy_xml_contexts(log: Arc<Mutex<Vec<(&'static str, EventContext)>>>) -> Component {
+    let provider = Arc::clone(&log);
+    let decoded = Arc::clone(&log);
+    let invalid = Arc::clone(&log);
+    use_provider_event_handler(ProviderEvent::TEXT, move |context, _| {
+        provider.lock().unwrap().push(("provider", context));
+        ready(Ok::<(), Infallible>(()))
+    });
+    view! {
+        {
+            StreamingXml::tag("speak").on_complete(move |context, _| {
+                log.lock().unwrap().push(("raw", context));
+                ready(Ok::<(), Infallible>(()))
+            })
+        }
+        {
+            XmlStreamingToolCall::contract("legacy.context", "v1")
+                .empty_element("choice")
+                .required_attribute::<u32>("value")
+                .on_decoded(move |context, _| {
+                    decoded.lock().unwrap().push(("decoded", context));
+                    ready(Ok::<(), Infallible>(()))
+                })
+                .on_invalid(move |context, _| {
+                    invalid.lock().unwrap().push(("invalid", context));
+                    ready(Ok::<(), Infallible>(()))
+                })
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_xml_keeps_inherited_source_without_fabricating_managed_attempts() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let signals = SignalRuntime::new();
+    let mut bindings = render_provider_handlers(legacy_xml_contexts(Arc::clone(&log)), &signals);
+    let source = bindings.event_context(EventSource::Provider {
+        output: Some(crate::component::execution::ProviderOutputKey::new(8)),
+    });
+    bindings
+        .dispatch_with_context(
+            source.clone(),
+            ProviderEvent::Text(TextTurnEvent::TextComplete(
+                r#"<speak>hello</speak><choice value="7"/><choice value="wrong"/>"#.to_owned(),
+            )),
+        )
+        .await
+        .unwrap();
+    bindings.finish_normal().await.unwrap();
+    let log = log.lock().unwrap();
+    assert_eq!(log.len(), 4);
+    for (stage, context) in log.iter() {
+        assert_eq!(context.application_id(), source.application_id());
+        assert_eq!(context.reaction_id(), None);
+        assert_eq!(context.frame_revision(), None);
+        if *stage == "provider" {
+            assert_eq!(context, &source);
+        } else {
+            assert_eq!(context.caused_by(), Some(source.event_id()));
+            assert_eq!(context.source(), &EventSource::ParsedXml);
+        }
+    }
 }

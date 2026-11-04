@@ -58,7 +58,7 @@ Return a concise answer and the next action."#;
 
 #[component]
 fn support_application(props: SupportCase) -> Component {
-    use_provider_event_handler(ProviderEvent::TEXT, |event| async move {
+    use_provider_event_handler(ProviderEvent::TEXT, |_ctx, event| async move {
         if let TextTurnEvent::TextComplete(text) = event {
             println!("{text}");
         }
@@ -66,7 +66,7 @@ fn support_application(props: SupportCase) -> Component {
     });
 
     let exit = use_application_exit();
-    use_reaction_completion(move || async move { exit.request(ExitReason::Completed) });
+    use_reaction_completion(move |_ctx| async move { exit.request(ExitReason::Completed) });
 
     view! {
         support_policy()
@@ -84,7 +84,7 @@ fn support_case() -> SupportCase {
     }
 }
 
-async fn run_support_agent(provider: impl ReactionPort) -> anyhow::Result<()> {
+async fn run_support_agent(provider: impl ReactionPort + 'static) -> anyhow::Result<()> {
     let props = support_case();
     let mut application = Application::mount(move || support_application(props.clone()), provider)?;
     let operation = application.run().await.map_err(anyhow::Error::from);

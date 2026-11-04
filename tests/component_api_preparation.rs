@@ -54,7 +54,7 @@ async fn wait_for_preparation_notification<F>(
     notification: &Notify,
     message: &'static str,
 ) where
-    F: Future,
+    F: Future + ?Sized,
 {
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
@@ -202,19 +202,54 @@ enum PreparationOperation {
     React,
 }
 
+type PreparationWait<'a> = Pin<Box<dyn Future<Output = Result<(), ApplicationFault>> + Send + 'a>>;
+type StartedPreparation<'a> = (
+    Option<agentview::component::execution::Reaction>,
+    PreparationWait<'a>,
+);
+
 impl PreparationOperation {
+    fn start(self, app: &mut Application<RecordingPort>) -> StartedPreparation<'_> {
+        match self {
+            Self::Prepare => (
+                None,
+                Box::pin(async move {
+                    assert_continue(app.prepare().await?);
+                    Ok(())
+                }),
+            ),
+            Self::React => {
+                let control = app.react().unwrap();
+                let reaction = control.clone();
+                (
+                    Some(control),
+                    Box::pin(async move {
+                        assert_continue(reaction.await?);
+                        Ok(())
+                    }),
+                )
+            }
+        }
+    }
+
     async fn run(self, app: &mut Application<RecordingPort>) -> Result<(), ApplicationFault> {
         let flow = match self {
-            Self::Prepare => app.prepare().await,
-            Self::React => app.react().await,
+            Self::Prepare => app
+                .prepare()
+                .await
+                .map(agentview::component::execution::ReactionOutcome::from),
+            Self::React => app.react().unwrap().await,
         }?;
         assert_continue(flow);
         Ok(())
     }
 }
 
-fn assert_continue(flow: ControlFlow<ExitReason>) {
-    assert_eq!(flow, ControlFlow::Continue(()));
+fn assert_continue(flow: impl Into<agentview::component::execution::ReactionOutcome>) {
+    assert_eq!(
+        flow.into(),
+        agentview::component::execution::ReactionOutcome::Completed
+    );
 }
 
 fn recording_port_for_nested_waves() -> (RecordingPort, Arc<RecordingProbe>) {
@@ -688,7 +723,11 @@ async fn react_waits_for_preparation_and_submits_its_signal_write() {
     )
     .unwrap();
 
-    let mut reaction = Box::pin(app.react());
+    let reaction_control = app.react().unwrap();
+
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     tokio::select! {
         _ = gate.started.notified() => {}
         result = &mut reaction => panic!("preparation did not block handoff: {result:?}"),
@@ -719,7 +758,11 @@ async fn same_wave_preparations_start_concurrently_and_wait_for_all_before_hando
     )
     .unwrap();
 
-    let mut reaction = Box::pin(app.react());
+    let reaction_control = app.react().unwrap();
+
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     wait_for_preparation_notification(
         &mut reaction,
         &first_gate.started,
@@ -781,7 +824,11 @@ async fn host_exit_interrupts_blocked_preparation_without_provider_submission() 
     .unwrap();
     let exit = app.exit_handle();
 
-    let mut reaction = Box::pin(app.react());
+    let reaction_control = app.react().unwrap();
+
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     tokio::select! {
         _ = gate.started.notified() => {}
         result = &mut reaction => panic!("preparation did not block reaction: {result:?}"),
@@ -803,7 +850,7 @@ async fn host_exit_interrupts_blocked_preparation_without_provider_submission() 
     assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
     assert_eq!(
-        app.react().await.unwrap(),
+        app.react().unwrap().await.unwrap(),
         ControlFlow::Break(ExitReason::Requested)
     );
     assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
@@ -816,11 +863,11 @@ async fn component_completed_exit_is_sticky_and_never_submits() {
     let mut app = Application::mount(completed_exit_root, port).unwrap();
 
     assert_eq!(
-        app.react().await.unwrap(),
+        app.react().unwrap().await.unwrap(),
         ControlFlow::Break(ExitReason::Completed)
     );
     assert_eq!(
-        app.react().await.unwrap(),
+        app.react().unwrap().await.unwrap(),
         ControlFlow::Break(ExitReason::Completed)
     );
     assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
@@ -834,7 +881,10 @@ async fn exit_after_provider_handoff_waits_for_eof_then_stops_without_a_second_s
     let (port, probe) = recording_port_with_completion_gate(Arc::clone(&completion_gate));
     let mut app = Application::mount(preparation_free_view, port).unwrap();
     let exit = app.exit_handle();
-    let mut reaction = Box::pin(app.react());
+    let reaction_control = app.react().unwrap();
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     assert!(matches!(poll!(reaction.as_mut()), Poll::Pending));
 
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -854,7 +904,7 @@ async fn exit_after_provider_handoff_waits_for_eof_then_stops_without_a_second_s
         ControlFlow::Break(ExitReason::Requested)
     );
     assert_eq!(
-        app.react().await.unwrap(),
+        app.react().unwrap().await.unwrap(),
         ControlFlow::Break(ExitReason::Requested)
     );
     assert_eq!(probe.submissions.load(Ordering::Acquire), 1);
@@ -867,7 +917,7 @@ async fn preparation_error_and_panic_are_not_converted_to_normal_exit() {
     let (port, probe) = recording_port();
     let mut app = Application::mount(exit_then_failing_preparation, port).unwrap();
 
-    let fault = app.react().await.unwrap_err();
+    let fault = app.react().unwrap().await.unwrap_err();
     assert_eq!(fault.stage(), ApplicationFaultStage::Preparation);
     assert_eq!(fault.kind(), ApplicationFaultKind::Retryable);
     assert_eq!(fault.reason(), ApplicationFaultReason::Preparation);
@@ -875,7 +925,7 @@ async fn preparation_error_and_panic_are_not_converted_to_normal_exit() {
 
     let (port, probe) = recording_port();
     let mut app = Application::mount(exit_then_panicking_preparation, port).unwrap();
-    let panic = AssertUnwindSafe(app.react())
+    let panic = AssertUnwindSafe(std::future::IntoFuture::into_future(app.react().unwrap()))
         .catch_unwind()
         .await
         .expect_err("preparation panic must not become a normal exit");
@@ -953,7 +1003,7 @@ async fn run_returns_preparation_fault_without_retry_and_keeps_the_owner_usable(
     assert_eq!(attempts.load(Ordering::Acquire), 1);
     assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
 
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
     assert_eq!(attempts.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
     app.shutdown().await.unwrap();
@@ -981,7 +1031,7 @@ async fn run_returns_reaction_fault_without_retry_and_keeps_the_owner_usable() {
     assert_eq!(probe.submissions.load(Ordering::Acquire), 1);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
     assert_eq!(probe.submissions.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
     app.shutdown().await.unwrap();
@@ -1056,13 +1106,13 @@ async fn ordinary_preparation_error_keeps_the_same_application_retryable() {
     )
     .unwrap();
 
-    let fault = app.react().await.unwrap_err();
+    let fault = app.react().unwrap().await.unwrap_err();
     assert_eq!(fault.stage(), ApplicationFaultStage::Preparation);
     assert_eq!(fault.kind(), ApplicationFaultKind::Retryable);
     assert_eq!(fault.reason(), ApplicationFaultReason::Preparation);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
     assert_eq!(attempts.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
 }
@@ -1080,8 +1130,8 @@ async fn every_explicit_react_reruns_successful_preparation() {
     )
     .unwrap();
 
-    assert_continue(app.react().await.unwrap());
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
 
     assert_eq!(runs.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 2);
@@ -1104,7 +1154,7 @@ async fn prepare_then_react_reruns_successful_preparation() {
     assert_eq!(runs.load(Ordering::Acquire), 1);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
     assert_eq!(runs.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
 }
@@ -1144,7 +1194,7 @@ async fn successful_earlier_preparation_reruns_after_a_later_preparation_fails()
 }
 
 #[tokio::test]
-async fn dropping_pending_react_cancels_preparation_without_handoff_and_retries() {
+async fn interrupting_pending_react_cancels_preparation_without_handoff_and_retries() {
     let gate = Arc::new(PreparationGate::new());
     let attempts = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
@@ -1166,19 +1216,28 @@ async fn dropping_pending_react_cancels_preparation_without_handoff_and_retries(
     )
     .unwrap();
 
-    let mut reaction = Box::pin(app.react());
+    let reaction_control = app.react().unwrap();
+
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     tokio::select! {
         _ = gate.started.notified() => {}
         result = &mut reaction => panic!("preparation did not remain pending: {result:?}"),
     }
+    reaction_control.interrupt().unwrap();
     drop(reaction);
+    assert_eq!(
+        reaction_control.await.unwrap(),
+        agentview::component::execution::ReactionOutcome::Interrupted
+    );
 
     assert_eq!(drops.load(Ordering::Acquire), 1);
     assert_eq!(attempts.load(Ordering::Acquire), 1);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
 
     gate.release.notify_one();
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
     assert_eq!(attempts.load(Ordering::Acquire), 2);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
 }
@@ -1210,12 +1269,19 @@ async fn successful_earlier_preparation_reruns_after_a_later_preparation_is_canc
         )
         .unwrap();
 
-        let mut preparation = Box::pin(operation.run(&mut app));
+        let (control, mut preparation) = operation.start(&mut app);
         tokio::select! {
             _ = gate.started.notified() => {}
             result = &mut preparation => panic!("later preparation did not remain pending: {result:?}"),
         }
         drop(preparation);
+        if let Some(reaction) = control {
+            reaction.interrupt().unwrap();
+            assert_eq!(
+                reaction.await.unwrap(),
+                agentview::component::execution::ReactionOutcome::Interrupted
+            );
+        }
 
         assert_eq!(earlier_runs.load(Ordering::Acquire), 1);
         assert_eq!(later_runs.load(Ordering::Acquire), 1);
@@ -1258,7 +1324,11 @@ async fn later_same_wave_error_returns_and_cancels_an_earlier_pending_sibling() 
     )
     .unwrap();
 
-    let mut reaction = Box::pin(app.react());
+    let reaction_control = app.react().unwrap();
+
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     wait_for_preparation_notification(
         &mut reaction,
         &pending_gate.started,
@@ -1290,7 +1360,7 @@ async fn later_same_wave_error_returns_and_cancels_an_earlier_pending_sibling() 
 
     pending_gate.release.notify_one();
     failing_gate.release.notify_one();
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
     assert_eq!(pending_runs.load(Ordering::Acquire), 2);
     assert_eq!(failing_runs.load(Ordering::Acquire), 2);
     assert_eq!(pending_drops.load(Ordering::Acquire), 2);
@@ -1330,7 +1400,7 @@ async fn dropping_pending_same_wave_preparation_cancels_all_siblings_and_retries
         )
         .unwrap();
 
-        let mut preparation = Box::pin(operation.run(&mut app));
+        let (control, mut preparation) = operation.start(&mut app);
         wait_for_preparation_notification(
             &mut preparation,
             &first_gate.started,
@@ -1344,6 +1414,13 @@ async fn dropping_pending_same_wave_preparation_cancels_all_siblings_and_retries
         )
         .await;
         drop(preparation);
+        if let Some(reaction) = control {
+            reaction.interrupt().unwrap();
+            assert_eq!(
+                reaction.await.unwrap(),
+                agentview::component::execution::ReactionOutcome::Interrupted
+            );
+        }
 
         assert_eq!(first_attempts.load(Ordering::Acquire), 1);
         assert_eq!(second_attempts.load(Ordering::Acquire), 1);
@@ -1401,7 +1478,11 @@ async fn host_exit_cancels_all_started_same_wave_preparations() {
     .unwrap();
     let exit = app.exit_handle();
 
-    let mut reaction = Box::pin(app.react());
+    let reaction_control = app.react().unwrap();
+
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     wait_for_preparation_notification(
         &mut reaction,
         &first_gate.started,
@@ -1432,7 +1513,7 @@ async fn host_exit_cancels_all_started_same_wave_preparations() {
     assert_eq!(probe.submissions.load(Ordering::Acquire), 0);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
     assert_eq!(
-        app.react().await.unwrap(),
+        app.react().unwrap().await.unwrap(),
         ControlFlow::Break(ExitReason::Requested)
     );
     app.shutdown().await.unwrap();
@@ -1451,7 +1532,7 @@ async fn preparation_stabilizes_nested_mounts_before_the_first_handoff() {
     )
     .unwrap();
 
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
 
     assert_eq!(*loader_order.lock().unwrap(), ["parent", "child"]);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
@@ -1510,7 +1591,7 @@ async fn remount_within_one_operation_reruns_the_child_but_not_the_parent() {
     )
     .unwrap();
 
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
 
     assert_eq!(
         *loader_order.lock().unwrap(),
@@ -1535,7 +1616,7 @@ async fn sixteen_preparation_waves_can_write_final_data_and_stabilize() {
     )
     .unwrap();
 
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
 
     assert_eq!(runs.load(Ordering::Acquire), 16);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 1);
@@ -1558,7 +1639,7 @@ async fn seventeenth_preparation_wave_fails_without_handoff() {
     )
     .unwrap();
 
-    let fault = app.react().await.unwrap_err();
+    let fault = app.react().unwrap().await.unwrap_err();
 
     assert_eq!(runs.load(Ordering::Acquire), 16);
     assert_eq!(probe.handoffs.load(Ordering::Acquire), 0);
@@ -1597,7 +1678,7 @@ async fn continuity_retry_in_the_same_react_does_not_rerun_preparation() {
     )
     .unwrap();
 
-    assert_continue(app.react().await.unwrap());
+    assert_continue(app.react().unwrap().await.unwrap());
 
     assert_eq!(runs.load(Ordering::Acquire), 1);
     assert_eq!(probe.submissions.load(Ordering::Acquire), 2);

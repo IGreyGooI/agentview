@@ -4,6 +4,7 @@ use crate::component::{
     execution::{command::CommandFeedback, DriverDemandHandle, ProviderEvent},
     signal::{self as signal_kernel, HookKind},
     task::MountTaskHandle,
+    ApplicationId, EventContext,
 };
 
 use super::{
@@ -97,7 +98,7 @@ impl<'render> HookRenderContext<'render> {
         site: u32,
         handler: Handler,
     ) where
-        Handler: FnOnce() -> HandlerFuture + Send + 'static,
+        Handler: FnOnce(EventContext) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -179,7 +180,7 @@ impl<'render> HookRenderContext<'render> {
         handler: Handler,
     ) where
         Event: Clone + Send + Sync + 'static,
-        Handler: FnMut(Event) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, Event) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -202,6 +203,14 @@ impl<'render> HookRenderContext<'render> {
                 mount,
                 task_context,
             ));
+    }
+
+    #[doc(hidden)]
+    pub fn use_application_id_at(&mut self, site: u32) -> ApplicationId {
+        self.signals
+            .use_marker_at(site, HookKind::ApplicationId)
+            .unwrap_or_else(|fault| panic!("{fault}"));
+        self.event_origin.application_id()
     }
 
     #[doc(hidden)]

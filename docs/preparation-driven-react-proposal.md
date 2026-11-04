@@ -5,6 +5,8 @@
 状态：部分落地。固定 react 循环、应用退出 API、Chess 迁移和同批 preparation 并发已实现。
 下文保留完整提案；其中带 hook identity 的错误诊断仍是提案目标，不是本轮并发实现的承诺。
 当前实现仍以 [engine.md](engine.md) 和 [component-preparation-design.md](component-preparation-design.md) 为准。
+本文保留旧调用形状作为提案背景；当前 `react()?` 返回可中断、可等待的
+[Reaction handle](parallel-reactions-design.md)，不再借用 Application 到本轮结束。
 
 ## 1. 建议
 

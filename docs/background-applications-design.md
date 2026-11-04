@@ -1,16 +1,20 @@
 # 并行后台 Application
 
-状态：编排方案已确定，本文记录设计选择；没有新增 runtime API。
+状态：本文记录编排方案，使用已实现的 Application mount、fork 与 driver API。
 [engine.md](engine.md) 继续是运行时的权威契约。
+
+本文描述当前可用的独立 mount 方案。同一 Application、同一 Component tree 内动态发起的
+`Main` / `Temporary` reaction 使用
+[异步 Reaction handles](parallel-reactions-design.md)，已接入同一 `EventContext` 来源路径。
 
 ## 1. 决定
 
 Popup / 后台应用使用一个独立的 `Application<P>`，由外层宿主与主 Application 并行驱动。
-两个 Application 的 reaction 可以实际重叠；各自内部继续保持 single-flight。
+两个 Application 的 reaction 可以实际重叠；每个 Application 也可拥有至多一个 Main 和多条独立 Temporary。
 
-这使用现有的 `Application::mount`、`react` / `run`、exit 和 `shutdown` 边界。
-不为 popup 拆出共享 Component Runtime 的多份交互上下文，也不要求同一 Application
-同时运行多个 reaction。
+此独立 mount 方案使用现有的 `Application::mount` / `fork_to`、`react` / `run`、exit 和
+`shutdown` 边界。它通过各应用自己的 Component Runtime、模型历史和生命周期实现并行；
+同一 Component tree 的临时 reaction 使用上述 handle API。
 
 ```text
 Host
@@ -35,9 +39,14 @@ Accepted cursor；相同模型或相同连接配置不代表相同 logical targe
 后台应用只得到显式提供的任务、规则和业务上下文。它不自动继承主应用完整 transcript，
 其 assistant output 和工具记录也不自动并入主应用 transcript。
 
+从现有应用携带显式业务 snapshot 切换到另一个 port 时，使用
+`parent.fork_to(root, fresh_target).await`。目标类型、模型和 profile 可以不同，子应用重新 mount
+独立状态并从空模型历史开始；源待交付结果保留在源应用。使用 `fork_to_with_commands` 时提供新的
+command inbox。snapshot 一致性和两个应用的 driver/shutdown 继续由宿主负责。
+
 需要从现有交互历史分支时，使用[保留历史的 Application Fork](application-fork-design.md)。
 `Application::fork()` 成对复制 FrameSession 和 port，再从显式业务 snapshot 重新 mount；
-Responses port 已支持该可选能力。普通 `mount()` 继续遵守本文的历史隔离规则。
+Responses port 已支持该可选能力。普通 `mount()` 和 `fork_to()` 继续遵守本文的历史隔离规则。
 
 共享业务数据放在明确的业务服务、数据库或外层拥有的状态句柄中，各应用只获得任务所需的能力。
 它们可以使用相同 Component 定义构建不同实例，但这不会共享 hook state。跨应用资源冲突、
@@ -50,14 +59,14 @@ Responses port 已支持该可选能力。普通 `mount()` 继续遵守本文的
 
 ## 3. 启动、反馈与完成
 
-宿主持有并监督后台 driver，发起后不要求主流程等待。driver 可以只执行一次 `react()`，
+宿主持有并监督后台 owner，发起后不要求主流程等待。driver 可以只执行一次 `react()?.await`，
 也可以用 `run()` 完成需要多次 observe -> act -> feedback 的应用交互；这是具体应用的选择。
 
 输入和输出通过业务消息交换，使用业务 work identity 区分不同任务。进度、实际结果、失败
 或取消状态由后台应用 / owner 发布给接收方。主应用收到消息后更新自己的 view，并在后续
 Frame 中交付，模型才能据此继续行动。收到一条消息或写入共享 store 本身不构成模型观察。
 
-普通业务结果与 runtime 完成分别表达。`react()` 返回 `Continue(())` 不代表业务任务成功，
+普通业务结果与 runtime 完成分别表达。等待得到 `ReactionOutcome::Completed` 不代表业务任务成功，
 `run()` 返回也不证明资源已经清理。主应用若需要向模型显示“后台工作已完成”，需要真实的
 业务结果；若对外承诺 owner 已关闭，还要等待 shutdown 完成。
 
@@ -66,7 +75,7 @@ Frame 中交付，模型才能据此继续行动。收到一条消息或写入�
 - 宿主保留后台 driver 的 owner 和完成句柄，不能仅丢弃 `JoinHandle` 使其无人监督。
 - 每个 Application 的 mount、driver 和 Component tasks 遵守现有 Tokio runtime identity 约束。
 - 软退出使用该应用的 exit handle；已经取得提交许可的 reaction 仍会结算。
-- 需要主动取消在途 reaction 时，driver 在仍持有 Application 的条件下取消当前 operation，
+- 需要主动取消在途 reaction 时，调用其 handle 的 `reaction.interrupt()`，再等待本轮结算，
   再按既有恢复、业务收尾和 consuming `shutdown()` 契约完成清理。
 - 一个应用普通失败不隐式取消另一个应用；宿主明确决定后续调度。共享服务中的已发生效果仍然保留。
 - 普通 Result 错误不能通过提前返回而跳过 owner cleanup；panic 保留现有传播及不可复用契约。

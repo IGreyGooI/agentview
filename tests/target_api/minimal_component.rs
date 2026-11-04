@@ -49,7 +49,7 @@ fn application_root(props: TargetProps, events: EventInput<ProviderEvent>) -> Co
         {
             EventListener::observe("target.response", "v1")
                 .listen_to(text)
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let completions = Arc::clone(&completions);
                     async move {
                         if let TextTurnEvent::TextComplete(text) = event {

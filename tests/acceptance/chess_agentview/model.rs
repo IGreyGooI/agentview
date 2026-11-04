@@ -1,4 +1,4 @@
-use std::{ops::ControlFlow, time::Duration};
+use std::time::Duration;
 
 use agentview::component::execution::{
     Application, ApplicationFault, ApplicationFaultCode, ApplicationFaultKind,
@@ -192,7 +192,7 @@ pub(crate) async fn play_white_ply_observed<P, F>(
     mut on_dispatch: F,
 ) -> WhitePlyOutcome
 where
-    P: ReactionPort,
+    P: ReactionPort + 'static,
     F: FnMut(AttemptTransition) -> Result<(), (InfrastructureStage, InfrastructureAbortReason)>,
 {
     let mut attempts = Vec::new();
@@ -233,22 +233,41 @@ where
         }) {
             return abort_before_dispatch(attempts, stage, reason_code);
         }
-        let output = match timeout(reaction_timeout, white.react()).await {
-            Ok(Ok(ControlFlow::Continue(()))) => match control.read_state() {
-                Ok(state) => state,
-                Err(_) => {
-                    return complete_dispatch_abort(
-                        attempts,
-                        &context,
-                        &attempt_snapshot,
-                        start,
-                        InfrastructureStage::AuthoritativeState,
-                        InfrastructureAbortReason::StateUnavailable,
-                        &mut on_dispatch,
-                    )
+        let reaction = match white.react() {
+            Ok(reaction) => reaction,
+            Err(fault) => {
+                return complete_dispatch_abort(
+                    attempts,
+                    &context,
+                    &attempt_snapshot,
+                    start,
+                    InfrastructureStage::ModelReaction,
+                    InfrastructureAbortReason::from_application(&fault),
+                    &mut on_dispatch,
+                )
+            }
+        };
+        let output = match timeout(reaction_timeout, reaction.clone()).await {
+            Ok(Ok(agentview::component::execution::ReactionOutcome::Completed)) => {
+                match control.read_state() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        return complete_dispatch_abort(
+                            attempts,
+                            &context,
+                            &attempt_snapshot,
+                            start,
+                            InfrastructureStage::AuthoritativeState,
+                            InfrastructureAbortReason::StateUnavailable,
+                            &mut on_dispatch,
+                        )
+                    }
                 }
-            },
-            Ok(Ok(ControlFlow::Break(_))) => {
+            }
+            Ok(Ok(
+                agentview::component::execution::ReactionOutcome::Exited(_)
+                | agentview::component::execution::ReactionOutcome::Interrupted,
+            )) => {
                 return complete_dispatch_abort(
                     attempts,
                     &context,
@@ -271,6 +290,10 @@ where
                 )
             }
             Err(_) => {
+                reaction
+                    .interrupt()
+                    .expect("the application owns this reaction");
+                let _ = reaction.await;
                 return complete_dispatch_abort(
                     attempts,
                     &context,
@@ -279,7 +302,7 @@ where
                     InfrastructureStage::ModelReaction,
                     InfrastructureAbortReason::ReactionTimeout,
                     &mut on_dispatch,
-                )
+                );
             }
         };
 
@@ -752,7 +775,7 @@ mod tests {
         assert!(application.current_projection().is_dirty());
 
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), application.react())
+            tokio::time::timeout(Duration::from_secs(1), application.react().unwrap())
                 .await
                 .expect("offline Chess reaction stays bounded")
                 .expect("scripted Chess reaction completes")
@@ -819,6 +842,7 @@ mod tests {
             .expect("retry state writes atomically");
         assert!(application
             .react()
+            .unwrap()
             .await
             .expect("retry projection reaches the provider")
             .is_continue());
@@ -853,7 +877,7 @@ mod tests {
             .push(LifecycleEvent::StateWritten);
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(25), application.react())
+            tokio::time::timeout(Duration::from_millis(25), application.react().unwrap())
                 .await
                 .is_err()
         );
@@ -891,6 +915,7 @@ mod tests {
 
         let fault = application
             .react()
+            .unwrap()
             .await
             .expect_err("injected failure must reject before handoff");
         assert_eq!(fault.stage(), ApplicationFaultStage::Submit);
@@ -936,6 +961,7 @@ mod tests {
         capture.reject_before_handoff.store(false, Ordering::SeqCst);
         assert!(application
             .react()
+            .unwrap()
             .await
             .expect("same Application retries the original response plan")
             .is_continue());

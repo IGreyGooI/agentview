@@ -4,6 +4,7 @@
 //! SSE, retry, and `async-openai` integration are intentionally separate.
 
 use std::{
+    borrow::Cow,
     collections::HashSet,
     io::{self, Write},
 };
@@ -167,6 +168,7 @@ pub struct CodexHttpV1Options {
     explicit_assistant_status: bool,
     parallel_tool_calls: bool,
     prompt_cache_comparison_response_id: Option<String>,
+    ark_caching: bool,
 }
 
 impl CodexHttpV1Options {
@@ -198,6 +200,7 @@ impl CodexHttpV1Options {
             explicit_assistant_status: false,
             parallel_tool_calls: false,
             prompt_cache_comparison_response_id: None,
+            ark_caching: false,
         })
     }
 
@@ -250,11 +253,31 @@ impl CodexHttpV1Options {
         self.parallel_tool_calls = enabled;
         self
     }
+
+    /// Enables Volcengine Ark Session caching on the native Responses port.
+    ///
+    /// Disabled by default. When enabled, the port stores responses remotely
+    /// and continues compatible turns with only their new input. Ark receives
+    /// System instructions as a first-turn input message, and inherits tools
+    /// on continued turns. Ephemeral input, changed tools, and recovery can
+    /// require a fresh request. This is an Ark extension, not an OpenAI prompt
+    /// cache hint; enable it only for an endpoint and model that support it.
+    /// Legacy ProviderPort submission does not support this mode.
+    pub fn with_ark_caching(mut self, enabled: bool) -> Self {
+        self.ark_caching = enabled;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct CodexPromptCacheOptions {
     comparison_response_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ArkCaching {
+    Enabled,
 }
 
 /// AgentView-owned request DTO suitable for a later BYOT transport adapter.
@@ -282,6 +305,10 @@ pub struct CodexHttpV1Request {
     prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_options: Option<CodexPromptCacheOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caching: Option<ArkCaching>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -296,8 +323,10 @@ struct CodexHttpV1WireRequest<'a> {
     input: &'a [Value],
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [CodexFunctionTool]>,
-    tool_choice: ToolChoice,
-    parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
     reasoning: Option<&'a CodexReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<&'a OpenRouterProviderRouting>,
@@ -308,6 +337,10 @@ struct CodexHttpV1WireRequest<'a> {
     prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_options: Option<&'a CodexPromptCacheOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caching: Option<ArkCaching>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<&'a str>,
 }
 
 impl<'a> CodexHttpV1WireRequest<'a> {
@@ -323,8 +356,8 @@ impl<'a> CodexHttpV1WireRequest<'a> {
             instructions,
             input,
             tools: request.tools.as_deref(),
-            tool_choice: request.tool_choice,
-            parallel_tool_calls: request.parallel_tool_calls,
+            tool_choice: Some(request.tool_choice),
+            parallel_tool_calls: Some(request.parallel_tool_calls),
             reasoning: request.reasoning.as_ref(),
             provider: request.provider.as_ref(),
             store: request.store,
@@ -332,6 +365,8 @@ impl<'a> CodexHttpV1WireRequest<'a> {
             include: &request.include,
             prompt_cache_key: request.prompt_cache_key.as_deref(),
             prompt_cache_options: request.prompt_cache_options.as_ref(),
+            caching: request.caching,
+            previous_response_id: request.previous_response_id.as_deref(),
         }
     }
 }
@@ -572,6 +607,19 @@ impl CodexHttpV1Encoder {
         self.options.model()
     }
 
+    pub(crate) const fn ark_caching_enabled(&self) -> bool {
+        self.options.ark_caching
+    }
+
+    pub(crate) const fn parallel_tool_calls_enabled(&self) -> bool {
+        self.options.parallel_tool_calls
+    }
+
+    /// Builds an isolated encoder for requests that cannot retain remote input.
+    pub(crate) fn without_ark_caching(&self) -> Self {
+        Self::new(self.options.clone().with_ark_caching(false))
+    }
+
     pub(crate) fn set_parallel_tool_calls(&mut self, enabled: bool) {
         self.options.parallel_tool_calls = enabled;
     }
@@ -712,6 +760,70 @@ impl CodexHttpV1Encoder {
         exact_tools: &[ToolDefinition],
         limit: usize,
     ) -> Result<Vec<u8>, CodexHttpV1Error> {
+        self.encode_frame_request_with_previous_response_id_bounded(
+            input,
+            instructions,
+            exact_tools,
+            None,
+            limit,
+        )
+    }
+
+    /// Encodes one native request, inheriting Ark's remote prefix when present.
+    /// The caller proves that the response covers exactly the omitted history
+    /// and that the System snapshot and tool catalog are unchanged.
+    pub(crate) fn encode_frame_request_with_previous_response_id_bounded(
+        &self,
+        input: &[Value],
+        instructions: &str,
+        exact_tools: &[ToolDefinition],
+        previous_response_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<u8>, CodexHttpV1Error> {
+        let mut request = self.request_from_history(
+            CodexHttpV1History {
+                instructions: String::new(),
+                input: Vec::new(),
+            },
+            Some(native_function_tools(exact_tools)?),
+        );
+        if !self.ark_caching_enabled() {
+            return request.encode_with_input_and_instructions_bounded(input, instructions, limit);
+        }
+
+        request.store = true;
+        request.caching = Some(ArkCaching::Enabled);
+        let input = if previous_response_id.is_none() && !instructions.is_empty() {
+            let mut values = Vec::with_capacity(input.len() + 1);
+            values.push(serde_json::json!({
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": instructions}],
+            }));
+            values.extend_from_slice(input);
+            Cow::Owned(values)
+        } else {
+            Cow::Borrowed(input)
+        };
+        let mut wire = CodexHttpV1WireRequest::with_input_and_instructions(&request, &input, "");
+        wire.previous_response_id = previous_response_id;
+        if previous_response_id.is_some() {
+            wire.tools = None;
+            wire.tool_choice = None;
+            wire.parallel_tool_calls = None;
+        }
+        serialize_json_bounded(&wire, limit)
+    }
+
+    /// Continues a stored parent without saving the temporary child response.
+    /// The parent already supplies System instructions and the tool catalog.
+    pub(crate) fn encode_temporary_frame_request_bounded(
+        &self,
+        input: &[Value],
+        exact_tools: &[ToolDefinition],
+        previous_response_id: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>, CodexHttpV1Error> {
         let request = self.request_from_history(
             CodexHttpV1History {
                 instructions: String::new(),
@@ -719,7 +831,31 @@ impl CodexHttpV1Encoder {
             },
             Some(native_function_tools(exact_tools)?),
         );
-        request.encode_with_input_and_instructions_bounded(input, instructions, limit)
+        let mut wire = CodexHttpV1WireRequest::with_input_and_instructions(&request, input, "");
+        wire.previous_response_id = Some(previous_response_id);
+        wire.tools = None;
+        wire.tool_choice = None;
+        wire.parallel_tool_calls = None;
+        serialize_json_bounded(&wire, limit)
+    }
+
+    /// Measures the complete effective context, independent of upload limits.
+    /// Cached turns still consume the model's context window even when the
+    /// actual request contains only the suffix after a remote response.
+    pub(crate) fn encoded_frame_context_bytes(
+        &self,
+        input: &[Value],
+        instructions: &str,
+        exact_tools: &[ToolDefinition],
+    ) -> Result<usize, CodexHttpV1Error> {
+        self.encode_frame_request_with_previous_response_id_bounded(
+            input,
+            instructions,
+            exact_tools,
+            None,
+            usize::MAX,
+        )
+        .map(|body| body.len())
     }
 
     fn request_from_history(
@@ -749,6 +885,8 @@ impl CodexHttpV1Encoder {
                 .map(|comparison_response_id| CodexPromptCacheOptions {
                     comparison_response_id,
                 }),
+            caching: None,
+            previous_response_id: None,
         }
     }
 
@@ -1085,6 +1223,171 @@ mod tests {
 
     fn prompt_document(text: &str) -> crate::pom::ResolvedDocument {
         resolve_artifact_document(Document::from_raw_text(text)).unwrap()
+    }
+
+    fn ark_encoder(enabled: bool) -> CodexHttpV1Encoder {
+        CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new(
+                ModelSpec::new("doubao-seed-character-260628", 128_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap()
+            .with_ark_caching(enabled),
+        )
+    }
+
+    #[test]
+    fn ark_caching_is_opt_in_and_limited_to_native_foreground_requests() {
+        let default = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new(
+                ModelSpec::new("test-model", 128_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap(),
+        );
+        assert!(!default.ark_caching_enabled());
+        let ordinary: Value = serde_json::from_slice(
+            &default
+                .encode_frame_request_bounded(&[], "system", &[], usize::MAX)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ordinary["store"], false);
+        assert_eq!(ordinary["instructions"], "system");
+        assert_eq!(ordinary["tool_choice"], "auto");
+        assert_eq!(ordinary["parallel_tool_calls"], false);
+        assert!(ordinary.get("caching").is_none());
+        assert!(ordinary.get("previous_response_id").is_none());
+
+        let enabled = ark_encoder(true);
+        assert!(enabled.ark_caching_enabled());
+        for body in [
+            enabled.encode_request(&CanonicalTranscript::new()).unwrap(),
+            enabled
+                .encode_summary_request_bounded(&[], "summarize", 64, usize::MAX)
+                .unwrap(),
+            enabled
+                .without_ark_caching()
+                .encode_frame_request_bounded(&[], "system", &[], usize::MAX)
+                .unwrap(),
+        ] {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["store"], false);
+            assert!(body.get("caching").is_none());
+            assert!(body.get("previous_response_id").is_none());
+        }
+    }
+
+    #[test]
+    fn ark_cached_requests_move_system_to_input_and_inherit_tools_on_continuation() {
+        let mut encoder = ark_encoder(true);
+        encoder.set_parallel_tool_calls(true);
+        assert!(encoder.parallel_tool_calls_enabled());
+        let tools =
+            [ToolDefinition::new("lookup", "Read the status", json!({"type":"object"})).unwrap()];
+        let first_input = [json!({"role":"user","content":"Read the status"})];
+        let first: Value = serde_json::from_slice(
+            &encoder
+                .encode_frame_request_bounded(
+                    &first_input,
+                    "Use the lookup tool",
+                    &tools,
+                    usize::MAX,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["store"], true);
+        assert_eq!(first["caching"], json!({"type":"enabled"}));
+        assert_eq!(first["tool_choice"], "auto");
+        assert_eq!(first["parallel_tool_calls"], true);
+        assert!(first.get("instructions").is_none());
+        assert!(first.get("previous_response_id").is_none());
+        assert_eq!(first["input"][0]["role"], "system");
+        assert_eq!(
+            first["input"][0]["content"][0]["text"],
+            "Use the lookup tool"
+        );
+        assert_eq!(first["input"][1], first_input[0]);
+        assert_eq!(first["tools"][0]["name"], "lookup");
+
+        let suffix = [json!({"type":"function_call_output","call_id":"call_1","output":"ready"})];
+        let body = encoder
+            .encode_frame_request_with_previous_response_id_bounded(
+                &suffix,
+                "Use the lookup tool",
+                &tools,
+                Some("resp_1"),
+                usize::MAX,
+            )
+            .unwrap();
+        let second: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["store"], true);
+        assert_eq!(second["caching"], json!({"type":"enabled"}));
+        assert_eq!(second["previous_response_id"], "resp_1");
+        assert_eq!(second["input"], json!(suffix));
+        assert!(second.get("instructions").is_none());
+        assert!(second.get("tools").is_none());
+        assert!(second.get("tool_choice").is_none());
+        assert!(second.get("parallel_tool_calls").is_none());
+        assert_eq!(
+            encoder
+                .encode_frame_request_with_previous_response_id_bounded(
+                    &suffix,
+                    "Use the lookup tool",
+                    &tools,
+                    Some("resp_1"),
+                    body.len(),
+                )
+                .unwrap(),
+            body
+        );
+        assert!(matches!(
+            encoder.encode_frame_request_with_previous_response_id_bounded(
+                &suffix,
+                "Use the lookup tool",
+                &tools,
+                Some("resp_1"),
+                body.len() - 1,
+            ),
+            Err(CodexHttpV1Error::SerializedRequestBodyLimit)
+        ));
+    }
+
+    #[test]
+    fn ark_context_estimate_includes_full_history_and_ignores_upload_budget() {
+        let encoder = ark_encoder(true);
+        let suffix = [json!({"role":"user","content":"next"})];
+        let history = [
+            json!({"role":"user","content":"retained".repeat(1024)}),
+            suffix[0].clone(),
+        ];
+        let upload = encoder
+            .encode_frame_request_with_previous_response_id_bounded(
+                &suffix,
+                "",
+                &[],
+                Some("resp_1"),
+                usize::MAX,
+            )
+            .unwrap();
+        let full_bytes = encoder
+            .encoded_frame_context_bytes(&history, "", &[])
+            .unwrap();
+        assert!(full_bytes > upload.len());
+        assert_eq!(
+            full_bytes,
+            encoder
+                .encode_frame_request_bounded(&history, "", &[], usize::MAX)
+                .unwrap()
+                .len()
+        );
+        let request: Value = serde_json::from_slice(&upload).unwrap();
+        assert_eq!(request["input"], json!(suffix));
     }
 
     #[test]

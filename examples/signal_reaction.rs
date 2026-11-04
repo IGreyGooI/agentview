@@ -73,7 +73,7 @@ fn review_turn(props: ReviewProps) -> Component {
         .with(|status| *status)
         .expect("mounted review status");
     let handler_status = status.clone();
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let status = handler_status.clone();
         async move {
             if let TextTurnEvent::TextComplete(text) = event {
@@ -84,7 +84,7 @@ fn review_turn(props: ReviewProps) -> Component {
         }
     });
 
-    use_reaction_completion(move || async move {
+    use_reaction_completion(move |_ctx| async move {
         if submitted_status != ReviewStatus::Pending {
             application_exit.request(ExitReason::Completed)?;
         }
@@ -105,7 +105,7 @@ fn review_application(props: ReviewProps) -> Component {
     }
 }
 
-async fn run_review(provider: impl ReactionPort) -> anyhow::Result<()> {
+async fn run_review(provider: impl ReactionPort + 'static) -> anyhow::Result<()> {
     let props = ReviewProps {
         document_id: "proposal-7".to_owned(),
     };

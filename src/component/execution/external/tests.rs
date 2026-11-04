@@ -190,7 +190,7 @@ fn external_root(props: ExternalProps, events: EventInput<ProviderEvent>) -> Com
         {
             EventListener::observe("test.external.text", "v1")
                 .listen_to(events.select(ProviderEvent::TEXT))
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let values = Arc::clone(&values);
                     let log = Arc::clone(&log);
                     let handler_started = Arc::clone(&handler_started);

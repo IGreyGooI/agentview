@@ -298,7 +298,7 @@ fn add_action(state: Signal<CounterState>, observed: i64) -> Component {
         CliCommand {
             command: ADD,
             enabled: observed < 10,
-            on_call: move |input: AddInput| {
+            on_call: move |_ctx, input: AddInput| {
                 state.update(|state| {
                     state.calls += 1;
                     state.value += input.delta;
@@ -323,7 +323,7 @@ fn counter_view(state: Signal<CounterState>) -> Component {
         { action }
         CliCommand {
             command: INSPECT,
-            on_call: move |_: NoInput| {
+            on_call: move |_ctx, _: NoInput| {
                 state.with(|state| json!({"value": state.value, "calls": state.calls}))
             },
         }
@@ -610,7 +610,7 @@ fn work_application(probe: CounterProbe, gate: Arc<WorkGate>) -> Component {
         counter_view(state)
         CliCommand {
             command: START,
-            on_call: move |_: NoInput| {
+            on_call: move |_ctx, _: NoInput| {
                 started.update(|state| {
                     state.calls += 1;
                     state.pending_work = true;
@@ -693,7 +693,7 @@ fn failing_application(probe: CounterProbe) -> Component {
         counter_view(state)
         CliCommand {
             command: FAIL,
-            on_call: move |_: NoInput| {
+            on_call: move |_ctx, _: NoInput| {
                 failed.update(|state| {
                     state.calls += 1;
                     state.value += 1;
@@ -781,7 +781,7 @@ fn duplicate_command() -> Component {
     view! {
         CliCommand {
             command: INSPECT,
-            on_call: |_: NoInput| Ok::<_, Infallible>(true),
+            on_call: |_ctx, _: NoInput| Ok::<_, Infallible>(true),
         }
     }
 }
@@ -894,7 +894,7 @@ fn spawning_command(probe: SpawnProbe) -> Component {
     view! {
         CliCommand {
             command: START,
-            on_call: move |_: NoInput| {
+            on_call: move |_ctx, _: NoInput| {
                 let probe = probe.clone();
                 spawn(async move {
                     let _guard = TaskDrop(probe.dropped);
@@ -920,7 +920,7 @@ fn spawning_application(probe: SpawnProbe) -> Component {
         { action }
         CliCommand {
             command: INSPECT,
-            on_call: |_: NoInput| Ok::<_, Infallible>(true),
+            on_call: |_ctx, _: NoInput| Ok::<_, Infallible>(true),
         }
     }
 }
@@ -968,7 +968,7 @@ fn switch_owner_a(probe: SwitchProbe) -> Component {
     view! {
         CliCommand {
             command: INSPECT,
-            on_call: move |_: NoInput| {
+            on_call: move |_ctx, _: NoInput| {
                 calls.store(true, Ordering::SeqCst);
                 Ok::<_, Infallible>("owner-a")
             },
@@ -983,7 +983,7 @@ fn switch_owner_b(probe: SwitchProbe) -> Component {
     view! {
         CliCommand {
             command: INSPECT,
-            on_call: move |_: NoInput| {
+            on_call: move |_ctx, _: NoInput| {
                 calls.store(true, Ordering::SeqCst);
                 Ok::<_, Infallible>("owner-b")
             },
@@ -1070,7 +1070,7 @@ fn failing_after_receive_app(probe: FailingPrepProbe) -> Component {
         { child }
         CliCommand {
             command: START,
-            on_call: move |_: NoInput| {
+            on_call: move |_ctx, _: NoInput| {
                 trigger.update(|state| state.0 = true).unwrap();
                 Ok::<_, Infallible>("triggered")
             },
@@ -1108,7 +1108,7 @@ fn repeated_command_owner() -> Component {
     view! {
         CliCommand {
             command: INSPECT,
-            on_call: |_: NoInput| Ok::<_, Infallible>(true),
+            on_call: |_ctx, _: NoInput| Ok::<_, Infallible>(true),
         }
     }
 }

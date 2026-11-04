@@ -44,7 +44,7 @@ Application<P>
 ```
 
 `Application::run()` is the default fixed driver. An integration that needs
-manual scheduling can call `react()` for one reaction at a time. Mounting,
+manual scheduling can call `react()?` to start an owned reaction and receive its handle. Mounting,
 reading state, writing a `Signal`, completing a Component task, or requesting
 driver attention does not render another projection or submit a Frame by
 itself.
@@ -60,9 +60,11 @@ The public lifecycle is:
    preparation and reactions until normal exit returns an `ExitReason`, or the
    first `ApplicationFault` occurs. It does not clean up business resources or
    call `shutdown()`.
-4. `react().await` is the manual single-reaction interface. It returns
-   `ControlFlow::Continue(())` after one reaction, or `Break(reason)` on normal
-   application exit and prevents subsequent Frame submissions.
+4. `react()?` starts one owned operation and returns a cloneable `Reaction` with `id()`,
+   `kind()`, `interrupt()`, and direct `await`. Awaiting yields `ReactionOutcome::Completed`,
+   `Interrupted`, or `Exited(reason)`. Idle admission is Main; while Main is active,
+   another admission is Temporary from a completed checkpoint with separate model history.
+   Dropping the handle or waiter does not cancel the operation.
 5. `wait_for_reaction_request().await` and `take_reaction_request()` optionally
    let a driver consume coalesced Component demand. They do not call `react()`.
 6. `shutdown().await` consumes the `Application`, fences the mount, and drains
@@ -90,7 +92,7 @@ fn application_root(props: AppProps) -> Component {
     let answer = use_signal(String::new);
     let answer_for_events = answer.clone();
 
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_context, event| {
         let answer = answer_for_events.clone();
         async move {
             if let TextTurnEvent::TextComplete(text) = event {
@@ -121,7 +123,7 @@ async fn run() -> Result<(), ApplicationFault> {
     )?;
 
     assert!(!application.current_projection().is_dirty());
-    assert_eq!(application.react().await?, std::ops::ControlFlow::Continue(()));
+    assert!(application.react()?.await?.is_continue());
     assert_eq!(capture.frame_snapshots().len(), 1);
     application.shutdown().await
 }
@@ -190,6 +192,30 @@ behavior, and how these boundaries map to services.
 
 ### Forking An Application
 
+`parent.fork_to(root, target).await` creates an independent `Application<Q>` from an explicit owned
+business snapshot on any new `ReactionPort`. The target's type, model and profile may differ. It must
+have a distinct fresh identity and declare `FullRequired`; the child's first Frame carries its current
+view. It starts with empty model history. The source port and staged tool results stay untouched.
+
+```rust,ignore
+let snapshot = export_business_snapshot();
+let mut child = parent
+    .fork_to(move || restored_root(snapshot.clone()), new_port)
+    .await?;
+```
+
+The source runtime must be healthy and not exiting. Snapshot consistency is the application's
+responsibility. Child Signals, tasks, exit, demand and FrameSession are independent; its driver runs
+preparation and submits only when explicitly called. `fork_to_with_commands(root, target, input)`
+supplies a separate command inbox. Each owner completes its own shutdown.
+
+[`application_fork_to`](examples/application_fork_to.rs) uses different Rust port types with Debug
+backends to record the child's first Full and empty replay, without credentials or model actions:
+
+```bash
+cargo run --no-default-features --example application_fork_to
+```
+
 For a `ForkableReactionPort`, `parent.fork(root).await` creates an independent
 Application with the shared conversation history and matching provider context.
 The native Responses port supports it. Capture an owned business snapshot in the
@@ -198,7 +224,12 @@ new root so it creates its own Signals and handlers:
 ```rust,ignore
 let snapshot = exported.lock().unwrap().clone();
 let mut child = parent.fork(move || restored_root(snapshot.clone())).await?;
-let (parent_turn, child_turn) = tokio::join!(parent.react(), child.react());
+let parent_reaction = parent.react()?;
+let child_reaction = child.react()?;
+let (parent_turn, child_turn) = tokio::join!(
+    async { parent_reaction.await },
+    async { child_reaction.await },
+);
 let (parent_cleanup, child_cleanup) = tokio::join!(parent.shutdown(), child.shutdown());
 parent_turn?;
 child_turn?;
@@ -206,8 +237,8 @@ parent_cleanup?;
 child_cleanup?;
 ```
 
-Fork requires closed tool calls and empty staged results, plus no source exit,
-pending command, mount retirement, or streaming recovery. A completed tool may
+The history-preserving `fork` requires closed tool calls and empty staged results, plus no source
+exit, pending command, mount retirement, or streaming recovery. A completed tool may
 still need the source's next Frame to deliver its result before forking. The
 child explicitly declares System and current ephemeral context; historical raw
 ephemeral prompts are excluded. `fork_with_commands(root, input)` accepts a new
@@ -227,6 +258,23 @@ cargo test --no-default-features --example application_fork
 
 See [HELP.md: Forking an Application](HELP.md#forking-an-application) for the
 snapshot and lifecycle contract.
+
+Component action/event callbacks receive `EventContext` before their business arguments:
+`|context, args|`, or `|context|` when no input is needed. The runtime supplies the source
+Application, reaction, submitted Frame, and event identity without adding model input fields.
+Move or clone this context into asynchronous work and retain it with business feedback.
+`use_application_id()` identifies the Application receiving the current view, so a shared
+Component can select feedback while preserving its original source. See
+[HELP.md: Event Sources](HELP.md#event-sources-and-shared-business-state).
+
+[Asynchronous Reaction handles](docs/parallel-reactions-design.md) support dynamic `Main` and
+`Temporary` reactions within one Application and Component tree. `EventContext::reaction_kind()`
+preserves the handle's history classification through callbacks and asynchronous feedback.
+A settled Temporary can continue its own context through `branch.react()?`; Main advances through
+`app.react()?`. Native Responses supports isolated temporary history, including fixed stored-parent
+references with `store:false` when Ark caching is enabled.
+Run `cargo run --no-default-features --example parallel_reactions` for an
+[offline interaction](examples/parallel_reactions.rs) with temporary tool feedback and targeted interruption.
 
 ### Business History
 
@@ -327,6 +375,42 @@ token estimates. See [compaction configuration](docs/parallel-compaction-design.
 All compaction is local: AgentView manages history replacement, and summaries use
 ordinary inference with the current model and reasoning configuration. No server
 compaction API or extension is enabled. See [design constraints](design.md).
+
+For Volcano Engine Ark's native Responses endpoint, enable explicit session caching
+in the request options before constructing the provider:
+
+```rust,ignore
+let options = CodexHttpV1Options::new(model, None, None, None::<String>)?
+    .with_ark_caching(true);
+```
+
+This option defaults to `false` and is supported by the native port; the legacy
+provider port rejects it. When enabled, eligible foreground requests send
+`store: true` and `caching: {"type": "enabled"}`. After a validated completed
+response, the next compatible Delta sends its `previous_response_id` and only
+new input. System instructions become an initial `system` input message because
+Ark caching requires an empty `instructions` field. Tools and tool selection
+settings are sent when starting the chain and inherited while continuing it;
+continued requests omit `tools`, `tool_choice`, and `parallel_tool_calls`.
+Changing the tool catalog or parallel call setting starts a new chain.
+Full Frames, context reset, a fork's first Frame, and installed local
+compaction also start a new chain with the retained input. Context limits and
+compaction thresholds still count the complete effective context.
+
+A request containing ephemeral prompts uses full replay with `store: false` and
+without caching, so those prompts never enter a retained server session. The
+next eligible request starts a new chain. Background and forced summary requests
+also keep `store: false` and do not use the foreground cache.
+
+Ark requires the model's **Inference (caching) pricing** capability to be enabled
+in [Open Management](https://ark.volcengine.com/region:cn-beijing/openManagement).
+Otherwise requests fail with `403 AccessDenied.CacheService`. Explicit caching
+incurs cache storage charges in addition to model inference charges; see
+[Ark context caching](https://docs.volcengine.com/docs/ark/context-cache?lang=zh).
+Use the response usage observer's `cached_tokens()` to inspect cache hits; the
+first request in a new chain normally reports zero. Expired response cursors
+start a new chain. If Ark reports `InvalidParameter.PreviousResponseNotFound`,
+the port reports a retryable fault and requires Full replay on the next reaction.
 
 The port checks the Frame handoff precondition at the crossing poll. A
 successful submit handoff commits the Application's outbound canonical input,

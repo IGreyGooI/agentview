@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use futures::FutureExt;
 
 use crate::{
-    component::authoring::ComponentAttemptFault,
+    component::{authoring::ComponentAttemptFault, EventContext, EventSource},
     pom::{BlockChildren, BlockContent, Document, MixedContent, TextNode, XmlName, XmlNode},
 };
 
@@ -187,8 +187,7 @@ where
     fn open(
         &mut self,
         state: &State,
-        attempt: StreamingToolAttemptId,
-        sequence: u64,
+        context: EventContext,
         occurrence: XmlOccurrenceId,
         attributes: Vec<(String, String)>,
         span: XmlSourceSpan,
@@ -200,8 +199,7 @@ where
     fn delta(
         &mut self,
         state: &State,
-        attempt: StreamingToolAttemptId,
-        sequence: u64,
+        context: EventContext,
         occurrence: XmlOccurrenceId,
         delta: String,
         accumulated: Arc<str>,
@@ -210,8 +208,7 @@ where
     fn complete(
         &mut self,
         state: &mut State,
-        attempt: StreamingToolAttemptId,
-        sequence: u64,
+        context: EventContext,
         occurrence: XmlOccurrenceId,
         form: XmlElementForm,
         span: XmlSourceSpan,
@@ -362,12 +359,12 @@ where
     fn open(
         &mut self,
         state: &State,
-        attempt: StreamingToolAttemptId,
-        sequence: u64,
+        context: EventContext,
         occurrence: XmlOccurrenceId,
         attributes: Vec<(String, String)>,
         span: XmlSourceSpan,
     ) -> ElementOpenDispatch<C> {
+        let (attempt, sequence) = xml_event_metadata(&context);
         let mut raw = HashMap::<&str, &str>::with_capacity(attributes.len());
         for (name, value) in &attributes {
             raw.insert(name.as_str(), value.as_str());
@@ -416,6 +413,7 @@ where
             Err(error) => return ElementOpenDispatch::Decode(error),
         };
         let event = XmlOpen {
+            context,
             attempt,
             sequence,
             occurrence,
@@ -429,6 +427,7 @@ where
                 reduce(
                     state,
                     XmlOpen {
+                        context: event.context.clone(),
                         attempt: event.attempt,
                         sequence: event.sequence,
                         occurrence: event.occurrence,
@@ -459,13 +458,13 @@ where
     fn delta(
         &mut self,
         state: &State,
-        attempt: StreamingToolAttemptId,
-        sequence: u64,
+        context: EventContext,
         occurrence: XmlOccurrenceId,
         delta: String,
         accumulated: Arc<str>,
         span: XmlSourceSpan,
     ) -> Result<StreamingToolUpdate<C>, ElementInvariant> {
+        let (attempt, sequence) = xml_event_metadata(&context);
         let Some(occurrence_state) = self.occurrences.get_mut(&occurrence) else {
             return Err(ElementInvariant {
                 message: "parser emitted a delta for an unopened XML occurrence",
@@ -479,6 +478,7 @@ where
                 reduce(
                     state,
                     XmlTextDelta {
+                        context: context.clone(),
                         attempt,
                         sequence,
                         occurrence,
@@ -496,12 +496,12 @@ where
     fn complete(
         &mut self,
         state: &mut State,
-        attempt: StreamingToolAttemptId,
-        sequence: u64,
+        context: EventContext,
         occurrence: XmlOccurrenceId,
         form: XmlElementForm,
         span: XmlSourceSpan,
     ) -> ElementCompleteDispatch<C> {
+        let (attempt, sequence) = xml_event_metadata(&context);
         let Some(occurrence_state) = self.occurrences.remove(&occurrence) else {
             return ElementCompleteDispatch::Invariant(ElementInvariant {
                 message: "parser emitted completion for an unopened XML occurrence",
@@ -513,6 +513,7 @@ where
                 Err(error) => return ElementCompleteDispatch::Decode(error),
             };
         let complete = XmlComplete {
+            context,
             attempt,
             sequence,
             occurrence,
@@ -536,6 +537,15 @@ where
 
     fn discard(&mut self, occurrence: XmlOccurrenceId) {
         self.occurrences.remove(&occurrence);
+    }
+}
+
+fn xml_event_metadata(context: &EventContext) -> (StreamingToolAttemptId, u64) {
+    match context.source() {
+        EventSource::Xml {
+            attempt, sequence, ..
+        } => (*attempt, *sequence),
+        _ => unreachable!("typed XML reducers require XML event provenance"),
     }
 }
 
@@ -634,7 +644,7 @@ where
             })
             .collect();
         Ok(Self {
-            start,
+            start: start.clone(),
             parser,
             state: Some(state),
             elements,
@@ -700,21 +710,24 @@ where
 
     fn record_diagnostic(
         &mut self,
+        context: EventContext,
         origin: StreamingToolDiagnosticOrigin,
         diagnostic: StreamingToolDiagnostic<C::Diagnostic>,
     ) -> Result<(), StreamingToolDriverFault> {
         let sequence = self.next_sequence()?;
-        self.record_diagnostic_at(sequence, origin, diagnostic);
+        self.record_diagnostic_at(context, sequence, origin, diagnostic);
         Ok(())
     }
 
     fn record_diagnostic_at(
         &mut self,
+        context: EventContext,
         sequence: u64,
         origin: StreamingToolDiagnosticOrigin,
         diagnostic: StreamingToolDiagnostic<C::Diagnostic>,
     ) {
         self.diagnostics.push(StreamingToolDiagnosticRecord {
+            context,
             sequence,
             origin,
             diagnostic,
@@ -723,14 +736,19 @@ where
 
     fn record_contract(
         &mut self,
-        occurrence: Option<XmlOccurrenceId>,
+        context: EventContext,
         span: Option<XmlSourceSpan>,
         element: Option<&'static str>,
         attribute: Option<&'static str>,
         kind: XmlContractViolationKind,
         detail: &'static str,
     ) -> Result<(), StreamingToolDriverFault> {
+        let occurrence = match context.source() {
+            EventSource::Xml { occurrence, .. } => *occurrence,
+            _ => unreachable!("XML diagnostics require XML source"),
+        };
         self.record_diagnostic(
+            context,
             StreamingToolDiagnosticOrigin::Parser { occurrence, span },
             StreamingToolDiagnostic::Contract(XmlContractViolation::new(
                 self.start.contract_identity,
@@ -744,14 +762,18 @@ where
 
     fn record_decode(
         &mut self,
-        occurrence: XmlOccurrenceId,
+        context: EventContext,
         span: XmlSourceSpan,
         violation: XmlDecodeViolation,
     ) -> Result<(), StreamingToolDriverFault> {
         match violation {
             XmlDecodeViolation::Model { .. } => self.record_diagnostic(
+                context.clone(),
                 StreamingToolDiagnosticOrigin::Parser {
-                    occurrence: Some(occurrence),
+                    occurrence: match context.source() {
+                        EventSource::Xml { occurrence, .. } => *occurrence,
+                        _ => unreachable!("XML diagnostics require XML source"),
+                    },
                     span: Some(span),
                 },
                 StreamingToolDiagnostic::Decode(violation),
@@ -778,6 +800,17 @@ where
 
     async fn process_event(&mut self, event: ParserEvent) -> Result<(), StreamingToolDriverFault> {
         let event_sequence = self.next_sequence()?;
+        let occurrence = match &event {
+            ParserEvent::Open { occurrence, .. }
+            | ParserEvent::Delta { occurrence, .. }
+            | ParserEvent::Complete { occurrence, .. } => Some(XmlOccurrenceId::new(*occurrence)),
+            ParserEvent::Invalid { occurrence, .. } => occurrence.map(XmlOccurrenceId::new),
+        };
+        let context = self.start.context.child(EventSource::Xml {
+            attempt: self.start.attempt,
+            occurrence,
+            sequence: event_sequence,
+        });
         match event {
             ParserEvent::Open {
                 occurrence,
@@ -797,7 +830,7 @@ where
                 let span = XmlSourceSpan::from_range(span);
                 if self.exceeds_maximum(index) {
                     self.record_contract(
-                        Some(occurrence),
+                        context.clone(),
                         Some(span),
                         Some(self.summaries[index].name),
                         None,
@@ -808,18 +841,13 @@ where
                     return Ok(());
                 }
                 let state = self.state.as_ref().ok_or_else(|| self.inactive_fault())?;
-                let dispatch = self.elements[index].open(
-                    state,
-                    self.start.attempt,
-                    event_sequence,
-                    occurrence,
-                    attributes,
-                    span,
-                );
+                let dispatch =
+                    self.elements[index].open(state, context.clone(), occurrence, attributes, span);
                 match dispatch {
                     ElementOpenDispatch::Opened(update) => {
                         self.summaries[index].opened += 1;
                         self.apply_update(
+                            context.clone(),
                             StreamingEmissionOrigin::Xml {
                                 event_sequence,
                                 occurrence,
@@ -831,7 +859,7 @@ where
                     ElementOpenDispatch::Contract(problems) => {
                         for problem in problems {
                             self.record_contract(
-                                Some(occurrence),
+                                context.clone(),
                                 Some(span),
                                 Some(self.summaries[index].name),
                                 problem.attribute,
@@ -842,7 +870,7 @@ where
                         self.invalidate_occurrence(occurrence).await?;
                     }
                     ElementOpenDispatch::Decode(violation) => {
-                        self.record_decode(occurrence, span, violation)?;
+                        self.record_decode(context.clone(), span, violation)?;
                         self.invalidate_occurrence(occurrence).await?;
                     }
                     ElementOpenDispatch::Invariant(fault) => return Err(self.element_fault(fault)),
@@ -863,8 +891,7 @@ where
                 let update = self.elements[index]
                     .delta(
                         state,
-                        self.start.attempt,
-                        event_sequence,
+                        context.clone(),
                         occurrence,
                         delta,
                         accumulated,
@@ -872,6 +899,7 @@ where
                     )
                     .map_err(|fault| self.element_fault(fault))?;
                 self.apply_update(
+                    context.clone(),
                     StreamingEmissionOrigin::Xml {
                         event_sequence,
                         occurrence,
@@ -903,14 +931,8 @@ where
                     contract: self.start.contract_identity,
                 };
                 let state = self.state.as_mut().ok_or(inactive)?;
-                let dispatch = self.elements[index].complete(
-                    state,
-                    self.start.attempt,
-                    event_sequence,
-                    occurrence,
-                    form,
-                    span,
-                );
+                let dispatch =
+                    self.elements[index].complete(state, context.clone(), occurrence, form, span);
                 match dispatch {
                     ElementCompleteDispatch::Completed(update) => {
                         self.summaries[index].decoded += 1;
@@ -919,6 +941,7 @@ where
                             self.summaries[index].implicit_eof += 1;
                         }
                         self.apply_update(
+                            context.clone(),
                             StreamingEmissionOrigin::Xml {
                                 event_sequence,
                                 occurrence,
@@ -931,6 +954,7 @@ where
                         self.summaries[index].decoded += 1;
                         for diagnostic in diagnostics {
                             self.record_diagnostic(
+                                context.clone(),
                                 StreamingToolDiagnosticOrigin::Reducer(
                                     StreamingEmissionOrigin::Xml {
                                         event_sequence,
@@ -943,7 +967,7 @@ where
                         self.invalidate_occurrence(occurrence).await?;
                     }
                     ElementCompleteDispatch::Decode(violation) => {
-                        self.record_decode(occurrence, span, violation)?;
+                        self.record_decode(context.clone(), span, violation)?;
                         self.invalidate_occurrence(occurrence).await?;
                     }
                     ElementCompleteDispatch::Invariant(fault) => {
@@ -974,7 +998,7 @@ where
                 let element_name = element_index.map(|index| self.summaries[index].name);
                 let span = span.map(XmlSourceSpan::from_range);
                 let (kind, detail) = map_invalid_kind(kind);
-                self.record_contract(occurrence, span, element_name, None, kind, detail)?;
+                self.record_contract(context, span, element_name, None, kind, detail)?;
                 if let Some(occurrence) = occurrence {
                     self.invalidate_occurrence(occurrence).await?;
                 }
@@ -1053,26 +1077,29 @@ where
 
     async fn apply_update(
         &mut self,
+        context: EventContext,
         origin: StreamingEmissionOrigin,
         update: StreamingToolUpdate<C>,
     ) -> Result<(), StreamingToolDriverFault> {
         let effect_update = self
             .effects
-            .handle_update(origin.clone(), update)
+            .handle_update(context.clone(), origin.clone(), update)
             .await
             .map_err(|fault| self.effects_fault(fault))?;
-        self.record_effect_diagnostics(origin, effect_update)?;
+        self.record_effect_diagnostics(context, origin, effect_update)?;
         Ok(())
     }
 
     fn record_effect_diagnostics(
         &mut self,
+        context: EventContext,
         origin: StreamingEmissionOrigin,
         update: EffectsUpdate<C::Diagnostic>,
     ) -> Result<(), StreamingToolDriverFault> {
         let status = update.status();
         for diagnostic in update.into_diagnostics() {
             self.record_diagnostic_at(
+                context.clone(),
                 diagnostic.sequence,
                 StreamingToolDiagnosticOrigin::Reducer(origin.clone()),
                 StreamingToolDiagnostic::Domain(diagnostic.diagnostic),
@@ -1088,8 +1115,14 @@ where
         for index in 0..self.summaries.len() {
             let required = self.elements[index].cardinality().min();
             if self.summaries[index].seen < required {
+                let sequence = self.effects.sequence_cursor();
+                let context = self.start.context.child(EventSource::Xml {
+                    attempt: self.start.attempt,
+                    occurrence: None,
+                    sequence,
+                });
                 self.record_contract(
-                    None,
+                    context,
                     None,
                     Some(self.summaries[index].name),
                     None,
@@ -1126,9 +1159,16 @@ where
             .finish_reducer
             .take()
             .ok_or_else(|| self.inactive_fault())?;
+        let finish_sequence = self.effects.sequence_cursor();
+        let context = self.start.context.child(EventSource::Xml {
+            attempt: self.start.attempt,
+            occurrence: None,
+            sequence: finish_sequence,
+        });
         let decision = finish(
             state,
             XmlAttemptSummary {
+                context: context.clone(),
                 attempt: self.start.attempt,
                 raw_output: &raw_output,
                 elements: &self.summaries,
@@ -1137,7 +1177,7 @@ where
         );
         match decision {
             StreamingToolDecision::Accept(update) => {
-                self.apply_update(StreamingEmissionOrigin::Finish, update)
+                self.apply_update(context, StreamingEmissionOrigin::Finish, update)
                     .await?;
                 if self.blocked {
                     return Ok(());
@@ -1155,6 +1195,7 @@ where
             StreamingToolDecision::Reject(rejection) => {
                 for diagnostic in rejection.into_diagnostics() {
                     self.record_diagnostic(
+                        context.clone(),
                         StreamingToolDiagnosticOrigin::Reducer(StreamingEmissionOrigin::Finish),
                         StreamingToolDiagnostic::Domain(diagnostic),
                     )?;
@@ -1507,7 +1548,14 @@ mod tests {
     ) -> ContractMachine<TestChannels, Arc<Mutex<Vec<String>>>, NoLiveRuntime, NoPublisher> {
         let state = Arc::clone(&observed);
         ContractMachine::new(
-            StreamingToolAttemptStart::new(StreamingToolAttemptId::new(1), "test", "v1"),
+            StreamingToolAttemptStart::new(
+                StreamingToolAttemptId::new(1),
+                "test",
+                "v1",
+                crate::component::provenance::EventScope::application(
+                    crate::component::ApplicationId::fresh(),
+                ),
+            ),
             XmlEnvelope::strict_fragment(),
             ignore_unknown_elements,
             state,
@@ -1683,7 +1731,14 @@ mod tests {
         let live_capture = Arc::clone(&capture);
         let publish_capture = Arc::clone(&capture);
         let mut contract = ContractMachine::new(
-            StreamingToolAttemptStart::new(StreamingToolAttemptId::new(1), "sequence", "v1"),
+            StreamingToolAttemptStart::new(
+                StreamingToolAttemptId::new(1),
+                "sequence",
+                "v1",
+                crate::component::provenance::EventScope::application(
+                    crate::component::ApplicationId::fresh(),
+                ),
+            ),
             XmlEnvelope::strict_fragment(),
             false,
             state,

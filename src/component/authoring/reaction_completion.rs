@@ -1,11 +1,11 @@
 use std::{fmt, future::Future, pin::Pin};
 
-use crate::component::signal::HookMount;
+use crate::component::{signal::HookMount, EventContext};
 
 use super::{async_task::ComponentTaskContext, handler::HandlerFault};
 
 type CompletionFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFault>> + Send + 'static>>;
-type CompletionHandler = Box<dyn FnOnce() -> CompletionFuture + Send + 'static>;
+type CompletionHandler = Box<dyn FnOnce(EventContext) -> CompletionFuture + Send + 'static>;
 
 /// Declare work that runs after one normally completed provider reaction.
 ///
@@ -15,7 +15,7 @@ type CompletionHandler = Box<dyn FnOnce() -> CompletionFuture + Send + 'static>;
 #[track_caller]
 pub fn use_reaction_completion<Handler, HandlerFuture, Error>(_handler: Handler)
 where
-    Handler: FnOnce() -> HandlerFuture + Send + 'static,
+    Handler: FnOnce(EventContext) -> HandlerFuture + Send + 'static,
     HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
     Error: fmt::Display + Send + 'static,
 {
@@ -35,13 +35,13 @@ impl ReactionCompletionDeclaration {
         task_context: Option<ComponentTaskContext>,
     ) -> Self
     where
-        Handler: FnOnce() -> HandlerFuture + Send + 'static,
+        Handler: FnOnce(EventContext) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
         Self {
-            handler: Some(Box::new(move || {
-                let future = handler();
+            handler: Some(Box::new(move |context| {
+                let future = handler(context);
                 Box::pin(async move {
                     future.await.map_err(|error| HandlerFault::ReturnedError {
                         message: error.to_string(),
@@ -53,15 +53,18 @@ impl ReactionCompletionDeclaration {
         }
     }
 
-    pub(crate) async fn dispatch(&mut self) -> Result<(), ReactionCompletionDispatchFault> {
+    pub(crate) async fn dispatch(
+        &mut self,
+        context: EventContext,
+    ) -> Result<(), ReactionCompletionDispatchFault> {
         let _mount_permit = self
             .mount
             .authorize()
             .ok_or(ReactionCompletionDispatchFault::StaleMount)?;
         let task_context = self.task_context.clone();
         let future = match &task_context {
-            Some(context) => context.scope_sync(|| self.start())?,
-            None => self.start()?,
+            Some(task_context) => task_context.scope_sync(|| self.start(context))?,
+            None => self.start(context)?,
         };
         match task_context {
             Some(context) => context.scope(future).await?,
@@ -70,12 +73,15 @@ impl ReactionCompletionDeclaration {
         Ok(())
     }
 
-    fn start(&mut self) -> Result<CompletionFuture, ReactionCompletionDispatchFault> {
+    fn start(
+        &mut self,
+        context: EventContext,
+    ) -> Result<CompletionFuture, ReactionCompletionDispatchFault> {
         let handler = self
             .handler
             .take()
             .ok_or(ReactionCompletionDispatchFault::AlreadyDispatched)?;
-        Ok(handler())
+        Ok(handler(context))
     }
 }
 

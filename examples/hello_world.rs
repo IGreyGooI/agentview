@@ -13,7 +13,7 @@ mod live_provider;
 
 #[component]
 fn hello_agent() -> Component {
-    use_provider_event_handler(ProviderEvent::TEXT, |event| async move {
+    use_provider_event_handler(ProviderEvent::TEXT, |_ctx, event| async move {
         if let TextTurnEvent::TextComplete(text) = event {
             println!("{text}");
         }
@@ -21,13 +21,13 @@ fn hello_agent() -> Component {
     });
 
     let exit = use_application_exit();
-    use_reaction_completion(move || async move { exit.request(ExitReason::Completed) });
+    use_reaction_completion(move |_ctx| async move { exit.request(ExitReason::Completed) });
 
     let request = "## Request\n\nSay exactly: Hello World";
     view! { { request } }
 }
 
-async fn run_agent(provider: impl ReactionPort) -> anyhow::Result<()> {
+async fn run_agent(provider: impl ReactionPort + 'static) -> anyhow::Result<()> {
     let mut application = Application::mount(hello_agent, provider)?;
     let operation = application.run().await.map_err(anyhow::Error::from);
     let shutdown = application.shutdown().await.map_err(anyhow::Error::from);

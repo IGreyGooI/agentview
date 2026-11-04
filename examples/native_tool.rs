@@ -63,7 +63,7 @@ fn counter(answer: Arc<Mutex<String>>) -> Component {
     };
     let adjust_state = state.clone();
 
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let answer = Arc::clone(&answer);
         async move {
             if let TextTurnEvent::TextComplete(text) = event {
@@ -87,7 +87,7 @@ fn counter(answer: Arc<Mutex<String>>) -> Component {
         NativeToolCall {
             name: "adjust",
             description: "Add an amount from -100 through 100. Available before the first adjustment.",
-            on_call: move |input: Adjustment| {
+            on_call: move |_ctx, input: Adjustment| {
                 adjust_state.update(|counter| {
                     if counter.operations != 0 || !(-100..=100).contains(&input.amount) {
                         counter.feedback = "Ignored: adjust requires a fresh counter and an amount from -100 through 100.";
@@ -104,7 +104,7 @@ fn counter(answer: Arc<Mutex<String>>) -> Component {
         NativeToolCall {
             name: "undo",
             description: "Undo the adjustment. Pass the current counter value to confirm which state you observed.",
-            on_call: move |input: Undo| {
+            on_call: move |_ctx, input: Undo| {
                 state.update(|counter| {
                     if counter.operations != 1 || input.expected_value != counter.value {
                         counter.feedback = "Ignored: undo requires an applied adjustment and the current counter value.";
@@ -135,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
                 (2, "undo", 17, serde_json::json!({"expected_value": 42})),
             ] {
                 println!("reaction {step}: observe the counter, then call {tool}");
-                let _ = application.react().await?;
+                let _ = application.react()?.await?;
                 let current_projection = application.current_projection();
                 let items: Vec<_> = current_projection
                     .projection()
@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             println!("reaction 3: deliver the undo result and restored state");
-            let _ = application.react().await?;
+            let _ = application.react()?.await?;
             let call_count = application
                 .current_projection()
                 .projection()

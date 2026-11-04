@@ -735,7 +735,7 @@ mod tests {
             completed { "{count}" }
             Action {
                 name: "work",
-                on_call: move || {
+                on_call: move |_ctx| {
                     let calls = calls.clone();
                     let completed = completed.clone();
                     async move {

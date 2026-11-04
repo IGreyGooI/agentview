@@ -141,7 +141,7 @@ fn support_agent(inbox: SupportInbox) -> Component {
     });
 
     let received = answer.clone();
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let received = received.clone();
         async move {
             if let TextTurnEvent::TextComplete(text) = event {
@@ -153,7 +153,7 @@ fn support_agent(inbox: SupportInbox) -> Component {
 
     let completed = ticket.clone();
     let drafts = inbox.drafts.clone();
-    use_reaction_completion(move || async move {
+    use_reaction_completion(move |_ctx| async move {
         let text = answer
             .with(Clone::clone)?
             .context("model returned no reply")?;

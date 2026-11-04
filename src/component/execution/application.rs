@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use std::{
+    borrow::Cow,
     future::Future,
     ops::ControlFlow,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
@@ -30,7 +31,7 @@ use super::{
         ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason,
         ResettableReactionPort, SubmitFault, TargetDeclaration, TargetDeclarationInvariantFault,
     },
-    streaming::{StreamingSupervisor, StreamingToolRecoveryStatus},
+    streaming::{StreamingReactionLease, StreamingSupervisor, StreamingToolRecoveryStatus},
 };
 use crate::component::{
     authoring::{
@@ -43,14 +44,22 @@ use crate::component::{
     },
     host::CommittedRenderTransition,
     host::ComponentHost,
+    provenance::EventScope,
     task::{
         MountTaskScope, MountTaskSupervisor, MountTaskSupervisorError, TaskPanicMonitor,
         TaskRetirement, TaskSupervisorStatus,
     },
-    ComponentHostFault, PreparedRender,
+    ApplicationId, ComponentHostFault, EventSource, PreparedRender, ReactionId,
 };
 
 type RootFactory = Arc<dyn Fn(EventInput<ProviderEvent>) -> Component + Send + Sync + 'static>;
+
+#[path = "application_fork_to.rs"]
+mod fork_to;
+
+#[path = "application_parallel.rs"]
+mod parallel;
+pub use parallel::{Application as ParallelApplication, Reaction, ReactionOutcome, ReactionWait};
 
 fn render_root(root: RootFactory, events: EventInput<ProviderEvent>) -> Component {
     root(events)
@@ -182,19 +191,19 @@ enum SubmissionAttempt {
     Exited(ExitReason),
 }
 
-enum ForkResource<P: ForkableReactionPort> {
+enum ForkResource<P: ReactionPort + 'static> {
     Port(P),
     Application(Box<Application<P>>),
 }
 
 /// Retain partial child cleanup when the fork waiter is cancelled or unwinds.
-struct ForkCandidate<'a, P: ForkableReactionPort> {
+struct ForkCandidate<'a, P: ReactionPort + 'static> {
     resource: Option<ForkResource<P>>,
     cleanups: &'a mut Vec<tokio::task::JoinHandle<()>>,
     runtime: tokio::runtime::Handle,
 }
 
-impl<P: ForkableReactionPort> ForkCandidate<'_, P> {
+impl<P: ReactionPort + 'static> ForkCandidate<'_, P> {
     fn port_mut(&mut self) -> &mut P {
         match self.resource.as_mut().expect("owned fork candidate") {
             ForkResource::Port(port) => port,
@@ -224,7 +233,7 @@ impl<P: ForkableReactionPort> ForkCandidate<'_, P> {
     }
 }
 
-impl<P: ForkableReactionPort> Drop for ForkCandidate<'_, P> {
+impl<P: ReactionPort + 'static> Drop for ForkCandidate<'_, P> {
     fn drop(&mut self) {
         if let Some(resource) = self.resource.take() {
             self.cleanups.push(self.runtime.spawn(async move {
@@ -308,7 +317,7 @@ impl Drop for ReactionCancellationRecovery<'_> {
 pub struct Application<P: ReactionPort> {
     components: ComponentHost<RootFactory>,
     pending_render: Option<PendingApplicationRender>,
-    driver_demand: DriverDemand,
+    driver_demand: Arc<DriverDemand>,
     application_exit: ApplicationExitControl,
     tasks: MountTaskSupervisor,
     session: FrameSession,
@@ -336,15 +345,15 @@ struct PendingApplicationRender {
 /// A dirty snapshot remains complete: `dirty` only reports that newer
 /// Component state is waiting for a later explicit reconcile.
 pub struct ProjectionSnapshot<'a> {
-    projection: &'a RenderedProjection,
+    projection: Cow<'a, RenderedProjection>,
     revision: u64,
     dirty: bool,
     prepared: bool,
 }
 
 impl ProjectionSnapshot<'_> {
-    pub const fn projection(&self) -> &RenderedProjection {
-        self.projection
+    pub fn projection(&self) -> &RenderedProjection {
+        &self.projection
     }
 
     pub const fn revision(&self) -> u64 {
@@ -362,7 +371,8 @@ impl ProjectionSnapshot<'_> {
     /// Export this complete current view as a standalone prompt with no history.
     ///
     /// Does not reconcile dirty state or run preparation. Call
-    /// [`Application::prepare`] first when a fresh prepared view is needed.
+    /// [`Application::prepare`](crate::component::execution::Application::prepare)
+    /// first when a fresh prepared view is needed.
     /// See [`RenderedProjection::render_prompt`] for the exported content.
     pub fn render_prompt(&self) -> Result<String, super::PromptExportError> {
         self.projection.render_prompt()
@@ -459,7 +469,7 @@ impl<P: ReactionPort> Application<P> {
                 Some(application_exit.clone()),
             ),
             pending_render: None,
-            driver_demand,
+            driver_demand: Arc::new(driver_demand),
             application_exit,
             tasks,
             session,
@@ -721,6 +731,11 @@ impl<P: ReactionPort> Application<P> {
         }
     }
 
+    /// Identity shared by render hooks and all events originating in this application.
+    pub fn application_id(&self) -> ApplicationId {
+        self.components.application_id()
+    }
+
     /// Return the latest committed complete projection without reconciling.
     pub fn current_projection(&self) -> ProjectionSnapshot<'_> {
         let projection = self
@@ -733,7 +748,7 @@ impl<P: ReactionPort> Application<P> {
             .expect("committed Application projection always has a revision")
             .get();
         ProjectionSnapshot {
-            projection,
+            projection: Cow::Borrowed(projection),
             revision,
             dirty: self.components.is_dirty() || self.pending_render.is_some(),
             prepared: self.components.current_projection_is_prepared(),
@@ -987,9 +1002,9 @@ impl<P: ReactionPort> Application<P> {
             ControlFlow::Continue(prepared) => prepared,
             ControlFlow::Break(reason) => return Ok(ControlFlow::Break(reason)),
         };
-        let mut streaming_lease = self.streaming.start(bindings.take_streaming_contracts())?;
-        self.driver_demand
-            .set_streaming_fence(self.streaming.pending());
+        let reaction_id = ReactionId::fresh();
+        let application_id = self.application_id();
+        let mut streaming_lease = None;
         let result: Result<ControlFlow<ExitReason>, ApplicationFault> = async {
             let prepared = self
                 .session
@@ -1008,6 +1023,10 @@ impl<P: ReactionPort> Application<P> {
                 cancellation,
                 &mut self.streaming,
                 &self.application_exit,
+                application_id,
+                reaction_id,
+                &self.driver_demand,
+                &mut streaming_lease,
             )
             .await?
             {
@@ -1036,6 +1055,10 @@ impl<P: ReactionPort> Application<P> {
                         cancellation,
                         &mut self.streaming,
                         &self.application_exit,
+                        application_id,
+                        reaction_id,
+                        &self.driver_demand,
+                        &mut streaming_lease,
                     )
                     .await?
                     {
@@ -1074,7 +1097,9 @@ impl<P: ReactionPort> Application<P> {
             }
         }
         if self.streaming.pending() && !self.streaming.clear() {
-            streaming_lease.complete();
+            if let Some(mut lease) = streaming_lease {
+                lease.complete();
+            }
             return Err(ApplicationFault::streaming_recovery());
         }
         if !self.streaming.pending() && self.components.is_dirty() {
@@ -1082,7 +1107,9 @@ impl<P: ReactionPort> Application<P> {
                 .await?;
         }
         let cleanup = self.complete_streaming_cleanup().await;
-        streaming_lease.complete();
+        if let Some(mut lease) = streaming_lease {
+            lease.complete();
+        }
         cleanup?;
         result.map(|flow| match self.application_exit.reason() {
             Some(reason) => ControlFlow::Break(reason),
@@ -1205,7 +1232,11 @@ impl<P: ReactionPort> Application<P> {
                             if let (Some((code, message)), Some(wait)) = (input.feedback(), &wait) {
                                 wait.feedback
                                     .update(|feedback| {
-                                        feedback.input_feedback(code.clone(), message.clone())
+                                        feedback.input_feedback(
+                                            bindings.event_context(EventSource::Host),
+                                            code.clone(),
+                                            message.clone(),
+                                        )
                                     })
                                     .map_err(|_| ApplicationFault::command_handler())?;
                             }
@@ -1219,10 +1250,11 @@ impl<P: ReactionPort> Application<P> {
                         PendingCommandState::Received => {
                             let call = input.call().expect("pending command").clone();
                             input.start();
+                            let context = bindings.command_context(call.name());
                             let outcome = match &wait {
                                 Some(wait) if input.belongs_to(&wait.mount) && wait.mount.authorize().is_some() => {
                                     bindings
-                                        .dispatch_command(call.name(), call.input().clone())
+                                        .dispatch_command(context.clone(), call.name(), call.input().clone())
                                         .await
                                 }
                                 _ => Ok(CommandOutcome::Rejected {
@@ -1245,7 +1277,9 @@ impl<P: ReactionPort> Application<P> {
                             if let Some(wait) = &wait {
                                 let new_frame = input.take_new_feedback_frame();
                                 wait.feedback
-                                    .update(|feedback| feedback.record(&call, outcome, new_frame))
+                                    .update(|feedback| {
+                                        feedback.record(context, &call, outcome, new_frame)
+                                    })
                                     .map_err(|_| ApplicationFault::command_handler())?;
                             }
                             if self.components.is_dirty() {
@@ -1640,19 +1674,36 @@ async fn run_submission_attempt<P: ReactionPort>(
     cancellation: &ReactionCancellationControl,
     streaming: &mut StreamingSupervisor,
     application_exit: &ApplicationExitControl,
+    application_id: ApplicationId,
+    reaction_id: ReactionId,
+    driver_demand: &DriverDemand,
+    streaming_lease: &mut Option<StreamingReactionLease>,
 ) -> Result<SubmissionAttempt, ApplicationFault> {
     // The permit orders exit against starting this submission, independently
     // of the provider's later Frame handoff and history commit.
     if let Err(reason) = application_exit.try_begin_submission() {
         return Ok(SubmissionAttempt::Exited(reason));
     }
+    let revision = prepared.revision();
     let submission = submit_prepared_frame(port, session, prepared).await;
     match submission {
         Ok(facts) => {
+            let scope = EventScope::reaction(application_id, reaction_id, revision);
+            bindings.set_event_scope(scope);
+            *streaming_lease = Some(streaming.start(bindings.take_streaming_contracts(), scope)?);
+            driver_demand.set_streaming_fence(streaming.pending());
             if let Some(input) = command_input {
                 input.finish_feedback_frame();
             }
-            pump_provider_facts(session, bindings, facts, cancellation.clone(), streaming).await?;
+            pump_provider_facts(
+                session,
+                bindings,
+                facts,
+                cancellation.clone(),
+                streaming,
+                false,
+            )
+            .await?;
             Ok(SubmissionAttempt::Completed)
         }
         Err(SubmitFault::ContinuityChanged) => Ok(SubmissionAttempt::ContinuityChanged),
@@ -1666,6 +1717,7 @@ async fn pump_provider_facts(
     facts: ProviderFactStream<'_>,
     cancellation: ReactionCancellationControl,
     streaming: &mut StreamingSupervisor,
+    defer_completion: bool,
 ) -> Result<(), ApplicationFault> {
     let budget = session.full_reserve_budget();
     let admission = ReactionAdmissionGuard::with_budget(
@@ -1712,14 +1764,36 @@ async fn pump_provider_facts(
                     ));
                 }
                 Next::Fact(Some(Ok(fact))) => {
+                    let (output, ordinal) = match &fact {
+                        super::reaction::ProviderFact::ToolCall {
+                            output, ordinal, ..
+                        } => (Some(*output), Some(*ordinal)),
+                        super::reaction::ProviderFact::TextDelta { output, .. }
+                        | super::reaction::ProviderFact::TextSealed { output, .. } => {
+                            (Some(*output), None)
+                        }
+                        super::reaction::ProviderFact::ReactionCompleted { primary_text } => {
+                            (*primary_text, None)
+                        }
+                    };
                     let (event, ticket, structured_text) = recovery
                         .admission_mut()
                         .admit(fact)?
                         .into_structured_parts();
+                    let source = match &event {
+                        Some(ProviderEvent::ToolCall(call)) => EventSource::NativeTool {
+                            call_id: call.call_id().to_owned(),
+                            output,
+                            ordinal,
+                        },
+                        _ => EventSource::Provider { output },
+                    };
+                    let context = bindings.event_context(source);
                     match (event, ticket) {
                         (Some(ProviderEvent::ToolCall(call)), Some(ticket)) => {
-                            let (future, record) =
-                                bindings.start_native_tool_record(call).map_err(|source| {
+                            let (future, record) = bindings
+                                .start_native_tool_record_with_context(context, call)
+                                .map_err(|source| {
                                     ApplicationFault::from_attempt(
                                         ApplicationFaultStage::Binding,
                                         source,
@@ -1735,12 +1809,15 @@ async fn pump_provider_facts(
                         (Some(event), None) => {
                             await_with_lanes(
                                 async {
-                                    bindings.dispatch(event).await.map_err(|source| {
-                                        ApplicationFault::from_attempt(
-                                            ApplicationFaultStage::Binding,
-                                            source,
-                                        )
-                                    })
+                                    bindings
+                                        .dispatch_with_context(context, event)
+                                        .await
+                                        .map_err(|source| {
+                                            ApplicationFault::from_attempt(
+                                                ApplicationFaultStage::Binding,
+                                                source,
+                                            )
+                                        })
                                 },
                                 &mut lanes,
                                 recovery.admission_mut(),
@@ -1807,9 +1884,11 @@ async fn pump_provider_facts(
             .await
             .map_err(ApplicationFault::from_streaming)?;
         streaming.finish(summary).await?;
-        bindings.finish_normal().await.map_err(|source| {
-            ApplicationFault::from_attempt(ApplicationFaultStage::Binding, source)
-        })?;
+        if !defer_completion || !streaming.pending() || streaming.clear() {
+            bindings.finish_normal().await.map_err(|source| {
+                ApplicationFault::from_attempt(ApplicationFaultStage::Binding, source)
+            })?;
+        }
         Ok(())
     }
     .await;
@@ -2770,7 +2849,7 @@ mod tests {
         view! {
             state { "{value}" }
             {
-                NativeToolCall::named("change").on_call(move |call| {
+                NativeToolCall::named("change").on_call(move |_ctx, call| {
                     let update = update.clone();
                     async move {
                         update.set(String::from("after")).map_err(|fault| fault.to_string())?;
@@ -2786,7 +2865,7 @@ mod tests {
         let state = use_signal(|| String::from("before"));
         let rendered = state.with(Clone::clone).expect("mounted state");
         let update = state.clone();
-        use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+        use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
             let update = update.clone();
             let events = Arc::clone(&events);
             async move {
@@ -2807,12 +2886,12 @@ mod tests {
 
     #[component]
     fn panicking_event_with_pending_tool() -> Component {
-        use_provider_event_handler(ProviderEvent::TEXT, |_event| async move {
+        use_provider_event_handler(ProviderEvent::TEXT, |_ctx, _event| async move {
             panic!("provider handler panic after tool admission");
             #[allow(unreachable_code)]
             Ok::<(), String>(())
         });
-        NativeToolCall::named("pending-during-handler-panic").on_call(|call| async move {
+        NativeToolCall::named("pending-during-handler-panic").on_call(|_ctx, call| async move {
             std::future::pending::<()>().await;
             Ok::<_, String>(call.output("unreachable"))
         })
@@ -2820,7 +2899,7 @@ mod tests {
 
     #[component]
     fn panicking_tool_lane_component() -> Component {
-        NativeToolCall::named("panicking-tool-lane").on_call(|_call| async move {
+        NativeToolCall::named("panicking-tool-lane").on_call(|_ctx, _call| async move {
             panic!("native tool lane panic");
             #[allow(unreachable_code)]
             Err::<ToolOutput, _>("unreachable")
@@ -2874,7 +2953,7 @@ mod tests {
     fn cancellable_event_handler_component(probe: Arc<CallbackCancellationProbe>) -> Component {
         let state = use_signal(|| String::from("before"));
         let rendered = state.with(Clone::clone).expect("mounted state");
-        use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+        use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
             let probe = Arc::clone(&probe);
             let state = state.clone();
             async move {
@@ -2900,8 +2979,8 @@ mod tests {
         let stream_probe = Arc::clone(&props.stream);
         let completions = Arc::clone(&props.completions);
         StreamingXml::tag("item")
-            .on_stream(move |_element| run_cancellable_callback(Arc::clone(&stream_probe)))
-            .on_complete(move |_element| {
+            .on_stream(move |_ctx, _element| run_cancellable_callback(Arc::clone(&stream_probe)))
+            .on_complete(move |_ctx, _element| {
                 let completions = Arc::clone(&completions);
                 async move {
                     completions.fetch_add(1, Ordering::AcqRel);
@@ -2914,7 +2993,7 @@ mod tests {
     #[component]
     fn cancellable_xml_invalid_component(probe: Arc<CallbackCancellationProbe>) -> Component {
         StreamingXml::tag("item")
-            .on_invalid(move |_diagnostic| run_cancellable_callback(Arc::clone(&probe)))
+            .on_invalid(move |_ctx, _diagnostic| run_cancellable_callback(Arc::clone(&probe)))
             .into_component()
     }
 
@@ -2922,20 +3001,20 @@ mod tests {
     fn cancellable_reaction_completion_component(
         probe: Arc<CallbackCancellationProbe>,
     ) -> Component {
-        use_reaction_completion(move || run_cancellable_callback(Arc::clone(&probe)));
+        use_reaction_completion(move |_ctx| run_cancellable_callback(Arc::clone(&probe)));
         __private::fragment(Vec::new())
     }
 
     #[component]
     fn empty_primary_completion_component(completions: Arc<AtomicUsize>) -> Component {
-        use_reaction_completion(move || async move {
+        use_reaction_completion(move |_ctx| async move {
             completions.fetch_add(1, Ordering::AcqRel);
             Ok::<(), String>(())
         });
         XmlStreamingToolCall::contract("test.empty-primary", "v1")
             .empty_element("choice")
-            .on_decoded(|| async { Ok::<(), String>(()) })
-            .on_invalid(|_| async { Ok::<(), String>(()) })
+            .on_decoded(|_ctx| async { Ok::<(), String>(()) })
+            .on_invalid(|_ctx, _| async { Ok::<(), String>(()) })
     }
 
     #[derive(Clone)]
@@ -3098,7 +3177,7 @@ mod tests {
 
     #[component]
     fn spawn_handler_component(props: SpawnHandlerProps) -> Component {
-        use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+        use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
             let invocation_sender = props.observed.clone();
             let invocation = spawn(async move {
                 let _ = invocation_sender.send("invocation");
@@ -3248,7 +3327,7 @@ mod tests {
         });
 
         let lane_started = Arc::clone(&props.lane_started);
-        NativeToolCall::named("pending-during-task-panic").on_call(move |call| {
+        NativeToolCall::named("pending-during-task-panic").on_call(move |_ctx, call| {
             let lane_started = Arc::clone(&lane_started);
             async move {
                 lane_started.notify_one();
@@ -4016,7 +4095,7 @@ mod tests {
             move || {
                 let lane_started = Arc::clone(&observed_start);
                 let release_lane = Arc::clone(&observed_release);
-                NativeToolCall::named("delayed").on_call(move |call| {
+                NativeToolCall::named("delayed").on_call(move |_ctx, call| {
                     let lane_started = Arc::clone(&lane_started);
                     let release_lane = Arc::clone(&release_lane);
                     async move {
@@ -4111,7 +4190,7 @@ mod tests {
             move || {
                 let ready = observed_ready.clone();
                 let started = observed_started.clone();
-                let finished = NativeToolCall::named("finished").on_call(move |call| {
+                let finished = NativeToolCall::named("finished").on_call(move |_ctx, call| {
                     let ready = ready.clone();
                     let started = started.clone();
                     async move {
@@ -4124,7 +4203,7 @@ mod tests {
                 let ready = observed_ready.clone();
                 let started = observed_started.clone();
                 let dropped = observed_dropped.clone();
-                let pending = NativeToolCall::named("pending").on_call(move |call| {
+                let pending = NativeToolCall::named("pending").on_call(move |_ctx, call| {
                     let ready = ready.clone();
                     let started = started.clone();
                     let dropped = dropped.clone();
@@ -4200,7 +4279,7 @@ mod tests {
             let mut application = Application::mount(
                 || {
                     NativeToolCall::named("failing")
-                        .on_call(|_call| async { Err::<ToolOutput, _>("handler failed") })
+                        .on_call(|_ctx, _call| async { Err::<ToolOutput, _>("handler failed") })
                 },
                 port,
             )
@@ -4239,7 +4318,7 @@ mod tests {
         let mut application = Application::mount(
             move || {
                 let completed = Arc::clone(&observed_completion);
-                NativeToolCall::named("wait").on_call(move |call| {
+                NativeToolCall::named("wait").on_call(move |_ctx, call| {
                     let completed = Arc::clone(&completed);
                     async move {
                         completed.notify_one();
@@ -4305,7 +4384,7 @@ mod tests {
         let mut application = Application::mount(
             move || {
                 let lane_started = Arc::clone(&observed_start);
-                NativeToolCall::named("never-finishes").on_call(move |call| {
+                NativeToolCall::named("never-finishes").on_call(move |_ctx, call| {
                     let lane_started = Arc::clone(&lane_started);
                     async move {
                         lane_started.notify_one();
@@ -4389,7 +4468,7 @@ mod tests {
         let mut application = Application::mount(
             move || {
                 let lane_started = Arc::clone(&observed_start);
-                NativeToolCall::named("retained-pending").on_call(move |call| {
+                NativeToolCall::named("retained-pending").on_call(move |_ctx, call| {
                     let lane_started = Arc::clone(&lane_started);
                     async move {
                         lane_started.notify_one();
@@ -4679,7 +4758,7 @@ mod tests {
         let mut application = Application::mount(
             move || {
                 let lane_started = Arc::clone(&observed_start);
-                NativeToolCall::named("never-finishes").on_call(move |call| {
+                NativeToolCall::named("never-finishes").on_call(move |_ctx, call| {
                     let lane_started = Arc::clone(&lane_started);
                     async move {
                         lane_started.notify_one();
@@ -4765,7 +4844,7 @@ mod tests {
         let mut application = Application::mount(
             move || {
                 let lane_started = Arc::clone(&observed_start);
-                NativeToolCall::named("never-finishes").on_call(move |call| {
+                NativeToolCall::named("never-finishes").on_call(move |_ctx, call| {
                     let lane_started = Arc::clone(&lane_started);
                     async move {
                         lane_started.notify_one();
@@ -4905,7 +4984,7 @@ mod tests {
         let mut application = Application::mount(
             move || {
                 let lane_started = Arc::clone(&observed_start);
-                NativeToolCall::named("pending-stream-drop-panic").on_call(move |call| {
+                NativeToolCall::named("pending-stream-drop-panic").on_call(move |_ctx, call| {
                     let lane_started = Arc::clone(&lane_started);
                     async move {
                         lane_started.notify_one();

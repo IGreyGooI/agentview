@@ -57,7 +57,7 @@ fn catalogue_application() -> Component {
             Action {
                 name: format!("choice_{current}"),
                 content: choice_content(current),
-                on_call: move || generation.update(|generation| {
+                on_call: move |_ctx| generation.update(|generation| {
                     *generation += 1;
                     json!({"generation": *generation})
                 }),
@@ -71,14 +71,14 @@ fn catalogue_application() -> Component {
         Action {
             name: "set",
             description: "Choose the generation",
-            on_call: move |input: SetInput| generation.update(|generation| {
+            on_call: move |_ctx, input: SetInput| generation.update(|generation| {
                 *generation = input.generation;
                 json!({"generation": *generation})
             }),
         }
         Action {
             name: "inspect",
-            on_call: move || Ok::<_, Infallible>(current),
+            on_call: move |_ctx| Ok::<_, Infallible>(current),
         }
     }
 }
@@ -94,7 +94,7 @@ fn disappearing_actions() -> Component {
         Action {
             name: "finish",
             content: choice_content(0),
-            on_call: move || finished.update(|finished| *finished = true),
+            on_call: move |_ctx| finished.update(|finished| *finished = true),
         }
     }
 }
@@ -111,7 +111,7 @@ fn disappearing_developer_actions() -> Component {
         Action {
             name: "finish",
             content: choice_content(0),
-            on_call: move || finished.update(|finished| *finished = true),
+            on_call: move |_ctx| finished.update(|finished| *finished = true),
         }
     }
 }
@@ -126,7 +126,7 @@ fn ephemeral_actions() -> Component {
         Action {
             name: format!("choice_{current}"),
             content: choice_content(current),
-            on_call: move || generation.update(|generation| {
+            on_call: move |_ctx| generation.update(|generation| {
                 *generation += 1;
                 json!({"generation": *generation})
             }),
@@ -146,7 +146,7 @@ fn mixed_action_placements() -> Component {
             Action {
                 name: "finish",
                 content: choice_content(0),
-                on_call: move || finished.update(|finished| *finished = true),
+                on_call: move |_ctx| finished.update(|finished| *finished = true),
             }
         }
     };
@@ -155,7 +155,7 @@ fn mixed_action_placements() -> Component {
         #[user(ephemeral, repeat)]
         Action {
             name: "inspect",
-            on_call: move || Ok::<_, Infallible>(is_finished),
+            on_call: move |_ctx| Ok::<_, Infallible>(is_finished),
         }
     }
 }
@@ -263,7 +263,7 @@ fn projection_catalogue(projection: &RenderedProjection) -> XmlNode {
     catalogue(&roots).clone()
 }
 
-async fn call<P: ReactionPort>(
+async fn call<P: ReactionPort + 'static>(
     app: &mut Application<P>,
     sender: &CommandSender,
     name: &str,
@@ -284,7 +284,7 @@ async fn handoff(
     capture: &DebugPromptCapture,
 ) -> DebugFrameSnapshot {
     let (reacted, observed) = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::join!(app.react(), sender.observe())
+        tokio::join!(app.react().unwrap(), sender.observe())
     })
     .await
     .unwrap();
@@ -601,7 +601,7 @@ async fn full_replay_retains_action_feedback_and_excludes_prior_ephemeral_catalo
             );
         }
         let (reacted, observed) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(app.react(), sender.observe())
+            tokio::join!(app.react().unwrap(), sender.observe())
         })
         .await
         .unwrap();

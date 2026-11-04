@@ -3,7 +3,7 @@ use std::{any::type_name, fmt, future::Future, marker::PhantomData, str::FromStr
 use async_trait::async_trait;
 
 use crate::{
-    component::execution::ProviderEvent,
+    component::{execution::ProviderEvent, EventContext},
     llm_call::TextTurnEvent,
     pom::{Document, PomError, XmlName, XmlNode},
     stream_parser::XmlElement,
@@ -83,16 +83,16 @@ impl StreamingXml {
 pub struct StreamingXmlTag {
     tag: &'static str,
     route: ContractRoute,
-    open: Option<AsyncHandler<XmlElement>>,
-    stream: Option<AsyncHandler<XmlElement>>,
-    complete: Option<AsyncHandler<XmlElement>>,
-    invalid: Option<AsyncHandler<XmlContractDiagnostic>>,
+    open: Option<AsyncHandler<(EventContext, XmlElement)>>,
+    stream: Option<AsyncHandler<(EventContext, XmlElement)>>,
+    complete: Option<AsyncHandler<(EventContext, XmlElement)>>,
+    invalid: Option<AsyncHandler<(EventContext, XmlContractDiagnostic)>>,
 }
 
 impl StreamingXmlTag {
-    pub fn on_open<Handler, HandlerFuture, Error>(mut self, handler: Handler) -> Self
+    pub fn on_open<Handler, HandlerFuture, Error>(mut self, mut handler: Handler) -> Self
     where
-        Handler: FnMut(XmlElement) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, XmlElement) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -100,14 +100,16 @@ impl StreamingXmlTag {
             self.open.is_none(),
             "StreamingXml tag declared on_open twice"
         );
-        self.open = Some(AsyncHandler::new(handler));
+        self.open = Some(AsyncHandler::new(move |(context, input)| {
+            handler(context, input)
+        }));
         self
     }
 
     /// Receive cumulative content snapshots while the selected element remains open.
-    pub fn on_stream<Handler, HandlerFuture, Error>(mut self, handler: Handler) -> Self
+    pub fn on_stream<Handler, HandlerFuture, Error>(mut self, mut handler: Handler) -> Self
     where
-        Handler: FnMut(XmlElement) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, XmlElement) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -115,13 +117,15 @@ impl StreamingXmlTag {
             self.stream.is_none(),
             "StreamingXml tag declared on_stream twice"
         );
-        self.stream = Some(AsyncHandler::new(handler));
+        self.stream = Some(AsyncHandler::new(move |(context, input)| {
+            handler(context, input)
+        }));
         self
     }
 
-    pub fn on_complete<Handler, HandlerFuture, Error>(mut self, handler: Handler) -> Self
+    pub fn on_complete<Handler, HandlerFuture, Error>(mut self, mut handler: Handler) -> Self
     where
-        Handler: FnMut(XmlElement) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, XmlElement) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -129,13 +133,15 @@ impl StreamingXmlTag {
             self.complete.is_none(),
             "StreamingXml tag declared on_complete twice"
         );
-        self.complete = Some(AsyncHandler::new(handler));
+        self.complete = Some(AsyncHandler::new(move |(context, input)| {
+            handler(context, input)
+        }));
         self
     }
 
-    pub fn on_invalid<Handler, HandlerFuture, Error>(mut self, handler: Handler) -> Self
+    pub fn on_invalid<Handler, HandlerFuture, Error>(mut self, mut handler: Handler) -> Self
     where
-        Handler: FnMut(XmlContractDiagnostic) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, XmlContractDiagnostic) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -143,7 +149,9 @@ impl StreamingXmlTag {
             self.invalid.is_none(),
             "StreamingXml tag declared on_invalid twice"
         );
-        self.invalid = Some(AsyncHandler::new(handler));
+        self.invalid = Some(AsyncHandler::new(move |(context, input)| {
+            handler(context, input)
+        }));
         self
     }
 
@@ -254,7 +262,7 @@ impl XmlStreamingToolCallElement {
         mut handler: Handler,
     ) -> XmlStreamingToolCallDecoded
     where
-        Handler: FnMut() -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -267,7 +275,7 @@ impl XmlStreamingToolCallElement {
             },
             route: ContractRoute::ProviderText,
             decoded: Box::new(UnitDecodedHandler {
-                handler: AsyncHandler::new(move |()| handler()),
+                handler: AsyncHandler::new(move |(context, ())| handler(context)),
             }),
         }
     }
@@ -298,10 +306,10 @@ where
     /// Dispatch every matching empty element from the current Provider stream.
     pub fn on_decoded<Handler, HandlerFuture, Error>(
         self,
-        handler: Handler,
+        mut handler: Handler,
     ) -> XmlStreamingToolCallDecoded
     where
-        Handler: FnMut(Decoded) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, Decoded) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
         Decoded::Err: Send + 'static,
@@ -310,7 +318,7 @@ where
             spec: self.spec,
             route: ContractRoute::ProviderText,
             decoded: Box::new(TypedDecodedHandler {
-                handler: AsyncHandler::new(handler),
+                handler: AsyncHandler::new(move |(context, input)| handler(context, input)),
             }),
         }
     }
@@ -338,7 +346,7 @@ impl XmlStreamingToolCallEmptyRouted {
         mut handler: Handler,
     ) -> XmlStreamingToolCallDecoded
     where
-        Handler: FnMut() -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -346,7 +354,7 @@ impl XmlStreamingToolCallEmptyRouted {
             spec: self.spec,
             route: self.route,
             decoded: Box::new(UnitDecodedHandler {
-                handler: AsyncHandler::new(move |()| handler()),
+                handler: AsyncHandler::new(move |(context, ())| handler(context)),
             }),
         }
     }
@@ -365,10 +373,10 @@ where
 {
     pub fn on_decoded<Handler, HandlerFuture, Error>(
         self,
-        handler: Handler,
+        mut handler: Handler,
     ) -> XmlStreamingToolCallDecoded
     where
-        Handler: FnMut(Decoded) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, Decoded) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -376,7 +384,7 @@ where
             spec: self.spec,
             route: self.route,
             decoded: Box::new(TypedDecodedHandler {
-                handler: AsyncHandler::new(handler),
+                handler: AsyncHandler::new(move |(context, input)| handler(context, input)),
             }),
         }
     }
@@ -389,9 +397,9 @@ pub struct XmlStreamingToolCallDecoded {
 }
 
 impl XmlStreamingToolCallDecoded {
-    pub fn on_invalid<Handler, HandlerFuture, Error>(self, handler: Handler) -> Component
+    pub fn on_invalid<Handler, HandlerFuture, Error>(self, mut handler: Handler) -> Component
     where
-        Handler: FnMut(XmlContractDiagnostic) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, XmlContractDiagnostic) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -400,7 +408,7 @@ impl XmlStreamingToolCallDecoded {
                 spec: self.spec,
                 route: self.route,
                 decoded: self.decoded,
-                invalid: AsyncHandler::new(handler),
+                invalid: AsyncHandler::new(move |(context, input)| handler(context, input)),
             },
         )))
     }
@@ -410,17 +418,18 @@ impl XmlStreamingToolCallDecoded {
 trait ErasedDecodedHandler: Send {
     async fn decode_and_invoke(
         &mut self,
+        context: EventContext,
         spec: &ContractSpec,
         raw: &str,
     ) -> Result<Option<XmlContractDiagnostic>, StreamingXmlDispatchFault>;
 }
 
 struct TypedDecodedHandler<Decoded> {
-    handler: AsyncHandler<Decoded>,
+    handler: AsyncHandler<(EventContext, Decoded)>,
 }
 
 struct UnitDecodedHandler {
-    handler: AsyncHandler<()>,
+    handler: AsyncHandler<(EventContext, ())>,
 }
 
 #[async_trait]
@@ -431,6 +440,7 @@ where
 {
     async fn decode_and_invoke(
         &mut self,
+        context: EventContext,
         spec: &ContractSpec,
         raw: &str,
     ) -> Result<Option<XmlContractDiagnostic>, StreamingXmlDispatchFault> {
@@ -448,28 +458,8 @@ where
                 }));
             }
         };
-        self.handler.invoke(decoded).await.map_err(|source| {
-            StreamingXmlDispatchFault::Handler {
-                contract: spec.identity,
-                phase: "decoded",
-                source,
-            }
-        })?;
-        Ok(None)
-    }
-}
-
-#[async_trait]
-impl ErasedDecodedHandler for UnitDecodedHandler {
-    async fn decode_and_invoke(
-        &mut self,
-        spec: &ContractSpec,
-        raw: &str,
-    ) -> Result<Option<XmlContractDiagnostic>, StreamingXmlDispatchFault> {
-        debug_assert!(spec.attribute.is_none());
-        debug_assert!(raw.is_empty());
         self.handler
-            .invoke(())
+            .invoke((context, decoded))
             .await
             .map_err(|source| StreamingXmlDispatchFault::Handler {
                 contract: spec.identity,
@@ -480,13 +470,34 @@ impl ErasedDecodedHandler for UnitDecodedHandler {
     }
 }
 
+#[async_trait]
+impl ErasedDecodedHandler for UnitDecodedHandler {
+    async fn decode_and_invoke(
+        &mut self,
+        context: EventContext,
+        spec: &ContractSpec,
+        raw: &str,
+    ) -> Result<Option<XmlContractDiagnostic>, StreamingXmlDispatchFault> {
+        debug_assert!(spec.attribute.is_none());
+        debug_assert!(raw.is_empty());
+        self.handler.invoke((context, ())).await.map_err(|source| {
+            StreamingXmlDispatchFault::Handler {
+                contract: spec.identity,
+                phase: "decoded",
+                source,
+            }
+        })?;
+        Ok(None)
+    }
+}
+
 pub(crate) struct StreamingXmlTagDeclaration {
     tag: &'static str,
     route: ContractRoute,
-    open: Option<AsyncHandler<XmlElement>>,
-    stream: Option<AsyncHandler<XmlElement>>,
-    complete: Option<AsyncHandler<XmlElement>>,
-    invalid: Option<AsyncHandler<XmlContractDiagnostic>>,
+    open: Option<AsyncHandler<(EventContext, XmlElement)>>,
+    stream: Option<AsyncHandler<(EventContext, XmlElement)>>,
+    complete: Option<AsyncHandler<(EventContext, XmlElement)>>,
+    invalid: Option<AsyncHandler<(EventContext, XmlContractDiagnostic)>>,
 }
 
 impl StreamingXmlTagDeclaration {
@@ -533,6 +544,7 @@ impl MountedStreamingXmlTag {
 
     pub(crate) async fn dispatch_phase(
         &mut self,
+        context: EventContext,
         phase: StreamingXmlPhase,
         element: XmlElement,
     ) -> Result<(), StreamingXmlDispatchFault> {
@@ -544,25 +556,25 @@ impl MountedStreamingXmlTag {
         let Some(handler) = handler else {
             return Ok(());
         };
-        handler
-            .invoke(element)
-            .await
-            .map_err(|source| StreamingXmlDispatchFault::Handler {
+        handler.invoke((context, element)).await.map_err(|source| {
+            StreamingXmlDispatchFault::Handler {
                 contract: self.declaration.identity(),
                 phase: phase.as_str(),
                 source,
-            })
+            }
+        })
     }
 
     pub(crate) async fn dispatch_invalid(
         &mut self,
+        context: EventContext,
         diagnostic: XmlContractDiagnostic,
     ) -> Result<(), StreamingXmlDispatchFault> {
         let Some(handler) = self.declaration.invalid.as_mut() else {
             return Ok(());
         };
         handler
-            .invoke(diagnostic)
+            .invoke((context, diagnostic))
             .await
             .map_err(|source| StreamingXmlDispatchFault::Handler {
                 contract: self.declaration.identity(),
@@ -576,7 +588,7 @@ pub(crate) struct XmlStreamingToolCallDeclaration {
     spec: ContractSpec,
     route: ContractRoute,
     decoded: Box<dyn ErasedDecodedHandler>,
-    invalid: AsyncHandler<XmlContractDiagnostic>,
+    invalid: AsyncHandler<(EventContext, XmlContractDiagnostic)>,
 }
 
 impl XmlStreamingToolCallDeclaration {
@@ -640,26 +652,28 @@ impl MountedXmlStreamingToolCall {
 
     pub(crate) async fn dispatch_decoded(
         &mut self,
+        context: EventContext,
         raw: &str,
     ) -> Result<(), StreamingXmlDispatchFault> {
         let diagnostic = self
             .declaration
             .decoded
-            .decode_and_invoke(&self.declaration.spec, raw)
+            .decode_and_invoke(context.clone(), &self.declaration.spec, raw)
             .await?;
         if let Some(diagnostic) = diagnostic {
-            self.dispatch_invalid(diagnostic).await?;
+            self.dispatch_invalid(context, diagnostic).await?;
         }
         Ok(())
     }
 
     pub(crate) async fn dispatch_invalid(
         &mut self,
+        context: EventContext,
         diagnostic: XmlContractDiagnostic,
     ) -> Result<(), StreamingXmlDispatchFault> {
         self.declaration
             .invalid
-            .invoke(diagnostic)
+            .invoke((context, diagnostic))
             .await
             .map_err(|source| StreamingXmlDispatchFault::Handler {
                 contract: self.declaration.identity(),

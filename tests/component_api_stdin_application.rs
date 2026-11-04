@@ -43,7 +43,7 @@ fn readable_schema_actions() -> Component {
         count { "{value}" }
         Action {
             name: "record",
-            on_call: move |input: ReadableSchemaInput| {
+            on_call: move |_ctx, input: ReadableSchemaInput| {
                 count.update(|count| {
                     *count += 1;
                     json!({"count": *count, "text": input.text, "enabled": input.settings.enabled})
@@ -212,7 +212,7 @@ fn child_actions(count: Signal<usize>) -> Component {
         count { "{value}" }
         Action {
             name: "increment",
-            on_call: move || {
+            on_call: move |_ctx| {
                 let count = increment.clone();
                 async move {
                     tokio::task::yield_now().await;
@@ -222,7 +222,7 @@ fn child_actions(count: Signal<usize>) -> Component {
         }
         Action {
             name: "refuse",
-            on_call: || Ok::<_, Infallible>(json!({"accepted": false, "message": "Business refusal"})),
+            on_call: |_ctx| Ok::<_, Infallible>(json!({"accepted": false, "message": "Business refusal"})),
         }
     }
 }
@@ -283,8 +283,8 @@ async fn owner_drives_root_wait_and_returns_outputs_feedback_and_next_view() {
 fn null_result_actions() -> Component {
     use_wait_for_command();
     view! {
-        Action { name: "unit", on_call: || Ok::<_, Infallible>(()), }
-        Action { name: "null", on_call: || Ok::<_, Infallible>(json!(null)), }
+        Action { name: "unit", on_call: |_ctx| Ok::<_, Infallible>(()), }
+        Action { name: "null", on_call: |_ctx| Ok::<_, Infallible>(json!(null)), }
     }
 }
 
@@ -354,7 +354,7 @@ fn slow_action(started: Arc<Notify>, release: Arc<Notify>, calls: Arc<AtomicUsiz
         count { "{value}" }
         Action {
             name: "slow",
-            on_call: move || {
+            on_call: move |_ctx| {
                 let (started, release, calls, count) = (started.clone(), release.clone(), calls.clone(), count.clone());
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -526,7 +526,7 @@ fn pending_action(started: Arc<Notify>, dropped: Arc<AtomicBool>) -> Component {
     view! {
         Action {
             name: "pending",
-            on_call: move || {
+            on_call: move |_ctx| {
                 let (started, dropped) = (started.clone(), dropped.clone());
                 async move {
                     let _drop = Dropped(dropped);
@@ -600,7 +600,7 @@ fn externally_loaded_choices(probe: ExternalChoiceProbe) -> Component {
         external_value { "{current}" }
         Action {
             name: name,
-            on_call: move || {
+            on_call: move |_ctx| {
                 probe.callbacks.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, Infallible>(current)
             },
@@ -722,7 +722,7 @@ fn fail_next_preparation(preparations: Arc<AtomicUsize>) -> Component {
         }
     });
     view! {
-        Action { name: "answer", on_call: || Ok::<_, Infallible>(42) }
+        Action { name: "answer", on_call: |_ctx| Ok::<_, Infallible>(42) }
     }
 }
 
@@ -750,11 +750,11 @@ fn failing_actions() -> Component {
     view! {
         Action {
             name: "fault",
-            on_call: || Err::<(), _>("storage unavailable"),
+            on_call: |_ctx| Err::<(), _>("storage unavailable"),
         }
         Action {
             name: "panic",
-            on_call: || -> Result<(), Infallible> { std::panic::panic_any(1234_u32) },
+            on_call: |_ctx| -> Result<(), Infallible> { std::panic::panic_any(1234_u32) },
         }
     }
 }

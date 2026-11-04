@@ -40,7 +40,7 @@ pub fn notebook() -> Component {
         Action {
             name: "record",
             description: "Save a nonempty note and return the current count and complete latest note.",
-            on_call: move |input: RecordInput| -> anyhow::Result<Value> {
+            on_call: move |_ctx, input: RecordInput| -> anyhow::Result<Value> {
                 if input.text.trim().is_empty() {
                     return Ok(json!({"error": {"code": "empty_note", "message": "Supply a nonempty text value."}}));
                 }
@@ -53,7 +53,7 @@ pub fn notebook() -> Component {
         Action {
             name: "inspect",
             description: "Read the current count and complete latest note without changing notebook state. Send an empty input object.",
-            on_call: move || inspect_notes.with(|notes| snapshot(notes)),
+            on_call: move |_ctx| inspect_notes.with(|notes| snapshot(notes)),
         }
         // No application-owned outcome log: the command barrier mounts the
         // framework's ordinary command_feedback Component automatically.

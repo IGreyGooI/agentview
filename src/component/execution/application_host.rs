@@ -306,6 +306,7 @@ where
         }
     };
     lifecycle.observe(EngineObservation::InputSubmitted);
+    bindings.begin_unframed_reaction();
     lifecycle.observe(EngineObservation::WireSnapshotAccepted);
     let mut lanes = FuturesUnordered::<ReactionLane>::new();
     let mut tool_call_ids = HashSet::new();
@@ -625,7 +626,7 @@ mod tests {
             runtime { "owned lanes" }
             {
                 NativeToolCall::named("wait")
-                    .on_call(move |call| {
+                    .on_call(move |_ctx, call| {
                         let started = Arc::clone(&started);
                         let started_signal = Arc::clone(&started_signal);
                         let release = Arc::clone(&release);
@@ -648,7 +649,7 @@ mod tests {
             {
                 EventListener::observe("test.owned-lane.text", "v1")
                     .listen_to(text)
-                    .on_event(move |_| {
+                    .on_event(move |_ctx, _| {
                         let text_seen = Arc::clone(&text_seen);
                         async move {
                             text_seen.notify_one();
@@ -661,8 +662,8 @@ mod tests {
                     .empty_element("done")
                     .required_attribute::<usize>("value")
                     .listen_to(xml)
-                    .on_decoded(|_| async { Ok::<(), Infallible>(()) })
-                    .on_invalid(move |_| {
+                    .on_decoded(|_ctx, _| async { Ok::<(), Infallible>(()) })
+                    .on_invalid(move |_ctx, _| {
                         let terminal_runs = Arc::clone(&terminal_runs);
                         async move {
                             terminal_runs.fetch_add(1, Ordering::SeqCst);

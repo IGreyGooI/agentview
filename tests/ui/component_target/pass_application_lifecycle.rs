@@ -1,7 +1,4 @@
-use std::{
-    num::{NonZeroU128, NonZeroU64},
-    ops::ControlFlow,
-};
+use std::num::{NonZeroU128, NonZeroU64};
 
 use agentview::component::{
     execution::{
@@ -37,38 +34,46 @@ fn root() -> Component {
 }
 
 fn main() {
-    futures::executor::block_on(async {
-        let identity = TargetIdentity::new(NonZeroU128::new(1).unwrap());
-        let epoch = TargetEpoch::new(NonZeroU64::new(1).unwrap());
-        let profile = FrameProfile::new(
-            FrameConstraints {
-                max_frame_bytes: 4_096,
-                max_component_bytes: 1_024,
-                context_window: ContextWindow::NotApplicable,
-                reserved_output_tokens: None,
-            },
-            FrameCapabilities::NONE,
-        );
-        let port = BorrowingPort {
-            declaration: TargetDeclaration::full(identity, epoch, profile),
-            facts: vec![Ok(ProviderFact::ReactionCompleted { primary_text: None })],
-        };
-        let mut application = Application::mount(root, port).unwrap();
-        let snapshot = application.current_projection();
-        let _ = (
-            snapshot.projection(),
-            snapshot.revision(),
-            snapshot.is_dirty(),
-        );
-        let _ = application.take_reaction_request().unwrap();
-        let wait = application.wait_for_reaction_request();
-        drop(wait);
-        match application.react().await {
-            Ok(ControlFlow::Continue(())) | Ok(ControlFlow::Break(_)) => {}
-            Err(fault) => inspect_fault(fault),
-        }
-        application.shutdown().await.unwrap();
-    });
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let identity = TargetIdentity::new(NonZeroU128::new(1).unwrap());
+            let epoch = TargetEpoch::new(NonZeroU64::new(1).unwrap());
+            let profile = FrameProfile::new(
+                FrameConstraints {
+                    max_frame_bytes: 4_096,
+                    max_component_bytes: 1_024,
+                    context_window: ContextWindow::NotApplicable,
+                    reserved_output_tokens: None,
+                },
+                FrameCapabilities::NONE,
+            );
+            let port = BorrowingPort {
+                declaration: TargetDeclaration::full(identity, epoch, profile),
+                facts: vec![Ok(ProviderFact::ReactionCompleted { primary_text: None })],
+            };
+            let mut application = Application::mount(root, port).unwrap();
+            let snapshot = application.current_projection();
+            let _ = (
+                snapshot.projection(),
+                snapshot.revision(),
+                snapshot.is_dirty(),
+            );
+            let _ = application.take_reaction_request().unwrap();
+            let wait = application.wait_for_reaction_request();
+            drop(wait);
+            match application.react().unwrap().await {
+                Ok(
+                    agentview::component::execution::ReactionOutcome::Completed
+                    | agentview::component::execution::ReactionOutcome::Interrupted
+                    | agentview::component::execution::ReactionOutcome::Exited(_),
+                ) => {}
+                Err(fault) => inspect_fault(fault),
+            }
+            application.shutdown().await.unwrap();
+        });
 }
 
 fn inspect_fault(fault: ApplicationFault) {

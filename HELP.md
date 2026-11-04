@@ -52,16 +52,68 @@ demonstrate interactivity. Error handling is one part of this experience; see
 | Declare an authored assistant message | `#[assistant]` on ordinary POM or a Component call |
 | Export the complete current view as a prompt with empty external model history | `projection.render_prompt()?` or `app.current_projection().render_prompt()?` |
 | Run an application | `Application::mount(...)`, then `app.run().await` |
+| Start an independent child on another port with explicit business state and empty model history | `app.fork_to(root, target).await`, or `fork_to_with_commands(root, target, input)` with a new inbox |
 | Branch the current model history into an independent application | `app.fork(root).await`, or `fork_with_commands(root, input)` with a new inbox; requires `ForkableReactionPort` |
 | Wait for required business inputs | `use_preparation` inside the owning Component |
 | End normal application work | `use_application_exit`, then owner calls `shutdown()` |
-| Drive a single model turn | `app.react().await` |
+| Start and control a model turn | `let reaction = app.react()?; reaction.interrupt()?; reaction.await` |
 | Receive ordinary provider output | `use_provider_event_handler` |
 | Declare a native model action with captured state | `NativeToolCall { name, description, on_call }` inside `view!` |
 | Declare a streaming XML action with captured state | `XmlStreamingToolCall { element, on_delta, on_complete, ... }` inside `view!` |
 | Run a stdin/stdout application | `StdinApplication::run(root).await` inside a Tokio main; the framework owns CLI, daemon, input, output, and cleanup |
 | Wait for application-owned CLI input | One `use_wait_for_command()` in the root Component; root and child Components declare inline `Action { name, description, on_call }` in `view!` |
 | Encode a provider request or retain remote state | a `ReactionPort`, outside the business Component |
+
+`app.react()?` immediately starts an Application-owned reaction and returns a cloneable
+`Reaction` handle. It provides `id()`, `kind()`, `interrupt()`, and direct `await`; dropping a
+handle or waiter does not cancel the operation. Each idle admission is `Main`; while
+Main is active, another call creates `Temporary` from the last completed, protocol-closed
+checkpoint. Without a checkpoint or provider capability, the temporary call is rejected.
+Temporary reactions share the Component tree and business Signals, and keep model history,
+provider continuation, and receipts separate from Main.
+
+```rust,ignore
+app.react()?.await?; // Establish a completed checkpoint first.
+let main = app.react()?;
+let branch = app.react()?; // A later event arrives while Main is active.
+let result = branch.clone().await?;
+let next = branch.react()?; // Continue this Temporary's history with a new ReactionId.
+next.await?;
+main.await?;
+```
+
+Use `reaction.interrupt()?` for directed cancellation, then await settlement. `ReactionOutcome`
+is `Completed`, `Interrupted`, or `Exited(reason)`; actual business results belong in the view.
+Managed recovery keeps the waiter pending until `recover_streaming_attempt()` or shutdown
+resolves the effects. See [asynchronous reactions](docs/parallel-reactions-design.md).
+The credential-free [parallel_reactions example](examples/parallel_reactions.rs) shows
+temporary tool continuation, shared business feedback, and directed interruption:
+`cargo run --no-default-features --example parallel_reactions`.
+
+## Event Sources and Shared Business State
+
+All action/event callbacks receive an `EventContext` before their business arguments:
+`|context, args|`, or `|context|` for no business arguments. This applies to native tools,
+XML callbacks, provider handlers, commands, and normal reaction completion. Runtime metadata
+is excluded from model argument schemas. Plain functions declared with `#[tool]` retain
+their business signatures.
+
+Use `context.application_id()`, `reaction_id()`, `reaction_kind()`, `frame_revision()`, `event_id()`, and `source()`
+to retain an operation's origin with its progress, result, or failure. Move or clone the context
+into asynchronous work; its source stays attached to the original operation. Model events refer
+to the actual submitted Frame and preserve the handle's Main/Temporary kind. Commands have no model
+reaction, kind, or Frame identity.
+
+`use_application_id()` returns the identity of the Application receiving this render. It matches
+`app.application_id()` and lets a shared Component select feedback for the recipient. For two
+Applications sharing an external store, retain source contexts in store records and explicitly
+choose which records each view exposes. A result produced by A keeps A's source when B sees it.
+Each Application retains its own Signals, history, tool receipts, and tasks. The store owns write
+conflicts and notifications; provenance supplies no authorization or transaction guarantee.
+
+After an action, render its actual outcome in the application-declared POM and deliver a subsequent
+Frame. A shared state update or a retained context alone does not deliver feedback to either model.
+See the [runtime provenance contract](docs/engine.md#event-provenance).
 
 ## Business History
 
@@ -162,6 +214,45 @@ input; consume typed POM and structured tools in application code and tests.
 
 ## Forking an Application
 
+Choose the branch operation by the context the child needs:
+
+| API | Child model context | Port requirement |
+| --- | --- | --- |
+| `fork_to(root, target)` | Fresh session; the root declares an explicit business snapshot. | Any new `Q: ReactionPort + 'static`; its type and profile may differ from the source. |
+| `fork(root)` | Inherits accepted history and matching provider context. | Source `P: ForkableReactionPort`; child has the same port type and profile. |
+
+`parent.fork_to(root, target).await` mounts an independent `Application<Q>` on a caller-supplied fresh
+target. Capture an owned business snapshot in the root and initialize fresh Signals. The target must
+declare a different identity and `FullRequired`. The child has a new FrameSession, hook state,
+handlers, tasks, exit state and driver demand. Its first submitted Frame is Full and contains the
+child's current declaration. Parent conversation, staged results and provider-private context are
+not imported; records explicitly declared by the child root are its own current input.
+
+```rust
+let snapshot = export_business_snapshot(); // Application-defined, owned business values.
+let mut child = parent
+    .fork_to(move || restored_root(snapshot.clone()), target)
+    .await?;
+```
+
+The source runtime must be healthy and have no exit request. Its staged tool results can remain
+pending: `fork_to` leaves their receipts, source history and driver demand untouched. It neither
+declares nor clones, resets or submits through the source port, so an unavailable source model does
+not prevent using another provider. Business snapshot consistency belongs to the application;
+capturing the parent's mount-scoped Signal handles would share that state instead of restoring
+independent values.
+
+`fork_to` mounts the child's Components and starts their declared tasks without running preparation
+or submitting a Frame. Each owner explicitly drives and shuts down its Application. Use
+`fork_to_with_commands(root, target, input)` for a new command inbox; results pass through explicit
+business messages and become visible in a receiving model's next Frame. The offline
+[`application_fork_to`](examples/application_fork_to.rs) example uses two different port types to
+record a copied counter view and the child's first Full with empty replay:
+
+```bash
+cargo run --no-default-features --example application_fork_to
+```
+
 With a `ForkableReactionPort`, `parent.fork(root).await` preserves the parent's accepted
 conversation and the matching provider context in an independent Application. The native Responses
 port supports it. Export an owned typed business snapshot and initialize fresh Signals in the child
@@ -197,8 +288,10 @@ async fn start_branch<P: ForkableReactionPort>(
 }
 ```
 
-The source must have no exit request, pending mount retirement, command in progress, or streaming
-recovery. Its tool calls must be closed and its staged tool results empty. A returned `react()`
+Both fork operations require all reactions to have settled. For the history-preserving `fork`,
+the source must have no exit request, pending mount retirement,
+command in progress, or streaming recovery. Its tool calls must be closed and its staged tool results
+empty. A completed reaction
 can still leave a result or cancellation fallback waiting for the next Frame; the source driver
 must deliver that work normally before forking. Fork does not submit a Frame, consume reaction
 demand, or run preparation. Successful child mounting starts its newly declared Component tasks.
@@ -531,7 +624,7 @@ fn notebook() -> Component {
         XmlStreamingToolCall {
             element: XmlToolElement::text("note"),
             description: "Save a text note; saved notes appear in the next view.",
-            on_complete: move |text: String| {
+            on_complete: move |_context, text: String| {
                 notes.update(|notes| notes.push(text))
             },
         }
@@ -550,8 +643,9 @@ discarded, so write actual outcomes to retained state and render them.
 The owning Component mount retains application state and the action's diagnostic view. Each
 reaction owns a fresh strict parser and callback bindings from its prepared render. Simple
 actions share that parser and execute in source order, awaiting one callback before the next.
-Rendering and preparation do not invoke callbacks. The execution runs directly inside
-`Application::react()`; cancellation drops its current callback future and remaining input.
+Rendering and preparation do not invoke callbacks. Execution runs in the Application-owned
+reaction task. `reaction.interrupt()` drops its current callback future and remaining input;
+dropping the handle or its waiter leaves the operation running.
 Earlier state writes and external effects remain, and callbacks are never replayed. An
 incomplete or invalid element does not receive completion. Callback `Err` is a runtime fault,
 not an ordinary model-input diagnostic. Callbacks may use `spawn`; explicitly spawned tasks
@@ -595,7 +689,7 @@ feedback in the next view even when other actions were accepted.
 
 Choose acceptance from the business result. Do not use a nonempty diagnostics
 list as a universal reason to reject every action. Partial acceptance with
-feedback is valid. `react()` returning `Continue(())` describes runtime progress;
+feedback is valid. Awaiting `ReactionOutcome::Completed` describes runtime progress;
 the Component presents the actual business results.
 
 Business admission, dependencies, and explicit atomic operations still apply.
@@ -667,17 +761,17 @@ view! {
     Action {
         name: "move",
         description: "Play one legal move",
-        on_call: move |input: MoveInput| game.update(|state| state.play(&input.uci)),
+        on_call: move |_context, input: MoveInput| game.update(|state| state.play(&input.uci)),
     }
     Action {
         name: "undo",
-        on_call: move || undone_game.update(GameState::undo),
+        on_call: move |_context| undone_game.update(GameState::undo),
     }
 }
 ```
 
 The stdin envelope is `{"action":"move","input":{"uci":"e2e4"}}`. No-argument
-callbacks use `||` and require an empty input object. Metadata and callbacks belong
+callbacks use `|context|` and require an empty input object. Metadata and callbacks belong
 to the same mounted declaration; there is no separate command catalog or `NoInput`
 structure. `enabled: false` returns `command_disabled` and the current view without
 invoking the callback. Enabled callbacks still validate current business state.
@@ -913,7 +1007,7 @@ fn counter() -> Component {
         NativeToolCall {
             name: "add",
             description: "Add an amount to the current total and return the new total.",
-            on_call: move |input: AddInput| {
+            on_call: move |_context, input: AddInput| {
                 total.update(|value| {
                     *value += i64::from(input.amount);
                     *value
@@ -926,7 +1020,7 @@ fn counter() -> Component {
 
 `name` and `on_call` are required; `description` is optional but should explain the action.
 Properties may appear in any order. Callbacks accept an owned `Deserialize + JsonSchema` input
-or use `||` for an empty input object, and return either `Result<Output, Error>` or a `Send` future producing that result. Async
+or use `|context|` for an empty input object, and return either `Result<Output, Error>` or a `Send` future producing that result. Async
 callbacks can clone captured handles before returning `async move { ... }`. Input structs use
 `#[serde(deny_unknown_fields)]` when extra fields should be rejected. Captured state never becomes
 a model argument. Rendering binds the callback without executing it; updated captures are bound
@@ -995,9 +1089,9 @@ run its handler, and stage output; it does not start another provider request. T
 
 ```rust
 # use agentview::component::execution::{Application, ApplicationFault, ReactionPort};
-# async fn continue_after_tool<P: ReactionPort>(app: &mut Application<P>) -> Result<(), ApplicationFault> {
-app.react().await?; // handles the tool call and stages its result
-app.react().await?; // submits that staged result on the next reaction
+# async fn continue_after_tool<P: ReactionPort + 'static>(app: &mut Application<P>) -> Result<(), ApplicationFault> {
+app.react()?.await?; // handles the tool call and stages its result
+app.react()?.await?; // submits that staged result on the next reaction
 # Ok(())
 # }
 ```

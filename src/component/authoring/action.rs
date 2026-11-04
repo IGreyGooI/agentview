@@ -6,7 +6,10 @@ use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 
-use crate::{component::execution::CommandOutcome, pom::XmlNode};
+use crate::{
+    component::{execution::CommandOutcome, EventContext},
+    pom::XmlNode,
+};
 
 use super::{
     cli_command::{decode_input, CliCommandDeclaration, CommandCallback, CommandFuture},
@@ -18,7 +21,8 @@ use super::{
 /// Declare `Action { name, description, enabled, on_call }` in `view!`. The
 /// callback's input type derives `Deserialize` and `JsonSchema`; the mounted view
 /// advertises that schema and the runtime decodes input before calling it. A
-/// callback without arguments can be written as `||` and accepts an empty object.
+/// callback receives the framework-owned `EventContext` first. Write `|context|`
+/// for an action without business arguments; it accepts an empty object.
 /// Native discovery groups current actions by name, shares invocation guidance,
 /// and advertises no-argument inputs as `input="{}"`. Optional `content: XmlNode`
 /// carries structured action details without repeating them in the description.
@@ -79,11 +83,12 @@ impl<Name, Callback> ActionProps<Name, Callback> {
 }
 
 impl<Name> ActionProps<Name> {
-    /// Bind a synchronous or asynchronous callback accepting a typed object or no arguments.
+    /// Bind a callback accepting `EventContext` and an optional typed object.
     ///
     /// `Ok` carries the serializable business outcome. Expected rejections belong
     /// in that outcome and the application view; `Err` reports a handler fault.
-    /// Callback captures are refreshed on render and never become model inputs.
+    /// Context and callback captures never become model inputs. Captures are
+    /// refreshed on render.
     pub fn on_call<Arguments, Handler, Return, Mode>(
         self,
         handler: Handler,
@@ -125,7 +130,7 @@ pub struct ActionCallback {
     invoke: CommandCallback,
 }
 
-/// Callback conversion used to infer typed and zero-argument closure signatures.
+/// Callback conversion used to infer typed input and context-only signatures.
 #[doc(hidden)]
 pub trait ActionHandler<Arguments, Return, Mode>: Send + 'static {
     fn into_action_callback(self) -> ActionCallback;
@@ -134,21 +139,21 @@ pub trait ActionHandler<Arguments, Return, Mode>: Send + 'static {
 impl<Input, Handler, Return, Mode> ActionHandler<(Input,), Return, Mode> for Handler
 where
     Input: DeserializeOwned + JsonSchema + 'static,
-    Handler: FnMut(Input) -> Return + Send + 'static,
+    Handler: FnMut(EventContext, Input) -> Return + Send + 'static,
     Return: ActionCallbackReturn<Mode>,
 {
     fn into_action_callback(mut self) -> ActionCallback {
         ActionCallback {
             schema: schemars::schema_for!(Input).to_value(),
             empty_input: false,
-            invoke: Box::new(move |input| {
+            invoke: Box::new(move |context, input| {
                 let input = match decode_input::<Input>(input) {
                     Ok(input) => input,
                     Err(message) => {
                         return Box::pin(async move { Ok(invalid_input(message)) });
                     }
                 };
-                self(input).into_action_future()
+                self(context, input).into_action_future()
             }),
         }
     }
@@ -156,7 +161,7 @@ where
 
 impl<Handler, Return, Mode> ActionHandler<(), Return, Mode> for Handler
 where
-    Handler: FnMut() -> Return + Send + 'static,
+    Handler: FnMut(EventContext) -> Return + Send + 'static,
     Return: ActionCallbackReturn<Mode>,
 {
     fn into_action_callback(mut self) -> ActionCallback {
@@ -167,7 +172,7 @@ where
                 "additionalProperties": false,
             }),
             empty_input: true,
-            invoke: Box::new(move |input| {
+            invoke: Box::new(move |context, input| {
                 if !input.as_object().is_some_and(|fields| fields.is_empty()) {
                     return Box::pin(async move {
                         Ok(invalid_input(
@@ -176,7 +181,7 @@ where
                         ))
                     });
                 }
-                self().into_action_future()
+                self(context).into_action_future()
             }),
         }
     }

@@ -205,7 +205,7 @@ fn ordinary_xml_application(props: StringSnapshotProps) -> Component {
     view! {
         state { "{value}" }
         {
-            NativeToolCall::named("lookup").on_call(|call| async move {
+            NativeToolCall::named("lookup").on_call(|_ctx, call| async move {
                 Ok::<_, Infallible>(call.output("unused"))
             })
         }
@@ -558,7 +558,11 @@ fn projection_documents(frame: &CapturedFrame) -> Vec<agentview::pom::ResolvedDo
 
 async fn react(application: &mut Application<CapturingPort>) {
     assert_eq!(
-        application.react().await.expect("reaction succeeds"),
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("reaction succeeds"),
         ControlFlow::Continue(())
     );
 }
@@ -1268,7 +1272,10 @@ async fn cancelled_pre_handoff_submission_does_not_advance_the_complete_snapshot
     props.signal().set("B".to_owned()).expect("set B");
 
     let notified = capture.pre_handoff_started.notified();
-    let mut cancelled = Box::pin(application.react());
+    let cancelled_control = application.react().unwrap();
+    let mut cancelled = Box::pin(std::future::IntoFuture::into_future(
+        cancelled_control.clone(),
+    ));
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
             () = notified => {}
@@ -1277,7 +1284,12 @@ async fn cancelled_pre_handoff_submission_does_not_advance_the_complete_snapshot
     })
     .await
     .expect("pre-handoff submission reaches the blocking port");
+    cancelled_control.interrupt().unwrap();
     drop(cancelled);
+    assert_eq!(
+        cancelled_control.await.unwrap(),
+        agentview::component::execution::ReactionOutcome::Interrupted
+    );
 
     props.signal().set("A".to_owned()).expect("restore A");
     react(&mut application).await;
@@ -1326,7 +1338,10 @@ async fn repeat_items_are_delivered_only_by_react_and_cancelled_frames_do_not_ad
     props.signal().set("B".to_owned()).expect("set B");
 
     let notified = capture.pre_handoff_started.notified();
-    let mut cancelled = Box::pin(application.react());
+    let cancelled_control = application.react().unwrap();
+    let mut cancelled = Box::pin(std::future::IntoFuture::into_future(
+        cancelled_control.clone(),
+    ));
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
             () = notified => {}
@@ -1335,7 +1350,12 @@ async fn repeat_items_are_delivered_only_by_react_and_cancelled_frames_do_not_ad
     })
     .await
     .expect("pre-handoff submission reaches the blocking port");
+    cancelled_control.interrupt().unwrap();
     drop(cancelled);
+    assert_eq!(
+        cancelled_control.await.unwrap(),
+        agentview::component::execution::ReactionOutcome::Interrupted
+    );
 
     props.signal().set("A".to_owned()).expect("restore A");
     react(&mut application).await;

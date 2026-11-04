@@ -3,7 +3,6 @@ mod pom_support;
 use pom_support::*;
 
 use std::{
-    ops::ControlFlow,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -24,8 +23,11 @@ use agentview::{
 
 struct TaskDropProbe(Arc<AtomicBool>);
 
-fn assert_continue(flow: ControlFlow<ExitReason>) {
-    assert_eq!(flow, ControlFlow::Continue(()));
+fn assert_continue(flow: impl Into<agentview::component::execution::ReactionOutcome>) {
+    assert_eq!(
+        flow.into(),
+        agentview::component::execution::ReactionOutcome::Completed
+    );
 }
 
 impl Drop for TaskDropProbe {
@@ -46,7 +48,7 @@ fn public_external_exchange(props: PublicExchangeProps) -> Component {
     let state = use_signal(|| String::from("pending"));
     let handler_state = state.clone();
     let effects = Arc::clone(&props.effects);
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let state = handler_state.clone();
         let effects = Arc::clone(&effects);
         async move {
@@ -106,7 +108,7 @@ async fn public_text_and_empty_completion_are_ordered_stale_fenced_and_consuming
     wait_for_task_start(&task_started).await;
 
     let first_ingress = {
-        let first_reaction = application.react();
+        let first_reaction = std::future::IntoFuture::into_future(application.react().unwrap());
         tokio::pin!(first_reaction);
         let first = tokio::select! {
             observation = control.next_observation() => observation.unwrap(),
@@ -131,7 +133,7 @@ async fn public_text_and_empty_completion_are_ordered_stale_fenced_and_consuming
     };
 
     let second_ingress = {
-        let second_reaction = application.react();
+        let second_reaction = std::future::IntoFuture::into_future(application.react().unwrap());
         tokio::pin!(second_reaction);
         let second = tokio::select! {
             observation = control.next_observation() => observation.unwrap(),
@@ -163,7 +165,7 @@ async fn public_text_and_empty_completion_are_ordered_stale_fenced_and_consuming
     };
 
     {
-        let third_reaction = application.react();
+        let third_reaction = std::future::IntoFuture::into_future(application.react().unwrap());
         tokio::pin!(third_reaction);
         let third = tokio::select! {
             observation = control.next_observation() => observation.unwrap(),

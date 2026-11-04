@@ -5,7 +5,7 @@ use agentview::component::prelude::*;
 #[component]
 fn provider_handlers(label: String) -> Component {
     let first_label = label.clone();
-    use_provider_event_handler(ProviderEvent::TEXT, move |_event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, _event| {
         let label = first_label.clone();
         async move {
             let _ = label;
@@ -15,7 +15,7 @@ fn provider_handlers(label: String) -> Component {
 
     agentview::component::prelude::use_provider_event_handler(
         ProviderEvent::TEXT,
-        move |_event| {
+        move |_ctx, _event| {
             let label = label.clone();
             async move {
                 let _ = label;

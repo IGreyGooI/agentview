@@ -31,7 +31,7 @@ struct CaptureSubmissions<P> {
 }
 
 #[async_trait::async_trait]
-impl<P: ReactionPort> ReactionPort for CaptureSubmissions<P> {
+impl<P: ReactionPort + 'static> ReactionPort for CaptureSubmissions<P> {
     fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
         self.inner.declare()
     }
@@ -128,7 +128,7 @@ async fn capture_atomic(mock: &mut ResponsesAcceptanceServer) -> anyhow::Result<
     let mut application =
         Application::mount(move || atomic_diff_application(props.clone()), provider)?;
     let operation_result = AssertUnwindSafe(async {
-        anyhow::ensure!(application.react().await?.is_continue());
+        anyhow::ensure!(application.react().unwrap().await?.is_continue());
         let baseline = request_view(&mock.next_request().await?)?;
         let signal = exported
             .lock()
@@ -136,7 +136,7 @@ async fn capture_atomic(mock: &mut ResponsesAcceptanceServer) -> anyhow::Result<
             .clone()
             .ok_or_else(|| anyhow::anyhow!("atomic Signal was not exported"))?;
         signal.set(String::from("A+"))?;
-        anyhow::ensure!(application.react().await?.is_continue());
+        anyhow::ensure!(application.react().unwrap().await?.is_continue());
         let current_component_prompt =
             projection_prompt(application.current_projection().projection())?;
         let current = request_view(&mock.next_request().await?)?;
@@ -182,7 +182,7 @@ async fn capture_replace(mock: &mut ResponsesAcceptanceServer) -> anyhow::Result
     let mut application =
         Application::mount(move || replace_diff_application(props.clone()), provider)?;
     let operation_result = AssertUnwindSafe(async {
-        anyhow::ensure!(application.react().await?.is_continue());
+        anyhow::ensure!(application.react().unwrap().await?.is_continue());
         let baseline = request_view(&mock.next_request().await?)?;
         let signal = exported
             .lock()
@@ -190,7 +190,7 @@ async fn capture_replace(mock: &mut ResponsesAcceptanceServer) -> anyhow::Result
             .clone()
             .ok_or_else(|| anyhow::anyhow!("replace Signal was not exported"))?;
         signal.set(String::from("B"))?;
-        anyhow::ensure!(application.react().await?.is_continue());
+        anyhow::ensure!(application.react().unwrap().await?.is_continue());
         let current_component_prompt =
             projection_prompt(application.current_projection().projection())?;
         let current = request_view(&mock.next_request().await?)?;

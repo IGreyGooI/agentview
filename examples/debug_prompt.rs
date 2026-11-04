@@ -40,10 +40,10 @@ fn add(a: i32, b: i32) -> Result<i32, ToolError> {
 fn debug_tool_agent(answer: Arc<Mutex<String>>) -> Component {
     let task_phase = use_signal(|| "awaiting_tool");
     let completed_phase = task_phase.clone();
-    use_reaction_completion(move || async move { completed_phase.set("answer_ready") });
+    use_reaction_completion(move |_ctx| async move { completed_phase.set("answer_ready") });
     let current_phase = task_phase.with(|phase| *phase).expect("mounted task phase");
 
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let answer = Arc::clone(&answer);
         async move {
             if let TextTurnEvent::TextComplete(text) = event {
@@ -75,7 +75,10 @@ Use the available native tool before answering arithmetic requests."#;
     }
 }
 
-async fn run_debug_tool(provider: impl ReactionPort, run_dir: &Path) -> anyhow::Result<()> {
+async fn run_debug_tool(
+    provider: impl ReactionPort + 'static,
+    run_dir: &Path,
+) -> anyhow::Result<()> {
     let answer = Arc::new(Mutex::new(String::new()));
     let component_answer = Arc::clone(&answer);
     let mut application = Application::mount(
@@ -86,7 +89,7 @@ async fn run_debug_tool(provider: impl ReactionPort, run_dir: &Path) -> anyhow::
     let operation = tokio::time::timeout(Duration::from_secs(120), async {
         println!("reaction 1: request native tool call");
         capture_projection_before_reaction(&mut application, run_dir, 1).await?;
-        let _ = application.react().await?;
+        let _ = application.react()?.await?;
         let records = native_records(&application);
         let [CanonicalInputItem::ToolCall {
             call_id,
@@ -112,7 +115,7 @@ async fn run_debug_tool(provider: impl ReactionPort, run_dir: &Path) -> anyhow::
 
         println!("reaction 2: submit tool result continuation");
         capture_projection_before_reaction(&mut application, run_dir, 2).await?;
-        let _ = application.react().await?;
+        let _ = application.react()?.await?;
         anyhow::ensure!(
             answer.lock().expect("answer lock").trim() == "42",
             "model did not answer with the tool result"
@@ -139,7 +142,7 @@ async fn run_debug_tool(provider: impl ReactionPort, run_dir: &Path) -> anyhow::
 }
 
 async fn capture_projection_before_reaction(
-    application: &mut Application<impl ReactionPort>,
+    application: &mut Application<impl ReactionPort + 'static>,
     run_dir: &Path,
     reaction: usize,
 ) -> anyhow::Result<()> {
@@ -151,7 +154,9 @@ async fn capture_projection_before_reaction(
     projection_debug::write_projection(run_dir, reaction, application.current_projection())
 }
 
-fn native_records(application: &Application<impl ReactionPort>) -> Vec<CanonicalInputItem> {
+fn native_records(
+    application: &Application<impl ReactionPort + 'static>,
+) -> Vec<CanonicalInputItem> {
     application
         .current_projection()
         .projection()

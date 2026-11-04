@@ -61,7 +61,7 @@ async fn run() -> anyhow::Result<()> {
 
 async fn play_chess(
     config: ChessConfig,
-    provider: impl ReactionPort,
+    provider: impl ReactionPort + 'static,
 ) -> anyhow::Result<ChessResult> {
     let (stop, stop_receiver) = watch::channel(false);
     let (result_sender, result_receiver) = watch::channel(None);

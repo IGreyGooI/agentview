@@ -18,7 +18,9 @@ use crate::{
             async_task::ComponentTaskContext, declaration::ComponentNode, Component,
             ComponentAttemptFault, Signal,
         },
+        provenance::EventScope,
         signal::HookMount,
+        EventContext, EventSource, ReactionId,
     },
     pom::{
         BlockChildren, BlockContent, Document, MixedContent, RawTextNode, TextNode, XmlName,
@@ -45,7 +47,7 @@ const CALLBACK_CONTRACT: &str = "agentview.xml-callbacks";
 const MAX_RETAINED_DIAGNOSTICS: usize = 32;
 
 type CallbackFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
-type Callback<Input> = Box<dyn FnMut(Input) -> CallbackFuture + Send + 'static>;
+type Callback<Input> = Box<dyn FnMut(EventContext, Input) -> CallbackFuture + Send + 'static>;
 
 /// Feedback for a model-authored XML action that could not be dispatched.
 ///
@@ -114,11 +116,11 @@ where
 
 fn callback<Input, Handler, Return, Mode>(mut handler: Handler) -> Callback<Input>
 where
-    Handler: FnMut(Input) -> Return + Send + 'static,
+    Handler: FnMut(EventContext, Input) -> Return + Send + 'static,
     Return: XmlCallbackReturn<Mode>,
 {
-    Box::new(move |input| {
-        let future = handler(input).into_callback_future();
+    Box::new(move |context, input| {
+        let future = handler(context, input).into_callback_future();
         Box::pin(async move { future.await.map(|_| ()).map_err(|error| error.to_string()) })
     })
 }
@@ -217,7 +219,7 @@ impl<Element> XmlStreamingToolCallProps<Element> {
     /// the next view. Unattributed input errors go to the first declared action.
     pub fn on_invalid<Handler, Return, Mode>(mut self, handler: Handler) -> Self
     where
-        Handler: FnMut(XmlCallbackDiagnostic) -> Return + Send + 'static,
+        Handler: FnMut(EventContext, XmlCallbackDiagnostic) -> Return + Send + 'static,
         Return: XmlCallbackReturn<Mode>,
     {
         self.invalid = Some(callback(handler));
@@ -232,7 +234,7 @@ where
 {
     pub fn on_open<Handler, Return, Mode>(mut self, handler: Handler) -> Self
     where
-        Handler: FnMut(Arc<Head>) -> Return + Send + 'static,
+        Handler: FnMut(EventContext, Arc<Head>) -> Return + Send + 'static,
         Return: XmlCallbackReturn<Mode>,
     {
         self.element.open = Some(callback(handler));
@@ -243,7 +245,7 @@ where
     /// undone if this occurrence later turns out to be incomplete or invalid.
     pub fn on_delta<Handler, Return, Mode>(mut self, handler: Handler) -> Self
     where
-        Handler: FnMut(String) -> Return + Send + 'static,
+        Handler: FnMut(EventContext, String) -> Return + Send + 'static,
         Return: XmlCallbackReturn<Mode>,
     {
         self.element.delta = Some(callback(handler));
@@ -253,7 +255,7 @@ where
     /// Receive one fully decoded valid element as soon as it closes.
     pub fn on_complete<Handler, Return, Mode>(mut self, handler: Handler) -> Self
     where
-        Handler: FnMut(Value) -> Return + Send + 'static,
+        Handler: FnMut(EventContext, Value) -> Return + Send + 'static,
         Return: XmlCallbackReturn<Mode>,
     {
         self.element.complete = Some(callback(handler));
@@ -287,8 +289,25 @@ where
 
 #[derive(Clone, Default)]
 pub(crate) struct XmlCallbackFeedback {
-    diagnostics: Vec<XmlCallbackDiagnostic>,
+    lineages: HashMap<Option<ReactionId>, XmlCallbackFeedbackLineage>,
+}
+
+impl XmlCallbackFeedback {
+    pub(crate) fn discard_lineage(&mut self, lineage: ReactionId) {
+        self.lineages.remove(&Some(lineage));
+    }
+}
+
+#[derive(Clone, Default)]
+struct XmlCallbackFeedbackLineage {
+    diagnostics: Vec<XmlCallbackFeedbackRecord>,
     omitted: usize,
+}
+
+#[derive(Clone)]
+struct XmlCallbackFeedbackRecord {
+    context: EventContext,
+    diagnostic: XmlCallbackDiagnostic,
 }
 
 pub(crate) struct XmlCallbackDeclaration {
@@ -342,6 +361,7 @@ impl XmlCallbackDeclaration {
 
     fn invalid_future(
         &mut self,
+        event_context: EventContext,
         diagnostic: XmlCallbackDiagnostic,
     ) -> Result<Option<CallbackFuture>, StreamingToolDriverFault> {
         if self.invalid.is_none() {
@@ -357,8 +377,8 @@ impl XmlCallbackDeclaration {
         let context = self.task_context.clone();
         let handler = self.invalid.as_mut().expect("checked callback");
         let future = match &context {
-            Some(context) => context.scope_sync(|| handler(diagnostic)),
-            None => handler(diagnostic),
+            Some(context) => context.scope_sync(|| handler(event_context, diagnostic)),
+            None => handler(event_context, diagnostic),
         };
         Ok(Some(match context {
             Some(context) => Box::pin(context.scope(future)),
@@ -366,7 +386,10 @@ impl XmlCallbackDeclaration {
         }))
     }
 
-    pub(crate) fn prompt_document(&self) -> Result<Document, ComponentAttemptFault> {
+    pub(crate) fn prompt_document(
+        &self,
+        history_scope: Option<ReactionId>,
+    ) -> Result<Document, ComponentAttemptFault> {
         self.element.validate().map_err(map_declaration_fault)?;
         let mut children = BlockChildren::new();
         if !self.description.is_empty() {
@@ -391,23 +414,68 @@ impl XmlCallbackDeclaration {
             ))));
         }
         if let Some(feedback) = &self.feedback {
-            let feedback = feedback.with(Clone::clone).map_err(|error| {
-                ComponentAttemptFault::RuntimeInvariant {
+            let feedback = feedback
+                .with(|feedback| {
+                    feedback
+                        .lineages
+                        .get(&history_scope)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .map_err(|error| ComponentAttemptFault::RuntimeInvariant {
                     message: error.to_string(),
-                }
-            })?;
+                })?;
             if !feedback.diagnostics.is_empty() || feedback.omitted != 0 {
                 let mut node =
                     XmlNode::new(XmlName::new("xml_action_feedback").expect("static name"));
                 node.push_attribute(XmlName::new("action").expect("static name"), self.name())
                     .expect("unique attribute");
-                for diagnostic in feedback.diagnostics {
+                for record in feedback.diagnostics {
+                    let diagnostic = record.diagnostic;
+                    let context = record.context;
                     let mut item = XmlNode::new(XmlName::new("invalid").expect("static name"));
                     item.push_attribute(
                         XmlName::new("code").expect("static name"),
                         diagnostic.code,
                     )
                     .expect("unique attribute");
+                    for (name, value) in [
+                        ("application_id", Some(context.application_id().to_string())),
+                        (
+                            "reaction_id",
+                            context.reaction_id().map(|id| id.to_string()),
+                        ),
+                        (
+                            "reaction_kind",
+                            context.reaction_kind().map(|kind| kind.as_str().to_owned()),
+                        ),
+                        ("event_id", Some(context.event_id().to_string())),
+                    ] {
+                        if let Some(value) = value {
+                            item.push_attribute(XmlName::new(name).expect("static name"), value)
+                                .expect("unique attribute");
+                        }
+                    }
+                    if let EventSource::Xml {
+                        attempt,
+                        occurrence,
+                        sequence,
+                    } = context.source()
+                    {
+                        for (name, value) in [
+                            ("attempt", Some(attempt.get().to_string())),
+                            ("occurrence", occurrence.map(|id| id.get().to_string())),
+                            ("event_sequence", Some(sequence.to_string())),
+                        ] {
+                            if let Some(value) = value {
+                                item.push_attribute(
+                                    XmlName::new(name).expect("static name"),
+                                    value,
+                                )
+                                .expect("unique attribute");
+                            }
+                        }
+                    }
                     if let Some(element) = diagnostic.element {
                         item.push_attribute(XmlName::new("element").expect("static name"), element)
                             .expect("unique attribute");
@@ -460,12 +528,14 @@ trait ErasedCallback: Send {
     fn prompt(&self) -> Result<XmlNode, StreamingToolDeclarationFault>;
     fn open(
         &mut self,
+        context: EventContext,
         occurrence: u64,
         attributes: Vec<(String, String)>,
         span: XmlSourceSpan,
     ) -> Result<Dispatch, StreamingToolDriverFault>;
     fn delta(
         &mut self,
+        context: EventContext,
         occurrence: u64,
         delta: String,
         accumulated: Arc<str>,
@@ -473,6 +543,7 @@ trait ErasedCallback: Send {
     ) -> Result<Dispatch, StreamingToolDriverFault>;
     fn complete(
         &mut self,
+        context: EventContext,
         occurrence: u64,
         form: XmlElementForm,
         span: XmlSourceSpan,
@@ -492,19 +563,26 @@ where
 }
 
 impl<Head: Send + Sync + 'static, Value: Send + 'static> TypedCallback<Head, Value> {
-    fn dispatch(&mut self, update: StreamingToolUpdate<CallbackChannels<Head, Value>>) -> Dispatch {
+    fn dispatch(
+        &mut self,
+        context: EventContext,
+        update: StreamingToolUpdate<CallbackChannels<Head, Value>>,
+    ) -> Dispatch {
         let mut invoke = None;
         for entry in update.into_entries() {
             invoke = match entry {
-                StreamingToolEmission::Output(CallbackEvent::Open(head)) => {
-                    self.open.as_mut().map(|handler| handler(head))
-                }
-                StreamingToolEmission::Output(CallbackEvent::Delta(text)) => {
-                    self.delta.as_mut().map(|handler| handler(text))
-                }
-                StreamingToolEmission::Output(CallbackEvent::Complete(value)) => {
-                    self.complete.as_mut().map(|handler| handler(value))
-                }
+                StreamingToolEmission::Output(CallbackEvent::Open(head)) => self
+                    .open
+                    .as_mut()
+                    .map(|handler| handler(context.clone(), head)),
+                StreamingToolEmission::Output(CallbackEvent::Delta(text)) => self
+                    .delta
+                    .as_mut()
+                    .map(|handler| handler(context.clone(), text)),
+                StreamingToolEmission::Output(CallbackEvent::Complete(value)) => self
+                    .complete
+                    .as_mut()
+                    .map(|handler| handler(context.clone(), value)),
                 StreamingToolEmission::Live(never)
                 | StreamingToolEmission::Commit(never)
                 | StreamingToolEmission::Diagnostic(never) => match never {},
@@ -575,6 +653,7 @@ impl<Head: Send + Sync + 'static, Value: Send + 'static> ErasedCallback
 
     fn open(
         &mut self,
+        context: EventContext,
         occurrence: u64,
         attributes: Vec<(String, String)>,
         span: XmlSourceSpan,
@@ -583,13 +662,12 @@ impl<Head: Send + Sync + 'static, Value: Send + 'static> ErasedCallback
         // its private reducer only forwards payloads to this direct executor.
         match self.inner.open(
             &(),
-            StreamingToolAttemptId::new(0),
-            0,
+            context.clone(),
             XmlOccurrenceId::new(occurrence),
             attributes,
             span,
         ) {
-            ElementOpenDispatch::Opened(update) => Ok(self.dispatch(update)),
+            ElementOpenDispatch::Opened(update) => Ok(self.dispatch(context, update)),
             ElementOpenDispatch::Contract(problems) => Ok(Dispatch::Invalid(
                 problems
                     .into_iter()
@@ -610,6 +688,7 @@ impl<Head: Send + Sync + 'static, Value: Send + 'static> ErasedCallback
 
     fn delta(
         &mut self,
+        context: EventContext,
         occurrence: u64,
         delta: String,
         accumulated: Arc<str>,
@@ -619,32 +698,31 @@ impl<Head: Send + Sync + 'static, Value: Send + 'static> ErasedCallback
             .inner
             .delta(
                 &(),
-                StreamingToolAttemptId::new(0),
-                0,
+                context.clone(),
                 XmlOccurrenceId::new(occurrence),
                 delta,
                 accumulated,
                 span,
             )
             .map_err(|fault| reducer_fault(self.inner.name(), fault.message))?;
-        Ok(self.dispatch(update))
+        Ok(self.dispatch(context, update))
     }
 
     fn complete(
         &mut self,
+        context: EventContext,
         occurrence: u64,
         form: XmlElementForm,
         span: XmlSourceSpan,
     ) -> Result<Dispatch, StreamingToolDriverFault> {
         match self.inner.complete(
             &mut (),
-            StreamingToolAttemptId::new(0),
-            0,
+            context.clone(),
             XmlOccurrenceId::new(occurrence),
             form,
             span,
         ) {
-            ElementCompleteDispatch::Completed(update) => Ok(self.dispatch(update)),
+            ElementCompleteDispatch::Completed(update) => Ok(self.dispatch(context, update)),
             ElementCompleteDispatch::DomainInvalid(never) => {
                 if let Some(value) = never.into_iter().next() {
                     match value {}
@@ -669,6 +747,9 @@ impl<Head: Send + Sync + 'static, Value: Send + 'static> ErasedCallback
 /// A parser and callback set owned only by the active reaction. Dropping its
 /// dispatch future cancels the current async callback without replay or rollback.
 pub(crate) struct XmlCallbackRuntime {
+    event_scope: Option<EventScope>,
+    attempt: StreamingToolAttemptId,
+    sequence: u64,
     declarations: Vec<XmlCallbackDeclaration>,
     parser: Parser,
     indexes: HashMap<&'static str, usize>,
@@ -681,6 +762,13 @@ pub(crate) struct XmlCallbackRuntime {
 }
 
 impl XmlCallbackRuntime {
+    pub(crate) fn feedback_signals(&self) -> Vec<Signal<XmlCallbackFeedback>> {
+        self.declarations
+            .iter()
+            .filter_map(|declaration| declaration.feedback.clone())
+            .collect()
+    }
+
     pub(crate) fn new(
         declarations: Vec<XmlCallbackDeclaration>,
         ignored_names: Vec<&'static str>,
@@ -717,6 +805,10 @@ impl XmlCallbackRuntime {
             .collect();
         let seen = vec![0; declarations.len()];
         Ok(Self {
+            event_scope: None,
+            attempt: StreamingToolAttemptId::fresh()
+                .ok_or_else(|| input_fault("XML attempt identity space exhausted"))?,
+            sequence: 0,
             declarations,
             parser,
             indexes,
@@ -729,17 +821,43 @@ impl XmlCallbackRuntime {
         })
     }
 
+    pub(crate) fn set_event_scope(&mut self, scope: EventScope) {
+        debug_assert!(
+            !self.started,
+            "XML event scope is fixed before callbacks start"
+        );
+        self.event_scope = Some(scope);
+    }
+
+    fn event_context(
+        &mut self,
+        occurrence: Option<u64>,
+    ) -> Result<EventContext, StreamingToolDriverFault> {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| input_fault("XML event sequence overflowed"))?;
+        let scope = self
+            .event_scope
+            .ok_or_else(|| input_fault("XML callback event scope was not initialized"))?;
+        Ok(scope.event(EventSource::Xml {
+            attempt: self.attempt,
+            occurrence: occurrence.map(XmlOccurrenceId::new),
+            sequence: self.sequence,
+        }))
+    }
+
     fn start_feedback(&mut self) -> Result<(), StreamingToolDriverFault> {
         if self.started {
             return Ok(());
         }
         self.started = true;
+        let lineage = self.event_scope.and_then(|scope| scope.reaction_lineage());
         for declaration in &self.declarations {
             if let Some(feedback) = &declaration.feedback {
                 feedback
                     .update(|feedback| {
-                        feedback.diagnostics.clear();
-                        feedback.omitted = 0;
+                        feedback.lineages.remove(&lineage);
                     })
                     .map_err(|error| reducer_fault(declaration.name(), &error.to_string()))?;
             }
@@ -788,7 +906,9 @@ impl XmlCallbackRuntime {
         self.process(events).await?;
         for index in 0..self.declarations.len() {
             if self.seen[index] < self.declarations[index].element.cardinality().min() {
+                let context = self.event_context(None)?;
                 self.report(
+                    context,
                     index,
                     XmlCallbackDiagnostic {
                         element: Some(self.declarations[index].name().to_owned()),
@@ -806,6 +926,13 @@ impl XmlCallbackRuntime {
 
     async fn process(&mut self, events: Vec<ParserEvent>) -> Result<(), StreamingToolDriverFault> {
         for event in events {
+            let occurrence = match &event {
+                ParserEvent::Open { occurrence, .. }
+                | ParserEvent::Delta { occurrence, .. }
+                | ParserEvent::Complete { occurrence, .. } => Some(*occurrence),
+                ParserEvent::Invalid { occurrence, .. } => *occurrence,
+            };
+            let context = self.event_context(occurrence)?;
             match event {
                 ParserEvent::Open {
                     occurrence,
@@ -827,6 +954,7 @@ impl XmlCallbackRuntime {
                     {
                         self.invalidate(occurrence, index);
                         self.report(
+                            context.clone(),
                             index,
                             XmlCallbackDiagnostic {
                                 element: Some(name),
@@ -839,9 +967,10 @@ impl XmlCallbackRuntime {
                         .await?;
                         continue;
                     }
-                    let dispatch = self.declarations[index]
-                        .invoke(|element| element.open(occurrence, attributes, span))?;
-                    self.dispatch(index, occurrence, dispatch).await?;
+                    let dispatch = self.declarations[index].invoke(|element| {
+                        element.open(context.clone(), occurrence, attributes, span)
+                    })?;
+                    self.dispatch(context, index, occurrence, dispatch).await?;
                 }
                 ParserEvent::Delta {
                     occurrence,
@@ -855,13 +984,14 @@ impl XmlCallbackRuntime {
                     let index = self.owner(occurrence)?;
                     let dispatch = self.declarations[index].invoke(|element| {
                         element.delta(
+                            context.clone(),
                             occurrence,
                             delta,
                             accumulated,
                             XmlSourceSpan::from_range(span),
                         )
                     })?;
-                    self.dispatch(index, occurrence, dispatch).await?;
+                    self.dispatch(context, index, occurrence, dispatch).await?;
                 }
                 ParserEvent::Complete {
                     occurrence,
@@ -878,9 +1008,14 @@ impl XmlCallbackRuntime {
                         CompletionForm::ImplicitEof => XmlElementForm::ImplicitEof,
                     };
                     let dispatch = self.declarations[index].invoke(|element| {
-                        element.complete(occurrence, form, XmlSourceSpan::from_range(span))
+                        element.complete(
+                            context.clone(),
+                            occurrence,
+                            form,
+                            XmlSourceSpan::from_range(span),
+                        )
                     })?;
-                    self.dispatch(index, occurrence, dispatch).await?;
+                    self.dispatch(context, index, occurrence, dispatch).await?;
                 }
                 ParserEvent::Invalid {
                     occurrence,
@@ -898,6 +1033,7 @@ impl XmlCallbackRuntime {
                     }
                     let (kind, code) = map_invalid_kind(kind);
                     self.report(
+                        context,
                         owner.unwrap_or(0),
                         XmlCallbackDiagnostic {
                             element,
@@ -933,6 +1069,7 @@ impl XmlCallbackRuntime {
 
     async fn dispatch(
         &mut self,
+        context: EventContext,
         index: usize,
         occurrence: u64,
         dispatch: Dispatch,
@@ -950,7 +1087,7 @@ impl XmlCallbackRuntime {
             Dispatch::Invalid(diagnostics) => {
                 self.invalidate(occurrence, index);
                 for diagnostic in diagnostics {
-                    self.report(index, diagnostic).await?;
+                    self.report(context.clone(), index, diagnostic).await?;
                 }
                 Ok(())
             }
@@ -959,6 +1096,7 @@ impl XmlCallbackRuntime {
 
     async fn report(
         &mut self,
+        context: EventContext,
         index: usize,
         diagnostic: XmlCallbackDiagnostic,
     ) -> Result<(), StreamingToolDriverFault> {
@@ -966,15 +1104,22 @@ impl XmlCallbackRuntime {
         if let Some(feedback) = &declaration.feedback {
             feedback
                 .update(|feedback| {
+                    let feedback = feedback
+                        .lineages
+                        .entry(context.reaction_lineage())
+                        .or_default();
                     if feedback.diagnostics.len() == MAX_RETAINED_DIAGNOSTICS {
                         feedback.diagnostics.remove(0);
                         feedback.omitted = feedback.omitted.saturating_add(1);
                     }
-                    feedback.diagnostics.push(diagnostic.clone());
+                    feedback.diagnostics.push(XmlCallbackFeedbackRecord {
+                        context: context.clone(),
+                        diagnostic: diagnostic.clone(),
+                    });
                 })
                 .map_err(|error| reducer_fault(declaration.name(), &error.to_string()))?;
         }
-        if let Some(future) = declaration.invalid_future(diagnostic)? {
+        if let Some(future) = declaration.invalid_future(context, diagnostic)? {
             future
                 .await
                 .map_err(|message| StreamingToolDriverFault::Adapter {
@@ -1049,5 +1194,110 @@ fn parser_fault(fault: ParserFault) -> StreamingToolDriverFault {
             contract: CALLBACK_CONTRACT,
             message,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU128, NonZeroU64};
+
+    use super::super::XmlToolElement;
+    use super::*;
+    use crate::component::{
+        authoring::XmlStreamingToolCall,
+        execution::{FrameRevision, TargetEpoch, TargetIdentity},
+        signal::{HookKind, SignalRuntime},
+        ApplicationId, ComponentId, ReactionKind,
+    };
+
+    fn declaration(
+        feedback: Signal<XmlCallbackFeedback>,
+        mount: HookMount,
+    ) -> XmlCallbackDeclaration {
+        let component = XmlStreamingToolCall::props()
+            .element(XmlToolElement::text("say"))
+            .on_complete(|_, _: String| Ok::<_, std::convert::Infallible>(()))
+            .build();
+        let ComponentNode::XmlCallback(mut declaration) = component.node else {
+            unreachable!()
+        };
+        declaration.mount(feedback, mount, None);
+        *declaration
+    }
+
+    #[tokio::test]
+    async fn concurrent_xml_streams_only_replace_their_own_lineage_feedback() {
+        let runtime = SignalRuntime::new();
+        let mut render = runtime.begin_render().unwrap();
+        let (feedback, mount) = render
+            .render_component(ComponentId::root(), |scope| {
+                let feedback = scope.use_signal_at(0, XmlCallbackFeedback::default)?;
+                let mount = scope.use_marker_at(1, HookKind::XmlCallback)?;
+                Ok((feedback, mount))
+            })
+            .unwrap();
+        render.commit();
+        let frame = FrameRevision::new(
+            NonZeroU128::new(1).unwrap(),
+            TargetIdentity::new(NonZeroU128::new(1).unwrap()),
+            TargetEpoch::new(NonZeroU64::new(1).unwrap()),
+            NonZeroU64::new(1).unwrap(),
+        );
+        let application = ApplicationId::fresh();
+        let main_id = ReactionId::fresh();
+        let branch = ReactionId::fresh();
+        let main_scope = EventScope::reaction(application, main_id, frame);
+        let branch_scope =
+            EventScope::reaction_with_kind(application, branch, ReactionKind::Temporary, frame);
+        let mut main =
+            XmlCallbackRuntime::new(vec![declaration(feedback.clone(), mount.clone())], vec![])
+                .unwrap();
+        main.set_event_scope(main_scope);
+        main.push("<main_typo/>").await.unwrap();
+        let mut temporary =
+            XmlCallbackRuntime::new(vec![declaration(feedback.clone(), mount.clone())], vec![])
+                .unwrap();
+        temporary.set_event_scope(branch_scope);
+        temporary.push("<branch_typo/>").await.unwrap();
+        feedback
+            .with(|feedback| {
+                let main = &feedback.lineages[&None].diagnostics;
+                let temporary = &feedback.lineages[&Some(branch)].diagnostics;
+                assert_eq!(main.len(), 1);
+                assert_eq!(temporary.len(), 1);
+                assert_eq!(main[0].context.reaction_id(), Some(main_id));
+                assert_eq!(main[0].diagnostic.element.as_deref(), Some("main_typo"));
+                assert_eq!(temporary[0].context.reaction_id(), Some(branch));
+                assert_eq!(
+                    temporary[0].context.reaction_kind(),
+                    Some(ReactionKind::Temporary)
+                );
+                assert_eq!(
+                    temporary[0].diagnostic.element.as_deref(),
+                    Some("branch_typo")
+                );
+            })
+            .unwrap();
+
+        let mut next_main =
+            XmlCallbackRuntime::new(vec![declaration(feedback.clone(), mount)], vec![]).unwrap();
+        next_main.set_event_scope(EventScope::reaction(
+            application,
+            ReactionId::fresh(),
+            frame,
+        ));
+        next_main.push("<say>valid</say>").await.unwrap();
+        feedback
+            .with(|feedback| {
+                assert!(!feedback.lineages.contains_key(&None));
+                assert_eq!(feedback.lineages[&Some(branch)].diagnostics.len(), 1);
+            })
+            .unwrap();
+        feedback
+            .update(|feedback| feedback.discard_lineage(branch))
+            .unwrap();
+        assert!(feedback
+            .with(|feedback| feedback.lineages.is_empty())
+            .unwrap());
     }
 }

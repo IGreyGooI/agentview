@@ -9,12 +9,13 @@ use crate::{
             CommandOutcome, DriverDemandHandle, ProviderOutputKey, RenderedProjection,
             RenderedProjectionNode,
         },
+        provenance::EventScope,
         signal::{
             HookKind, SignalMountTransition, SignalRenderError, SignalRenderTransaction,
             SignalRuntime,
         },
         task::MountTaskHandle,
-        ComponentId,
+        ComponentId, EventContext, EventSource, ReactionId,
     },
     pom::{BlockChildren, Document, ResolvedDocument, XmlNode},
     pom_resolution::resolve_artifact_document,
@@ -48,7 +49,7 @@ use super::{
         MountedStreamingRoute, ParsedContractEvent, StreamingXmlDispatchFault,
         StreamingXmlMountFault,
     },
-    Component,
+    Component, Signal,
 };
 
 #[cfg(test)]
@@ -177,9 +178,11 @@ where
             tasks,
             application_exit,
             "",
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_complete_root_candidate_with_command_prefix<'runtime>(
         root: Component,
         event_origin: EventInputOrigin,
@@ -188,6 +191,7 @@ where
         tasks: Option<&MountTaskHandle>,
         application_exit: Option<&ApplicationExitControl>,
         command_prefix: &str,
+        native_history_scope: Option<ReactionId>,
     ) -> Result<ComponentRenderCandidate<'runtime, Root>, ComponentAttemptFault> {
         let mut signal_render = signals
             .begin_render()
@@ -200,6 +204,7 @@ where
             tasks,
             application_exit,
             command_prefix,
+            native_history_scope,
         )?;
         Ok(ComponentRenderCandidate {
             stage,
@@ -208,6 +213,7 @@ where
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn mount(
         root: Component,
         event_origin: EventInputOrigin,
@@ -216,6 +222,7 @@ where
         tasks: Option<&MountTaskHandle>,
         application_exit: Option<&ApplicationExitControl>,
         command_prefix: &str,
+        native_history_scope: Option<ReactionId>,
     ) -> Result<(Self, Option<ResolvedDocument>), ComponentAttemptFault> {
         let mut listeners = Vec::new();
         let mut reaction_completions = Vec::new();
@@ -224,6 +231,7 @@ where
         let mut task_starts = Vec::new();
         let root_id = ComponentId::root();
         let mut capture = RenderCapture::new(root_id.clone(), command_prefix);
+        capture.native_history_scope = native_history_scope;
         let mut scope_cursor = 0;
         let mut system_scope_cursor = 0;
         let rendered = visit_render(
@@ -298,6 +306,7 @@ where
                 projection,
                 preparations,
                 bindings: RenderBindings {
+                    event_scope: EventScope::application(event_origin.application_id()),
                     listeners,
                     reaction_completions,
                     native_tools,
@@ -348,6 +357,7 @@ where
 /// [`finish_normal`](Self::finish_normal) performs semantic stream completion
 /// and dispatches diagnostics discovered at EOF.
 pub(crate) struct RenderBindings<Root> {
+    event_scope: EventScope,
     listeners: Vec<MountedListener>,
     reaction_completions: Vec<ReactionCompletionDeclaration>,
     native_tools: Vec<NativeToolCallDeclaration>,
@@ -362,10 +372,52 @@ pub(crate) struct RenderBindings<Root> {
     marker: std::marker::PhantomData<fn(Root)>,
 }
 
+/// Mounted protocol feedback handles without event callbacks or parser state.
+#[derive(Default)]
+pub(crate) struct RetainedModelHistory {
+    native: Vec<Signal<NativeToolHistory>>,
+    xml: Vec<Signal<XmlCallbackFeedback>>,
+}
+
+impl RetainedModelHistory {
+    pub(crate) fn discard_temporary(&self, lineage: ReactionId) {
+        // A retired mount may already have invalidated its Signal. There is no
+        // live history to release in that case, and cleanup must not run user code.
+        for history in &self.native {
+            let _ = history.update(|history| history.discard_lineage(lineage));
+        }
+        for history in &self.xml {
+            let _ = history.update(|history| history.discard_lineage(lineage));
+        }
+    }
+}
+
 impl<Root> RenderBindings<Root>
 where
     Root: Send + Sync + 'static,
 {
+    pub(crate) fn retained_model_history(&self) -> RetainedModelHistory {
+        RetainedModelHistory {
+            native: self
+                .native_tools
+                .iter()
+                .filter_map(|tool| tool.history_signal())
+                .collect(),
+            xml: self
+                .xml_callbacks
+                .as_ref()
+                .map(XmlCallbackRuntime::feedback_signals)
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn set_event_scope(&mut self, scope: EventScope) {
+        self.event_scope = scope;
+        if let Some(callbacks) = &mut self.xml_callbacks {
+            callbacks.set_event_scope(scope);
+        }
+    }
+
     pub(crate) fn take_streaming_contracts(&mut self) -> Vec<ContractDeclaration> {
         std::mem::take(&mut self.streaming_contracts)
     }
@@ -382,6 +434,7 @@ where
 
     pub(crate) async fn dispatch_command(
         &mut self,
+        context: EventContext,
         name: &str,
         input: serde_json::Value,
     ) -> Result<CommandOutcome, String> {
@@ -395,7 +448,7 @@ where
                 message: format!("Command `{name}` is not currently mounted."),
             });
         };
-        command.invoke(input).await
+        command.invoke(context, input).await
     }
 
     /// Ordinary XML callbacks run within the caller's reaction future. The
@@ -451,10 +504,40 @@ where
         callbacks.finish().await
     }
 
+    pub(crate) fn command_context(&self, name: &str) -> EventContext {
+        // Commands are external events, even if bindings were previously used by a reaction.
+        EventScope::application(self.event_scope.application_id()).event(EventSource::Command {
+            name: name.to_owned(),
+        })
+    }
+
+    pub(crate) fn event_context(&self, source: EventSource) -> EventContext {
+        self.event_scope.event(source)
+    }
+
+    #[cfg(feature = "legacy-provider-port")]
+    pub(crate) fn begin_unframed_reaction(&mut self) {
+        self.set_event_scope(EventScope::unframed_reaction(
+            self.event_scope.application_id(),
+        ));
+    }
+
     /// Dispatch one immutable root event without rendering.
+    #[cfg(any(test, feature = "legacy-provider-port"))]
     pub(crate) async fn dispatch(&mut self, event: Root) -> Result<(), ComponentAttemptFault> {
+        let context = self
+            .event_scope
+            .event(EventSource::Provider { output: None });
+        self.dispatch_with_context(context, event).await
+    }
+
+    pub(crate) async fn dispatch_with_context(
+        &mut self,
+        context: EventContext,
+        event: Root,
+    ) -> Result<(), ComponentAttemptFault> {
         self.ensure_open()?;
-        match self.dispatch_inner(event).await {
+        match self.dispatch_inner(context, event).await {
             Ok(()) => Ok(()),
             Err(fault) => self.abort(fault),
         }
@@ -469,8 +552,22 @@ where
             .map(|(future, _)| future)
     }
 
+    #[cfg(feature = "legacy-provider-port")]
     pub(crate) fn start_native_tool_record(
         &mut self,
+        call: crate::component::execution::ToolCall,
+    ) -> Result<(NativeToolFuture, NativeToolRecord), ComponentAttemptFault> {
+        let context = self.event_scope.event(EventSource::NativeTool {
+            call_id: call.call_id().to_owned(),
+            output: None,
+            ordinal: None,
+        });
+        self.start_native_tool_record_with_context(context, call)
+    }
+
+    pub(crate) fn start_native_tool_record_with_context(
+        &mut self,
+        context: EventContext,
         call: crate::component::execution::ToolCall,
     ) -> Result<(NativeToolFuture, NativeToolRecord), ComponentAttemptFault> {
         self.ensure_open()?;
@@ -494,10 +591,10 @@ where
             });
         }
         let record = tool
-            .append_call(&call)
+            .append_call(context.clone(), &call)
             .map_err(ComponentAttemptFault::native_tool)?;
         let future = tool
-            .start(call)
+            .start(context, call)
             .map_err(ComponentAttemptFault::native_tool)?;
         Ok((
             Box::pin(await_output(call_id, future, record.clone())),
@@ -505,19 +602,23 @@ where
         ))
     }
 
-    async fn dispatch_inner(&mut self, event: Root) -> Result<(), ComponentAttemptFault> {
+    async fn dispatch_inner(
+        &mut self,
+        context: EventContext,
+        event: Root,
+    ) -> Result<(), ComponentAttemptFault> {
         let mut parsed_events = Vec::new();
         for route in &mut self.streaming_routes {
             parsed_events.extend(
                 route
-                    .dispatch_root(&event)
+                    .dispatch_root(&context, &event)
                     .map_err(ComponentAttemptFault::streaming_input)?,
             );
         }
 
         // Raw observers see the provider event before handlers for events derived from it.
         for listener in &mut self.listeners {
-            listener.dispatch_root(&event).await?;
+            listener.dispatch_root(context.clone(), &event).await?;
         }
         for parsed in parsed_events {
             dispatch_parsed_at(&mut self.listeners, parsed).await?;
@@ -538,11 +639,12 @@ where
     }
 
     async fn finish_normal_inner(&mut self) -> Result<(), ComponentAttemptFault> {
+        let context = self.event_scope.event(EventSource::ReactionCompleted);
         let mut parsed_events = Vec::new();
         for route in &mut self.streaming_routes {
             parsed_events.extend(
                 route
-                    .finish()
+                    .finish(&context)
                     .map_err(ComponentAttemptFault::streaming_input)?,
             );
         }
@@ -552,7 +654,7 @@ where
         }
         for completion in &mut self.reaction_completions {
             completion
-                .dispatch()
+                .dispatch(context.clone())
                 .await
                 .map_err(ComponentAttemptFault::reaction_completion)?;
         }
@@ -597,14 +699,29 @@ async fn dispatch_parsed(
     event: ParsedContractEvent,
 ) -> Result<(), ComponentAttemptFault> {
     match event {
-        ParsedContractEvent::Decoded { value, .. } => {
-            listener.dispatch_streaming_decoded(Some(value), None).await
+        ParsedContractEvent::Decoded { context, value, .. } => {
+            listener
+                .dispatch_streaming_decoded(context, Some(value), None)
+                .await
         }
-        ParsedContractEvent::Invalid { diagnostic, .. } => {
-            listener.dispatch_streaming_invalid(diagnostic).await
+        ParsedContractEvent::Invalid {
+            context,
+            diagnostic,
+            ..
+        } => {
+            listener
+                .dispatch_streaming_invalid(context, diagnostic)
+                .await
         }
-        ParsedContractEvent::Lifecycle { phase, element, .. } => {
-            listener.dispatch_streaming_phase(phase, element).await
+        ParsedContractEvent::Lifecycle {
+            context,
+            phase,
+            element,
+            ..
+        } => {
+            listener
+                .dispatch_streaming_phase(context, phase, element)
+                .await
         }
     }
 }
@@ -899,7 +1016,7 @@ fn visit_render(
                 .cloned()
                 .map(|tasks| ComponentTaskContext::new(mount.clone(), tasks));
             declaration.mount(history, mount, task_context);
-            let document = declaration.prompt_document()?;
+            let document = declaration.prompt_document(capture.native_history_scope)?;
             capture.register_component(component_id.clone())?;
             capture.push(&component_id, placement, document.into_children(), None)?;
             capture.xml_callbacks.push(*declaration);
@@ -928,7 +1045,12 @@ fn visit_render(
                 })
                 .map_err(ComponentAttemptFault::signal)?;
             let items = history
-                .with(|history| history.items().cloned().collect())
+                .with(|history| {
+                    history
+                        .items_for_scope(capture.native_history_scope)
+                        .cloned()
+                        .collect()
+                })
                 .map_err(|error| ComponentAttemptFault::RuntimeInvariant {
                     message: error.to_string(),
                 })?;
@@ -1058,6 +1180,7 @@ fn ensure_depth(depth: usize) -> Result<(), ComponentAttemptFault> {
 
 struct RenderCapture {
     command_prefix: String,
+    native_history_scope: Option<ReactionId>,
     streaming_contracts: Vec<ContractDeclaration>,
     xml_callbacks: Vec<XmlCallbackDeclaration>,
     cli_commands: Vec<CliCommandDeclaration>,
@@ -1075,6 +1198,7 @@ impl RenderCapture {
         node_indexes.insert(root.clone(), 0);
         Self {
             command_prefix: command_prefix.to_owned(),
+            native_history_scope: None,
             streaming_contracts: Vec::new(),
             xml_callbacks: Vec::new(),
             cli_commands: Vec::new(),

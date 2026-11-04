@@ -13,7 +13,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    component::execution::reaction::{Frame, FrameBasis, FrameRevision},
+    component::execution::{
+        reaction::{Frame, FrameBasis, FrameRevision},
+        ToolDefinition,
+    },
     provider::codex_http_v1::{CodexHttpV1Encoder, CodexHttpV1Error},
     transcript::{CanonicalInputItem, InstructionAuthority},
 };
@@ -101,6 +104,44 @@ pub(super) struct ResponsesFrameRequestState {
     compaction_instructions: Option<CompactionInstructionsProof>,
     pending_calls: BTreeMap<u64, PendingWireCall>,
     last_output_index: Option<u64>,
+    ark_cache: Option<ArkCacheState>,
+    temporary_parent: Option<TemporaryArkParent>,
+}
+
+/// A temporary lineage always references the same completed stored parent.
+/// Child outputs remain local scratch and can never replace this cursor.
+#[derive(Debug, Clone)]
+struct TemporaryArkParent {
+    response: ArkCachedResponse,
+    wire_input: Vec<Value>,
+    instructions: String,
+    tools: Vec<ToolDefinition>,
+    parallel_tool_calls: bool,
+}
+
+/// A cursor is usable only after the entire response has been validated. Its
+/// prefix is exactly this state's retained wire input, never ephemeral input.
+#[derive(Debug, Clone)]
+struct ArkCacheState {
+    tools: Vec<ToolDefinition>,
+    parallel_tool_calls: bool,
+    response: Option<ArkCachedResponse>,
+}
+
+#[derive(Debug, Clone)]
+struct ArkCachedResponse {
+    id: String,
+    expire_at: Option<u64>,
+}
+
+impl ArkCachedResponse {
+    fn is_live(&self) -> bool {
+        self.expire_at.is_none_or(|expiry| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .is_ok_and(|now| now.as_secs() < expiry)
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +151,40 @@ struct PendingWireCall {
 }
 
 impl ResponsesFrameRequestState {
+    pub(super) fn make_temporary(
+        &mut self,
+        encoder: &CodexHttpV1Encoder,
+    ) -> Result<(), ResponsesFrameRequestFault> {
+        if !encoder.ark_caching_enabled() {
+            return Ok(());
+        }
+        if let Some(parent) = &self.temporary_parent {
+            return parent
+                .response
+                .is_live()
+                .then_some(())
+                .ok_or(ResponsesFrameRequestFault::TemporaryCheckpointUnavailable);
+        }
+        let cache = self
+            .ark_cache
+            .as_ref()
+            .ok_or(ResponsesFrameRequestFault::TemporaryCheckpointUnavailable)?;
+        let response = cache
+            .response
+            .as_ref()
+            .filter(|response| response.is_live())
+            .ok_or(ResponsesFrameRequestFault::TemporaryCheckpointUnavailable)?;
+        self.temporary_parent = Some(TemporaryArkParent {
+            response: response.clone(),
+            wire_input: self.wire_input.clone(),
+            instructions: self.instructions.clone(),
+            tools: cache.tools.clone(),
+            parallel_tool_calls: cache.parallel_tool_calls,
+        });
+        self.ark_cache = None;
+        Ok(())
+    }
+
     /// Only closed, sealed wire windows can become an independent session.
     /// Live stream state is never stored here, and its recovery fence is
     /// checked separately by the port before copying this snapshot.
@@ -181,6 +256,7 @@ impl ResponsesFrameRequestState {
             return Ok(None);
         }
         let mut state = self.clone();
+        state.ark_cache = None;
         state.wire_input = output
             .iter()
             .cloned()
@@ -262,23 +338,96 @@ impl ResponsesFrameRequestState {
             Cow::Owned(input)
         };
 
-        let request_body = encoder
-            .encode_frame_request_bounded(
-                &request_input,
-                &state.instructions,
-                frame.submission().tools().definitions(),
+        // A storing remote chain would retain raw ephemeral prompts. Ordinary
+        // ephemeral requests break that chain; temporary branches can keep
+        // their frozen parent because their child response is never stored.
+        let request_encoder =
+            if frame.submission().ephemeral().is_empty() || state.temporary_parent.is_some() {
+                Cow::Borrowed(encoder)
+            } else {
+                Cow::Owned(encoder.without_ark_caching())
+            };
+        let tools = frame.submission().tools().definitions();
+        let temporary_response = if let Some(parent) = &state.temporary_parent {
+            if !parent.response.is_live()
+                || parent.instructions != state.instructions
+                || parent.tools != tools
+                || parent.parallel_tool_calls != encoder.parallel_tool_calls_enabled()
+                || !state.wire_input.starts_with(&parent.wire_input)
+            {
+                return Err(ResponsesFrameRequestFault::TemporaryCheckpointUnavailable);
+            }
+            Some((parent.response.id.as_str(), parent.wire_input.len()))
+        } else {
+            None
+        };
+        let previous_response = temporary_response.or_else(|| {
+            previous
+                .filter(|previous| {
+                    request_encoder.ark_caching_enabled()
+                        && matches!(frame.basis(), FrameBasis::DeltaFrom(_))
+                        && state.instructions == previous.instructions
+                        && state.wire_input.starts_with(&previous.wire_input)
+                })
+                .and_then(|previous| {
+                    let cache = previous.ark_cache.as_ref()?;
+                    let response = cache.response.as_ref()?;
+                    (cache.tools == tools
+                        && cache.parallel_tool_calls
+                            == request_encoder.parallel_tool_calls_enabled()
+                        && response.is_live())
+                    .then_some((response.id.as_str(), previous.wire_input.len()))
+                })
+        });
+        let upload_input = match previous_response {
+            Some((_, prefix_len)) => &request_input[prefix_len..],
+            None => request_input.as_ref(),
+        };
+        let request_body = if let Some((parent_id, _)) = temporary_response {
+            request_encoder.encode_temporary_frame_request_bounded(
+                upload_input,
+                tools,
+                parent_id,
                 max_serialized_request_body_bytes,
             )
-            .map_err(ResponsesFrameRequestFault::Encoding)?;
+        } else {
+            request_encoder.encode_frame_request_with_previous_response_id_bounded(
+                upload_input,
+                &state.instructions,
+                tools,
+                previous_response.map(|(id, _)| id),
+                max_serialized_request_body_bytes,
+            )
+        }
+        .map_err(ResponsesFrameRequestFault::Encoding)?;
 
         *request_body_bytes = Some(request_body.len());
+        // Upload bytes and model context are different budgets: cached history
+        // and inherited tool definitions still occupy the context window.
+        let context_bytes = if previous_response.is_some() {
+            request_encoder
+                .encoded_frame_context_bytes(&request_input, &state.instructions, tools)
+                .map_err(ResponsesFrameRequestFault::Encoding)?
+        } else {
+            request_body.len()
+        };
+        state.ark_cache =
+            if request_encoder.ark_caching_enabled() && state.temporary_parent.is_none() {
+                Some(ArkCacheState {
+                    tools: tools.to_vec(),
+                    parallel_tool_calls: request_encoder.parallel_tool_calls_enabled(),
+                    response: None,
+                })
+            } else {
+                None
+            };
 
         let constraints = &frame.prepared_profile().constraints;
         let limit = constraints
             .context_window
             .tokens()
             .ok_or(ResponsesFrameRequestFault::MissingContextWindow)?;
-        if u128::from(ContextEstimate::from_bytes(request_body.len()).tokens)
+        if u128::from(ContextEstimate::from_bytes(context_bytes).tokens)
             + u128::from(constraints.reserved_output_tokens.unwrap_or(0))
             > u128::from(limit.get())
         {
@@ -287,6 +436,8 @@ impl ResponsesFrameRequestState {
 
         Ok(PreparedResponsesFrameRequest {
             request_body,
+            context_bytes,
+            cache_continuation: previous_response.is_some(),
             state,
         })
     }
@@ -308,6 +459,8 @@ impl ResponsesFrameRequestState {
                     compaction_instructions: None,
                     pending_calls: BTreeMap::new(),
                     last_output_index: None,
+                    ark_cache: None,
+                    temporary_parent: None,
                 },
                 0,
             ));
@@ -338,6 +491,8 @@ impl ResponsesFrameRequestState {
                 compaction_instructions: previous.compaction_instructions,
                 pending_calls: previous.pending_calls.clone(),
                 last_output_index: None,
+                ark_cache: None,
+                temporary_parent: previous.temporary_parent.clone(),
             },
             covered,
         ))
@@ -378,6 +533,8 @@ impl ResponsesFrameRequestState {
                 compaction_instructions: previous.compaction_instructions,
                 pending_calls: previous.pending_calls.clone(),
                 last_output_index: None,
+                ark_cache: None,
+                temporary_parent: previous.temporary_parent.clone(),
             },
             pending,
         ))
@@ -436,6 +593,7 @@ impl ResponsesFrameRequestState {
         match kind {
             PrivateOutputKind::Reasoning => self.wire_input.push(wire_item),
             PrivateOutputKind::Compaction => {
+                self.ark_cache = None;
                 let mut compacted = Vec::with_capacity(1 + self.pending_calls.len());
                 compacted.push(wire_item);
                 compacted.extend(
@@ -470,6 +628,18 @@ impl ResponsesFrameRequestState {
         self.revision
     }
 
+    /// Called only after the terminal envelope, output ledger, and usage have
+    /// all passed validation. A failed or interrupted response never installs
+    /// a cursor, even when its response.created event supplied an ID.
+    pub(super) fn record_cached_response(&mut self, id: &str, expire_at: Option<u64>) {
+        if let Some(cache) = &mut self.ark_cache {
+            cache.response = Some(ArkCachedResponse {
+                id: id.to_owned(),
+                expire_at,
+            });
+        }
+    }
+
     #[cfg(test)]
     pub(super) const fn accepted_prefix(&self) -> CanonicalPrefixProof {
         self.accepted_prefix
@@ -489,6 +659,8 @@ impl ResponsesFrameRequestState {
 #[derive(Debug)]
 pub(super) struct PreparedResponsesFrameRequest {
     pub(super) request_body: Vec<u8>,
+    pub(super) context_bytes: usize,
+    pub(super) cache_continuation: bool,
     pub(super) state: ResponsesFrameRequestState,
 }
 
@@ -500,6 +672,8 @@ pub(super) enum PrivateOutputKind {
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ResponsesFrameRequestFault {
+    #[error("temporary Responses parent is unavailable or incompatible")]
+    TemporaryCheckpointUnavailable,
     #[error("Responses requires a model context window")]
     MissingContextWindow,
     #[error("estimated Responses request context exceeds the configured window")]
@@ -532,6 +706,7 @@ impl ResponsesFrameRequestFault {
                 OpenAiFailureClass::RequestBodyLimit
             }
             Self::MissingContextWindow
+            | Self::TemporaryCheckpointUnavailable
             | Self::MissingDeltaBaseline
             | Self::DeltaBaselineMismatch
             | Self::CoverageMismatch
@@ -644,6 +819,19 @@ mod tests {
                 None::<String>,
             )
             .unwrap(),
+        )
+    }
+
+    fn ark_encoder() -> CodexHttpV1Encoder {
+        CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new(
+                crate::provider::ModelSpec::new("ark-test-model", 272_000).unwrap(),
+                None,
+                None,
+                None::<String>,
+            )
+            .unwrap()
+            .with_ark_caching(true),
         )
     }
 
@@ -1991,5 +2179,418 @@ mod tests {
             error,
             ResponsesFrameRequestFault::UnexpectedSystemItem
         ));
+    }
+
+    #[test]
+    fn temporary_ark_ephemeral_input_keeps_the_parent_and_is_never_replayed() {
+        let encoder = ark_encoder();
+        let retained = CanonicalInputItem::assistant_text("retained parent", None);
+        let initial = full(
+            1,
+            Vec::new(),
+            vec![system("policy"), retained.clone()],
+            Vec::new(),
+        );
+        let mut initial = ResponsesFrameRequestState::prepare(None, &initial, &encoder, usize::MAX)
+            .unwrap()
+            .state;
+        initial.record_cached_response("resp_parent", None);
+        initial.make_temporary(&encoder).unwrap();
+        let frame = frame_with_ephemeral(
+            2,
+            None,
+            vec![retained],
+            Vec::new(),
+            vec![system("policy")],
+            vec![ephemeral_user("one request only")],
+        );
+        let mut first =
+            ResponsesFrameRequestState::prepare(Some(&initial), &frame, &encoder, usize::MAX)
+                .unwrap();
+        let request = body(&first.request_body);
+        assert_eq!(request["previous_response_id"], "resp_parent");
+        assert_eq!(request["store"], false);
+        assert!(request.get("caching").is_none());
+        assert_eq!(request["input"].as_array().unwrap().len(), 1);
+        assert_eq!(first.state.wire_input, initial.wire_input);
+        first
+            .state
+            .record_cached_response("resp_child_not_stored", None);
+        let next = delta(3, revision(2), Vec::new(), Vec::new(), Vec::new());
+        let next =
+            ResponsesFrameRequestState::prepare(Some(&first.state), &next, &encoder, usize::MAX)
+                .unwrap();
+        let request = body(&next.request_body);
+        assert_eq!(request["previous_response_id"], "resp_parent");
+        assert_eq!(request["store"], false);
+        assert!(request["input"].as_array().unwrap().is_empty());
+        assert!(next.state.ark_cache.is_none());
+    }
+
+    #[test]
+    fn temporary_ark_checkpoint_rejects_unstored_expired_or_incompatible_parents() {
+        let encoder = ark_encoder();
+        let retained = CanonicalInputItem::assistant_text("retained parent", None);
+        let initial = full(
+            1,
+            Vec::new(),
+            vec![system("policy"), retained.clone()],
+            Vec::new(),
+        );
+        let mut initial = ResponsesFrameRequestState::prepare(None, &initial, &encoder, usize::MAX)
+            .unwrap()
+            .state;
+        assert!(matches!(
+            initial.make_temporary(&encoder),
+            Err(ResponsesFrameRequestFault::TemporaryCheckpointUnavailable)
+        ));
+        initial.record_cached_response("resp_expired", Some(0));
+        assert!(matches!(
+            initial.make_temporary(&encoder),
+            Err(ResponsesFrameRequestFault::TemporaryCheckpointUnavailable)
+        ));
+        initial.record_cached_response("resp_parent", None);
+        initial.make_temporary(&encoder).unwrap();
+        let changed_system = full(
+            2,
+            vec![retained.clone()],
+            vec![system("other policy")],
+            Vec::new(),
+        );
+        assert!(matches!(
+            ResponsesFrameRequestState::prepare(
+                Some(&initial),
+                &changed_system,
+                &encoder,
+                usize::MAX
+            ),
+            Err(ResponsesFrameRequestFault::TemporaryCheckpointUnavailable)
+        ));
+        let changed_tools = full(
+            2,
+            vec![retained.clone()],
+            vec![system("policy")],
+            vec!["new_tool"],
+        );
+        assert!(matches!(
+            ResponsesFrameRequestState::prepare(
+                Some(&initial),
+                &changed_tools,
+                &encoder,
+                usize::MAX
+            ),
+            Err(ResponsesFrameRequestFault::TemporaryCheckpointUnavailable)
+        ));
+        let frame = full(2, vec![retained], vec![system("policy")], Vec::new());
+        initial
+            .temporary_parent
+            .as_mut()
+            .unwrap()
+            .response
+            .expire_at = Some(0);
+        assert!(matches!(
+            ResponsesFrameRequestState::prepare(Some(&initial), &frame, &encoder, usize::MAX),
+            Err(ResponsesFrameRequestFault::TemporaryCheckpointUnavailable)
+        ));
+    }
+
+    #[test]
+    fn ark_delta_uses_only_the_suffix_and_never_inherits_an_unsealed_cursor() {
+        let encoder = ark_encoder();
+        let initial = full(
+            1,
+            Vec::new(),
+            vec![
+                system("policy"),
+                CanonicalInputItem::assistant_text("retained", None),
+            ],
+            Vec::new(),
+        );
+        let mut initial = ResponsesFrameRequestState::prepare(None, &initial, &encoder, usize::MAX)
+            .unwrap()
+            .state;
+        initial.record_cached_response("resp_first", None);
+        let item = CanonicalInputItem::assistant_text("new item", None);
+        let next = delta(2, revision(1), Vec::new(), Vec::new(), vec![item.clone()]);
+        let next = ResponsesFrameRequestState::prepare(Some(&initial), &next, &encoder, usize::MAX)
+            .unwrap();
+        let request = body(&next.request_body);
+        assert_eq!(request["previous_response_id"], "resp_first");
+        assert_eq!(
+            request["input"],
+            json!(encoder.lower_canonical_item(&item).unwrap().into_parts().1)
+        );
+        assert!(request.get("instructions").is_none());
+        assert!(request.get("tools").is_none());
+        assert!(next.context_bytes > next.request_body.len());
+        assert_eq!(next.state.wire_input.len(), 2);
+
+        // Handoff installs the candidate, not the previous completed cursor.
+        let third = delta(3, revision(2), Vec::new(), Vec::new(), Vec::new());
+        let third =
+            ResponsesFrameRequestState::prepare(Some(&next.state), &third, &encoder, usize::MAX)
+                .unwrap();
+        assert!(body(&third.request_body)
+            .get("previous_response_id")
+            .is_none());
+    }
+
+    #[test]
+    fn ark_ephemeral_requests_are_not_stored_and_the_next_chain_excludes_their_prompt() {
+        let encoder = ark_encoder();
+        let first = full(
+            1,
+            Vec::new(),
+            vec![
+                system("policy"),
+                CanonicalInputItem::assistant_text("retained", None),
+            ],
+            Vec::new(),
+        );
+        let mut first = ResponsesFrameRequestState::prepare(None, &first, &encoder, usize::MAX)
+            .unwrap()
+            .state;
+        first.record_cached_response("resp_first", None);
+        let ephemeral = frame_with_ephemeral(
+            2,
+            Some(revision(1)),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![ephemeral_user("temporary")],
+        );
+        let mut ephemeral =
+            ResponsesFrameRequestState::prepare(Some(&first), &ephemeral, &encoder, usize::MAX)
+                .unwrap();
+        let request = body(&ephemeral.request_body);
+        assert_eq!(request["store"], false);
+        assert!(request.get("caching").is_none());
+        assert!(request.get("previous_response_id").is_none());
+        assert!(request.get("instructions").is_some());
+        assert_eq!(request["input"].as_array().unwrap().len(), 2);
+        assert_eq!(ephemeral.state.wire_input, first.wire_input);
+        ephemeral
+            .state
+            .record_cached_response("resp_ephemeral", None);
+        assert!(ephemeral.state.ark_cache.is_none());
+
+        let next = delta(3, revision(2), Vec::new(), Vec::new(), Vec::new());
+        let next = ResponsesFrameRequestState::prepare(
+            Some(&ephemeral.state),
+            &next,
+            &encoder,
+            usize::MAX,
+        )
+        .unwrap();
+        let request = body(&next.request_body);
+        assert_eq!(request["store"], true);
+        assert_eq!(request["caching"], json!({"type":"enabled"}));
+        assert!(request.get("previous_response_id").is_none());
+        assert_eq!(request["input"][0]["role"], "system");
+        assert_eq!(
+            &request["input"].as_array().unwrap()[1..],
+            first.wire_input.as_slice()
+        );
+    }
+
+    #[test]
+    fn ark_full_tool_changes_and_expired_cursors_start_new_chains() {
+        let encoder = ark_encoder();
+        let initial = full(
+            1,
+            Vec::new(),
+            vec![
+                system("policy"),
+                CanonicalInputItem::assistant_text("retained", None),
+            ],
+            vec!["lookup"],
+        );
+        let mut initial = ResponsesFrameRequestState::prepare(None, &initial, &encoder, usize::MAX)
+            .unwrap()
+            .state;
+        initial.record_cached_response("resp_first", None);
+        let changed_tools = frame(
+            revision(2),
+            TargetContinuity::Accepted {
+                epoch: epoch(),
+                revision: revision(1),
+            },
+            FrameBasis::DeltaFrom(revision(1)),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["search"],
+        );
+        let changed = ResponsesFrameRequestState::prepare(
+            Some(&initial),
+            &changed_tools,
+            &encoder,
+            usize::MAX,
+        )
+        .unwrap();
+        let request = body(&changed.request_body);
+        assert!(request.get("previous_response_id").is_none());
+        assert_eq!(request["tools"][0]["name"], "search");
+        assert_eq!(request["input"][0]["role"], "system");
+        assert_eq!(
+            &request["input"].as_array().unwrap()[1..],
+            initial.wire_input.as_slice()
+        );
+
+        let full = full(
+            2,
+            Vec::new(),
+            vec![
+                system("new policy"),
+                CanonicalInputItem::assistant_text("retained", None),
+            ],
+            vec!["lookup"],
+        );
+        let prepared =
+            ResponsesFrameRequestState::prepare(Some(&initial), &full, &encoder, usize::MAX)
+                .unwrap();
+        assert!(body(&prepared.request_body)
+            .get("previous_response_id")
+            .is_none());
+        assert_eq!(input(&prepared.request_body)[0]["role"], "system");
+
+        initial.record_cached_response("resp_expired", Some(0));
+        let same_tools = frame(
+            revision(2),
+            TargetContinuity::Accepted {
+                epoch: epoch(),
+                revision: revision(1),
+            },
+            FrameBasis::DeltaFrom(revision(1)),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["lookup"],
+        );
+        let prepared =
+            ResponsesFrameRequestState::prepare(Some(&initial), &same_tools, &encoder, usize::MAX)
+                .unwrap();
+        assert!(body(&prepared.request_body)
+            .get("previous_response_id")
+            .is_none());
+        assert_eq!(tool_names(&prepared.request_body), vec!["lookup"]);
+
+        initial.record_cached_response("resp_live", None);
+        let mut parallel_encoder = encoder.clone();
+        parallel_encoder.set_parallel_tool_calls(true);
+        let prepared = ResponsesFrameRequestState::prepare(
+            Some(&initial),
+            &same_tools,
+            &parallel_encoder,
+            usize::MAX,
+        )
+        .unwrap();
+        let request = body(&prepared.request_body);
+        assert!(request.get("previous_response_id").is_none());
+        assert_eq!(request["parallel_tool_calls"], true);
+        assert_eq!(tool_names(&prepared.request_body), vec!["lookup"]);
+    }
+
+    #[test]
+    fn ark_compaction_discards_the_remote_cursor() {
+        let encoder = ark_encoder();
+        let first = full(
+            1,
+            Vec::new(),
+            vec![
+                CanonicalInputItem::assistant_text("first", None),
+                CanonicalInputItem::assistant_text("last", None),
+            ],
+            Vec::new(),
+        );
+        let mut first = ResponsesFrameRequestState::prepare(None, &first, &encoder, usize::MAX)
+            .unwrap()
+            .state;
+        first.record_cached_response("resp_first", None);
+        let next = delta(2, revision(1), Vec::new(), Vec::new(), Vec::new());
+        let source = first.compaction_source().unwrap();
+        let replacement = vec![
+            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}),
+        ];
+        let compacted = first
+            .with_parallel_compaction(&source, &replacement, &next, &encoder)
+            .unwrap()
+            .unwrap();
+        let next =
+            ResponsesFrameRequestState::prepare(Some(&compacted), &next, &encoder, usize::MAX)
+                .unwrap();
+        let request = body(&next.request_body);
+        assert!(request.get("previous_response_id").is_none());
+        assert_eq!(request["input"][0], replacement[0]);
+    }
+
+    #[test]
+    fn ark_upload_budget_is_incremental_but_context_budget_includes_the_cached_prefix() {
+        let encoder = ark_encoder();
+        let first = full(
+            1,
+            Vec::new(),
+            vec![CanonicalInputItem::assistant_text("x".repeat(4096), None)],
+            Vec::new(),
+        );
+        let mut first = ResponsesFrameRequestState::prepare(None, &first, &encoder, usize::MAX)
+            .unwrap()
+            .state;
+        first.record_cached_response("resp_first", None);
+        let next = delta(
+            2,
+            revision(1),
+            Vec::new(),
+            Vec::new(),
+            vec![CanonicalInputItem::assistant_text("next", None)],
+        );
+        let prepared =
+            ResponsesFrameRequestState::prepare(Some(&first), &next, &encoder, usize::MAX).unwrap();
+        let upload_len = prepared.request_body.len();
+        assert!(prepared.context_bytes > upload_len + 4096);
+        assert!(
+            ResponsesFrameRequestState::prepare(Some(&first), &next, &encoder, upload_len).is_ok()
+        );
+        assert!(matches!(
+            ResponsesFrameRequestState::prepare(Some(&first), &next, &encoder, upload_len - 1),
+            Err(ResponsesFrameRequestFault::Encoding(
+                CodexHttpV1Error::SerializedRequestBodyLimit
+            ))
+        ));
+
+        let mut small = profile();
+        small.constraints.context_window =
+            ContextWindow::Tokens(NonZeroU64::new((upload_len.div_ceil(4) + 64) as u64).unwrap());
+        let next = Frame::from_compiled(
+            revision(2),
+            target(),
+            epoch(),
+            TargetContinuity::Accepted {
+                epoch: epoch(),
+                revision: revision(1),
+            },
+            small,
+            FrameBasis::DeltaFrom(revision(1)),
+            FrameSubmission::from_compiled(
+                Vec::new(),
+                Vec::new(),
+                ProjectionSubmission::new(vec![CanonicalInputItem::assistant_text("next", None)]),
+                ToolCatalog::new(Vec::new()).unwrap(),
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        let mut measured = None;
+        assert!(matches!(
+            ResponsesFrameRequestState::prepare_with_measurements(
+                Some(&first),
+                &next,
+                &encoder,
+                upload_len,
+                &mut measured
+            ),
+            Err(ResponsesFrameRequestFault::ContextWindowLimit)
+        ));
+        assert_eq!(measured, Some(upload_len));
     }
 }

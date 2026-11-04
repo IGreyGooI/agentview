@@ -81,7 +81,7 @@ fn chat_capture_application(
         {
             EventListener::observe("chat.capture", "v1")
                 .listen_to(text)
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let completed = Arc::clone(&completed);
                     async move {
                         if let TextTurnEvent::TextComplete(text) = event {
@@ -134,7 +134,7 @@ fn chat_native_tool_gate_application(
             { state }
             {
                 NativeToolCall::named("native-gate-secret-tool")
-                    .on_call(|call| async move {
+                    .on_call(|_context, call| async move {
                         Ok::<_, String>(call.output("unused-native-tool-output"))
                     })
             }

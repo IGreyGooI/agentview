@@ -236,7 +236,11 @@ fn assert_ephemeral_not_retained(frames: &[CapturedFrame]) {
 
 async fn react(application: &mut Application<CapturingPort>) {
     assert_eq!(
-        application.react().await.expect("reaction succeeds"),
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("reaction succeeds"),
         ControlFlow::Continue(())
     );
 }
@@ -563,7 +567,10 @@ async fn preparation_and_pre_handoff_cancellation_do_not_consume_ephemeral_or_or
     props.signal().set("B".to_owned()).expect("set B");
 
     let notified = capture.pre_handoff_started.notified();
-    let mut cancelled = Box::pin(application.react());
+    let cancelled_control = application.react().unwrap();
+    let mut cancelled = Box::pin(std::future::IntoFuture::into_future(
+        cancelled_control.clone(),
+    ));
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
             () = notified => {}
@@ -572,7 +579,12 @@ async fn preparation_and_pre_handoff_cancellation_do_not_consume_ephemeral_or_or
     })
     .await
     .expect("submission reaches the blocking port");
+    cancelled_control.interrupt().unwrap();
     drop(cancelled);
+    assert_eq!(
+        cancelled_control.await.unwrap(),
+        agentview::component::execution::ReactionOutcome::Interrupted
+    );
 
     props.signal().set("A".to_owned()).expect("restore A");
     react(&mut application).await;
@@ -638,7 +650,7 @@ fn balance_context(props: StateProps<BalanceState>) -> Component {
             next_action { "{next_action}" }
         }
         {
-            NativeToolCall::named("adjust_balance").on_call(move |call| {
+            NativeToolCall::named("adjust_balance").on_call(move |_ctx, call| {
                 let state = adjust_state.clone();
                 async move {
                     state.set(BalanceState {
@@ -651,7 +663,7 @@ fn balance_context(props: StateProps<BalanceState>) -> Component {
             })
         }
         {
-            NativeToolCall::named("confirm_balance").on_call(move |call| {
+            NativeToolCall::named("confirm_balance").on_call(move |_ctx, call| {
                 let state = confirm_state.clone();
                 async move {
                     state.update(|state| {

@@ -268,7 +268,7 @@ where
             elements: self.elements,
             finish_reducer: self.finish_reducer,
             live_factory: Some(Box::new(move |start| {
-                factory(*start).map_err(|_| ManagedEffectsFault::LiveFactory)
+                factory(start.clone()).map_err(|_| ManagedEffectsFault::LiveFactory)
             })),
             publisher_factory: self.publisher_factory,
             rejection_handler: self.rejection_handler,
@@ -336,7 +336,7 @@ where
             finish_reducer: self.finish_reducer,
             live_factory: self.live_factory,
             publisher_factory: Some(Box::new(move |start| {
-                factory(*start).map_err(|_| ManagedEffectsFault::PublisherFactory)
+                factory(start.clone()).map_err(|_| ManagedEffectsFault::PublisherFactory)
             })),
             rejection_handler: self.rejection_handler,
             marker: PhantomData,
@@ -471,10 +471,11 @@ where
                 message: "state factory was not configured".to_owned(),
             })
         })?;
-        let state = state_factory(start).map_err(|message| StreamingToolDriverFault::Adapter {
-            contract: identity,
-            message,
-        })?;
+        let state =
+            state_factory(start.clone()).map_err(|message| StreamingToolDriverFault::Adapter {
+                contract: identity,
+                message,
+            })?;
         let finish_reducer = finish_reducer.ok_or_else(|| {
             StreamingToolDriverFault::Declaration(StreamingToolDeclarationFault::Prompt {
                 contract: identity,

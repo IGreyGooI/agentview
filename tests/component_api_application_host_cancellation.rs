@@ -74,7 +74,7 @@ fn cancellation_application(
         {
             EventListener::observe("test.cancel.write", "v1")
                 .listen_to(selected)
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let values = first_values.clone();
                     async move {
                         let value = event_number(event);
@@ -85,7 +85,7 @@ fn cancellation_application(
         {
             EventListener::observe("test.cancel.pending", "v1")
                 .listen_to(pending_selected)
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let log = Arc::clone(&pending_log);
                     let started = Arc::clone(&pending_started);
                     let drops = Arc::clone(&pending_drops);
@@ -105,7 +105,7 @@ fn cancellation_application(
         {
             EventListener::observe("test.cancel.after", "v1")
                 .listen_to(final_selected)
-                .on_event(move |event| {
+                .on_event(move |_ctx, event| {
                     let values = values.clone();
                     let log = Arc::clone(&final_log);
                     async move {

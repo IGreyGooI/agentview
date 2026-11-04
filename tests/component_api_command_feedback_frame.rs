@@ -39,10 +39,17 @@ struct EchoInput {
 #[component]
 fn feedback_application() -> Component {
     use_wait_for_command();
+    let application_id = use_application_id();
     view! {
         Action {
             name: "echo",
-            on_call: |input: EchoInput| Ok::<_, Infallible>(input.value),
+            on_call: move |context: EventContext, input: EchoInput| {
+                assert_eq!(context.application_id(), application_id);
+                assert_eq!(context.reaction_id(), None);
+                assert_eq!(context.frame_revision(), None);
+                assert_eq!(context.source(), &EventSource::Command { name: "echo".to_owned() });
+                Ok::<_, Infallible>(input.value)
+            },
         }
     }
 }
@@ -146,7 +153,7 @@ fn frame_items(frame: &DebugFrameSnapshot) -> Vec<CanonicalInputItem> {
     serde_json::from_value(payload["component"]["projection"]["items"].clone()).unwrap()
 }
 
-async fn command<P: ReactionPort>(
+async fn command<P: ReactionPort + 'static>(
     app: &mut Application<P>,
     sender: &CommandSender,
     sequence: u64,
@@ -166,7 +173,7 @@ async fn command<P: ReactionPort>(
     response.projection
 }
 
-async fn observe<P: ReactionPort>(
+async fn observe<P: ReactionPort + 'static>(
     app: &mut Application<P>,
     sender: &CommandSender,
 ) -> RenderedProjection {
@@ -179,9 +186,9 @@ async fn observe<P: ReactionPort>(
     observed.unwrap()
 }
 
-async fn handoff<P: ReactionPort>(app: &mut Application<P>, sender: &CommandSender) {
+async fn handoff<P: ReactionPort + 'static>(app: &mut Application<P>, sender: &CommandSender) {
     let (reacted, observed) = tokio::time::timeout(TIMEOUT, async {
-        tokio::join!(app.react(), sender.observe())
+        tokio::join!(app.react().unwrap(), sender.observe())
     })
     .await
     .unwrap();
@@ -228,6 +235,23 @@ async fn command_feedback_tracks_complete_frame_batches_and_whole_snapshot_deliv
         (1..=10).collect::<Vec<_>>()
     );
     assert_complete_snapshot(&first_feedback);
+    let records = xml_children(&first_feedback)
+        .find(|child| child.name().as_str() == "records")
+        .unwrap();
+    let expected_application = app.application_id().to_string();
+    let mut event_ids = std::collections::HashSet::new();
+    for record in xml_children(records) {
+        let origin = xml_children(record)
+            .find(|child| child.name().as_str() == "origin")
+            .unwrap();
+        assert_eq!(
+            attribute(origin, "application_id"),
+            Some(expected_application.as_str())
+        );
+        assert_eq!(attribute(origin, "reaction_id"), None);
+        assert!(event_ids.insert(attribute(origin, "event_id").unwrap().to_owned()));
+    }
+    assert_eq!(event_ids.len(), 10);
 
     let observed = observe(&mut app, &sender).await;
     assert_eq!(
@@ -319,7 +343,7 @@ async fn pre_handoff_failure_and_cancellation_preserve_the_pending_feedback_batc
 
     control.next.store(1, Ordering::SeqCst);
     let (reacted, observed) = tokio::time::timeout(TIMEOUT, async {
-        tokio::join!(app.react(), sender.observe())
+        tokio::join!(app.react().unwrap(), sender.observe())
     })
     .await
     .unwrap();
@@ -333,7 +357,10 @@ async fn pre_handoff_failure_and_cancellation_preserve_the_pending_feedback_batc
     let blocked = control.blocked.notified();
     let mut observed = Box::pin(sender.observe());
     assert!(poll!(&mut observed).is_pending());
-    let mut reaction = Box::pin(app.react());
+    let reaction_control = app.react().unwrap();
+    let mut reaction = Box::pin(std::future::IntoFuture::into_future(
+        reaction_control.clone(),
+    ));
     tokio::time::timeout(TIMEOUT, async {
         tokio::select! {
             _ = blocked => {}
@@ -342,7 +369,12 @@ async fn pre_handoff_failure_and_cancellation_preserve_the_pending_feedback_batc
     })
     .await
     .unwrap();
+    reaction_control.interrupt().unwrap();
     drop(reaction);
+    assert_eq!(
+        reaction_control.await.unwrap(),
+        agentview::component::execution::ReactionOutcome::Interrupted
+    );
     assert_eq!(
         record_sequences(&feedback(&observed.await.unwrap())),
         [1, 2]

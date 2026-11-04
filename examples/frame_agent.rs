@@ -14,7 +14,7 @@ fn frame_agent_component() -> Component {
     let state = use_signal(|| String::from("initial"));
     let application_exit = use_application_exit();
 
-    use_provider_event_handler(ProviderEvent::TEXT, |event| async move {
+    use_provider_event_handler(ProviderEvent::TEXT, |_ctx, event| async move {
         if let TextTurnEvent::TextComplete(text) = event {
             println!("{text}");
         }
@@ -22,7 +22,7 @@ fn frame_agent_component() -> Component {
     });
 
     let completed_state = state.clone();
-    use_reaction_completion(move || async move {
+    use_reaction_completion(move |_ctx| async move {
         if completed_state.with(|value| value == "initial")? {
             completed_state.set(String::from("published"))?;
         } else {
@@ -42,7 +42,7 @@ State the publication status in one concise sentence."#;
     }
 }
 
-async fn run_agent(provider: impl ReactionPort) -> anyhow::Result<()> {
+async fn run_agent(provider: impl ReactionPort + 'static) -> anyhow::Result<()> {
     let mut application = Application::mount(frame_agent_component, provider)?;
     let operation = application.run().await.map_err(anyhow::Error::from);
     let shutdown = application.shutdown().await.map_err(anyhow::Error::from);

@@ -237,7 +237,11 @@ fn assert_user_developer_raw(frame: &CapturedFrame, raw: &str) {
 
 async fn react(application: &mut Application<CapturingPort>) {
     assert_eq!(
-        application.react().await.expect("reaction succeeds"),
+        application
+            .react()
+            .unwrap()
+            .await
+            .expect("reaction succeeds"),
         ControlFlow::Continue(())
     );
 }

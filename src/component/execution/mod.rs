@@ -36,10 +36,12 @@ pub(crate) use driver_demand::{DriverDemandFault, DriverDemandHandle};
 pub mod reaction;
 
 pub use crate::component::authoring::ExitReason;
+pub use crate::component::ReactionKind;
 pub use admission::{ReactionAdmissionReason, ToolOutputStagingReason};
 pub use application::{
-    Application, ApplicationFault, ApplicationFaultCode, ApplicationFaultKind,
-    ApplicationFaultReason, ApplicationFaultStage, ProjectionSnapshot,
+    ApplicationFault, ApplicationFaultCode, ApplicationFaultKind, ApplicationFaultReason,
+    ApplicationFaultStage, ParallelApplication as Application, ProjectionSnapshot, Reaction,
+    ReactionOutcome, ReactionWait,
 };
 #[cfg(feature = "legacy-provider-port")]
 #[allow(

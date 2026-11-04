@@ -802,6 +802,12 @@ impl AsyncOpenAiResponsesProvider {
 
     #[cfg(feature = "legacy-provider-port")]
     fn ensure_legacy_mode(&self) -> Result<(), ProviderFault> {
+        if self.encoder.ark_caching_enabled() {
+            return Err(ProviderFault::model_rejected(
+                "Ark caching requires the Frame-native Responses protocol",
+            )
+            .with_code(ProviderFaultCode::RequestPreparation));
+        }
         match self.execution_mode {
             ResponsesExecutionMode::Unclaimed | ResponsesExecutionMode::Legacy => Ok(()),
             ResponsesExecutionMode::FrameNative => Err(ProviderFault::model_rejected(
@@ -1897,7 +1903,11 @@ impl NativeToolLedger {
         let output_index = native_output_index(payload)?;
         let item = native_item(payload)?;
         if item.get("status").and_then(Value::as_str) != Some("in_progress")
-            || item.get("arguments").and_then(Value::as_str) != Some("")
+            // Ark omits the initial arguments field; an explicitly supplied
+            // value must still be the empty string before argument deltas.
+            || item
+                .get("arguments")
+                .is_some_and(|arguments| arguments.as_str() != Some(""))
         {
             return Err(native_tool_fault());
         }
@@ -2246,6 +2256,69 @@ mod native_tool_tests {
             "item": {"id": "item-1", "type": "function_call", "status": "completed", "call_id": "call-1", "name": "lookup", "arguments": "{\"q\":\"x\"}"}
         }))).unwrap();
         assert_eq!(call.call_id(), "call-1");
+    }
+
+    #[test]
+    fn native_tool_lifecycle_accepts_omitted_initial_arguments() {
+        let mut initial = added();
+        initial
+            .get_mut("item")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("arguments");
+        let mut ledger = NativeToolLedger::default();
+        ledger.added(&initial).unwrap();
+        for delta in ["{\"q\":", "\"x\"}"] {
+            ledger
+                .delta(&payload(serde_json::json!({
+                    "output_index": 0, "item_id": "item-1", "delta": delta
+                })))
+                .unwrap();
+        }
+        ledger
+            .arguments_done(&payload(serde_json::json!({
+                "output_index": 0, "item_id": "item-1", "arguments": "{\"q\":\"x\"}"
+            })))
+            .unwrap();
+        let completed = serde_json::json!({
+            "id": "item-1", "type": "function_call", "status": "completed",
+            "call_id": "call-1", "name": "lookup", "arguments": "{\"q\":\"x\"}"
+        });
+        let call = ledger
+            .item_done(&payload(serde_json::json!({
+                "output_index": 0, "item": completed.clone()
+            })))
+            .unwrap();
+        assert_eq!(call.call_id(), "call-1");
+        ledger
+            .completed(&payload(serde_json::json!({
+                "response": {"output": [completed]}
+            })))
+            .unwrap();
+    }
+
+    #[test]
+    fn native_tool_added_rejects_invalid_explicit_arguments() {
+        for arguments in [
+            Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!("{}"),
+        ] {
+            let mut initial = added();
+            initial
+                .get_mut("item")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("arguments".into(), arguments);
+            let mut ledger = NativeToolLedger::default();
+            assert!(ledger.added(&initial).is_err());
+            assert!(ledger.calls.is_empty());
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # AgentView Engine 设计
 
 本文是 AgentView Engine 的权威设计文档。它规定稳定边界、状态所有权、调度语义和必须保持的
-不变量，不记录实现进度、测试数量、提交版本或临时迁移状态。
+不变量，不记录测试数量、提交版本或临时调试状态。
 
 若其他设计说明与本文冲突，以本文为准。实施顺序和迁移锚点见
 [`frame-driven-runtime-plan.md`](frame-driven-runtime-plan.md)。
@@ -180,22 +180,21 @@ preparation completion仅属于当前显式operation；Runtime不保留key、rea
 
 ### Application<P>
 
-`Application<P>` 是公开的应用编排 owner，长期固定持有：
+`Application<P>` 是同一棵 mounted Component tree 的编排 owner，长期持有：
 
-- 一个 Component Runtime；
-- 一个 crate-private `FrameSession`；
-- 一个不可替换的 `P: ReactionPort`；
-- single-flight reaction gate。
+- 一个 Component Runtime 与共享业务 Signals；
+- 主线 `P: ReactionPort`、private FrameSession 和 history/diff/receipt 状态；
+- 至多一个活跃 Main，以及独立的 Temporary port/session/admission/streaming 状态；
+- 已接纳 reaction 的任务、中断、结算和恢复所有权；
+- 成对保存的稳定 canonical/provider checkpoint template。
 
-一个 Application 只代表一个 logical target session。它不公开 `port_mut()`、FrameSession mutation、
-history commit 或替换 port 的 API。`&mut Application` 使第一版同一 Application 最多运行一个 reaction。
-每次active `prepare()`或`react()` operation还临时拥有本轮各`(mount identity, lexical slot)`的完成记录；
-该记录随operation结束而丢弃，不是Application或Component上的跨operation缓存。
-
-公共编排入口保持很小；root没有运行时props，但可以由mount closure捕获只读启动配置：
+Application 不公开 mutable port、FrameSession、history commit 或替换主 port 的 API。
+`react()` 的 `&mut Application` 借用只覆盖同步准入，不随 operation 存活；后续事件可以再次发起
+reaction，与先前 stream 重叠。每次 preparation 仍有自己的 hook 完成记录，没有跨 operation
+readiness cache。
 
 ```rust
-impl<P: ReactionPort> Application<P> {
+impl<P: ReactionPort + 'static> Application<P> {
     pub fn mount(
         root: impl Fn() -> Component + Send + Sync + 'static,
         port: P,
@@ -207,35 +206,125 @@ impl<P: ReactionPort> Application<P> {
     pub async fn wait_for_reaction_request(&mut self) -> Result<(), ApplicationFault>;
     pub fn take_reaction_request(&self) -> Result<bool, ApplicationFault>;
     pub async fn run(&mut self) -> Result<ExitReason, ApplicationFault>;
-    pub async fn react(&mut self) -> Result<ControlFlow<ExitReason>, ApplicationFault>;
-    pub async fn shutdown(self) -> Result<(), ApplicationFault>;
+    pub fn react(&mut self) -> Result<Reaction, ApplicationFault>;
+    pub fn shutdown(self) -> impl Future<Output = Result<(), ApplicationFault>> + Send;
 }
 ```
 
-`mount()`保持同步。它发布一版完整bootstrap projection；若render含有preparation declaration，该projection
-可以是provisional，`ProjectionSnapshot::is_prepared()`明确区分它。`prepare()`只驱动Component preparation
-和reconcile，不读取`declare()`、不构造或修改`FrameSession` candidate，也不调用`submit()`。
-每次显式`prepare()`和`react()`各自创建一个新的preparation operation，因此成功的`prepare()`之后的
-`react()`仍须再次运行全部active preparation。普通preparation失败或调用方drop pending operation后，
-同一个Application仍可由下一次显式`prepare()`或`react()`重试；该新operation也从全部active hooks重新开始。
+`mount()` 同步发布完整 bootstrap projection，不提交请求。含 preparation declaration 时，初始 projection
+可以是 provisional；`ProjectionSnapshot::is_prepared()` 明确区分。`prepare()` 仲裁共享 tree 的
+preparation/reconcile，不 declare、构造 Frame candidate 或 submit；运行中的网络流可以继续。
+每个新 `prepare()` 和 reaction 都重新运行全部 active preparation；普通准备失败可由下一次显式
+operation 重试。丢弃 preparation future 会取消该 preparation；丢弃 Reaction waiter 不取消 operation。
 
-`run()`顺序循环调用`react()`，在第一个`Break(reason)`返回该`ExitReason`，或直接返回第一个
-`ApplicationFault`。它不spawn background driver、不替owner停止业务资源，也不调用`shutdown()`。
-`react()`是手动单步入口，返回`Continue(())`表示本轮已结算；`prepare()`的`Continue(())`只表示准备完成。
-`use_application_exit()`提供mount-fenced退出句柄，宿主可以通过`exit_handle()`取得独立句柄。
-`request(ExitReason::Completed | ExitReason::Requested)`记录第一个退出原因并唤醒pending preparation；
-退出后两个operation返回相同的`Break(reason)`，不再运行新准备或提交Frame。
+### 异步 Reaction handle
 
-退出与提交许可经过同一个同步状态检查：退出先记录则不调用`port.submit`；当前提交先取得许可时，
-允许当前reaction完成，再返回Break。该许可不改变Provider handoff或history commit边界；continuity retry
-也必须再次检查许可。Exit不越过streaming recovery fence，不吞掉fault或panic。Break不证明业务资源已清理；
-owner仍需完成业务stop/ack并调用consuming shutdown，shutdown及Application drop会使退出句柄失效。
+```rust,ignore
+app.react()?.await?; // 建立已完成、工具协议闭合的 checkpoint。
+let main = app.react()?;
+// 后续业务事件发生时，main 仍可能在 streaming。
+let branch = app.react()?;
+let id = branch.id();
+let kind = branch.kind(); // ReactionKind::Temporary
+branch.interrupt()?;
+let outcome = branch.await?;
+main.await?;
+```
 
-`ReactionRequest::request()`只记录至少一次后续reaction的sticky request；重复request在driver消费前合并。
-`wait_for_reaction_request()`阻塞直到消费一个请求，`take_reaction_request()`不阻塞地消费当前请求并在没有请求时
-返回`Ok(false)`。二者都不render Component、不调用`declare()`或`submit()`，并在消费前后复用与`react()`相同的
-outer-boundary仲裁：mount fence、supervisor `Closed`和已经终结的Application均fail closed，fresh Component task
-panic保留原payload并优先unwind。
+`Reaction` 是可 Clone 的控制与等待 handle，复用 ReactionId，在准入时分配身份，早于 preparation。
+同步准入后 Application-owned Tokio task 即推进操作；不依赖首次 await。
+`IntoFuture` 为每个副本创建独立 waiter；丢弃 handle 或 waiter 不取消请求。
+同步错误表示准入失败，异步准备、提交和执行 fault 由 waiter 报告。
+`ReactionOutcome::{Completed, Interrupted, Exited(ExitReason)}` 表达 runtime 结算，不替代业务结果。
+
+准入原子分类：没有占用主线执行位时为 Main，否则为 Temporary。Main 正常完成且工具协议闭合、
+staging 为空后，成对保留 canonical history 和 provider 私有上下文作为新 checkpoint；没有新合法
+checkpoint 时保留旧版本。首次 Main 可以从空历史启动；尚无 checkpoint 或 port 不支持独立临时
+请求时，Temporary 明确拒绝。kind 一经返回固定，中断 Main 不提升其他 Temporary。
+
+Main 按 handoff/admission 规则推进主 canonical history、continuation、staging、receipt 和 baseline。
+Temporary 使用固定 checkpoint 和独立协议状态，不消费、更新或重置主线状态。共享 tree 和 Signal
+写入仍是真实业务效果，不提供事务隔离或回滚。保留的 native tool history 和 XML feedback 按 lineage
+选择，Temporary 的模型记录不会自动进入 Main。历史独立的并发 sibling 可使用相同局部 call_id；
+同一 retained 协议 lineage（包括继承的 checkpoint prefix）中的 canonical call_id 仍须唯一，
+不会覆盖旧历史或自动重映射 wire 身份。
+
+一个已结算 Temporary 用 `branch.react()?` 继续自己的 scratch，返回新的 ReactionId；同一 lineage
+至多有一轮活跃，后续需使用最新返回的 handle。可继续的 handle 存活时保留临时上下文，丢弃全部
+相关 handle 后可回收。Main 后续轮次仍通过 `app.react()?` 发起。
+
+`interrupt()` 只请求中断指定 reaction，终态后幂等；不会中断其他 reaction、伪造 completion 或请求
+Application exit。等待在必要结算和清理完成后返回。managed recovery 未解决时，worker、执行位和
+恢复 fence 仍归 Application，waiter Pending；`recover_streaming_attempt()` 或 shutdown 继续恢复。
+恢复完成不把本轮原始 fault 改写为成功。普通终态结果支持多 waiter；user panic 保留唯一原 payload，
+在第一个观察边界传播，Application fail closed，其他 waiter 不复制 payload。
+
+`ReactionPort::fork_temporary()` 是可选、object-safe 的同步能力，默认拒绝。支持者返回 fresh identity、
+相同 profile、FullRequired 的独立 port，保留精确 canonical prefix 和必要私有 artifacts；不提交、观察
+或启动后台工作。Application 保留独立 template，Main streaming 借用主 port 时从 template 创建 sibling，
+不会用一把覆盖整个 stream 生命周期的锁串行化网络。native Responses 和 Debug 支持该能力。
+
+Ark caching 打开时，Temporary 继续固定已保存、未过期的父 `previous_response_id`，发送 `store:false`，
+后续只重放分支新增完整协议项；子响应 ID 不成为新父 checkpoint。普通非缓存 Responses 在独立分支
+重放其 wire history，仍 `store:false`。详细来源、资源生命周期与交互契约见
+[parallel-reactions-design.md](parallel-reactions-design.md)。
+
+`run()` 是默认顺序 Main driver；若已有 Main，先等待它结算，再发起下一 Main，直到正常 exit 或首个
+fault。run waiter 被丢弃不取消已接纳的 reaction。owner 仍需停止业务资源并 consuming shutdown。
+shutdown 调用立即关闭准入、中断全部 reaction 并开始独立清理；取消其 waiter 不取消清理。
+`fork`、`fork_to` 和 `reset_model_context` 要求所有 reaction 空闲，不越过 recovery fence。
+
+`use_application_exit()` 和 `exit_handle()` 提供 mount-fenced 正常退出句柄。
+退出与每次提交许可同步仲裁：退出先记录则不 submit；提交先取得许可时允许当前 reaction 结算，
+再报告 Exited。continuity retry 重新检查许可；exit 不吞掉 fault/panic，也不代表业务资源已清理。
+
+`ReactionRequest::request()` 只记录 sticky demand，重复请求在 driver 消费前合并。
+`wait_for_reaction_request()` 等待并消费，`take_reaction_request()` 非阻塞消费，没有请求时 `Ok(false)`。
+它们不 render、declare 或 submit；入口保留 mount fence、supervisor 关闭和原 task panic 仲裁。
+
+### 新 port 上的独立 Application 分支
+
+任意源 `P: ReactionPort` 均可从显式业务 snapshot 创建新的 `Application<Q>`：
+
+```rust
+impl<P: ReactionPort + 'static> Application<P> {
+    pub async fn fork_to<Q: ReactionPort + 'static>(
+        &mut self,
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        target: Q,
+    ) -> Result<Application<Q>, ApplicationFault>;
+
+    pub async fn fork_to_with_commands<Q: ReactionPort + 'static>(
+        &mut self,
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        target: Q,
+        input: CommandInput,
+    ) -> Result<Application<Q>, ApplicationFault>;
+}
+```
+
+`fork_to` 消费调用方提供的 fresh target，要求其 identity 与源 target 不同，且声明
+`FullRequired`。Q 的类型、模型配置和 FrameProfile 可以与 P 不同；各自始终固定自己的 logical
+target/profile。源 port 无需 `ForkableReactionPort` 或 `Clone`，该操作不调用它的 `declare`、
+`fork`、reset 或 `submit`。
+
+子应用使用全新的 FrameSession、namespace、revision 序列、Component mount、hook state、Signals、
+handlers、preparation、tasks、exit、driver demand 和可选 command inbox。canonical history、
+ToolOutput staging、delivery baseline 及 provider-private context 均不从源导入。首次 handoff 必须
+为 Full，输入来自 child root 当前声明的 System、业务 POM、工具及 ephemeral context；若 root
+显式声明业务记录，它们是子应用当前输入。业务 snapshot 的一致性由 owner 保证。
+
+源 Application 需通过 runtime 健康与未退出检查；其未交付工具结果、正在处理的 command、mount
+retirement 或 streaming recovery 不阻止这个独立 mount。源的 session、staged results/receipts 和
+demand 不被消费或提交。源模型或 port 不可用本身不阻止使用新 target；已终结或 panic 的源 runtime
+仍遵守既有 fail-closed 契约。
+
+bootstrap 在启动子 Component tasks 前按目标自己的 profile 预检初始 Full 预算，不 commit 或提交
+Frame，也不运行 Component preparation。成功 mount 按正常规则启动子 Component tasks。调用需
+当前 Tokio runtime，owner 后续显式推进两个 driver 并分别完成 consuming shutdown。
+target 和部分构造的子应用在失败或取消时由 cleanup owner 收尾；取消 waiter 不丢弃清理，源
+Application 持有其完成句柄。初始化失败不推进源 session/port；业务代码的状态写入和外部副作用不回滚。
+结果与进度通过显式业务消息交换，并在接收方后续 Frame 中交付。
 
 ### 保留历史的 Application fork
 
@@ -263,7 +352,7 @@ impl<P: ForkableReactionPort> Application<P> {
 ```
 
 fork 将 private FrameSession 与 port 的同一历史分支点成对复制，返回独立 Application；
-每个实例继续固定一个 logical target 并保持 single-flight。业务 owner 导出 owned typed snapshot，
+每个实例拥有独立主 logical target 和 reaction 调度；fork 要求源实例所有 reaction 空闲。业务 owner 导出 owned typed snapshot，
 由新的 root 初始化自己的 Signals；框架不复制任意 hook value、handler、正在运行的 future 或
 外部副作用。`&mut Application` 不冻结 Component tasks 或外部业务状态，snapshot 一致性由业务保证。
 
@@ -377,7 +466,7 @@ pub struct ReactionPortFault {
 }
 
 #[non_exhaustive]
-pub enum ApplicationFaultKind { Retryable, Terminal }
+pub enum ApplicationFaultKind { Retryable, RecoveryRequired, Terminal }
 
 #[non_exhaustive]
 pub enum ApplicationFaultCode {
@@ -462,7 +551,7 @@ pub enum SubmitFault {
 `ReactionPortFault`只保留closed、payload-free classification，不持有provider text、wire body、credential、
 arbitrary source或自由字符串。`ApplicationFault`在编排边界同样只暴露payload-free
 `stage/kind/code/reason`；tool/call identity和authored/model text必须在分类后丢弃。Component、handler、tool、
-parser或observer panic不进入`ApplicationFault`，而是保留原payload沿caller stack unwind。
+parser或observer panic不进入`ApplicationFault`，而是保留原payload在调用栈或 owned task 的观察边界 unwind。
 `ReactionAdmissionReason`和`ToolOutputStagingReason`同样是closed、payload-free的子分类；其具体variant在
 Phase 9 curated public export前保持crate-private，不允许携带任意字符串或底层source。
 详细诊断属于integration-private observability。`ContinuityChanged`与`ProfileChanged`都保证pre-handoff；
@@ -508,7 +597,7 @@ ToolCall Component 声明 target 可调用的能力。它接收完整 ToolCall�
 `view!` 支持 `NativeToolCall { name, description, on_call }` 属性声明。`name` 和 `on_call`
 必填，属性顺序无关；输入 schema 从 callback 的 owned `Deserialize + JsonSchema` 参数类型生成。
 callback 可捕获当前 Component 的 Signal 或其他应用句柄，这些捕获值不属于模型输入。
-无参数 callback 可直接写 `||`，schema 为只接受空 object 的输入。
+没有业务参数的 callback 写为 `|context|`，schema 为只接受空 object 的输入；context 不进入 schema。
 同步 `Result<Output, Error>` 和返回该结果的 `Send` future 均可作为 callback 返回值；
 `Output` 必须可序列化。参数解码失败返回 `invalid_arguments`，不执行 callback；普通业务拒绝
 应作为 `Ok` 中的结果数据返回，callback `Err` 仍为 reaction fault。
@@ -533,7 +622,7 @@ strict parser 及进行中的 callback；每个 occurrence 独立处理 open/del
 callback 的创建和 future polling 都带 action Component 的 mount/task context；显式 `spawn`
 仍为该挂载的任务能力，卸载时关闭并清理。
 
-执行直接借用 `react()` future，不创建后台 worker。取消会先丢弃当前 callback future，再丢弃
+执行运行在 Application-owned reaction task 内，普通 XML callback 不另建 managed worker。定向中断会先丢弃当前 callback future，再丢弃
 后续未执行的输入；不合成完成回调、不重放、不回滚已经写入的 Signal 或外部效果。普通 callback
 错误为 runtime fault，panic 原样传播；模型 XML 错误是诊断，跳过无效 occurrence 后继续独立
 合法动作。诊断写入动作 Component 的 retained view，并可通过 `on_invalid` 额外处理；未知标签
@@ -662,8 +751,9 @@ Runtime只等待返回的future，对factory自行detached的work不提供readin
 preparation不提供exactly-once保证；factory及其返回future必须tolerate repeated/partial execution和cancellation，
 外部effects需要业务方自己的idempotency和durable deduplication。
 
-factory或future panic仍是当前`prepare()`/`react()`调用栈上的direct user-code panic，原样unwind且不转为
-`ApplicationFault`；supervised mount-task panic保持既有sticky terminal仲裁。ordinary failure和
+factory或future panic仍是原始 user-code panic，不转为`ApplicationFault`。独立`prepare()`直接 unwind；
+owned reaction task 保留原 payload，在观察边界恢复 unwind 并令 Application fail closed；supervised
+mount-task panic 保持既有 sticky terminal 仲裁。ordinary failure和
 pre-handoff cancellation均不隐式开始reaction；下一次显式operation重新运行全部active hooks。一个
 `ContinuityChanged`所要求的同一`react()`内retry复用当前operation的completed slots，不重跑preparation。
 
@@ -817,7 +907,8 @@ Native `AsyncOpenAiResponsesProvider` 默认使用 `DefaultCompactionPolicy` 在
 也不提供 server compaction 分支或 fallback。此约束同样适用于 forced compaction 和未来 runtime
 checkpoint；见 [design.md](../design.md)。`with_parallel_compaction(policy)` 替换默认策略，
 `without_parallel_compaction()` 关闭后台摘要；这些配置不影响独立的请求上限检查。
-此功能不影响 Application 内 reaction 的 single-flight 契约，也不适用于 legacy port。
+此功能只影响对应 port 的 wire window，不改变 Main/Temporary 历史归属，也不适用于 legacy port。
+Temporary 禁用后台及 forced compaction，以保留固定父 prefix。
 
 Forced compaction 是同一 native provider 的独立 opt-in：`with_forced_compaction()` 默认关闭，
 且不受 `without_parallel_compaction()` 影响。它只在一个本来可编码的前台 Frame 因
@@ -1049,14 +1140,14 @@ submit poll -> Ready(Ok(stream)) Frame已经handoff
 
 drop一个返回Pending的submit future必须是零handoff、零FrameSession commit、零receipt consumption。
 drop一个已经成功返回但尚未poll的stream属于post-handoff，不回滚outbound segment或diff baseline。
-drop整个`Application::react()` future时，handoff前和handoff后取消都保持Application ready，但handoff仍决定
+调用 `reaction.interrupt()` 导致 owned operation 取消时，handoff前后都保留其他 reaction 的可用性，handoff决定
 哪些state已经成为权威事实：handoff前candidate不commit；handoff后保留已commit Frame、已接纳facts、已完成
 ToolOutputs、Component/Signal写入和外部副作用。当前callback、reaction-owned lanes和provider stream按该顺序
 drop且永不resume或replay；open assistant text保留为`Interrupted`，每个尚未完成的已接纳ToolCall物化一个预留的
 `Tool execution was cancelled; its outcome is unknown.` ToolOutput。取消不会自动发起下一reaction；只有下一次
 显式`react()`才重新declare，并接受兼容`Accepted`、更高epoch `FullRequired`或terminal fault。direct panic和
 supervised task panic都不属于cancellation且不得发布fallback recovery；caller catch user panic后仍必须丢弃
-Application。
+Application。丢弃 Reaction handle 或 waiter 不触发这一取消路径。
 
 External/Skill adapter可以先异步reserve outbound queue capacity；取得permit后必须在crossing poll同步
 send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame，不是下游业务callback最终读取。
@@ -1064,10 +1155,10 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
 ## 5. 一次 reaction
 
 ```text
-1. &mut Application acquires single-flight ownership
+1. synchronous admission allocates ReactionId and fixed Main/Temporary kind; starts owned task
 2. port.declare() -> identity + continuity + stable profile
 3. validate fixed target/profile and monotonic epoch
-4. start an operation-scoped Component preparation
+4. serialize an operation-scoped Component preparation on the shared tree
      -> synchronous render/discover active declarations in structural/hook order
      -> invoke each unfinished `(mount generation, lexical slot)` factory once
      -> concurrently poll the wave's returned futures; first observed error drops the rest
@@ -1075,7 +1166,6 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
      -> early success only when clean with no unfinished hooks
      -> after a dirty sixteenth execution wave, one final reconcile without a 17th dispatch
      -> complete projection + exact bindings
-     -> create fresh independent streaming contract attempts
 5. FrameSession.prepare(...)
      -> select and validate canonical replay view
      -> lower #[diff]
@@ -1084,6 +1174,8 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
      -> private PreparedFrame
 6. acquire submission permission against application exit; port.submit(public Frame)
 7. Ready(Ok(stream)) -> synchronous infallible FrameSession commit
+     -> bind ApplicationId + ReactionId + the handed-off FrameRevision
+     -> create fresh independent streaming contract attempts with this source
 8. run one fact/lane pump
      -> validate fact
      -> precompute the optional admitted root ProviderEvent
@@ -1095,12 +1187,12 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
      -> poll active lanes while awaiting raw handlers or streaming work
 9. valid terminal + normal EOF -> drain remaining lanes
 10. finalize direct XML callbacks at normal EOF; decide managed contracts and settle their effects
-    -> unresolved effects retain workers and return RecoveryRequired before step 11
+    -> unresolved effects retain workers and keep waiter Pending until explicit recovery or shutdown
 11. post-reconcile Component state
-12. release gate; return Continue, or Break if exit was requested
+12. publish checkpoint/temporary continuation; release execution slot; resolve ReactionOutcome or fault
 ```
 
-一次`react()`最多render/submit一个Frame，不自动开始下一次reaction。pre-handoff failure不推进任何
+一次 reaction 最多 handoff 一个 Frame，不自动开始下一次reaction。pre-handoff failure不推进任何
 candidate state；post-handoff HTTP、stream、handler或lane failure不回滚已经handoff的input、已经接纳的
 fact、Component写入或外部副作用。continuity retry只重复declaration、Frame prepare和submit，不重复第4步。
 
@@ -1117,11 +1209,11 @@ contract；Commentary不进入新parser。`TextSealed`只校验完整文本，�
 上面普通副作用规则的显式补充：只有注册receipt的效果由框架执行confirm/rollback；它不回滚canonical
 history、普通Signal写入或任意未登记的外部副作用。
 
-worker持有进行中的apply、publish和settlement，取消`react()`等待不会丢弃这些操作。流在EOF前中断时
+worker持有进行中的apply、publish和settlement，丢弃 Reaction waiter 不取消这些操作。定向中断流时，
 所有仍在解析的contract进入abort；EOF后的发布恢复保留各contract已确定的结果。所有worker清理完成后
 Application执行post-reconcile，再释放至多一个合并的后继reaction请求。取消清理完成后可重新使用
-Application；无法确定的效果返回`RecoveryRequired`并阻止新的prepare/react和reaction demand，调用
-`recover_streaming_attempt()`继续处理。后置reconcile失败保留fence和fault；恢复不会重跑已完成的拒绝
+对应 reaction；无法确定的效果保留该 reaction 的 fence 和执行位，waiter 保持 Pending，调用
+`recover_streaming_attempt()`继续处理；其他独立 reaction 可以继续。后置reconcile失败保留fault；恢复不会重跑已完成的拒绝
 回调。完整API和恢复报告见[streaming-tool-api-design.md](streaming-tool-api-design.md)。
 
 ## 6. ProviderFact 与 canonical admission
@@ -1236,7 +1328,7 @@ Provider stream与active lanes必须在同一个pump中并发推进，不能先�
 
 ### Default run and manual scheduling
 
-AgentView不提供framework-owned AgentLoop、public Reactor trait、ReactionHandle或Frame scheduling stream。
+公开单步接口返回 Application-owned `Reaction` handle，不另增 public Reactor trait 或 Frame scheduling stream。
 `Application::run()`是默认固定循环；组件在`use_preparation`中等待timer、channel、CLI request或parent
 invocation：
 
@@ -1248,8 +1340,8 @@ let reason = run_result?;
 shutdown_result?;
 ```
 
-`reactor`是持有`Application<P>`的变量，不是另一个runtime类型。`run()`内部的每次`react()`先等待组件
-准备，再完成一整个structured reaction。Signal dirty、Provider EOF、读取latest和command名称都不会自动
+`reactor`是持有`Application<P>`的变量，不是另一个runtime类型。`run()`等待已有 Main 后，逐轮执行
+`react()?.await`；每轮先等待组件准备，再完成一整个structured reaction。Signal dirty、Provider EOF、读取latest和command名称都不会自动
 触发reaction。外界发送业务输入即可，不需要额外发送reaction demand。准备hook的factory按声明顺序同步
 调用，返回future在同批中并发poll；全部成功后才继续，首个被观察到的错误会drop其余future。
 
@@ -1366,7 +1458,7 @@ preparation 会保留尚未执行的 pending request 和已完成的 outcome；�
 callback 判断。回调返回值进入 action feedback 和程序接口的 result，框架不解释其中的 bool 或业务成功字段。
 
 Action 的 callback 输入结构体以 `Deserialize + JsonSchema` 声明 JSON 解码和可发现的 input schema。
-无参数 callback 直接写 `||`，只接受空 object。stdin envelope 为
+无业务参数 callback 写为 `|context|`，只接受空 object。stdin envelope 为
 `{"action":"move","input":{"uci":"e2e4"}}`；框架按本轮实际挂载的动作名路由并执行 typed 解码。
 未知动作、错误类型等普通输入错误返回 feedback 和当前 view，不阻止下一次有效动作。callback
 返回错误仍遵循运行时失败规则。业务作者不维护独立 descriptor 常量、parser catalog 或 NoInput 类型。
@@ -1522,7 +1614,7 @@ socket 或 Application。CLI catalog 描述 binary 能识别的命令，当前�
 Provider event handler在`view!`外声明；`view!`只描述完整projection。目标authoring shape是：
 
 ```rust
-use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+use_provider_event_handler(ProviderEvent::TEXT, move |_context, event| {
     let state = state.clone();
     async move { state.set(reduce(event)) }
 });
@@ -1536,16 +1628,49 @@ generation派生一次private binding。successful rerender原子更新callback 
 slot；unmount删除slot。旧binding不能dispatch到新mount。公共API不暴露`EventInput`、
 `EventListener::observe`、listener identity/version或DOM bubbling/capture。
 
+### Event provenance
+
+`Application::application_id()`、`ComponentHost::application_id()` 和 Component 内的
+`use_application_id()` 返回同一稳定的 `ApplicationId`。独立 mount/fork 创建新 identity；同一 host
+重新 render 或 remount 不改变 owner identity。该 hook 表示当前 view 的接收方，不改变事件来源。
+
+provider handler、native tool、XML callback 和命令 callback 以 `EventContext` 为第一个参数；
+无业务参数的 callback 写为 `|context|`，正常 reaction completion 同样接收 context。context 由
+runtime 注入，不进入模型工具参数的 JSON Schema。`#[tool]` 声明的普通可调用函数保持业务参数签名，
+其 NativeToolCall adapter 接收并保留来源。
+
+context 提供 `application_id()`、`reaction_id()`、`reaction_kind()`、`frame_revision()`、`event_id()`、`source()` 和
+`caused_by()`。模型事件绑定实际成功 handoff 的 FrameRevision；pre-handoff continuity retry 保持同一
+ReactionId 和 Main/Temporary kind，采用最终成功提交的 revision。native source 保留 call_id、output key 和 ordinal；XML
+source 保留 contract attempt、occurrence 和 sequence。一个派发事件的 multicast handlers 收到相同
+EventId；不同事件使用不同 EventId。host/command 事件没有虚构的模型 reaction、kind 或 Frame。
+
+context 是 owned value，业务代码将其 move/clone 到 future、任务或结果记录中；异步完成、失败和恢复
+保留创建时来源，不读取“当前 reaction”来重写它。仅在正常 EOF 和 actions settle 后派发 completion；
+取消不合成成功 completion。identity 为 process-local metadata，不是跨进程 durable ID、授权或业务
+版本校验 capability。caused_by 只记录框架已知的派生关系，不自动推断任意跨应用业务因果链。
+
+多个 Application 可以使用相同 Component 并共享外部业务 store，各自保留 mount、Signal、history、
+provider continuation 和工具协议回执。A 的事件更新 store 后，B 渲染该结果仍应保留 A 的 context；
+B 自己发起的新 reaction 使用 B 的来源。业务 store 决定并发准入、通知和反馈可见范围。共享写入本身
+不提交 Frame；接收 Application 的下一次 submitted Frame 才将当前 state/feedback 交付模型。
+
+同一 Application 的异步 Reaction 使用上述 EventContext；Main 和 Temporary 共享 ApplicationId，
+handle、事件、工具、恢复和中断使用同一 ReactionId。每条流保留独立 admission、parser 和工具协议状态，
+模型记录按主线或临时 lineage 选择。来源与交互契约见
+[parallel-reactions-design.md](parallel-reactions-design.md#7-eventcontext)。
+
 ### User panic boundary
 
-Runtime不在Component root/render、provider-event handler、legacy event listener、native tool handler、legacy
-streaming decoder、engine observer或usage observer外层调用`catch_unwind`。这些user-code panic不转换成typed fault、不吞掉、
+Runtime不把Component root/render、provider-event handler、legacy event listener、native tool handler、legacy
+streaming decoder、engine observer或usage observer的user-code panic转换成typed fault或吞掉。owned reaction
+task 为跨任务传递而保留原始 payload，并在第一个观察边界 `resume_unwind`；不复制 payload，
 也不通过ErrorBoundary恢复旧Application。正常返回的`Result::Err`仍按各自typed contract处理。
 
 render candidate、hook topology、listener declaration和task factory仍遵守commit-before-publish；panic unwind时未发布
 candidate由RAII丢弃。这只证明candidate未publish，不构成对任意user side effect、共享`Arc`或live Signal mutation
 的rollback保证。caller若自行catch，必须丢弃该Application以及可能被这次调用触及的可变user资源；继续复用它们
-超出Runtime contract。v1不为这种外部catch建立状态隔离、回滚、恢复或terminalization协议。
+超出Runtime contract。owned reaction 捕获边界令 Application terminal，不能恢复业务执行；这不提供状态隔离或回滚。
 
 panic unwind期间Runtime不得再次进入任何user callback或observer；RAII cleanup只销毁reaction-local资源。
 因此panic路径不保证发送terminal/cleanup observation，原panic payload优先。
@@ -1640,7 +1765,7 @@ Engine也不能伪造ToolOutput，更不能发送包含裸pending call的下一F
 3. 未声明tool返回`unsupported_tool_call`；
 4. 已声明但本轮无binding返回`tool_binding_missing`；
 5. handler正常返回但无ToolOutput返回`tool_output_missing`；
-6. 普通reaction中lane future返回错误、取消或执行设施失败时返回`tool_lane_failure`；drop整个`react()`则按下节
+6. 普通reaction中lane future返回错误、取消或执行设施失败时返回`tool_lane_failure`；定向 interrupt 则按下节
    物化unknown-outcome fallback；user handler panic直接unwind；
 7. fault后不得提交下一Frame，open history不能作为合法wire input；
 8. pending call不得通过丢continuation、Fresh、context reset或插入无关input绕过；
@@ -1741,7 +1866,7 @@ worker 必须完成配置的审计回执后才能发布 Ready；回执错误使�
 16. ToolCall commit后立即启动lane；fact stream和lanes并发推进，不同lanes可以并发但mutation保序。
 17. ToolOutput只在下一Frame successful handoff时作为ordered input commit，receipt只消费一次。
 18. 下一Frame必须闭合全部pending ToolCall，不能以Fresh、Full或context reset绕过。
-19. 一次`react()`最多handoff一个Frame，不自动rerender、retry或开始下一reaction。
+19. 一次 reaction 最多 handoff 一个 Frame，不自动开始下一 reaction；continuity retry 只能发生在 handoff 前。
 20. Signal dirty、读取latest、Provider EOF和task completion都不自动调用`react()`。
 21. `Application::run()`是默认固定循环；direct `react()`是手动单步接口。Component preparation决定何时
     允许提交，exit决定正常结束；兼容的Component demand只表达sticky demand，固定循环不依赖它。
@@ -1749,7 +1874,7 @@ worker 必须完成配置的审计回执后才能发布 Ready；回执错误使�
 23. cancellation不回滚已commit Component state、canonical fact、sealed private artifact或外部副作用。
 24. mounted handler/task/demand capability受mount generation fence，旧mount不能影响新mount；unmount先fence，
     再abort并await tasks，之后才能发布replacement projection。
-25. pre-handoff和post-handoff `react()` cancellation都保持Application ready且不自动开始reaction；post-handoff
+25. pre-handoff和post-handoff 定向 interrupt 不自动开始reaction，也不取消其他流；丢弃 waiter 不触发取消。post-handoff
     保留已commit/admit的state，把open text标记`Interrupted`，并以exactly one预留
     `Tool execution was cancelled; its outcome is unknown.` ToolOutput闭合每个未完成的已接纳ToolCall。下一次
     显式`react()`必须从port的truthful continuity declaration继续。
@@ -1795,7 +1920,7 @@ worker 必须完成配置的审计回执后才能发布 Ready；回执错误使�
 
 - Chess、裁判或其他业务领域规则；
 - 某个ToolCall的业务schema和执行实现；
-- 同一 Application 内的 concurrent multi-target writers、multi-checkpoint delta 或 durable session recovery；
+- 多条同时写入主线的 reaction、multi-checkpoint delta 或 durable session recovery；
 - 任意 mounted hook/future 的透明 clone、自动业务 snapshot 或分支历史自动 merge；
 - public mutable history/session API；
 - framework-owned AgentLoop、public Reactor trait或Component-owned scheduling policy；

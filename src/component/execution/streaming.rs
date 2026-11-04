@@ -3,7 +3,7 @@
 use std::{
     any::Any,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
 };
@@ -25,13 +25,15 @@ use super::{
     ProviderOutputKey,
 };
 
-static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+use crate::component::{provenance::EventScope, EventContext};
 
 type WorkerPanic = Box<dyn Any + Send + 'static>;
 
 /// One independent contract's result during Application recovery.
 #[derive(Debug, Clone)]
 pub struct StreamingToolRecoveryReport {
+    /// Original contract start, including its reaction identity and history kind.
+    pub context: EventContext,
     pub attempt: StreamingToolAttemptId,
     pub contract: &'static str,
     pub accepted: bool,
@@ -55,7 +57,7 @@ pub enum StreamingToolRecoveryStatus {
     },
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct StreamingSupervisor {
     workers: Vec<Worker>,
     selected: Option<ProviderOutputKey>,
@@ -72,25 +74,31 @@ impl StreamingSupervisor {
     pub(super) fn start(
         &mut self,
         declarations: Vec<ContractDeclaration>,
+        scope: EventScope,
     ) -> Result<StreamingReactionLease, ApplicationFault> {
         debug_assert!(!self.pending());
         let mut drivers = Vec::with_capacity(declarations.len());
         for declaration in declarations {
-            let id = NEXT_ATTEMPT
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-                .map_err(|_| ApplicationFault::streaming_runtime())?;
+            let id =
+                StreamingToolAttemptId::fresh().ok_or_else(ApplicationFault::streaming_runtime)?;
             let start = StreamingToolAttemptStart::new(
-                StreamingToolAttemptId::new(id),
+                id,
                 declaration.identity(),
                 declaration.implementation_version(),
+                scope,
             );
-            drivers.push(
+            let context = start.event_context().clone();
+            drivers.push((
                 declaration
                     .start(start)
                     .map_err(ApplicationFault::from_streaming)?,
-            );
+                context,
+            ));
         }
-        self.workers = drivers.into_iter().map(Worker::spawn).collect();
+        self.workers = drivers
+            .into_iter()
+            .map(|(driver, context)| Worker::spawn(driver, context))
+            .collect();
         self.selected = None;
         self.sealed = false;
         self.normal_eof = false;
@@ -217,6 +225,7 @@ impl StreamingSupervisor {
             .map(|worker| {
                 let state = worker.state.lock().unwrap_or_else(|p| p.into_inner());
                 StreamingToolRecoveryReport {
+                    context: worker.context.clone(),
                     attempt: worker.attempt,
                     contract: worker.identity,
                     accepted: state.accepted,
@@ -299,6 +308,7 @@ struct WorkerState {
 
 #[derive(Clone)]
 struct Worker {
+    context: EventContext,
     identity: &'static str,
     attempt: StreamingToolAttemptId,
     commands: mpsc::UnboundedSender<Command>,
@@ -320,7 +330,7 @@ struct Command {
 }
 
 impl Worker {
-    fn spawn(mut driver: Box<dyn ErasedContract>) -> Self {
+    fn spawn(mut driver: Box<dyn ErasedContract>, context: EventContext) -> Self {
         let identity = driver.identity();
         let attempt = driver.attempt();
         let (commands, mut receiver) = mpsc::unbounded_channel::<Command>();
@@ -408,6 +418,7 @@ impl Worker {
             }
         });
         Self {
+            context,
             identity,
             attempt,
             commands,

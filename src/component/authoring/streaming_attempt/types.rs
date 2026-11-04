@@ -11,8 +11,15 @@ use std::{
     marker::PhantomData,
     ops::Range,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
+
+use crate::component::{provenance::EventScope, EventContext, EventSource};
+
+static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 /// Nominal lane types emitted by one streaming-tool contract.
 pub trait StreamingToolChannels: Send + Sync + 'static {
@@ -126,6 +133,7 @@ impl StreamingEmissionOrigin {
 
 /// An output or commit retained until accepted publication.
 pub struct StagedStreamingToolEmission<C: StreamingToolChannels> {
+    pub context: EventContext,
     pub sequence: u64,
     pub origin: StreamingEmissionOrigin,
     pub value: StagedStreamingToolValue<C>,
@@ -133,11 +141,13 @@ pub struct StagedStreamingToolEmission<C: StreamingToolChannels> {
 
 impl<C: StreamingToolChannels> StagedStreamingToolEmission<C> {
     pub(crate) fn new(
+        context: EventContext,
         sequence: u64,
         origin: StreamingEmissionOrigin,
         value: StagedStreamingToolValue<C>,
     ) -> Self {
         Self {
+            context,
             sequence,
             origin,
             value,
@@ -160,6 +170,19 @@ pub enum StagedStreamingToolValue<C: StreamingToolChannels> {
 pub struct StreamingToolAttemptId(u64);
 
 impl StreamingToolAttemptId {
+    /// The opaque process-local numeric identity.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn fresh() -> Option<Self> {
+        NEXT_ATTEMPT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .ok()
+            .map(Self)
+    }
+
+    #[cfg(test)]
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
@@ -170,6 +193,11 @@ impl StreamingToolAttemptId {
 pub struct XmlOccurrenceId(u64);
 
 impl XmlOccurrenceId {
+    /// The opaque process-local numeric identity.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
@@ -214,6 +242,7 @@ pub enum XmlElementForm {
 
 /// A successfully decoded element opening.
 pub struct XmlOpen<Head> {
+    pub context: EventContext,
     pub attempt: StreamingToolAttemptId,
     pub sequence: u64,
     pub occurrence: XmlOccurrenceId,
@@ -223,6 +252,7 @@ pub struct XmlOpen<Head> {
 
 /// One decoded text increment for an open text element.
 pub struct XmlTextDelta<Head> {
+    pub context: EventContext,
     pub attempt: StreamingToolAttemptId,
     pub sequence: u64,
     pub occurrence: XmlOccurrenceId,
@@ -234,6 +264,7 @@ pub struct XmlTextDelta<Head> {
 
 /// A decoded element completion.
 pub struct XmlComplete<Head, Value> {
+    pub context: EventContext,
     pub attempt: StreamingToolAttemptId,
     pub sequence: u64,
     pub occurrence: XmlOccurrenceId,
@@ -767,6 +798,7 @@ impl<D> XmlOccurrenceRejection<D> {
 
 /// Final report passed to a contract's final reducer.
 pub struct XmlAttemptSummary<'a, D> {
+    pub context: EventContext,
     pub attempt: StreamingToolAttemptId,
     pub raw_output: &'a str,
     pub elements: &'a [XmlElementSummary],
@@ -955,20 +987,32 @@ pub struct XmlElementSummary {
 }
 
 /// Contract metadata supplied before state construction.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct StreamingToolAttemptStart {
+    pub(super) context: EventContext,
     pub(super) attempt: StreamingToolAttemptId,
     pub(super) contract_identity: &'static str,
     pub(super) implementation_version: &'static str,
 }
 
 impl StreamingToolAttemptStart {
-    pub(crate) const fn new(
+    /// Immutable source of the attempt or original emitting event.
+    pub fn event_context(&self) -> &EventContext {
+        &self.context
+    }
+
+    pub(crate) fn new(
         attempt: StreamingToolAttemptId,
         contract_identity: &'static str,
         implementation_version: &'static str,
+        scope: EventScope,
     ) -> Self {
         Self {
+            context: scope.event(EventSource::Xml {
+                attempt,
+                occurrence: None,
+                sequence: 0,
+            }),
             attempt,
             contract_identity,
             implementation_version,
@@ -989,16 +1033,23 @@ impl StreamingToolAttemptStart {
 }
 
 /// Contract metadata retained throughout one attempt.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct StreamingToolAttemptContext {
+    context: EventContext,
     attempt: StreamingToolAttemptId,
     contract_identity: &'static str,
     implementation_version: &'static str,
 }
 
 impl StreamingToolAttemptContext {
-    pub(crate) const fn from_start(start: &StreamingToolAttemptStart) -> Self {
+    /// Immutable source of the attempt or original emitting event.
+    pub fn event_context(&self) -> &EventContext {
+        &self.context
+    }
+
+    pub(crate) fn from_start(start: &StreamingToolAttemptStart) -> Self {
         Self {
+            context: start.context.clone(),
             attempt: start.attempt,
             contract_identity: start.contract_identity,
             implementation_version: start.implementation_version,
@@ -1040,6 +1091,7 @@ impl StreamingPublicationId {
 
 /// Context for preparing/applying a live value.
 pub struct LiveEffectContext {
+    context: EventContext,
     attempt: StreamingToolAttemptId,
     effect: StreamingEffectId,
     emission_sequence: u64,
@@ -1047,13 +1099,20 @@ pub struct LiveEffectContext {
 }
 
 impl LiveEffectContext {
+    /// Immutable source of the attempt or original emitting event.
+    pub fn event_context(&self) -> &EventContext {
+        &self.context
+    }
+
     pub(crate) fn new(
         start: &StreamingToolAttemptStart,
+        context: EventContext,
         effect: StreamingEffectId,
         emission_sequence: u64,
         origin: StreamingEmissionOrigin,
     ) -> Self {
         Self {
+            context,
             attempt: start.attempt,
             effect,
             emission_sequence,
@@ -1080,13 +1139,24 @@ impl LiveEffectContext {
 
 /// Context for confirming a live effect after publication.
 pub struct LiveConfirmContext {
+    context: EventContext,
     attempt: StreamingToolAttemptId,
     effect: StreamingEffectId,
 }
 
 impl LiveConfirmContext {
-    pub(crate) const fn new(start: &StreamingToolAttemptStart, effect: StreamingEffectId) -> Self {
+    /// Immutable source of the attempt or original emitting event.
+    pub fn event_context(&self) -> &EventContext {
+        &self.context
+    }
+
+    pub(crate) fn new(
+        start: &StreamingToolAttemptStart,
+        context: EventContext,
+        effect: StreamingEffectId,
+    ) -> Self {
         Self {
+            context,
             attempt: start.attempt,
             effect,
         }
@@ -1103,18 +1173,26 @@ impl LiveConfirmContext {
 
 /// Context for rolling back a live effect.
 pub struct LiveRollbackContext {
+    context: EventContext,
     attempt: StreamingToolAttemptId,
     effect: StreamingEffectId,
     cause: StreamingToolAbortCause,
 }
 
 impl LiveRollbackContext {
-    pub(crate) const fn new(
+    /// Immutable source of the attempt or original emitting event.
+    pub fn event_context(&self) -> &EventContext {
+        &self.context
+    }
+
+    pub(crate) fn new(
         start: &StreamingToolAttemptStart,
+        context: EventContext,
         effect: StreamingEffectId,
         cause: StreamingToolAbortCause,
     ) -> Self {
         Self {
+            context,
             attempt: start.attempt,
             effect,
             cause,
@@ -1136,6 +1214,7 @@ impl LiveRollbackContext {
 
 /// Context for a live settlement preparation.
 pub struct LiveSettlementContext {
+    context: EventContext,
     attempt: StreamingToolAttemptId,
     effect: StreamingEffectId,
     settlement: LiveSettlement,
@@ -1143,13 +1222,20 @@ pub struct LiveSettlementContext {
 }
 
 impl LiveSettlementContext {
-    pub(crate) const fn new(
+    /// Immutable source of the attempt or original emitting event.
+    pub fn event_context(&self) -> &EventContext {
+        &self.context
+    }
+
+    pub(crate) fn new(
         start: &StreamingToolAttemptStart,
+        context: EventContext,
         effect: StreamingEffectId,
         settlement: LiveSettlement,
         rollback_cause: Option<StreamingToolAbortCause>,
     ) -> Self {
         Self {
+            context,
             attempt: start.attempt,
             effect,
             settlement,
@@ -1176,6 +1262,7 @@ impl LiveSettlementContext {
 
 /// Context for resolving an indeterminate live operation.
 pub struct LiveRecoveryContext {
+    context: EventContext,
     attempt: StreamingToolAttemptId,
     effect: StreamingEffectId,
     phase: StreamingToolRecoveryPhase,
@@ -1183,13 +1270,20 @@ pub struct LiveRecoveryContext {
 }
 
 impl LiveRecoveryContext {
-    pub(crate) const fn new(
+    /// Immutable source of the attempt or original emitting event.
+    pub fn event_context(&self) -> &EventContext {
+        &self.context
+    }
+
+    pub(crate) fn new(
         start: &StreamingToolAttemptStart,
+        context: EventContext,
         effect: StreamingEffectId,
         phase: StreamingToolRecoveryPhase,
         rollback_cause: Option<StreamingToolAbortCause>,
     ) -> Self {
         Self {
+            context,
             attempt: start.attempt,
             effect,
             phase,
@@ -1216,16 +1310,23 @@ impl LiveRecoveryContext {
 
 /// Context for publishing accepted output and commits.
 pub struct StreamingPublishContext {
+    context: EventContext,
     attempt: StreamingToolAttemptId,
     publication: StreamingPublicationId,
 }
 
 impl StreamingPublishContext {
-    pub(crate) const fn new(
+    /// Immutable source of the attempt or original emitting event.
+    pub fn event_context(&self) -> &EventContext {
+        &self.context
+    }
+
+    pub(crate) fn new(
         start: &StreamingToolAttemptStart,
         publication: StreamingPublicationId,
     ) -> Self {
         Self {
+            context: start.context.clone(),
             attempt: start.attempt,
             publication,
         }
@@ -1242,16 +1343,23 @@ impl StreamingPublishContext {
 
 /// Context for resolving an indeterminate publication.
 pub struct StreamingPublishRecoveryContext {
+    context: EventContext,
     attempt: StreamingToolAttemptId,
     publication: StreamingPublicationId,
 }
 
 impl StreamingPublishRecoveryContext {
-    pub(crate) const fn new(
+    /// Immutable source of the attempt or original emitting event.
+    pub fn event_context(&self) -> &EventContext {
+        &self.context
+    }
+
+    pub(crate) fn new(
         start: &StreamingToolAttemptStart,
         publication: StreamingPublicationId,
     ) -> Self {
         Self {
+            context: start.context.clone(),
             attempt: start.attempt,
             publication,
         }
@@ -1356,6 +1464,7 @@ pub enum StreamingToolDiagnosticOrigin {
 
 /// One sequenced contract, decode, or domain diagnostic.
 pub struct StreamingToolDiagnosticRecord<D> {
+    pub context: EventContext,
     pub sequence: u64,
     pub origin: StreamingToolDiagnosticOrigin,
     pub diagnostic: StreamingToolDiagnostic<D>,

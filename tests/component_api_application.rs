@@ -90,7 +90,7 @@ async fn public_application_mounts_reacts_and_shuts_down_through_the_curated_own
     let initial_revision = application.current_projection().revision();
 
     assert_eq!(
-        application.react().await.unwrap(),
+        application.react().unwrap().await.unwrap(),
         ControlFlow::Continue(())
     );
 

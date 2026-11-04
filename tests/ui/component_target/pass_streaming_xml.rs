@@ -7,19 +7,19 @@ fn lifecycle_subscription() -> Component {
     view! {
         {
             StreamingXml::tag("speak")
-                .on_open(|element| async move {
+                .on_open(|_ctx, element| async move {
                     let _attributes = element.attributes;
                     Ok::<(), Infallible>(())
                 })
-                .on_stream(|element| async move {
+                .on_stream(|_ctx, element| async move {
                     let _cumulative_snapshot = element.content;
                     Ok::<(), Infallible>(())
                 })
-                .on_complete(|element| async move {
+                .on_complete(|_ctx, element| async move {
                     let _complete_content = element.content;
                     Ok::<(), Infallible>(())
                 })
-                .on_invalid(|_diagnostic| async move { Ok::<(), Infallible>(()) })
+                .on_invalid(|_ctx, _diagnostic| async move { Ok::<(), Infallible>(()) })
         }
     }
 }
@@ -29,7 +29,7 @@ fn open_only() -> Component {
     view! {
         {
             StreamingXml::tag("open_only")
-                .on_open(|_element: XmlElement| async move { Ok::<(), Infallible>(()) })
+                .on_open(|_ctx, _element: XmlElement| async move { Ok::<(), Infallible>(()) })
         }
     }
 }
@@ -38,6 +38,6 @@ fn main() {
     let _lifecycle = lifecycle_subscription();
     let _open = open_only();
     let _direct: Component = StreamingXml::tag("complete_only")
-        .on_complete(|_element| async move { Ok::<(), Infallible>(()) })
+        .on_complete(|_ctx, _element| async move { Ok::<(), Infallible>(()) })
         .into();
 }

@@ -5,6 +5,7 @@
 
 mod action;
 pub(crate) mod application_exit;
+mod application_id;
 mod async_task;
 mod attempt;
 mod capture;
@@ -29,12 +30,13 @@ pub use action::{Action, ActionProps};
 pub use application_exit::{
     use_application_exit, ApplicationExitError, ApplicationExitHandle, ExitReason,
 };
+pub use application_id::use_application_id;
 pub(crate) use async_task::MountTaskStart;
 pub use async_task::{
     spawn, use_coroutine, use_future, Coroutine, CoroutineInbox, CoroutineSendError, SpawnError,
 };
 pub use attempt::ComponentAttemptFault;
-pub(crate) use attempt::{ComponentRenderStage, RenderBindings};
+pub(crate) use attempt::{ComponentRenderStage, RenderBindings, RetainedModelHistory};
 pub use capture::ComponentCaptureError;
 pub use cli_command::{CliCommand, Command, CommandArgument, CommandDefinition};
 pub use declaration::Component;

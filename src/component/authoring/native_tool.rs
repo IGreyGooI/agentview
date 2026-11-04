@@ -7,7 +7,10 @@ use std::{
 };
 
 use crate::{
-    component::execution::{ToolCall, ToolDefinition, ToolDefinitionError, ToolOutput},
+    component::{
+        execution::{ToolCall, ToolDefinition, ToolDefinitionError, ToolOutput},
+        EventContext, ReactionId,
+    },
     transcript::CanonicalInputItem,
 };
 use schemars::JsonSchema;
@@ -33,8 +36,9 @@ impl NativeToolCall {
     ///
     /// `view! { NativeToolCall { name: ..., description: ..., on_call: ... } }`
     /// uses these properties. `name` and `on_call` are required. A callback returns
-    /// either `Result<Output, Error>` or a future producing that result. Use `||`
-    /// for a tool without input fields; it accepts only an empty JSON object.
+    /// either `Result<Output, Error>` or a future producing that result. The first
+    /// argument is the framework-owned `EventContext`. Use `|context|` for a tool
+    /// without input fields; it accepts only an empty JSON object.
     pub fn props() -> NativeToolCallProps {
         NativeToolCallProps {
             name: (),
@@ -51,7 +55,7 @@ impl NativeToolCall {
         Self::props()
             .name(T::NAME)
             .description(T::DESCRIPTION)
-            .on_call(move |arguments: T::Args| {
+            .on_call(move |_context: EventContext, arguments: T::Args| {
                 let tool = Arc::clone(&tool);
                 async move { tool.call(arguments).await }
             })
@@ -74,7 +78,7 @@ pub struct NativeToolCallProps<Name = (), Callback = ()> {
 #[doc(hidden)]
 pub struct NativeToolCallback {
     schema: serde_json::Value,
-    invoke: Box<dyn FnMut(ToolCall) -> ToolFuture + Send + 'static>,
+    invoke: Box<dyn FnMut(EventContext, ToolCall) -> ToolFuture + Send + 'static>,
 }
 
 impl<Name, Callback> NativeToolCallProps<Name, Callback> {
@@ -93,8 +97,9 @@ impl<Name, Callback> NativeToolCallProps<Name, Callback> {
 }
 
 impl<Name> NativeToolCallProps<Name> {
-    /// Bind model-supplied arguments to a callback. Captured values are never
-    /// included in the input schema. Expected business rejections should be
+    /// Bind model-supplied arguments to a callback after its `EventContext`.
+    /// Context and captured values are never included in the input schema.
+    /// Expected business rejections should be
     /// serialized output values; returning `Err` reports a runtime handler fault.
     pub fn on_call<Arguments, Handler, Mode>(
         self,
@@ -111,7 +116,7 @@ impl<Name> NativeToolCallProps<Name> {
     }
 }
 
-/// Callback conversion for typed and zero-argument native tool closures.
+/// Callback conversion for typed input and context-only native tool closures.
 #[doc(hidden)]
 pub trait NativeToolHandler<Arguments, Mode>: Send + 'static {
     fn into_native_tool_callback(self) -> NativeToolCallback;
@@ -120,18 +125,18 @@ pub trait NativeToolHandler<Arguments, Mode>: Send + 'static {
 impl<Args, Handler, Return, Mode> NativeToolHandler<(Args,), Mode> for Handler
 where
     Args: DeserializeOwned + JsonSchema + Send + 'static,
-    Handler: FnMut(Args) -> Return + Send + 'static,
+    Handler: FnMut(EventContext, Args) -> Return + Send + 'static,
     Return: NativeToolCallbackReturn<Mode>,
 {
     fn into_native_tool_callback(mut self) -> NativeToolCallback {
         NativeToolCallback {
             schema: schemars::schema_for!(Args).to_value(),
-            invoke: Box::new(move |call| {
+            invoke: Box::new(move |context, call| {
                 let arguments = match serde_json::from_str::<Args>(call.raw_arguments()) {
                     Ok(arguments) => arguments,
                     Err(_) => return invalid_arguments(call),
                 };
-                native_tool_output(call, self(arguments))
+                native_tool_output(call, self(context, arguments))
             }),
         }
     }
@@ -139,7 +144,7 @@ where
 
 impl<Handler, Return, Mode> NativeToolHandler<(), Mode> for Handler
 where
-    Handler: FnMut() -> Return + Send + 'static,
+    Handler: FnMut(EventContext) -> Return + Send + 'static,
     Return: NativeToolCallbackReturn<Mode>,
 {
     fn into_native_tool_callback(mut self) -> NativeToolCallback {
@@ -149,13 +154,13 @@ where
                 "properties": {},
                 "additionalProperties": false,
             }),
-            invoke: Box::new(move |call| {
+            invoke: Box::new(move |context, call| {
                 let empty_object = serde_json::from_str::<serde_json::Value>(call.raw_arguments())
                     .is_ok_and(|input| input.as_object().is_some_and(|fields| fields.is_empty()));
                 if !empty_object {
                     return invalid_arguments(call);
                 }
-                native_tool_output(call, self())
+                native_tool_output(call, self(context))
             }),
         }
     }
@@ -252,7 +257,7 @@ pub struct NativeToolCallNamed {
 impl NativeToolCallNamed {
     pub fn on_call<Handler, HandlerFuture, Error>(self, mut handler: Handler) -> Component
     where
-        Handler: FnMut(ToolCall) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, ToolCall) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<ToolOutput, Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
@@ -266,8 +271,8 @@ impl NativeToolCallNamed {
                 ),
                 history: None,
                 round: Arc::new(()),
-                invoke: Box::new(move |call| {
-                    let future = handler(call);
+                invoke: Box::new(move |context, call| {
+                    let future = handler(context, call);
                     Box::pin(async move { future.await.map_err(|error| error.to_string()) })
                         as ToolFuture
                 }),
@@ -282,7 +287,7 @@ pub(crate) struct NativeToolCallDeclaration {
     history: Option<Signal<NativeToolHistory>>,
     // Render bindings serve one response; only dispatched calls retain this token.
     round: Arc<()>,
-    invoke: Box<dyn FnMut(ToolCall) -> ToolFuture + Send + 'static>,
+    invoke: Box<dyn FnMut(EventContext, ToolCall) -> ToolFuture + Send + 'static>,
 }
 
 impl NativeToolCallDeclaration {
@@ -298,8 +303,13 @@ impl NativeToolCallDeclaration {
         self.history = Some(history);
     }
 
+    pub(crate) fn history_signal(&self) -> Option<Signal<NativeToolHistory>> {
+        self.history.clone()
+    }
+
     pub(crate) fn append_call(
         &self,
+        context: EventContext,
         call: &ToolCall,
     ) -> Result<NativeToolRecord, NativeToolDispatchFault> {
         let history = self
@@ -310,24 +320,24 @@ impl NativeToolCallDeclaration {
             .expect("a ToolCall was already validated at admission");
         history
             .update(|history| {
-                if history
-                    .rounds
-                    .iter()
-                    .any(|round| round.call_ids.contains(call.call_id()))
-                {
+                if history.rounds.iter().any(|round| {
+                    round.reaction_id == context.reaction_id()
+                        && round.call_ids.contains(call.call_id())
+                }) {
                     return Err(NativeToolDispatchFault::DuplicateCall {
                         call_id: call.call_id().to_owned(),
                     });
                 }
-                let round = match history
-                    .rounds
-                    .iter_mut()
-                    .find(|round| Arc::ptr_eq(&round.identity, &self.round))
-                {
+                let round = match history.rounds.iter_mut().find(|round| {
+                    round.reaction_id == context.reaction_id()
+                        && Arc::ptr_eq(&round.identity, &self.round)
+                }) {
                     Some(round) => round,
                     None => {
                         history.rounds.push_back(NativeToolRound {
                             identity: Arc::clone(&self.round),
+                            reaction_id: context.reaction_id(),
+                            lineage: context.reaction_lineage(),
                             calls: Vec::new(),
                             call_ids: HashSet::new(),
                             results: HashMap::new(),
@@ -336,7 +346,10 @@ impl NativeToolCallDeclaration {
                     }
                 };
                 round.call_ids.insert(call.call_id().to_owned());
-                round.calls.push(item);
+                round.calls.push(NativeToolFeedbackRecord {
+                    context: context.clone(),
+                    item,
+                });
                 history.prune();
                 Ok(())
             })
@@ -347,10 +360,15 @@ impl NativeToolCallDeclaration {
             history: history.clone(),
             round: Arc::clone(&self.round),
             call_id: call.call_id().to_owned(),
+            context,
         })
     }
 
-    pub(crate) fn start(&mut self, call: ToolCall) -> Result<ToolFuture, NativeToolDispatchFault> {
+    pub(crate) fn start(
+        &mut self,
+        context: EventContext,
+        call: ToolCall,
+    ) -> Result<ToolFuture, NativeToolDispatchFault> {
         let call_id = call.call_id().to_owned();
         if call.name() != self.name {
             return Err(NativeToolDispatchFault::WrongTool {
@@ -358,7 +376,7 @@ impl NativeToolCallDeclaration {
                 name: call.name().to_owned(),
             });
         }
-        Ok((self.invoke)(call))
+        Ok((self.invoke)(context, call))
     }
 }
 
@@ -384,36 +402,73 @@ pub(crate) struct NativeToolHistory {
 
 struct NativeToolRound {
     identity: Arc<()>,
-    calls: Vec<CanonicalInputItem>,
+    reaction_id: Option<ReactionId>,
+    lineage: Option<ReactionId>,
+    calls: Vec<NativeToolFeedbackRecord>,
     call_ids: HashSet<String>,
-    results: HashMap<String, CanonicalInputItem>,
+    results: HashMap<String, NativeToolFeedbackRecord>,
+}
+
+struct NativeToolFeedbackRecord {
+    context: EventContext,
+    item: CanonicalInputItem,
 }
 
 impl NativeToolHistory {
+    pub(crate) fn discard_lineage(&mut self, lineage: ReactionId) {
+        self.rounds.retain(|round| round.lineage != Some(lineage));
+    }
+    #[cfg(test)]
     pub(crate) fn items(&self) -> impl Iterator<Item = &CanonicalInputItem> {
-        self.rounds.iter().flat_map(|round| {
-            // Reset replays this projection directly, without ToolOutputStaging.
-            round
-                .calls
-                .iter()
-                .chain(round.calls.iter().filter_map(|call| {
-                    let CanonicalInputItem::ToolCall { call_id, .. } = call else {
-                        unreachable!("native tool rounds contain only admitted calls")
-                    };
-                    round.results.get(call_id)
-                }))
-        })
+        self.items_for_scope(None)
+    }
+
+    pub(crate) fn items_for_scope(
+        &self,
+        lineage: Option<ReactionId>,
+    ) -> impl Iterator<Item = &CanonicalInputItem> {
+        self.rounds
+            .iter()
+            .filter(move |round| round.lineage == lineage)
+            .flat_map(NativeToolRound::records)
+            .map(|(_, item)| item)
+    }
+
+    #[cfg(test)]
+    fn records(&self) -> impl Iterator<Item = (&EventContext, &CanonicalInputItem)> {
+        self.rounds.iter().flat_map(NativeToolRound::records)
     }
 
     fn prune(&mut self) {
-        let mut older_rounds = self.rounds.len().saturating_sub(2);
+        let mut remaining = HashMap::<Option<ReactionId>, usize>::new();
+        for round in &self.rounds {
+            *remaining.entry(round.lineage).or_default() += 1;
+        }
         self.rounds.retain(|round| {
-            if older_rounds == 0 {
-                return true;
-            }
-            older_rounds -= 1;
-            round.calls.len() != round.results.len()
+            let remaining = remaining
+                .get_mut(&round.lineage)
+                .expect("all native history lineages were counted");
+            let keep = *remaining <= 2 || round.calls.len() != round.results.len();
+            *remaining -= 1;
+            keep
         });
+    }
+}
+
+impl NativeToolRound {
+    fn records(&self) -> impl Iterator<Item = (&EventContext, &CanonicalInputItem)> {
+        // Reset replays this projection directly, without ToolOutputStaging.
+        self.calls
+            .iter()
+            .map(|record| (&record.context, &record.item))
+            .chain(self.calls.iter().filter_map(|call| {
+                let CanonicalInputItem::ToolCall { call_id, .. } = &call.item else {
+                    unreachable!("native tool rounds contain only admitted calls")
+                };
+                self.results
+                    .get(call_id)
+                    .map(|record| (&record.context, &record.item))
+            }))
     }
 }
 
@@ -423,6 +478,7 @@ pub(crate) struct NativeToolRecord {
     history: Signal<NativeToolHistory>,
     round: Arc<()>,
     call_id: String,
+    context: EventContext,
 }
 
 impl NativeToolRecord {
@@ -431,11 +487,10 @@ impl NativeToolRecord {
             .expect("a native tool record retains a validated call identity");
         self.history
             .update(|history| {
-                let Some(round) = history
-                    .rounds
-                    .iter_mut()
-                    .find(|round| Arc::ptr_eq(&round.identity, &self.round))
-                else {
+                let Some(round) = history.rounds.iter_mut().find(|round| {
+                    round.reaction_id == self.context.reaction_id()
+                        && Arc::ptr_eq(&round.identity, &self.round)
+                }) else {
                     // Only completed rounds can have left the retained window.
                     return Err(NativeToolDispatchFault::DuplicateResult {
                         call_id: self.call_id.clone(),
@@ -448,7 +503,10 @@ impl NativeToolRecord {
                         });
                     }
                     Entry::Vacant(result) => {
-                        result.insert(item);
+                        result.insert(NativeToolFeedbackRecord {
+                            context: self.context.clone(),
+                            item,
+                        });
                     }
                 }
                 history.prune();
@@ -466,7 +524,10 @@ impl NativeToolRecord {
                 history
                     .rounds
                     .iter()
-                    .find(|round| Arc::ptr_eq(&round.identity, &self.round))
+                    .find(|round| {
+                        round.reaction_id == self.context.reaction_id()
+                            && Arc::ptr_eq(&round.identity, &self.round)
+                    })
                     .is_none_or(|round| round.results.contains_key(&self.call_id))
             })
             .expect("a cancelled reaction retains its Component mount");
@@ -495,12 +556,21 @@ pub(crate) enum NativeToolDispatchFault {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU128, NonZeroU64};
+
     use super::*;
-    use crate::component::{identity::ComponentId, signal::SignalRuntime};
+    use crate::component::{
+        execution::{FrameRevision, TargetEpoch, TargetIdentity},
+        identity::ComponentId,
+        provenance::EventScope,
+        signal::SignalRuntime,
+        ApplicationId, EventSource, ReactionKind,
+    };
 
     fn declaration(history: &Signal<NativeToolHistory>) -> NativeToolCallDeclaration {
-        let component = NativeToolCall::named("work")
-            .on_call(|call| async move { Ok::<_, std::convert::Infallible>(call.output("done")) });
+        let component = NativeToolCall::named("work").on_call(|_context, call| async move {
+            Ok::<_, std::convert::Infallible>(call.output("done"))
+        });
         let ComponentNode::NativeToolCall(mut declaration) = component.node else {
             unreachable!()
         };
@@ -510,6 +580,111 @@ mod tests {
 
     fn call(call_id: &str) -> ToolCall {
         ToolCall::new(call_id, "work", "{}").unwrap()
+    }
+
+    fn context(call_id: &str) -> EventContext {
+        EventScope::application(ApplicationId::fresh()).event(EventSource::NativeTool {
+            call_id: call_id.to_owned(),
+            output: None,
+            ordinal: None,
+        })
+    }
+
+    fn reaction_context(kind: ReactionKind, lineage: Option<ReactionId>) -> EventContext {
+        let revision = FrameRevision::new(
+            NonZeroU128::new(1).unwrap(),
+            TargetIdentity::new(NonZeroU128::new(1).unwrap()),
+            TargetEpoch::new(NonZeroU64::new(1).unwrap()),
+            NonZeroU64::new(1).unwrap(),
+        );
+        let mut scope = EventScope::reaction_with_kind(
+            ApplicationId::fresh(),
+            ReactionId::fresh(),
+            kind,
+            revision,
+        );
+        if let Some(lineage) = lineage {
+            scope = scope.with_temporary_lineage(lineage);
+        }
+        scope.event(EventSource::NativeTool {
+            call_id: "shared".to_owned(),
+            output: None,
+            ordinal: None,
+        })
+    }
+
+    #[test]
+    fn native_protocol_records_are_scoped_by_reaction_and_projected_by_lineage() {
+        let runtime = SignalRuntime::new();
+        let mut render = runtime.begin_render().unwrap();
+        let history = render
+            .render_component(ComponentId::root(), |scope| {
+                scope.use_signal_at(0, NativeToolHistory::default)
+            })
+            .unwrap();
+        render.commit();
+        // Reusing a declaration also exercises per-reaction result lookup;
+        // the render's binding token alone cannot identify a protocol round.
+        let tool = declaration(&history);
+        let main_context = reaction_context(ReactionKind::Main, None);
+        let lineage = ReactionId::fresh();
+        let temporary_context = reaction_context(ReactionKind::Temporary, Some(lineage));
+        let main = tool
+            .append_call(main_context.clone(), &call("shared"))
+            .unwrap();
+        let temporary = tool
+            .append_call(temporary_context.clone(), &call("shared"))
+            .unwrap();
+        assert!(matches!(
+            tool.append_call(temporary_context.clone(), &call("shared")),
+            Err(NativeToolDispatchFault::DuplicateCall { .. })
+        ));
+        temporary.append_result("temporary-result").unwrap();
+        main.finish_cancelled("main-interrupted");
+        main.finish_cancelled("main-interrupted");
+
+        history
+            .with(|history| {
+                assert_eq!(
+                    history.items().cloned().collect::<Vec<_>>(),
+                    [
+                        CanonicalInputItem::tool_call("shared", "work", "{}").unwrap(),
+                        CanonicalInputItem::tool_result("shared", "main-interrupted").unwrap(),
+                    ]
+                );
+                assert_eq!(
+                    history
+                        .items_for_scope(Some(lineage))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    [
+                        CanonicalInputItem::tool_call("shared", "work", "{}").unwrap(),
+                        CanonicalInputItem::tool_result("shared", "temporary-result").unwrap(),
+                    ]
+                );
+                let records = history.records().collect::<Vec<_>>();
+                assert_eq!(records[1].0, &main_context);
+                assert_eq!(records[3].0, &temporary_context);
+            })
+            .unwrap();
+
+        for _ in 0..3 {
+            let context = reaction_context(ReactionKind::Temporary, Some(lineage));
+            tool.append_call(context, &call("shared"))
+                .unwrap()
+                .append_result("continued")
+                .unwrap();
+        }
+        history
+            .with(|history| {
+                assert_eq!(
+                    history.items().count(),
+                    2,
+                    "temporary rounds cannot evict main records"
+                );
+                assert_eq!(history.items_for_scope(Some(lineage)).count(), 4);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -524,12 +699,16 @@ mod tests {
         render.commit();
 
         let first = declaration(&history);
-        let completed = first.append_call(&call("first-completed")).unwrap();
+        let completed = first
+            .append_call(context("first-completed"), &call("first-completed"))
+            .unwrap();
         completed.append_result("done").unwrap();
-        let pending = first.append_call(&call("first-pending")).unwrap();
+        let pending = first
+            .append_call(context("first-pending"), &call("first-pending"))
+            .unwrap();
         for call_id in ["second", "third"] {
             declaration(&history)
-                .append_call(&call(call_id))
+                .append_call(context(call_id), &call(call_id))
                 .unwrap()
                 .append_result("done")
                 .unwrap();
@@ -558,5 +737,36 @@ mod tests {
             expected[3..],
             "the closed old round leaves as a whole, and cleanup remains idempotent"
         );
+    }
+
+    #[test]
+    fn cancellation_feedback_retains_the_admitted_call_context() {
+        let runtime = SignalRuntime::new();
+        let mut render = runtime.begin_render().unwrap();
+        let history = render
+            .render_component(ComponentId::root(), |scope| {
+                scope.use_signal_at(0, NativeToolHistory::default)
+            })
+            .unwrap();
+        render.commit();
+
+        let origin = context("pending");
+        let record = declaration(&history)
+            .append_call(origin.clone(), &call("pending"))
+            .unwrap();
+        record.finish_cancelled("cancelled");
+
+        history
+            .with(|history| {
+                let records = history.records().collect::<Vec<_>>();
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].0, &origin);
+                assert_eq!(records[1].0, &origin);
+                assert_eq!(
+                    records[1].1,
+                    &CanonicalInputItem::tool_result("pending", "cancelled").unwrap()
+                );
+            })
+            .unwrap();
     }
 }

@@ -5,6 +5,8 @@
 //! I/O, which makes an outer Application-owned worker able to survive loss of
 //! its original waiter without guessing about an external result.
 
+use crate::component::EventContext;
+
 use std::{
     error::Error,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -319,6 +321,7 @@ pub(crate) type PublisherFactory<P> =
 
 #[derive(Clone)]
 struct LiveRecordIdentity {
+    context: EventContext,
     effect: StreamingEffectId,
     occurrence: Option<XmlOccurrenceId>,
 }
@@ -455,6 +458,7 @@ where
     /// authored entry order; no later entry is interpreted after uncertainty.
     pub(crate) async fn handle_update(
         &mut self,
+        context: EventContext,
         origin: StreamingEmissionOrigin,
         update: StreamingToolUpdate<C>,
     ) -> Result<EffectsUpdate<C::Diagnostic>, ManagedEffectsFault> {
@@ -472,6 +476,7 @@ where
             match emission {
                 StreamingToolEmission::Output(value) => {
                     self.staged.push(StagedStreamingToolEmission::new(
+                        context.clone(),
                         sequence,
                         origin.clone(),
                         StagedStreamingToolValue::Output(value),
@@ -479,6 +484,7 @@ where
                 }
                 StreamingToolEmission::Commit(value) => {
                     self.staged.push(StagedStreamingToolEmission::new(
+                        context.clone(),
                         sequence,
                         origin.clone(),
                         StagedStreamingToolValue::Commit(value),
@@ -491,7 +497,10 @@ where
                     });
                 }
                 StreamingToolEmission::Live(value) => {
-                    match self.apply_live(sequence, origin.clone(), value).await? {
+                    match self
+                        .apply_live(context.clone(), sequence, origin.clone(), value)
+                        .await?
+                    {
                         ManagedEffectsStatus::Active => {}
                         ManagedEffectsStatus::RecoveryRequired => {
                             return Ok(EffectsUpdate {
@@ -683,6 +692,12 @@ where
 
     /// Allocate from the contract-wide event order. The contract machine uses
     /// this same allocator for parser events and diagnostics.
+    /// Metadata at a synchronous lifecycle boundary does not consume an
+    /// authored event or emission position.
+    pub(crate) fn sequence_cursor(&self) -> u64 {
+        self.next_sequence
+    }
+
     pub(crate) fn allocate_sequence(&mut self) -> Result<u64, ManagedEffectsFault> {
         let sequence = self.next_sequence;
         self.next_sequence = self
@@ -750,16 +765,18 @@ where
 
     async fn apply_live(
         &mut self,
+        source: EventContext,
         sequence: u64,
         origin: StreamingEmissionOrigin,
         effect: C::Live,
     ) -> Result<ManagedEffectsStatus, ManagedEffectsFault> {
         let effect_id = self.allocate_effect_id()?;
         let identity = LiveRecordIdentity {
+            context: source.clone(),
             effect: effect_id,
             occurrence: origin.occurrence(),
         };
-        let context = LiveEffectContext::new(&self.start, effect_id, sequence, origin);
+        let context = LiveEffectContext::new(&self.start, source, effect_id, sequence, origin);
         let mut runtime = match self.take_live_runtime() {
             Ok(runtime) => runtime,
             Err(fault) => {
@@ -922,6 +939,7 @@ where
         };
         let context = LiveRecoveryContext::new(
             &self.start,
+            pending.identity.context.clone(),
             pending.identity.effect,
             StreamingToolRecoveryPhase::ResolveLiveApply,
             Some(
@@ -1074,7 +1092,13 @@ where
             LiveSettlement::Confirm => StreamingToolRecoveryPhase::ConfirmLive,
             LiveSettlement::Rollback => StreamingToolRecoveryPhase::RollbackLive,
         };
-        let context = LiveRecoveryContext::new(&self.start, effect, phase, cause);
+        let context = LiveRecoveryContext::new(
+            &self.start,
+            record.identity.context.clone(),
+            effect,
+            phase,
+            cause,
+        );
         let mut runtime = match self.take_live_runtime() {
             Ok(runtime) => runtime,
             Err(_) => return false,
@@ -1158,7 +1182,13 @@ where
         );
         if needs_prepare {
             let effect = self.receipts[index].identity.effect;
-            let context = LiveSettlementContext::new(&self.start, effect, settlement, cause);
+            let context = LiveSettlementContext::new(
+                &self.start,
+                self.receipts[index].identity.context.clone(),
+                effect,
+                settlement,
+                cause,
+            );
             let mut runtime = match self.take_live_runtime() {
                 Ok(runtime) => runtime,
                 Err(_) => {
@@ -1238,7 +1268,11 @@ where
             };
             match settlement {
                 LiveSettlement::Confirm => {
-                    let context = LiveConfirmContext::new(&self.start, effect);
+                    let context = LiveConfirmContext::new(
+                        &self.start,
+                        record.identity.context.clone(),
+                        effect,
+                    );
                     AssertUnwindSafe(runtime.confirm(&context, &record.receipt, operation))
                         .catch_unwind()
                         .await
@@ -1246,6 +1280,7 @@ where
                 LiveSettlement::Rollback => {
                     let context = LiveRollbackContext::new(
                         &self.start,
+                        record.identity.context.clone(),
                         effect,
                         cause.unwrap_or(StreamingToolAbortCause::RuntimeFault),
                     );
@@ -1359,7 +1394,14 @@ mod tests {
     }
 
     fn start() -> StreamingToolAttemptStart {
-        StreamingToolAttemptStart::new(StreamingToolAttemptId::new(1), "effects-test", "v1")
+        StreamingToolAttemptStart::new(
+            StreamingToolAttemptId::new(1),
+            "effects-test",
+            "v1",
+            crate::component::provenance::EventScope::application(
+                crate::component::ApplicationId::fresh(),
+            ),
+        )
     }
 
     #[derive(Clone, Copy)]
@@ -1388,6 +1430,7 @@ mod tests {
 
     #[derive(Default)]
     struct RuntimeState {
+        contexts: Vec<(&'static str, EventContext)>,
         apply: VecDeque<ApplyStep>,
         resolve_apply: VecDeque<ResolveApplyStep>,
         settlement: HashMap<(bool, u8), VecDeque<SettlementStep>>,
@@ -1446,17 +1489,25 @@ mod tests {
 
         fn prepare_apply(
             &mut self,
-            _context: &LiveEffectContext,
+            context: &LiveEffectContext,
             effect: u8,
         ) -> Result<Self::ApplyOperation, Self::Error> {
+            self.probe
+                .state()
+                .contexts
+                .push(("prepare_apply", context.event_context().clone()));
             Ok(effect)
         }
 
         async fn apply(
             &mut self,
-            _context: &LiveEffectContext,
+            context: &LiveEffectContext,
             operation: &Self::ApplyOperation,
         ) -> LiveApplyOutcome<Self::Receipt, Self::Error> {
+            self.probe
+                .state()
+                .contexts
+                .push(("apply", context.event_context().clone()));
             let step = {
                 let mut state = self.probe.state();
                 state.applied.push(*operation);
@@ -1471,9 +1522,13 @@ mod tests {
 
         async fn resolve_apply(
             &mut self,
-            _context: &LiveRecoveryContext,
+            context: &LiveRecoveryContext,
             operation: &Self::ApplyOperation,
         ) -> Result<LiveApplyResolution<Self::Receipt>, Self::Error> {
+            self.probe
+                .state()
+                .contexts
+                .push(("resolve_apply", context.event_context().clone()));
             let step = {
                 let mut state = self.probe.state();
                 state.resolved_apply.push(*operation);
@@ -1489,36 +1544,52 @@ mod tests {
 
         fn prepare_settlement(
             &mut self,
-            _context: &LiveSettlementContext,
+            context: &LiveSettlementContext,
             receipt: &Self::Receipt,
         ) -> Result<Self::SettlementOperation, Self::Error> {
+            self.probe
+                .state()
+                .contexts
+                .push(("prepare_settlement", context.event_context().clone()));
             Ok(*receipt)
         }
 
         async fn confirm(
             &mut self,
-            _context: &LiveConfirmContext,
+            context: &LiveConfirmContext,
             receipt: &Self::Receipt,
             _operation: &Self::SettlementOperation,
         ) -> LiveSettleOutcome<Self::Error> {
+            self.probe
+                .state()
+                .contexts
+                .push(("confirm", context.event_context().clone()));
             self.settle(*receipt, false)
         }
 
         async fn rollback(
             &mut self,
-            _context: &LiveRollbackContext,
+            context: &LiveRollbackContext,
             receipt: &Self::Receipt,
             _operation: &Self::SettlementOperation,
         ) -> LiveSettleOutcome<Self::Error> {
+            self.probe
+                .state()
+                .contexts
+                .push(("rollback", context.event_context().clone()));
             self.settle(*receipt, true)
         }
 
         async fn resolve_settlement(
             &mut self,
-            _context: &LiveRecoveryContext,
+            context: &LiveRecoveryContext,
             receipt: &Self::Receipt,
             _operation: &Self::SettlementOperation,
         ) -> Result<LiveSettleResolution, Self::Error> {
+            self.probe
+                .state()
+                .contexts
+                .push(("resolve_settlement", context.event_context().clone()));
             let step = {
                 let mut state = self.probe.state();
                 state.resolved_settlement.push(*receipt);
@@ -1557,6 +1628,8 @@ mod tests {
 
     #[derive(Default)]
     struct PublisherState {
+        contexts: Vec<(&'static str, EventContext)>,
+        staged: Vec<EventContext>,
         publish: VecDeque<PublishStep>,
         resolve: VecDeque<PublishStep>,
         published: usize,
@@ -1578,17 +1651,36 @@ mod tests {
 
         fn prepare(
             &mut self,
-            _context: &StreamingPublishContext,
+            context: &StreamingPublishContext,
             attempt: AcceptedStreamingToolAttempt<PublishedChannels>,
         ) -> Result<Self::PublicationOperation, Self::Error> {
+            self.probe
+                .0
+                .lock()
+                .unwrap()
+                .contexts
+                .push(("prepare", context.event_context().clone()));
+            let mut state = self.probe.0.lock().unwrap();
+            state
+                .contexts
+                .push(("accepted", attempt.context.event_context().clone()));
+            state
+                .staged
+                .extend(attempt.entries.iter().map(|entry| entry.context.clone()));
             Ok(attempt)
         }
 
         async fn publish(
             &mut self,
-            _context: &StreamingPublishContext,
+            context: &StreamingPublishContext,
             _operation: &Self::PublicationOperation,
         ) -> StreamingPublishOutcome<Self::Published, Self::Error> {
+            self.probe
+                .0
+                .lock()
+                .unwrap()
+                .contexts
+                .push(("publish", context.event_context().clone()));
             let step = {
                 let mut state = self.probe.0.lock().unwrap();
                 state.published += 1;
@@ -1605,9 +1697,15 @@ mod tests {
 
         async fn resolve(
             &mut self,
-            _context: &StreamingPublishRecoveryContext,
+            context: &StreamingPublishRecoveryContext,
             _operation: &Self::PublicationOperation,
         ) -> Result<StreamingPublishResolution<Self::Published>, Self::Error> {
+            self.probe
+                .0
+                .lock()
+                .unwrap()
+                .contexts
+                .push(("resolve", context.event_context().clone()));
             let step = {
                 let mut state = self.probe.0.lock().unwrap();
                 state.resolved += 1;
@@ -1662,7 +1760,11 @@ mod tests {
             .with_live(3)
             .with_live(4);
         effects
-            .handle_update(StreamingEmissionOrigin::Finish, update)
+            .handle_update(
+                effects.start.context.clone(),
+                StreamingEmissionOrigin::Finish,
+                update,
+            )
             .await
             .unwrap();
 
@@ -1696,6 +1798,7 @@ mod tests {
         let mut effects = live_only_effects(probe.clone());
         let update = effects
             .handle_update(
+                effects.start.context.clone(),
                 StreamingEmissionOrigin::Finish,
                 StreamingToolUpdate::live(7),
             )
@@ -1725,6 +1828,7 @@ mod tests {
         let mut effects = published_effects(runtime.clone(), publisher.clone());
         effects
             .handle_update(
+                effects.start.context.clone(),
                 StreamingEmissionOrigin::Finish,
                 StreamingToolUpdate::live(1),
             )
@@ -1732,6 +1836,7 @@ mod tests {
             .unwrap();
         effects
             .handle_update(
+                effects.start.context.clone(),
                 StreamingEmissionOrigin::Finish,
                 StreamingToolUpdate::output("accepted".to_owned()),
             )
@@ -1766,6 +1871,7 @@ mod tests {
         let mut effects = published_effects(runtime.clone(), publisher);
         effects
             .handle_update(
+                effects.start.context.clone(),
                 StreamingEmissionOrigin::Finish,
                 StreamingToolUpdate::live(1),
             )
@@ -1773,6 +1879,7 @@ mod tests {
             .unwrap();
         effects
             .handle_update(
+                effects.start.context.clone(),
                 StreamingEmissionOrigin::Finish,
                 StreamingToolUpdate::output("accepted".to_owned()),
             )
@@ -1801,6 +1908,7 @@ mod tests {
         let mut effects = live_only_effects(probe.clone());
         effects
             .handle_update(
+                effects.start.context.clone(),
                 StreamingEmissionOrigin::Finish,
                 StreamingToolUpdate::live(1),
             )
@@ -1837,6 +1945,7 @@ mod tests {
 
         let update = effects
             .handle_update(
+                effects.start.context.clone(),
                 StreamingEmissionOrigin::Finish,
                 StreamingToolUpdate::live(6),
             )
@@ -1856,5 +1965,152 @@ mod tests {
         let state = probe.state();
         assert_eq!(state.resolved_apply, vec![6]);
         assert_eq!(state.rolled_back, vec![6]);
+    }
+
+    #[tokio::test]
+    async fn live_recovery_and_uncertain_rollback_keep_the_original_emitting_event() {
+        let probe = RuntimeProbe::default();
+        {
+            let mut state = probe.state();
+            state.apply.push_back(ApplyStep::Indeterminate);
+            state
+                .settlement
+                .insert((true, 7), VecDeque::from([SettlementStep::Indeterminate]));
+        }
+        let mut effects = live_only_effects(probe.clone());
+        let source = effects
+            .start
+            .context
+            .child(crate::component::EventSource::Xml {
+                attempt: effects.start.attempt,
+                occurrence: Some(XmlOccurrenceId::new(3)),
+                sequence: 8,
+            });
+        assert_eq!(source.reaction_id(), None);
+        assert_eq!(source.frame_revision(), None);
+        let update = effects
+            .handle_update(
+                source.clone(),
+                StreamingEmissionOrigin::Xml {
+                    event_sequence: 8,
+                    occurrence: XmlOccurrenceId::new(3),
+                },
+                StreamingToolUpdate::live(7),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), ManagedEffectsStatus::RecoveryRequired);
+        assert_eq!(
+            effects.recover().await,
+            ManagedEffectsStatus::RecoveryRequired
+        );
+        assert_eq!(effects.recover().await, ManagedEffectsStatus::Aborted);
+        let state = probe.state();
+        assert_eq!(
+            state
+                .contexts
+                .iter()
+                .map(|(phase, _)| *phase)
+                .collect::<Vec<_>>(),
+            [
+                "prepare_apply",
+                "apply",
+                "resolve_apply",
+                "prepare_settlement",
+                "rollback",
+                "resolve_settlement",
+            ]
+        );
+        assert!(state.contexts.iter().all(|(_, context)| context == &source));
+    }
+
+    #[tokio::test]
+    async fn publication_recovery_and_confirmation_retain_their_original_sources() {
+        let runtime = RuntimeProbe::default();
+        let publisher = PublisherProbe::default();
+        publisher
+            .0
+            .lock()
+            .unwrap()
+            .publish
+            .push_back(PublishStep::Indeterminate);
+        let mut effects = published_effects(runtime.clone(), publisher.clone());
+        let attempt_source = effects.start.context.clone();
+        let source = attempt_source.child(crate::component::EventSource::Xml {
+            attempt: effects.start.attempt,
+            occurrence: Some(XmlOccurrenceId::new(1)),
+            sequence: 4,
+        });
+        effects
+            .handle_update(
+                source.clone(),
+                StreamingEmissionOrigin::Xml {
+                    event_sequence: 4,
+                    occurrence: XmlOccurrenceId::new(1),
+                },
+                StreamingToolUpdate::live(1).with_output("kept".to_owned()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            effects
+                .accept("<say/>".to_owned(), Vec::new())
+                .await
+                .unwrap(),
+            ManagedEffectsStatus::RecoveryRequired
+        );
+        assert_eq!(effects.recover().await, ManagedEffectsStatus::Accepted);
+        let publication = publisher.0.lock().unwrap();
+        assert_eq!(
+            publication
+                .contexts
+                .iter()
+                .map(|(phase, _)| *phase)
+                .collect::<Vec<_>>(),
+            ["prepare", "accepted", "publish", "resolve"]
+        );
+        assert!(publication
+            .contexts
+            .iter()
+            .all(|(_, context)| context == &attempt_source));
+        assert_eq!(publication.staged.as_slice(), std::slice::from_ref(&source));
+        let live = runtime.state();
+        assert!(live.contexts.iter().all(|(_, context)| context == &source));
+        assert!(live.contexts.iter().any(|(phase, _)| *phase == "confirm"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_the_original_source_during_compensation() {
+        let runtime = RuntimeProbe::default();
+        let mut effects = live_only_effects(runtime.clone());
+        let source = effects
+            .start
+            .context
+            .child(crate::component::EventSource::Xml {
+                attempt: effects.start.attempt,
+                occurrence: Some(XmlOccurrenceId::new(1)),
+                sequence: 1,
+            });
+        effects
+            .handle_update(
+                source.clone(),
+                StreamingEmissionOrigin::Xml {
+                    event_sequence: 1,
+                    occurrence: XmlOccurrenceId::new(1),
+                },
+                StreamingToolUpdate::live(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            effects
+                .abort(StreamingToolAbortCause::Cancelled)
+                .await
+                .unwrap(),
+            ManagedEffectsStatus::Aborted
+        );
+        let state = runtime.state();
+        assert!(state.contexts.iter().all(|(_, context)| context == &source));
+        assert_eq!(state.rolled_back, [1]);
     }
 }

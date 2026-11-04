@@ -115,11 +115,11 @@ fn counter_view(probe: Probe) -> Component {
         Action {
             name: "increment",
             description: "Increment the counter",
-            on_call: move || state.update(|state| { state.value += 1; state.value }),
+            on_call: move |_ctx| state.update(|state| { state.value += 1; state.value }),
         }
         Action {
             name: "increment_by",
-            on_call: move |input: IncrementInput| typed_state.update(|state| {
+            on_call: move |_ctx, input: IncrementInput| typed_state.update(|state| {
                 state.value += input.amount;
                 state.value
             }),
@@ -140,7 +140,7 @@ fn feedback_counter(probe: Probe, large_output: String) -> Component {
         counter_view(probe)
         Action {
             name: "large_output",
-            on_call: move || Ok::<_, std::convert::Infallible>(large_output.clone()),
+            on_call: move |_ctx| Ok::<_, std::convert::Infallible>(large_output.clone()),
         }
     }
 }
@@ -240,7 +240,7 @@ async fn large_retained_feedback_stays_complete_through_following_actions_and_ob
         .into_iter()
         .any(|record| attribute(record, "command") == Some("increment")
             && attribute(record, "status") == Some("completed")
-            && direct_text(record) == "1"));
+            && record.has_text("1")));
     assert_eq!(feedback_sequence(&observed), 10);
     assert_eq!(view.elements("command_result").len(), 10);
     app.shutdown().await.unwrap();

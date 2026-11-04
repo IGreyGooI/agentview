@@ -2,7 +2,6 @@
 
 use agentview::provider::ModelSpec;
 use std::{
-    ops::ControlFlow,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -46,7 +45,7 @@ fn two_turn_application(props: TwoTurnProps) -> Component {
     let current_turn = turn.with(Clone::clone).expect("mounted request turn");
     let next_turn = turn.clone();
     let completed_turns = Arc::clone(&props.completed_turns);
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let next_turn = next_turn.clone();
         let completed_turns = Arc::clone(&completed_turns);
         async move {
@@ -164,13 +163,13 @@ async fn request_observer_captures_handed_off_bodies_and_frame_context() -> anyh
         Application::mount(move || two_turn_application(root_props.clone()), provider)?;
 
     assert!(matches!(
-        application.react().await?,
-        ControlFlow::Continue(())
+        application.react().unwrap().await?,
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     let first_body = next_request(&mut server).await?;
     assert!(matches!(
-        application.react().await?,
-        ControlFlow::Continue(())
+        application.react().unwrap().await?,
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     let second_body = next_request(&mut server).await?;
 
@@ -229,6 +228,7 @@ async fn request_observer_does_not_publish_pre_handoff_preparation_failures() ->
 
     let _fault = application
         .react()
+        .unwrap()
         .await
         .expect_err("one-byte request body limit must reject before handoff");
     assert!(
@@ -268,6 +268,7 @@ async fn request_observer_captures_handed_off_requests_before_http_failure() -> 
 
     let _fault = application
         .react()
+        .unwrap()
         .await
         .expect_err("service failure follows a completed transport handoff");
     let body = next_request(&mut server).await?;
@@ -313,13 +314,13 @@ async fn request_observer_panics_do_not_break_reactions_or_continuity() -> anyho
         Application::mount(move || two_turn_application(root_props.clone()), provider)?;
 
     assert!(matches!(
-        application.react().await?,
-        ControlFlow::Continue(())
+        application.react().unwrap().await?,
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     let first_body = next_request(&mut server).await?;
     assert!(matches!(
-        application.react().await?,
-        ControlFlow::Continue(())
+        application.react().unwrap().await?,
+        agentview::component::execution::ReactionOutcome::Completed
     ));
     let second_body = next_request(&mut server).await?;
 

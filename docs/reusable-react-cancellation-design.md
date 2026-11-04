@@ -2,7 +2,12 @@
 
 ## Status
 
-Implemented and verified.
+Historical design for the former caller-owned `react()` future. The current
+[asynchronous Reaction handle contract](parallel-reactions-design.md) supersedes its
+public cancellation entry: use `reaction.interrupt()`, then await settlement.
+Dropping a handle or waiter leaves the Application-owned operation running.
+The handoff/admission preservation rules below remain implementation background;
+[engine.md](engine.md) is authoritative for current ownership and recovery.
 
 ## Problem
 

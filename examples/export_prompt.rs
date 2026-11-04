@@ -39,7 +39,7 @@ fn route_picker() -> Component {
         NativeToolCall {
             name: "select_route",
             description: "Record the selected route.",
-            on_call: move |input: SelectRoute| selected.set(match input.route {
+            on_call: move |_ctx, input: SelectRoute| selected.set(match input.route {
                 Route::Train => "train".to_owned(),
                 Route::Ferry => "ferry".to_owned(),
             }),

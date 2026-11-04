@@ -25,7 +25,7 @@ fn frame_skill_component(props: SkillProps) -> Component {
 
     let response = use_signal(|| None::<String>);
     let received = response.clone();
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let received = received.clone();
         async move {
             if let TextTurnEvent::TextComplete(text) = event {
@@ -63,7 +63,7 @@ struct ParentProps {
 #[component]
 fn response_parent(props: ParentProps) -> Component {
     let response = Arc::clone(&props.response);
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let response = Arc::clone(&response);
         async move {
             if let TextTurnEvent::TextComplete(text) = event {
@@ -76,7 +76,7 @@ fn response_parent(props: ParentProps) -> Component {
     });
 
     let exit = use_application_exit();
-    use_reaction_completion(move || async move { exit.request(ExitReason::Completed) });
+    use_reaction_completion(move |_ctx| async move { exit.request(ExitReason::Completed) });
 
     let delegated_frame = props.delegated_frame;
     let prompt = r#"## Parent instructions
@@ -89,7 +89,10 @@ You are the parent agent for a delegated frame skill. Answer the skill request c
     }
 }
 
-async fn run_parent_agent(provider: impl ReactionPort, delegated_frame: String) -> Result<String> {
+async fn run_parent_agent(
+    provider: impl ReactionPort + 'static,
+    delegated_frame: String,
+) -> Result<String> {
     let response = Arc::new(Mutex::new(None));
     let props = ParentProps {
         delegated_frame,

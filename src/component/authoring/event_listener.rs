@@ -13,7 +13,7 @@ use super::{
     handler::{AsyncHandler, HandlerFault},
     InternalEventInput as EventInput,
 };
-use crate::component::{execution::ProviderEvent, signal::HookMount};
+use crate::component::{execution::ProviderEvent, signal::HookMount, EventContext};
 
 type EventHandlerFuture =
     Pin<Box<dyn Future<Output = Result<(), EventListenerDispatchFault>> + Send + 'static>>;
@@ -71,16 +71,17 @@ where
 {
     pub fn on_event<Handler, HandlerFuture, Error>(self, handler: Handler) -> Component
     where
-        Handler: FnMut(E) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, E) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
+        let mut handler = handler;
         Component::from_node(ComponentNode::EventListener(EventListenerDeclaration {
             identity: self.identity,
             implementation_version: self.implementation_version,
             route: self.route,
             handler: Box::new(TypedEventHandler {
-                handler: AsyncHandler::new(handler),
+                handler: AsyncHandler::new(move |(context, event)| handler(context, event)),
             }),
             mount: None,
             task_context: None,
@@ -107,10 +108,11 @@ impl EventListenerDeclaration {
     ) -> Self
     where
         Event: Clone + Send + Sync + 'static,
-        Handler: FnMut(Event) -> HandlerFuture + Send + 'static,
+        Handler: FnMut(EventContext, Event) -> HandlerFuture + Send + 'static,
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
+        let mut handler = handler;
         let route = EventInput::<ProviderEvent>::from_origin(origin)
             .select(selector)
             .route_descriptor();
@@ -119,7 +121,7 @@ impl EventListenerDeclaration {
             implementation_version: "v1",
             route,
             handler: Box::new(TypedEventHandler {
-                handler: AsyncHandler::new(handler),
+                handler: AsyncHandler::new(move |(context, event)| handler(context, event)),
             }),
             mount: Some(mount),
             task_context,
@@ -144,6 +146,7 @@ impl EventListenerDeclaration {
 
     pub(crate) async fn dispatch_root<Root>(
         &mut self,
+        context: EventContext,
         root: &Root,
     ) -> Result<bool, EventListenerDispatchFault>
     where
@@ -159,8 +162,8 @@ impl EventListenerDeclaration {
         };
         let task_context = self.task_context.clone();
         let started = match &task_context {
-            Some(context) => context.scope_sync(|| self.start_root(root))?,
-            None => self.start_root(root)?,
+            Some(task_context) => task_context.scope_sync(|| self.start_root(context, root))?,
+            None => self.start_root(context, root)?,
         };
         let Some(future) = started else {
             return Ok(false);
@@ -174,6 +177,7 @@ impl EventListenerDeclaration {
 
     fn start_root<Root>(
         &mut self,
+        context: EventContext,
         root: &Root,
     ) -> Result<Option<EventHandlerFuture>, EventListenerDispatchFault>
     where
@@ -182,19 +186,20 @@ impl EventListenerDeclaration {
         let Some(event) = self.route.project_root(root)? else {
             return Ok(None);
         };
-        self.handler.start(event).map(Some)
+        self.handler.start(context, event).map(Some)
     }
 }
 
 trait ErasedEventHandler: Send {
     fn start(
         &mut self,
+        context: EventContext,
         event: &(dyn Any + Send + Sync),
     ) -> Result<EventHandlerFuture, EventListenerDispatchFault>;
 }
 
 struct TypedEventHandler<E> {
-    handler: AsyncHandler<E>,
+    handler: AsyncHandler<(EventContext, E)>,
 }
 
 impl<E> ErasedEventHandler for TypedEventHandler<E>
@@ -203,6 +208,7 @@ where
 {
     fn start(
         &mut self,
+        context: EventContext,
         event: &(dyn Any + Send + Sync),
     ) -> Result<EventHandlerFuture, EventListenerDispatchFault> {
         let event = event.downcast_ref::<E>().cloned().ok_or(
@@ -210,7 +216,7 @@ where
                 expected: std::any::type_name::<E>(),
             },
         )?;
-        let future = self.handler.start(event)?;
+        let future = self.handler.start((context, event))?;
         Ok(Box::pin(async move {
             future.await.map_err(EventListenerDispatchFault::from)
         }))

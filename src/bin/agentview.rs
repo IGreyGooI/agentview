@@ -1251,7 +1251,7 @@ fn external_cli_application(props: ExternalCliProps) -> Component {
     let error_on_text = props.error_on_text;
     #[cfg(test)]
     let panic_after_speculation_started = props.panic_after_speculation_started.clone();
-    use_provider_event_handler(ProviderEvent::TEXT, move |event| {
+    use_provider_event_handler(ProviderEvent::TEXT, move |_ctx, event| {
         let state = event_state.clone();
         let business_snapshot = Arc::clone(&business_snapshot);
         let snapshot_hidden = Arc::clone(&snapshot_hidden);
