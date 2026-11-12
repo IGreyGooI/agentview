@@ -18,6 +18,74 @@ pub struct Component {
 }
 
 impl Component {
+    /// Compose ordinary content, keyed child instances, tools and Decisions.
+    pub fn fragment(children: impl IntoIterator<Item = Component>) -> Self {
+        Self::from_node(ComponentNode::Fragment(children.into_iter().collect()))
+    }
+
+    /// Preserve an existing prompt as an opaque POM text block.
+    pub fn text(value: impl Into<crate::StorageString>) -> Self {
+        raw_text_root(value)
+    }
+
+    pub fn raw_text(value: impl Into<crate::StorageString>) -> Self {
+        Self::text(value)
+    }
+
+    /// Declare a complete, typed POM document.
+    pub fn document(document: Document) -> Self {
+        Self::from_node(ComponentNode::Pom(PomFragment::Document(Ok(document))))
+    }
+
+    /// Build a typed AgentView value through the same POM lowering as `view!`.
+    pub fn view<T>(value: T) -> Self
+    where
+        T: AgentView,
+        T::Root: IntoBlockChildren,
+    {
+        value.into_view_root()
+    }
+
+    pub fn user(self) -> Self {
+        self.placed(Placement::User)
+    }
+
+    pub fn user_repeat(self) -> Self {
+        self.placed(Placement::UserRepeat)
+    }
+
+    pub fn user_ephemeral_repeat(self) -> Self {
+        self.placed(Placement::UserEphemeralRepeat)
+    }
+
+    pub fn developer(self) -> Self {
+        self.placed(Placement::Developer)
+    }
+
+    pub fn developer_repeat(self) -> Self {
+        self.placed(Placement::DeveloperRepeat)
+    }
+
+    pub fn developer_ephemeral_repeat(self) -> Self {
+        self.placed(Placement::DeveloperEphemeralRepeat)
+    }
+
+    pub fn assistant(self) -> Self {
+        self.placed(Placement::Assistant)
+    }
+
+    /// Declare System content. Hooks and actions are rejected in this subtree.
+    pub fn system_once(self) -> Self {
+        self.placed(Placement::SystemOnce)
+    }
+
+    fn placed(self, placement: Placement) -> Self {
+        Self::from_node(ComponentNode::Placement {
+            placement,
+            child: Box::new(self),
+        })
+    }
+
     pub(crate) fn from_node(node: ComponentNode) -> Self {
         Self { node }
     }
@@ -29,6 +97,10 @@ pub(crate) enum ComponentNode {
     Scope {
         function: &'static str,
         render: ScopeRender,
+    },
+    DynamicScope {
+        definition: super::definition::ComponentDefinition,
+        instance_key: String,
     },
     Placement {
         placement: Placement,
@@ -45,6 +117,7 @@ pub(crate) enum ComponentNode {
     StreamingAttempt(Box<super::streaming_attempt::ContractDeclaration>),
     XmlCallback(Box<super::streaming_attempt::XmlCallbackDeclaration>),
     NativeToolCall(Box<super::native_tool::NativeToolCallDeclaration>),
+    Decision(Box<super::decision::DecisionData>),
     CliCommand(Box<super::cli_command::CliCommandDeclaration>),
 }
 

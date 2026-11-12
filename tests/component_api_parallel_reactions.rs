@@ -286,7 +286,9 @@ impl ProbePort {
                     context_window: ContextWindow::NotApplicable,
                     reserved_output_tokens: None,
                 },
-                FrameCapabilities::new(true),
+                FrameCapabilities::new(true)
+                    .with_native_tool_calls(true)
+                    .with_text_delta_output(true),
             )),
             probe,
             main: true,
@@ -471,7 +473,7 @@ async fn handles_start_eagerly_and_each_clone_waits_without_owning_cancellation(
     )
     .unwrap();
 
-    let first = app.react().unwrap();
+    let first = app.react(false).unwrap();
     assert_eq!(first.kind(), ReactionKind::Main);
     let id = first.id();
     probe.frame_count(1).await;
@@ -491,7 +493,7 @@ async fn handles_start_eagerly_and_each_clone_waits_without_owning_cancellation(
     assert_eq!(second_result.unwrap(), ReactionOutcome::Completed);
     probe.completed(id).await;
 
-    let detached = app.react().unwrap();
+    let detached = app.react(false).unwrap();
     let detached_id = detached.id();
     assert_ne!(id, detached_id);
     assert_eq!(detached.kind(), ReactionKind::Main);
@@ -499,6 +501,158 @@ async fn handles_start_eagerly_and_each_clone_waits_without_owning_cancellation(
     probe.frame_count(2).await;
     detached_gate.notify_one();
     probe.completed(detached_id).await;
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn idle_ephemeral_reactions_preserve_main_history_and_delivery_baseline() {
+    let probe = Probe::scripted([
+        Script::text("checkpoint"),
+        Script::text("decision-one"),
+        Script::text("decision-two"),
+        Script::text("decision-three"),
+        Script::text("next-main"),
+        Script::text("history-check"),
+    ]);
+    let root_probe = Arc::clone(&probe);
+    let mut app = Application::mount(
+        move || observed_application(Arc::clone(&root_probe)),
+        ProbePort::new(Arc::clone(&probe)),
+    )
+    .unwrap();
+    app.react(false).unwrap().await.unwrap();
+    let checkpoint = probe.frame("checkpoint");
+    let mut targets = Vec::new();
+    for label in ["decision-one", "decision-two", "decision-three"] {
+        let reaction = app.react(true).unwrap();
+        assert_eq!(reaction.kind(), ReactionKind::Temporary);
+        assert_eq!(reaction.await.unwrap(), ReactionOutcome::Completed);
+        let frame = probe.frame(label);
+        assert_eq!(frame.basis, FrameBasis::Full);
+        assert_eq!(frame.assistant_text(), ["checkpoint"]);
+        assert_ne!(frame.target, checkpoint.target);
+        assert!(!targets.contains(&frame.target));
+        targets.push(frame.target);
+    }
+
+    let next = app.react(false).unwrap();
+    assert_eq!(next.kind(), ReactionKind::Main);
+    assert_eq!(next.await.unwrap(), ReactionOutcome::Completed);
+    let continued = probe.frame("next-main");
+    assert_eq!(continued.target, checkpoint.target);
+    assert_eq!(continued.basis, FrameBasis::DeltaFrom(checkpoint.revision));
+
+    probe.force_main_full.store(true, Ordering::Release);
+    app.react(false).unwrap().await.unwrap();
+    let replay = probe.frame("history-check");
+    assert_eq!(replay.basis, FrameBasis::Full);
+    assert_eq!(replay.assistant_text(), ["checkpoint", "next-main"]);
+    assert!(probe.events.lock().unwrap().iter().all(|(text, context)| {
+        !text.starts_with("decision-") || context.reaction_kind() == Some(ReactionKind::Temporary)
+    }));
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn ephemeral_without_a_checkpoint_is_rejected_without_claiming_main() {
+    let main_gate = Arc::new(Notify::new());
+    let probe = Probe::scripted([
+        Script::gated_text("first-main", Arc::clone(&main_gate)),
+        Script::text("first-temporary"),
+        Script::text("next-main"),
+    ]);
+    let root_probe = Arc::clone(&probe);
+    let mut app = Application::mount(
+        move || observed_application(Arc::clone(&root_probe)),
+        ProbePort::new(Arc::clone(&probe)),
+    )
+    .unwrap();
+    assert!(app.react(true).is_err());
+    assert!(probe.frames.lock().unwrap().is_empty());
+    assert!(probe.forked_targets.lock().unwrap().is_empty());
+
+    let main = app.react(false).unwrap();
+    assert_eq!(main.kind(), ReactionKind::Main);
+    probe.frame_count(1).await;
+    assert!(app.react(true).is_err());
+    assert_eq!(probe.frames.lock().unwrap().len(), 1);
+    main_gate.notify_one();
+    assert_eq!(main.await.unwrap(), ReactionOutcome::Completed);
+
+    let temporary = app.react(true).unwrap();
+    assert_eq!(temporary.kind(), ReactionKind::Temporary);
+    assert_eq!(temporary.await.unwrap(), ReactionOutcome::Completed);
+    let main = app.react(false).unwrap();
+    assert_eq!(main.kind(), ReactionKind::Main);
+    assert_eq!(main.await.unwrap(), ReactionOutcome::Completed);
+    assert_eq!(
+        probe.frame("next-main").target,
+        probe.frame("first-main").target
+    );
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_idle_ephemeral_reaction_leaves_main_free_and_cancellation_stays_local() {
+    let main_gate = Arc::new(Notify::new());
+    let probe = Probe::scripted([
+        Script::text("checkpoint"),
+        Script::gated_text("idle-temporary", Arc::new(Notify::new())),
+        Script::text("idle-sibling"),
+        Script::gated_text("main", Arc::clone(&main_gate)),
+        Script::text("active-main-sibling"),
+        Script::text("new-checkpoint-temporary"),
+        Script::text("next-main"),
+    ]);
+    let root_probe = Arc::clone(&probe);
+    let mut app = Application::mount(
+        move || observed_application(Arc::clone(&root_probe)),
+        ProbePort::new(Arc::clone(&probe)),
+    )
+    .unwrap();
+    app.react(false).unwrap().await.unwrap();
+    let temporary = app.react(true).unwrap();
+    assert_eq!(temporary.kind(), ReactionKind::Temporary);
+    probe.frame_count(2).await;
+
+    let sibling = app.react(true).unwrap();
+    assert_eq!(sibling.kind(), ReactionKind::Temporary);
+    assert_eq!(sibling.await.unwrap(), ReactionOutcome::Completed);
+    assert_eq!(probe.frame("idle-sibling").assistant_text(), ["checkpoint"]);
+
+    let main = app.react(false).unwrap();
+    assert_eq!(main.kind(), ReactionKind::Main);
+    probe.frame_count(4).await;
+    temporary.interrupt().unwrap();
+    assert_eq!(temporary.await.unwrap(), ReactionOutcome::Interrupted);
+    let mut waiting_main = Box::pin(main.clone().into_future());
+    assert!(poll!(waiting_main.as_mut()).is_pending());
+    drop(waiting_main);
+
+    // Cancelling the Temporary must not release the active Main's execution slot.
+    let sibling = app.react(false).unwrap();
+    assert_eq!(sibling.kind(), ReactionKind::Temporary);
+    assert_eq!(sibling.await.unwrap(), ReactionOutcome::Completed);
+    assert_eq!(
+        probe.frame("active-main-sibling").assistant_text(),
+        ["checkpoint"]
+    );
+    main_gate.notify_one();
+    assert_eq!(main.await.unwrap(), ReactionOutcome::Completed);
+
+    let temporary = app.react(true).unwrap();
+    assert_eq!(temporary.kind(), ReactionKind::Temporary);
+    assert_eq!(temporary.await.unwrap(), ReactionOutcome::Completed);
+    assert_eq!(
+        probe.frame("new-checkpoint-temporary").assistant_text(),
+        ["checkpoint", "main"]
+    );
+    probe.force_main_full.store(true, Ordering::Release);
+    app.react(false).unwrap().await.unwrap();
+    assert_eq!(
+        probe.frame("next-main").assistant_text(),
+        ["checkpoint", "main"]
+    );
     app.shutdown().await.unwrap();
 }
 
@@ -520,16 +674,16 @@ async fn later_events_start_siblings_and_interrupt_only_the_selected_reaction() 
     )
     .unwrap();
     let application_id = app.application_id();
-    app.react().unwrap().await.unwrap();
+    app.react(false).unwrap().await.unwrap();
 
-    let main = app.react().unwrap();
+    let main = app.react(false).unwrap();
     let main_id = main.id();
     probe.frame_count(2).await;
-    let temporary = app.react().unwrap();
+    let temporary = app.react(false).unwrap();
     let interrupted_id = temporary.id();
     assert_eq!(temporary.kind(), ReactionKind::Temporary);
     probe.frame_count(3).await;
-    let later = app.react().unwrap();
+    let later = app.react(false).unwrap();
     let later_id = later.id();
     assert_eq!(later.kind(), ReactionKind::Temporary);
     assert_ne!(main_id, interrupted_id);
@@ -549,7 +703,7 @@ async fn later_events_start_siblings_and_interrupt_only_the_selected_reaction() 
     assert_eq!(main.await.unwrap(), ReactionOutcome::Completed);
 
     probe.force_main_full.store(true, Ordering::Release);
-    let next = app.react().unwrap();
+    let next = app.react(false).unwrap();
     assert_eq!(next.kind(), ReactionKind::Main);
     assert_eq!(next.await.unwrap(), ReactionOutcome::Completed);
     let resumed = probe.frame("next-main");
@@ -609,12 +763,12 @@ async fn shared_actions_keep_reaction_local_protocol_and_deliver_actual_feedback
     )
     .unwrap();
     let application_id = app.application_id();
-    app.react().unwrap().await.unwrap();
+    app.react(false).unwrap().await.unwrap();
 
-    let main = app.react().unwrap();
+    let main = app.react(false).unwrap();
     let main_id = main.id();
     probe.tool_count(1).await;
-    let temporary = app.react().unwrap();
+    let temporary = app.react(false).unwrap();
     let temporary_id = temporary.id();
     assert_eq!(temporary.kind(), ReactionKind::Temporary);
     assert_eq!(temporary.await.unwrap(), ReactionOutcome::Completed);
@@ -623,8 +777,8 @@ async fn shared_actions_keep_reaction_local_protocol_and_deliver_actual_feedback
     assert_eq!(main.await.unwrap(), ReactionOutcome::Completed);
 
     probe.force_main_full.store(true, Ordering::Release);
-    app.react().unwrap().await.unwrap();
-    app.react().unwrap().await.unwrap();
+    app.react(false).unwrap().await.unwrap();
+    app.react(false).unwrap().await.unwrap();
     let next = probe.frame("next-action");
     assert!(next.observes_total(11));
     assert_eq!(next.tools, ["adjust"]);
@@ -676,10 +830,10 @@ async fn temporary_handles_continue_their_own_tool_feedback_after_main_finishes(
         ProbePort::new(Arc::clone(&probe)),
     )
     .unwrap();
-    app.react().unwrap().await.unwrap();
-    let main = app.react().unwrap();
+    app.react(false).unwrap().await.unwrap();
+    let main = app.react(false).unwrap();
     probe.frame_count(2).await;
-    let first = app.react().unwrap();
+    let first = app.react(false).unwrap();
     assert_eq!(first.clone().await.unwrap(), ReactionOutcome::Completed);
 
     main_gate.notify_one();
@@ -707,7 +861,7 @@ async fn temporary_handles_continue_their_own_tool_feedback_after_main_finishes(
     );
 
     probe.force_main_full.store(true, Ordering::Release);
-    let main = app.react().unwrap();
+    let main = app.react(false).unwrap();
     assert_eq!(main.kind(), ReactionKind::Main);
     assert_eq!(main.await.unwrap(), ReactionOutcome::Completed);
     let observed = probe.frame("next-main");
@@ -730,10 +884,10 @@ async fn shutdown_interrupts_and_drains_every_owned_reaction() {
         ProbePort::new(Arc::clone(&probe)),
     )
     .unwrap();
-    app.react().unwrap().await.unwrap();
-    let main = app.react().unwrap();
+    app.react(false).unwrap().await.unwrap();
+    let main = app.react(false).unwrap();
     probe.frame_count(2).await;
-    let temporary = app.react().unwrap();
+    let temporary = app.react(false).unwrap();
     probe.frame_count(3).await;
     let main_target = probe.frame("main").target;
     let temporary_target = probe.frame("temporary").target;
@@ -758,7 +912,7 @@ async fn retaining_a_handle_does_not_keep_a_dropped_application_running() {
         ProbePort::new(Arc::clone(&probe)),
     )
     .unwrap();
-    let reaction = app.react().unwrap();
+    let reaction = app.react(false).unwrap();
     let observer = reaction.clone();
     probe.frame_count(1).await;
     let target = probe.frame("main").target;
@@ -805,16 +959,16 @@ async fn a_main_only_port_rejects_temporary_admission_without_disrupting_main() 
     )
     .unwrap();
     assert_eq!(
-        app.react().unwrap().await.unwrap(),
+        app.react(false).unwrap().await.unwrap(),
         ReactionOutcome::Completed
     );
-    let main = app.react().unwrap();
+    let main = app.react(false).unwrap();
     probe.frame_count(2).await;
-    assert!(app.react().is_err());
+    assert!(app.react(false).is_err());
     assert_eq!(probe.frames.lock().unwrap().len(), 2);
     main_gate.notify_one();
     assert_eq!(main.await.unwrap(), ReactionOutcome::Completed);
-    let next = app.react().unwrap();
+    let next = app.react(false).unwrap();
     assert_eq!(next.kind(), ReactionKind::Main);
     assert_eq!(next.await.unwrap(), ReactionOutcome::Completed);
     app.shutdown().await.unwrap();
@@ -837,6 +991,57 @@ fn preparing_application(gate: PreparationGate) -> Component {
 }
 
 #[tokio::test]
+async fn interrupting_idle_ephemeral_before_handoff_keeps_the_main_checkpoint() {
+    let gate = PreparationGate::default();
+    let root_gate = gate.clone();
+    let probe = Probe::scripted([
+        Script::text("checkpoint"),
+        Script::text("main-after-cancel"),
+    ]);
+    let mut app = Application::mount(
+        move || preparing_application(root_gate.clone()),
+        ProbePort::new(Arc::clone(&probe)),
+    )
+    .unwrap();
+    gate.release.notify_one();
+    app.react(false).unwrap().await.unwrap();
+    tokio::time::timeout(DEADLINE, gate.entered.notified())
+        .await
+        .unwrap();
+    let checkpoint = probe.frame("checkpoint");
+
+    let queued = app.react(true).unwrap();
+    assert_eq!(queued.kind(), ReactionKind::Temporary);
+    queued.interrupt().unwrap();
+    assert_eq!(queued.await.unwrap(), ReactionOutcome::Interrupted);
+    assert_eq!(probe.frames.lock().unwrap().len(), 1);
+
+    let preparing = app.react(true).unwrap();
+    assert_eq!(preparing.kind(), ReactionKind::Temporary);
+    tokio::time::timeout(DEADLINE, gate.entered.notified())
+        .await
+        .expect("an idle Temporary still owns its preparation");
+    preparing.interrupt().unwrap();
+    assert_eq!(
+        tokio::time::timeout(DEADLINE, preparing)
+            .await
+            .unwrap()
+            .unwrap(),
+        ReactionOutcome::Interrupted
+    );
+    assert_eq!(probe.frames.lock().unwrap().len(), 1);
+
+    gate.release.notify_one();
+    let main = app.react(false).unwrap();
+    assert_eq!(main.kind(), ReactionKind::Main);
+    assert_eq!(main.await.unwrap(), ReactionOutcome::Completed);
+    let continued = probe.frame("main-after-cancel");
+    assert_eq!(continued.target, checkpoint.target);
+    assert_eq!(continued.basis, FrameBasis::DeltaFrom(checkpoint.revision));
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn interrupt_during_preparation_does_not_submit_a_frame() {
     let gate = PreparationGate::default();
     let root_gate = gate.clone();
@@ -846,7 +1051,7 @@ async fn interrupt_during_preparation_does_not_submit_a_frame() {
         ProbePort::new(Arc::clone(&probe)),
     )
     .unwrap();
-    let reaction = app.react().unwrap();
+    let reaction = app.react(false).unwrap();
     assert_eq!(reaction.kind(), ReactionKind::Main);
     tokio::time::timeout(DEADLINE, gate.entered.notified())
         .await
@@ -885,7 +1090,7 @@ async fn the_original_panic_is_rethrown_once_and_later_waiters_observe_terminal_
         ProbePort::new(Arc::clone(&probe)),
     )
     .unwrap();
-    let reaction = app.react().unwrap();
+    let reaction = app.react(false).unwrap();
     let other_waiter = reaction.clone();
     let panic = AssertUnwindSafe(reaction.into_future())
         .catch_unwind()
@@ -894,7 +1099,7 @@ async fn the_original_panic_is_rethrown_once_and_later_waiters_observe_terminal_
     let received = panic.downcast::<Arc<()>>().expect("original payload type");
     assert!(Arc::ptr_eq(&payload, &received));
     assert!(other_waiter.await.is_err());
-    assert!(app.react().is_err());
+    assert!(app.react(false).is_err());
     assert!(app.shutdown().await.is_err());
     assert!(probe
         .shutdowns
@@ -914,8 +1119,8 @@ async fn assert_temporary_admission_panic(declare: bool) {
         ProbePort::new(Arc::clone(&probe)),
     )
     .unwrap();
-    app.react().unwrap().await.unwrap();
-    let main = app.react().unwrap();
+    app.react(false).unwrap().await.unwrap();
+    let main = app.react(false).unwrap();
     probe.frame_count(2).await;
     if declare {
         probe.panic_declare.store(true, Ordering::Release);
@@ -923,7 +1128,7 @@ async fn assert_temporary_admission_panic(declare: bool) {
         probe.panic_fork.store(true, Ordering::Release);
     }
 
-    let panic = std::panic::catch_unwind(AssertUnwindSafe(|| app.react()))
+    let panic = std::panic::catch_unwind(AssertUnwindSafe(|| app.react(false)))
         .expect_err("a port capability panic must retain its original payload");
     let received = panic.downcast::<Arc<()>>().expect("original payload type");
     assert!(Arc::ptr_eq(&probe.panic_payload, &received));
@@ -931,7 +1136,7 @@ async fn assert_temporary_admission_panic(declare: bool) {
         .await
         .expect("a capability panic also stops the active main stream");
     assert!(matches!(result, Err(_) | Ok(ReactionOutcome::Interrupted)));
-    assert!(app.react().is_err());
+    assert!(app.react(false).is_err());
     assert!(app.shutdown().await.is_err());
     let shutdowns = probe.shutdowns.lock().unwrap();
     assert!(shutdowns.contains(&probe.frame("main").target));
@@ -970,8 +1175,8 @@ fn runtime_teardown_does_not_leave_an_active_handle_or_shutdown_hanging() {
             ProbePort::new(Arc::clone(&probe)),
         )
         .unwrap();
-        app.react().unwrap().await.unwrap();
-        let reaction = app.react().unwrap();
+        app.react(false).unwrap().await.unwrap();
+        let reaction = app.react(false).unwrap();
         probe.frame_count(2).await;
         (app, reaction)
     });
@@ -1008,10 +1213,10 @@ async fn settled_temporary_continuations_are_rejected_while_fork_owns_maintenanc
         ProbePort::new(Arc::clone(&probe)),
     )
     .unwrap();
-    app.react().unwrap().await.unwrap();
-    let main = app.react().unwrap();
+    app.react(false).unwrap().await.unwrap();
+    let main = app.react(false).unwrap();
     probe.frame_count(2).await;
-    let temporary = app.react().unwrap();
+    let temporary = app.react(false).unwrap();
     assert_eq!(temporary.clone().await.unwrap(), ReactionOutcome::Completed);
     main_gate.notify_one();
     main.await.unwrap();

@@ -188,7 +188,7 @@ async fn observe<P: ReactionPort + 'static>(
 
 async fn handoff<P: ReactionPort + 'static>(app: &mut Application<P>, sender: &CommandSender) {
     let (reacted, observed) = tokio::time::timeout(TIMEOUT, async {
-        tokio::join!(app.react().unwrap(), sender.observe())
+        tokio::join!(app.react(false).unwrap(), sender.observe())
     })
     .await
     .unwrap();
@@ -343,7 +343,7 @@ async fn pre_handoff_failure_and_cancellation_preserve_the_pending_feedback_batc
 
     control.next.store(1, Ordering::SeqCst);
     let (reacted, observed) = tokio::time::timeout(TIMEOUT, async {
-        tokio::join!(app.react().unwrap(), sender.observe())
+        tokio::join!(app.react(false).unwrap(), sender.observe())
     })
     .await
     .unwrap();
@@ -357,7 +357,7 @@ async fn pre_handoff_failure_and_cancellation_preserve_the_pending_feedback_batc
     let blocked = control.blocked.notified();
     let mut observed = Box::pin(sender.observe());
     assert!(poll!(&mut observed).is_pending());
-    let reaction_control = app.react().unwrap();
+    let reaction_control = app.react(false).unwrap();
     let mut reaction = Box::pin(std::future::IntoFuture::into_future(
         reaction_control.clone(),
     ));

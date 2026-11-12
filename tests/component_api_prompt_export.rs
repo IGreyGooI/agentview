@@ -64,7 +64,9 @@ impl ScriptedPort {
                     context_window: ContextWindow::NotApplicable,
                     reserved_output_tokens: None,
                 },
-                FrameCapabilities::new(true),
+                FrameCapabilities::new(true)
+                    .with_native_tool_calls(true)
+                    .with_text_delta_output(true),
             ),
         );
         (
@@ -284,7 +286,12 @@ async fn interact(export: bool) -> Vec<Delivery> {
         export_without_effects(&application, &provider, &calls);
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(application.react().unwrap().await.unwrap().is_continue());
+    assert!(application
+        .react(false)
+        .unwrap()
+        .await
+        .unwrap()
+        .is_continue());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     let expected_call = CanonicalInputItem::tool_call(CALL_ID, "adjust", ARGUMENTS).unwrap();
@@ -312,7 +319,12 @@ async fn interact(export: bool) -> Vec<Delivery> {
         export_without_effects(&application, &provider, &calls);
     }
 
-    assert!(application.react().unwrap().await.unwrap().is_continue());
+    assert!(application
+        .react(false)
+        .unwrap()
+        .await
+        .unwrap()
+        .is_continue());
     assert_eq!(
         native_records(application.current_projection().projection()),
         expected_records
@@ -320,7 +332,12 @@ async fn interact(export: bool) -> Vec<Delivery> {
     if export {
         export_without_effects(&application, &provider, &calls);
     }
-    assert!(application.react().unwrap().await.unwrap().is_continue());
+    assert!(application
+        .react(false)
+        .unwrap()
+        .await
+        .unwrap()
+        .is_continue());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let deliveries = {
         let frames = provider.frames.lock().unwrap();

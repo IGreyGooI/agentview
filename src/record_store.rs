@@ -2380,7 +2380,13 @@ fn validate_canonical_item(item: &CanonicalInputItem) -> Result<(), RecordLogErr
     match item {
         CanonicalInputItem::Instruction { .. }
         | CanonicalInputItem::Message { .. }
-        | CanonicalInputItem::AssistantText { .. } => Ok(()),
+        | CanonicalInputItem::AssistantText { .. }
+        | CanonicalInputItem::DecisionOutput { .. } => Ok(()),
+        CanonicalInputItem::DecisionRequest { declaration } => {
+            declaration.validate().map_err(|_| {
+                crate::transcript::CanonicalTranscriptError::InvalidDecisionDeclaration.into()
+            })
+        }
         CanonicalInputItem::ToolCall {
             call_id,
             name,

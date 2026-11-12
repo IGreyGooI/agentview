@@ -138,7 +138,9 @@ impl ScriptedPort {
                         context_window: ContextWindow::NotApplicable,
                         reserved_output_tokens: None,
                     },
-                    FrameCapabilities::new(true),
+                    FrameCapabilities::new(true)
+                        .with_native_tool_calls(true)
+                        .with_text_delta_output(true),
                 ),
             ),
             probe,
@@ -199,7 +201,12 @@ async fn provider_multicast_and_completion_keep_frame_identity_and_order_across_
     .unwrap();
     let application_id = application.application_id();
     for _ in 0..2 {
-        assert!(application.react().unwrap().await.unwrap().is_continue());
+        assert!(application
+            .react(false)
+            .unwrap()
+            .await
+            .unwrap()
+            .is_continue());
         assert!(
             projection_document(application.current_projection().projection())
                 .has_field("feedback", "completed")
@@ -263,7 +270,7 @@ async fn cancelling_a_reaction_keeps_delivered_context_without_dispatching_compl
     )
     .unwrap();
     let application_id = application.application_id();
-    let reaction_control = application.react().unwrap();
+    let reaction_control = application.react(false).unwrap();
     let mut reaction = Box::pin(std::future::IntoFuture::into_future(
         reaction_control.clone(),
     ));

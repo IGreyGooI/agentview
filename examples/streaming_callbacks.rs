@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
         Application::mount(move || notebook(Arc::clone(&component_answer)), provider)?;
     let operation = tokio::time::timeout(Duration::from_secs(120), async {
         for step in 1..=3 {
-            let _ = application.react()?.await?;
+            let _ = application.react(false)?.await?;
             let mut view = String::new();
             for item in application
                 .current_projection()

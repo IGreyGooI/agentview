@@ -77,7 +77,9 @@ async fn public_application_mounts_reacts_and_shuts_down_through_the_curated_own
             context_window: ContextWindow::NotApplicable,
             reserved_output_tokens: None,
         },
-        FrameCapabilities::NONE,
+        FrameCapabilities::NONE
+            .with_native_tool_calls(true)
+            .with_text_delta_output(true),
     );
     let port = ObservedPort {
         declaration: TargetDeclaration::full(identity, epoch, profile),
@@ -90,7 +92,7 @@ async fn public_application_mounts_reacts_and_shuts_down_through_the_curated_own
     let initial_revision = application.current_projection().revision();
 
     assert_eq!(
-        application.react().unwrap().await.unwrap(),
+        application.react(false).unwrap().await.unwrap(),
         ControlFlow::Continue(())
     );
 

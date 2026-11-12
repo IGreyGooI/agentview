@@ -3,7 +3,7 @@
 //! The transcript owns semantic POM and causal tool facts. Provider request
 //! DTOs, remote cursors, retry state, and SDK types belong to later layers.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -11,6 +11,7 @@ use std::cell::Cell;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::component::execution::{DecisionDeclaration, ProviderDecision};
 use crate::pom::ResolvedDocument;
 
 /// Instruction authority carried by one canonical POM item.
@@ -162,6 +163,12 @@ pub enum CanonicalInputItem {
         call_id: String,
         content: String,
     },
+    DecisionRequest {
+        declaration: DecisionDeclaration,
+    },
+    DecisionOutput {
+        decision: ProviderDecision,
+    },
     ProviderExtension(ProviderExtension),
 }
 
@@ -196,6 +203,12 @@ impl<'de> Deserialize<'de> for CanonicalInputItem {
                 call_id: String,
                 content: String,
             },
+            DecisionRequest {
+                declaration: DecisionDeclaration,
+            },
+            DecisionOutput {
+                decision: ProviderDecision,
+            },
             ProviderExtension(ProviderExtension),
         }
 
@@ -227,6 +240,12 @@ impl<'de> Deserialize<'de> for CanonicalInputItem {
             }
             WireCanonicalInputItem::ProviderExtension(extension) => {
                 Self::ProviderExtension(extension)
+            }
+            WireCanonicalInputItem::DecisionRequest { declaration } => {
+                Self::DecisionRequest { declaration }
+            }
+            WireCanonicalInputItem::DecisionOutput { decision } => {
+                Self::DecisionOutput { decision }
             }
         };
         item.validate().map_err(D::Error::custom)?;
@@ -306,6 +325,10 @@ impl CanonicalInputItem {
                 validate_tool_arguments(call_id, raw_arguments)
             }
             Self::ToolResult { call_id, .. } => validate_identifier_ref("tool call id", call_id),
+            Self::DecisionRequest { declaration } => declaration
+                .validate()
+                .map_err(|_| CanonicalTranscriptError::InvalidDecisionDeclaration),
+            Self::DecisionOutput { .. } => Ok(()),
             Self::ProviderExtension(extension) => extension.validate(),
         }
     }
@@ -394,10 +417,23 @@ impl CanonicalTranscript {
     ) -> Result<(), CanonicalTranscriptError> {
         let mut calls = HashSet::new();
         let mut results = HashSet::new();
+        let mut decisions = HashMap::new();
         for item in items {
             record_construction_work(1);
             item.validate()?;
             match item {
+                CanonicalInputItem::DecisionRequest { declaration } => {
+                    decisions.insert(declaration.batch_id(), false);
+                }
+                CanonicalInputItem::DecisionOutput { decision } => {
+                    let produced = decisions
+                        .get_mut(decision.batch_id())
+                        .ok_or(CanonicalTranscriptError::UnknownDecisionRequest)?;
+                    if *produced {
+                        return Err(CanonicalTranscriptError::DuplicateDecisionOutput);
+                    }
+                    *produced = true;
+                }
                 CanonicalInputItem::ToolCall { call_id, .. } => {
                     if !calls.insert(call_id.as_str()) {
                         return Err(CanonicalTranscriptError::DuplicateToolCall {
@@ -440,6 +476,23 @@ impl CanonicalTranscript {
         item: &CanonicalInputItem,
     ) -> Result<(), CanonicalTranscriptError> {
         match item {
+            CanonicalInputItem::DecisionRequest { .. } => {}
+            CanonicalInputItem::DecisionOutput { decision } => {
+                let mut request_seen = false;
+                for previous in self.items.iter().rev() {
+                    match previous {
+                        CanonicalInputItem::DecisionOutput { decision: previous } if previous.batch_id() == decision.batch_id() => {
+                            return Err(CanonicalTranscriptError::DuplicateDecisionOutput);
+                        }
+                        CanonicalInputItem::DecisionRequest { declaration } if declaration.batch_id() == decision.batch_id() => {
+                            request_seen = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !request_seen { return Err(CanonicalTranscriptError::UnknownDecisionRequest); }
+            }
             CanonicalInputItem::ToolCall { call_id, .. } => {
                 if self.items.iter().any(|item| {
                     matches!(item, CanonicalInputItem::ToolCall { call_id: prior, .. } if prior == call_id)
@@ -494,6 +547,12 @@ impl<'de> Deserialize<'de> for CanonicalTranscript {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CanonicalTranscriptError {
+    #[error("canonical decision output references no request")]
+    UnknownDecisionRequest,
+    #[error("canonical decision request produced more than one result")]
+    DuplicateDecisionOutput,
+    #[error("canonical decision declaration is invalid")]
+    InvalidDecisionDeclaration,
     #[error(
         "invalid {kind} `{value}`; expected a non-empty identifier using supported characters"
     )]

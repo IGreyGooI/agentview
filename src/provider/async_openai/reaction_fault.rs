@@ -10,7 +10,7 @@ use crate::component::execution::reaction::{
 /// HTTP, SSE, or model diagnostics remain on [`OpenAiReactionFailure`] and are
 /// never consulted by [`map_openai_fault`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum OpenAiFailureClass {
+pub(in crate::provider) enum OpenAiFailureClass {
     DeclarationStateLost,
     RequestPreparation,
     RequestBodyLimit,
@@ -33,20 +33,20 @@ pub(super) enum OpenAiFailureClass {
 
 /// One classified OpenAI failure plus provider-private diagnostic context.
 #[derive(Debug)]
-pub(super) struct OpenAiReactionFailure {
+pub(in crate::provider) struct OpenAiReactionFailure {
     class: OpenAiFailureClass,
     diagnostic: OpenAiPrivateDiagnostic,
 }
 
 #[derive(Debug)]
-pub(super) enum OpenAiPrivateDiagnostic {
+pub(in crate::provider) enum OpenAiPrivateDiagnostic {
     Static(&'static str),
     Message(String),
     HttpStatus(u16),
 }
 
 impl OpenAiReactionFailure {
-    pub(super) const fn static_diagnostic(
+    pub(in crate::provider) const fn static_diagnostic(
         class: OpenAiFailureClass,
         diagnostic: &'static str,
     ) -> Self {
@@ -56,14 +56,17 @@ impl OpenAiReactionFailure {
         }
     }
 
-    pub(super) fn message(class: OpenAiFailureClass, diagnostic: impl Into<String>) -> Self {
+    pub(in crate::provider) fn message(
+        class: OpenAiFailureClass,
+        diagnostic: impl Into<String>,
+    ) -> Self {
         Self {
             class,
             diagnostic: OpenAiPrivateDiagnostic::Message(diagnostic.into()),
         }
     }
 
-    pub(super) fn http_status(status: reqwest::StatusCode) -> Self {
+    pub(in crate::provider) fn http_status(status: reqwest::StatusCode) -> Self {
         let class = match status {
             reqwest::StatusCode::UNAUTHORIZED => OpenAiFailureClass::Authentication,
             reqwest::StatusCode::FORBIDDEN => OpenAiFailureClass::Authorization,
@@ -82,7 +85,7 @@ impl OpenAiReactionFailure {
     /// Structured provider-private observability payload.
     ///
     /// This value must not be formatted into a public or Application fault.
-    pub(super) const fn diagnostic(&self) -> &OpenAiPrivateDiagnostic {
+    pub(in crate::provider) const fn diagnostic(&self) -> &OpenAiPrivateDiagnostic {
         &self.diagnostic
     }
 }
@@ -91,7 +94,7 @@ impl OpenAiReactionFailure {
 ///
 /// Mapping depends exclusively on the closed class. In particular it never
 /// parses or formats the provider-private diagnostic payload.
-pub(super) fn map_openai_fault(failure: &OpenAiReactionFailure) -> ReactionPortFault {
+pub(in crate::provider) fn map_openai_fault(failure: &OpenAiReactionFailure) -> ReactionPortFault {
     observe_private_failure(failure);
     use OpenAiFailureClass as Class;
     use ReactionPortFaultCode as Code;

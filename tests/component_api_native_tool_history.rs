@@ -80,7 +80,9 @@ impl ScriptedPort {
                 context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
-            FrameCapabilities::new(true),
+            FrameCapabilities::new(true)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
         );
         let identity = TargetIdentity::new(NonZeroU128::new(7).expect("non-zero identity"));
         let epoch = TargetEpoch::new(NonZeroU64::new(1).expect("non-zero epoch"));
@@ -352,7 +354,7 @@ async fn native_tool_component_keeps_each_same_argument_call_once_across_rerende
 
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("first tool reaction"),
@@ -360,7 +362,7 @@ async fn native_tool_component_keeps_each_same_argument_call_once_across_rerende
     ));
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("second tool reaction"),
@@ -376,7 +378,7 @@ async fn native_tool_component_keeps_each_same_argument_call_once_across_rerende
         .expect("mounted signal accepts a write");
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("explicit rerender reaction"),
@@ -465,7 +467,7 @@ async fn native_tool_component_retains_only_the_latest_two_provider_response_rou
 
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("first provider response"),
@@ -509,7 +511,7 @@ async fn native_tool_component_retains_only_the_latest_two_provider_response_rou
         .expect("mounted signal accepts a write");
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("tool-free provider response"),
@@ -521,7 +523,7 @@ async fn native_tool_component_retains_only_the_latest_two_provider_response_rou
 
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("second provider response"),
@@ -550,7 +552,7 @@ async fn native_tool_component_retains_only_the_latest_two_provider_response_rou
 
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("third provider response"),
@@ -580,7 +582,7 @@ async fn native_tool_component_retains_only_the_latest_two_provider_response_rou
 
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("post-prune continuation"),
@@ -634,7 +636,7 @@ async fn reset_model_context_replays_the_retained_native_tool_component_rounds_i
         "handoff third completed tool result",
     ] {
         assert!(matches!(
-            application.react().unwrap().await.expect(description),
+            application.react(false).unwrap().await.expect(description),
             agentview::component::execution::ReactionOutcome::Completed
         ));
     }
@@ -644,7 +646,7 @@ async fn reset_model_context_replays_the_retained_native_tool_component_rounds_i
         .expect("completed native tool rounds allow a context reset");
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("full reset handoff"),
@@ -715,7 +717,7 @@ async fn native_tool_history_continues_after_reset_without_duplicate_later_round
         "handoff second completed tool result",
     ] {
         assert!(matches!(
-            application.react().unwrap().await.expect(description),
+            application.react(false).unwrap().await.expect(description),
             agentview::component::execution::ReactionOutcome::Completed
         ));
     }
@@ -725,7 +727,7 @@ async fn native_tool_history_continues_after_reset_without_duplicate_later_round
         .expect("completed native tool rounds allow a context reset");
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("reset Full accepts a later native tool round"),
@@ -733,7 +735,7 @@ async fn native_tool_history_continues_after_reset_without_duplicate_later_round
     ));
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("later native tool result is submitted after reset"),
@@ -743,7 +745,7 @@ async fn native_tool_history_continues_after_reset_without_duplicate_later_round
     force_full.store(true, Ordering::SeqCst);
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("a later provider-required Full replays native history once"),
@@ -755,7 +757,7 @@ async fn native_tool_history_continues_after_reset_without_duplicate_later_round
         .expect("the later completed native tool round allows another reset");
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("second reset replays the current retained window"),
@@ -915,7 +917,7 @@ async fn parallel_native_tool_results_follow_provider_ordinals_not_tree_or_compl
     let second_started = props.second_started.notified();
     tokio::pin!(first_started);
     tokio::pin!(second_started);
-    let reaction_control = application.react().unwrap();
+    let reaction_control = application.react(false).unwrap();
     let mut reaction = Box::pin(std::future::IntoFuture::into_future(
         reaction_control.clone(),
     ));
@@ -963,7 +965,7 @@ async fn parallel_native_tool_results_follow_provider_ordinals_not_tree_or_compl
     assert_eq!(props.second_calls.load(Ordering::SeqCst), 1);
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("continuation reaction"),
@@ -1091,7 +1093,7 @@ async fn same_native_tool_parallel_reverse_completion_continues_after_context_re
     let second_started = props.second_started.notified();
     tokio::pin!(first_started);
     tokio::pin!(second_started);
-    let reaction_control = application.react().unwrap();
+    let reaction_control = application.react(false).unwrap();
     let mut reaction = Box::pin(std::future::IntoFuture::into_future(
         reaction_control.clone(),
     ));
@@ -1138,7 +1140,7 @@ async fn same_native_tool_parallel_reverse_completion_continues_after_context_re
     assert_eq!(props.calls.load(Ordering::SeqCst), 2);
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("same-tool parallel result continuation"),
@@ -1150,7 +1152,7 @@ async fn same_native_tool_parallel_reverse_completion_continues_after_context_re
         .expect("completed same-tool parallel results allow a context reset");
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("same-tool reset Full replays both completed calls"),
@@ -1158,7 +1160,7 @@ async fn same_native_tool_parallel_reverse_completion_continues_after_context_re
     ));
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("same-tool reset continuation has no pending calls"),
@@ -1261,9 +1263,13 @@ async fn unmounting_a_native_tool_keeps_accepted_history_in_later_replay() {
     )
     .expect("mount conditional native tool");
 
-    let _ = application.react().unwrap().await.expect("tool reaction");
     let _ = application
-        .react()
+        .react(false)
+        .unwrap()
+        .await
+        .expect("tool reaction");
+    let _ = application
+        .react(false)
         .unwrap()
         .await
         .expect("tool output continuation");
@@ -1283,7 +1289,7 @@ async fn unmounting_a_native_tool_keeps_accepted_history_in_later_replay() {
         .expect("mounted signal accepts a write");
     force_full.store(true, Ordering::SeqCst);
     let _ = application
-        .react()
+        .react(false)
         .unwrap()
         .await
         .expect("unmounted continuation");
@@ -1356,7 +1362,7 @@ async fn cancelled_native_tool_appends_fallback_to_its_component_log_before_reco
 
     let started_wait = started.notified();
     tokio::pin!(started_wait);
-    let cancelled_control = application.react().unwrap();
+    let cancelled_control = application.react(false).unwrap();
     let mut cancelled = Box::pin(std::future::IntoFuture::into_future(
         cancelled_control.clone(),
     ));
@@ -1386,7 +1392,7 @@ async fn cancelled_native_tool_appends_fallback_to_its_component_log_before_reco
     );
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("fallback continuation"),
@@ -1442,7 +1448,7 @@ async fn typed_native_tool_component_records_successful_and_invalid_argument_cal
 
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("valid typed tool call"),
@@ -1450,7 +1456,7 @@ async fn typed_native_tool_component_records_successful_and_invalid_argument_cal
     ));
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("invalid typed tool call"),
@@ -1458,7 +1464,7 @@ async fn typed_native_tool_component_records_successful_and_invalid_argument_cal
     ));
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("typed tool continuation"),
@@ -1539,7 +1545,7 @@ async fn unicode_named_tool_executes_stages_results_and_continues_after_context_
 
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("first Unicode tool call"),
@@ -1547,7 +1553,7 @@ async fn unicode_named_tool_executes_stages_results_and_continues_after_context_
     ));
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("first Unicode tool result continuation"),
@@ -1559,7 +1565,7 @@ async fn unicode_named_tool_executes_stages_results_and_continues_after_context_
         .expect("completed Unicode tool result allows a context reset");
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("reset Full accepts a later Unicode tool call"),
@@ -1567,7 +1573,7 @@ async fn unicode_named_tool_executes_stages_results_and_continues_after_context_
     ));
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("later Unicode tool result continuation"),
@@ -1575,7 +1581,7 @@ async fn unicode_named_tool_executes_stages_results_and_continues_after_context_
     ));
     assert!(matches!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("post-reset Unicode continuation"),
@@ -1725,7 +1731,7 @@ async fn native_callback_infers_schema_and_rejects_invalid_arguments_before_invo
     .expect("mount callback counter");
 
     let _ = application
-        .react()
+        .react(false)
         .unwrap()
         .await
         .expect("invalid calls retain feedback");
@@ -1748,7 +1754,7 @@ async fn native_callback_infers_schema_and_rejects_invalid_arguments_before_invo
     );
     assert_eq!(tools[0].input_schema(), tools[1].input_schema());
     let _ = application
-        .react()
+        .react(false)
         .unwrap()
         .await
         .expect("deliver invalid argument results");
@@ -1812,7 +1818,7 @@ async fn native_callbacks_deliver_state_and_results_and_refresh_captures_between
 
     for _ in 0..4 {
         let _ = application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("counter interaction");
@@ -1919,7 +1925,7 @@ async fn zero_argument_native_callbacks_reject_input_fields_and_deliver_sync_and
         );
     }
     for _ in 0..3 {
-        let _ = app.react().unwrap().await.unwrap();
+        let _ = app.react(false).unwrap().await.unwrap();
     }
 
     assert_eq!(props.sync_calls.load(Ordering::SeqCst), 1);

@@ -11,6 +11,7 @@ use super::{
     application_exit::ApplicationExitControl,
     async_task::{ComponentTaskContext, MountTaskStart},
     declaration::Placement,
+    definition::ComponentDefinitionError,
     event_input::{EventInputOrigin, EventSelector},
     event_listener::EventListenerDeclaration,
     preparation::{CommandWaitDeclaration, PreparationDeclaration, PreparationSet},
@@ -31,6 +32,7 @@ pub struct HookRenderContext<'render> {
     tasks: Option<&'render MountTaskHandle>,
     application_exit: Option<&'render ApplicationExitControl>,
     attempt_local_allowed: bool,
+    definition_fault: Option<ComponentDefinitionError>,
 }
 
 impl<'render> HookRenderContext<'render> {
@@ -60,6 +62,7 @@ impl<'render> HookRenderContext<'render> {
             tasks,
             application_exit,
             attempt_local_allowed: true,
+            definition_fault: None,
         }
     }
 
@@ -89,6 +92,7 @@ impl<'render> HookRenderContext<'render> {
             tasks,
             application_exit,
             attempt_local_allowed: false,
+            definition_fault: None,
         }
     }
 
@@ -102,23 +106,8 @@ impl<'render> HookRenderContext<'render> {
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
-        if !self.attempt_local_allowed {
-            panic!("System component declared generation-local reaction completion handler");
-        }
-        let mount = self
-            .signals
-            .use_marker_at(site, HookKind::ReactionCompletion)
-            .unwrap_or_else(|fault| panic!("{fault}"));
-        let task_context = self
-            .tasks
-            .cloned()
-            .map(|tasks| ComponentTaskContext::new(mount.clone(), tasks));
-        self.reaction_completions
-            .push(ReactionCompletionDeclaration::new(
-                handler,
-                mount,
-                task_context,
-            ));
+        self.try_use_reaction_completion_at(site, handler)
+            .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
     #[doc(hidden)]
@@ -128,35 +117,14 @@ impl<'render> HookRenderContext<'render> {
         LoaderFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
-        if !self.attempt_local_allowed {
-            panic!("System component declared generation-local preparation");
-        }
-        let mount = self
-            .signals
-            .use_marker_at(site, HookKind::Preparation)
-            .unwrap_or_else(|fault| panic!("{fault}"));
-        self.preparations
-            .push(PreparationDeclaration::new(loader, mount));
+        self.try_use_preparation_at(site, loader)
+            .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
     #[doc(hidden)]
     pub fn use_wait_for_command_at(&mut self, site: u32) {
-        if !self.attempt_local_allowed {
-            panic!("System component declared generation-local command wait");
-        }
-        let mount = self
-            .signals
-            .use_marker_at(site, HookKind::CommandWait)
-            .unwrap_or_else(|fault| panic!("{fault}"));
-        let feedback = self
-            .signals
-            .use_signal_at(site, CommandFeedback::default)
-            .unwrap_or_else(|fault| panic!("{fault}"));
-        self.preparations.push_command_wait(CommandWaitDeclaration {
-            mount,
-            feedback,
-            placement: Placement::User,
-        });
+        self.try_use_wait_for_command_at(site)
+            .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
     #[doc(hidden)]
@@ -164,11 +132,7 @@ impl<'render> HookRenderContext<'render> {
     where
         T: Send + Sync + 'static,
     {
-        if !self.attempt_local_allowed {
-            panic!("System component declared generation-local signal");
-        }
-        self.signals
-            .use_signal_at(site, initialize)
+        self.try_use_signal_at(site, initialize)
             .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
@@ -184,63 +148,26 @@ impl<'render> HookRenderContext<'render> {
         HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
         Error: fmt::Display + Send + 'static,
     {
-        if !self.attempt_local_allowed {
-            panic!("System component declared generation-local provider event handler");
-        }
-        let mount = self
-            .signals
-            .use_marker_at(site, HookKind::ProviderEventHandler)
-            .unwrap_or_else(|fault| panic!("{fault}"));
-        let task_context = self
-            .tasks
-            .cloned()
-            .map(|tasks| ComponentTaskContext::new(mount.clone(), tasks));
-        self.provider_handlers
-            .push(EventListenerDeclaration::provider_handler(
-                self.event_origin,
-                selector,
-                handler,
-                mount,
-                task_context,
-            ));
+        self.try_use_provider_event_handler_at(site, selector, handler)
+            .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
     #[doc(hidden)]
     pub fn use_application_id_at(&mut self, site: u32) -> ApplicationId {
-        self.signals
-            .use_marker_at(site, HookKind::ApplicationId)
-            .unwrap_or_else(|fault| panic!("{fault}"));
-        self.event_origin.application_id()
+        self.try_use_application_id_at(site)
+            .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
     #[doc(hidden)]
     pub fn use_reaction_request_at(&mut self, site: u32) -> ReactionRequest {
-        if !self.attempt_local_allowed {
-            panic!("System component declared generation-local reaction request");
-        }
-        let demand = self.driver_demand.cloned().unwrap_or_else(|| {
-            panic!("Component requires unavailable reaction request capability")
-        });
-        let mount = self
-            .signals
-            .use_marker_at(site, HookKind::ReactionRequest)
-            .unwrap_or_else(|fault| panic!("{fault}"));
-        ReactionRequest::new(mount, demand)
+        self.try_use_reaction_request_at(site)
+            .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
     #[doc(hidden)]
     pub fn use_application_exit_at(&mut self, site: u32) -> ApplicationExitHandle {
-        if !self.attempt_local_allowed {
-            panic!("System component declared generation-local application exit");
-        }
-        let exit = self.application_exit.cloned().unwrap_or_else(|| {
-            panic!("Component requires unavailable application exit capability")
-        });
-        let mount = self
-            .signals
-            .use_marker_at(site, HookKind::ApplicationExit)
-            .unwrap_or_else(|fault| panic!("{fault}"));
-        ApplicationExitHandle::for_mount(mount, exit)
+        self.try_use_application_exit_at(site)
+            .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
     #[doc(hidden)]
@@ -249,21 +176,8 @@ impl<'render> HookRenderContext<'render> {
         Factory: FnOnce() -> TaskFuture + Send + 'static,
         TaskFuture: Future<Output = ()> + Send + 'static,
     {
-        self.ensure_task_hook_allowed("future");
-        let tasks = self
-            .tasks
-            .cloned()
-            .expect("task hook capability was checked");
-        let mount = self
-            .signals
-            .use_marker_at(site, HookKind::Future)
-            .unwrap_or_else(|fault| panic!("{fault}"));
-        if mount.is_new_mount() {
-            self.task_starts.push(MountTaskStart::future(
-                ComponentTaskContext::new(mount, tasks),
-                factory,
-            ));
-        }
+        self.try_use_future_at(site, factory)
+            .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
     #[doc(hidden)]
@@ -278,36 +192,291 @@ impl<'render> HookRenderContext<'render> {
         Factory: FnOnce(CoroutineInbox<Message>) -> TaskFuture + Send + 'static,
         TaskFuture: Future<Output = ()> + Send + 'static,
     {
-        self.ensure_task_hook_allowed("coroutine");
-        assert!(
-            capacity > 0,
-            "Component coroutine capacity must be non-zero"
-        );
-        let tasks = self
-            .tasks
-            .cloned()
-            .expect("task hook capability was checked");
-        let (candidate_sender, receiver) = tokio::sync::mpsc::channel(capacity);
-        let (mount, sender) = self
-            .signals
-            .use_retained_at(site, HookKind::Coroutine, || candidate_sender)
-            .unwrap_or_else(|fault| panic!("{fault}"));
-        if mount.is_new_mount() {
-            self.task_starts.push(MountTaskStart::coroutine(
-                ComponentTaskContext::new(mount.clone(), tasks),
-                receiver,
-                service,
-            ));
-        }
-        Coroutine::new(mount, sender.as_ref().clone())
+        self.try_use_coroutine_at(site, capacity, service)
+            .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
-    fn ensure_task_hook_allowed(&self, capability: &'static str) {
-        if !self.attempt_local_allowed {
-            panic!("System component declared generation-local {capability}");
+    /// Dynamic definitions report invalid hook declarations as ordinary update
+    /// failures. Keep these failures sticky even if an external renderer ignores
+    /// an individual hook's returned error.
+    fn definition_hook<T>(
+        &mut self,
+        declare: impl FnOnce(&mut Self) -> Result<T, ComponentDefinitionError>,
+    ) -> Result<T, ComponentDefinitionError> {
+        if let Some(fault) = &self.definition_fault {
+            return Err(fault.clone());
         }
-        if self.tasks.is_none() {
-            panic!("Component requires unavailable {capability} capability");
+        let result = declare(self);
+        if let Err(fault) = &result {
+            self.definition_fault = Some(fault.clone());
         }
+        result
+    }
+
+    fn definition_hook_allowed(
+        &self,
+        capability: &'static str,
+    ) -> Result<(), ComponentDefinitionError> {
+        if self.attempt_local_allowed {
+            Ok(())
+        } else {
+            Err(ComponentDefinitionError::new(format!(
+                "System component declared generation-local {capability}"
+            )))
+        }
+    }
+
+    pub(crate) fn definition_result(&self) -> Result<(), ComponentDefinitionError> {
+        match &self.definition_fault {
+            Some(fault) => Err(fault.clone()),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn try_use_signal_at<T>(
+        &mut self,
+        site: u32,
+        initialize: impl FnOnce() -> T,
+    ) -> Result<Signal<T>, ComponentDefinitionError>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.definition_hook(move |context| {
+            context.definition_hook_allowed("signal")?;
+            context
+                .signals
+                .use_signal_at(site, initialize)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))
+        })
+    }
+
+    pub(crate) fn try_use_preparation_at<Loader, LoaderFuture, Error>(
+        &mut self,
+        site: u32,
+        loader: Loader,
+    ) -> Result<(), ComponentDefinitionError>
+    where
+        Loader: FnOnce() -> LoaderFuture + Send + 'static,
+        LoaderFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        self.definition_hook(move |context| {
+            context.definition_hook_allowed("preparation")?;
+            let mount = context
+                .signals
+                .use_marker_at(site, HookKind::Preparation)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            context
+                .preparations
+                .push(PreparationDeclaration::new(loader, mount));
+            Ok(())
+        })
+    }
+
+    pub(crate) fn try_use_wait_for_command_at(
+        &mut self,
+        site: u32,
+    ) -> Result<(), ComponentDefinitionError> {
+        self.definition_hook(move |context| {
+            context.definition_hook_allowed("command wait")?;
+            let mount = context
+                .signals
+                .use_marker_at(site, HookKind::CommandWait)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            let feedback = context
+                .signals
+                .use_signal_at(site, CommandFeedback::default)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            context
+                .preparations
+                .push_command_wait(CommandWaitDeclaration {
+                    mount,
+                    feedback,
+                    placement: Placement::User,
+                });
+            Ok(())
+        })
+    }
+
+    pub(crate) fn try_use_provider_event_handler_at<Event, Handler, HandlerFuture, Error>(
+        &mut self,
+        site: u32,
+        selector: EventSelector<ProviderEvent, Event>,
+        handler: Handler,
+    ) -> Result<(), ComponentDefinitionError>
+    where
+        Event: Clone + Send + Sync + 'static,
+        Handler: FnMut(EventContext, Event) -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        self.definition_hook(move |context| {
+            context.definition_hook_allowed("provider event handler")?;
+            let mount = context
+                .signals
+                .use_marker_at(site, HookKind::ProviderEventHandler)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            let task_context = context
+                .tasks
+                .cloned()
+                .map(|tasks| ComponentTaskContext::new(mount.clone(), tasks));
+            context
+                .provider_handlers
+                .push(EventListenerDeclaration::provider_handler(
+                    context.event_origin,
+                    selector,
+                    handler,
+                    mount,
+                    task_context,
+                ));
+            Ok(())
+        })
+    }
+
+    pub(crate) fn try_use_reaction_completion_at<Handler, HandlerFuture, Error>(
+        &mut self,
+        site: u32,
+        handler: Handler,
+    ) -> Result<(), ComponentDefinitionError>
+    where
+        Handler: FnOnce(EventContext) -> HandlerFuture + Send + 'static,
+        HandlerFuture: Future<Output = Result<(), Error>> + Send + 'static,
+        Error: fmt::Display + Send + 'static,
+    {
+        self.definition_hook(move |context| {
+            context.definition_hook_allowed("reaction completion handler")?;
+            let mount = context
+                .signals
+                .use_marker_at(site, HookKind::ReactionCompletion)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            let task_context = context
+                .tasks
+                .cloned()
+                .map(|tasks| ComponentTaskContext::new(mount.clone(), tasks));
+            context
+                .reaction_completions
+                .push(ReactionCompletionDeclaration::new(
+                    handler,
+                    mount,
+                    task_context,
+                ));
+            Ok(())
+        })
+    }
+
+    pub(crate) fn try_use_application_id_at(
+        &mut self,
+        site: u32,
+    ) -> Result<ApplicationId, ComponentDefinitionError> {
+        self.definition_hook(move |context| {
+            context
+                .signals
+                .use_marker_at(site, HookKind::ApplicationId)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            Ok(context.event_origin.application_id())
+        })
+    }
+
+    pub(crate) fn try_use_reaction_request_at(
+        &mut self,
+        site: u32,
+    ) -> Result<ReactionRequest, ComponentDefinitionError> {
+        self.definition_hook(move |context| {
+            context.definition_hook_allowed("reaction request")?;
+            let demand = context.driver_demand.cloned().ok_or_else(|| {
+                ComponentDefinitionError::new(
+                    "Component requires unavailable reaction request capability",
+                )
+            })?;
+            let mount = context
+                .signals
+                .use_marker_at(site, HookKind::ReactionRequest)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            Ok(ReactionRequest::new(mount, demand))
+        })
+    }
+
+    pub(crate) fn try_use_application_exit_at(
+        &mut self,
+        site: u32,
+    ) -> Result<ApplicationExitHandle, ComponentDefinitionError> {
+        self.definition_hook(move |context| {
+            context.definition_hook_allowed("application exit")?;
+            let exit = context.application_exit.cloned().ok_or_else(|| {
+                ComponentDefinitionError::new(
+                    "Component requires unavailable application exit capability",
+                )
+            })?;
+            let mount = context
+                .signals
+                .use_marker_at(site, HookKind::ApplicationExit)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            Ok(ApplicationExitHandle::for_mount(mount, exit))
+        })
+    }
+
+    pub(crate) fn try_use_future_at<Factory, TaskFuture>(
+        &mut self,
+        site: u32,
+        factory: Factory,
+    ) -> Result<(), ComponentDefinitionError>
+    where
+        Factory: FnOnce() -> TaskFuture + Send + 'static,
+        TaskFuture: Future<Output = ()> + Send + 'static,
+    {
+        self.definition_hook(move |context| {
+            context.definition_hook_allowed("future")?;
+            let tasks = context.tasks.cloned().ok_or_else(|| {
+                ComponentDefinitionError::new("Component requires unavailable future capability")
+            })?;
+            let mount = context
+                .signals
+                .use_marker_at(site, HookKind::Future)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            if mount.is_new_mount() {
+                context.task_starts.push(MountTaskStart::future(
+                    ComponentTaskContext::new(mount, tasks),
+                    factory,
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn try_use_coroutine_at<Message, Factory, TaskFuture>(
+        &mut self,
+        site: u32,
+        capacity: usize,
+        service: Factory,
+    ) -> Result<Coroutine<Message>, ComponentDefinitionError>
+    where
+        Message: Send + 'static,
+        Factory: FnOnce(CoroutineInbox<Message>) -> TaskFuture + Send + 'static,
+        TaskFuture: Future<Output = ()> + Send + 'static,
+    {
+        self.definition_hook(move |context| {
+            context.definition_hook_allowed("coroutine")?;
+            let tasks = context.tasks.cloned().ok_or_else(|| {
+                ComponentDefinitionError::new("Component requires unavailable coroutine capability")
+            })?;
+            if capacity == 0 {
+                return Err(ComponentDefinitionError::new(
+                    "Component coroutine capacity must be non-zero",
+                ));
+            }
+            let (candidate_sender, receiver) = tokio::sync::mpsc::channel(capacity);
+            let (mount, sender) = context
+                .signals
+                .use_retained_at(site, HookKind::Coroutine, || candidate_sender)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            if mount.is_new_mount() {
+                context.task_starts.push(MountTaskStart::coroutine(
+                    ComponentTaskContext::new(mount.clone(), tasks),
+                    receiver,
+                    service,
+                ));
+            }
+            Ok(Coroutine::new(mount, sender.as_ref().clone()))
+        })
     }
 }

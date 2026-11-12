@@ -18,6 +18,17 @@ pub(super) struct MountedListener {
 }
 
 impl MountedListener {
+    pub(super) fn requires_text_deltas(&self) -> bool {
+        matches!(&self.declaration, MountedListenerDeclaration::Event(event) if event.requires_text_deltas())
+    }
+
+    pub(super) fn is_xml_action(&self) -> bool {
+        matches!(
+            &self.declaration,
+            MountedListenerDeclaration::StreamingToolCall(_)
+        )
+    }
+
     pub(super) fn new_event(
         declaration: EventListenerDeclaration,
         event_origin: EventInputOrigin,

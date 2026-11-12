@@ -336,12 +336,23 @@ fn diff_keyed(current: &XmlNode, previous: &XmlNode, key: &XmlName) -> Option<Xm
                 operation_node("remove", removed)
             }),
     );
-    operations.extend(current_items.iter().filter_map(|(key, item)| {
-        previous_items
+    operations.extend(current_items.iter().filter_map(|(identity, item)| {
+        let (_, previous_item) = previous_items
             .iter()
-            .find(|(previous_key, _)| previous_key == key)
-            .filter(|(_, previous_item)| previous_item != item)
-            .map(|_| operation_node("update", item.clone()))
+            .find(|(previous_key, _)| previous_key == identity)?;
+        // Explicit nested slots retain their field strategies inside keyed
+        // records. Unmarked changes still yield the complete current record.
+        let mut patch = diff_xml_nodes(item, previous_item)?;
+        match patch.attributes().get(key) {
+            // A business key may itself use a delta marker's attribute name.
+            // Preserve its identity by sending the complete record instead.
+            Some(attribute) if attribute.value() != identity.as_str() => patch = item.clone(),
+            None => patch
+                .push_attribute(key.clone(), identity.clone())
+                .expect("a sparse keyed update has no identity attribute yet"),
+            Some(_) => {}
+        }
+        Some(operation_node("update", patch))
     }));
     collection_delta(current, operations)
 }

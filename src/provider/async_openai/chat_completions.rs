@@ -865,6 +865,8 @@ pub(super) enum OpenAiChatCompletionsError {
     SerializedRequestBodyLimit,
     #[error("Chat Completions does not support native tool declarations")]
     UnsupportedNativeToolDeclarations,
+    #[error("Chat Completions does not support structured Decision declarations")]
+    UnsupportedDecision,
     #[error(transparent)]
     PomRender(#[from] PomRenderError),
     #[error(transparent)]

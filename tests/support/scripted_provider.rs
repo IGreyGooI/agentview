@@ -163,7 +163,9 @@ impl ScriptedProvider {
                         context_window: ContextWindow::NotApplicable,
                         reserved_output_tokens: None,
                     },
-                    FrameCapabilities::new(true),
+                    FrameCapabilities::new(true)
+                        .with_native_tool_calls(true)
+                        .with_text_delta_output(true),
                 ),
                 scripts: scripts.into_iter().collect(),
                 capture: capture.clone(),
@@ -312,7 +314,7 @@ mod tests {
         let mut application =
             Application::mount(move || capture_retry_application(props.clone()), provider).unwrap();
 
-        let fault = application.react().unwrap().await.unwrap_err();
+        let fault = application.react(false).unwrap().await.unwrap_err();
         assert_eq!(fault.stage(), ApplicationFaultStage::Submit);
         assert_eq!(fault.kind(), ApplicationFaultKind::Retryable);
         assert_eq!(
@@ -323,7 +325,12 @@ mod tests {
         assert_eq!(capture.accepted_revision(), None);
         assert!(completions.lock().unwrap().is_empty());
 
-        assert!(application.react().unwrap().await.unwrap().is_continue());
+        assert!(application
+            .react(false)
+            .unwrap()
+            .await
+            .unwrap()
+            .is_continue());
         assert_eq!(capture.submission_count(), 1);
         assert_eq!(capture.frames()[0].basis, FrameBasis::Full);
         assert!(capture.accepted_revision().is_some());

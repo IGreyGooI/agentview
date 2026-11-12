@@ -67,7 +67,9 @@ impl CapturingPort {
                 context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
-            FrameCapabilities::new(true),
+            FrameCapabilities::new(true)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
         );
         let identity = TargetIdentity::new(NonZeroU128::new(91).expect("non-zero target"));
         let epoch = TargetEpoch::new(NonZeroU64::new(1).expect("non-zero epoch"));
@@ -238,7 +240,7 @@ fn assert_user_developer_raw(frame: &CapturedFrame, raw: &str) {
 async fn react(application: &mut Application<CapturingPort>) {
     assert_eq!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("reaction succeeds"),

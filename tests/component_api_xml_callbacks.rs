@@ -78,7 +78,9 @@ impl Port {
                             context_window: ContextWindow::NotApplicable,
                             reserved_output_tokens: None,
                         },
-                        FrameCapabilities::new(true),
+                        FrameCapabilities::new(true)
+                            .with_native_tool_calls(true)
+                            .with_text_delta_output(true),
                     ),
                 ),
                 scripts: scripts.into_iter().collect(),
@@ -286,7 +288,7 @@ async fn callbacks_preserve_source_order_skip_typos_and_deliver_feedback_for_the
         completed(),
     ]);
     let mut app = Application::mount(move || notebook(root_probe.clone()), port).unwrap();
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     let first = probe.snapshot();
     assert_eq!(first.notes, ["first & 中", "last"]);
     assert_eq!(first.streamed, "first & 中last");
@@ -316,8 +318,8 @@ async fn callbacks_preserve_source_order_skip_typos_and_deliver_feedback_for_the
         "callbacks across declared components execute in XML source order"
     );
 
-    let _ = app.react().unwrap().await.unwrap();
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     assert_eq!(probe.snapshot().confirmations, [1, 2]);
     let views = capture.views();
     assert!(views[0].has_text("Save one note. Its decoded text becomes the note."));
@@ -418,7 +420,7 @@ async fn typed_attribute_errors_skip_callbacks_and_valid_following_actions_conti
         "<confirm count=\"0\"/><say>still works</say>",
     ]))]);
     let mut app = Application::mount(move || notebook(root_probe.clone()), port).unwrap();
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     let state = probe.snapshot();
     assert_eq!(state.notes, ["still works"]);
     assert_eq!(state.confirmations, [0]);
@@ -447,13 +449,13 @@ async fn rerender_refreshes_captures_and_unmount_removes_the_action() {
         Script::Finite(text_facts(&["<say>unmounted</say><confirm count=\"2\"/>"])),
     ]);
     let mut app = Application::mount(move || notebook(root_probe.clone()), port).unwrap();
-    let _ = app.react().unwrap().await.unwrap();
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     let state = probe.snapshot();
     assert!(state.events.contains(&"complete:0:one".to_owned()));
     assert!(state.events.contains(&"complete:1:two".to_owned()));
     probe.signal().update(|book| book.show_say = false).unwrap();
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     let state = probe.snapshot();
     assert_eq!(state.notes, ["one", "two"]);
     assert_eq!(state.confirmations, [2]);
@@ -485,13 +487,13 @@ async fn commentary_is_not_executed_and_eof_reports_incomplete_actions() {
     facts.extend(text_facts(&["<say>kept</say><say>unfinished"]));
     let (port, capture) = Port::new([Script::Finite(facts), completed()]);
     let mut app = Application::mount(move || notebook(root_probe.clone()), port).unwrap();
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     let state = probe.snapshot();
     assert_eq!(state.notes, ["kept"]);
     assert_eq!(state.streamed, "keptunfinished");
     assert_eq!(state.diagnostics.len(), 1);
     assert_eq!(state.diagnostics[0].element.as_deref(), Some("say"));
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     assert!(capture.views()[1].has_field("saved_count", "1"));
     assert!(capture.views()[1].has_field(
         "feedback",
@@ -537,7 +539,7 @@ async fn callback_failure_stops_later_buffered_events_and_remains_a_runtime_faul
     let mut app =
         Application::mount(move || failing_callback(Arc::clone(&root_events)), port).unwrap();
     let error = app
-        .react()
+        .react(false)
         .unwrap()
         .await
         .expect_err("callback error is a reaction fault");
@@ -604,7 +606,7 @@ async fn cancellation_drops_callback_future_and_does_not_replay_buffered_complet
         Script::Finite(text_facts(&["<say>next</say>"])),
     ]);
     let mut app = Application::mount(move || pending_callback(root_probe.clone()), port).unwrap();
-    let reaction_control = app.react().unwrap();
+    let reaction_control = app.react(false).unwrap();
     let mut reaction = Box::pin(std::future::IntoFuture::into_future(
         reaction_control.clone(),
     ));
@@ -625,7 +627,7 @@ async fn cancellation_drops_callback_future_and_does_not_replay_buffered_complet
     assert!(probe.dropped.load(Ordering::SeqCst));
     let state = probe.state.lock().unwrap().clone().unwrap();
     assert_eq!(state.with(Clone::clone).unwrap(), ["delta:pause"]);
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     assert_eq!(
         state.with(Clone::clone).unwrap(),
         ["delta:pause", "delta:next", "complete:next"]
@@ -656,8 +658,8 @@ async fn self_closing_defaults_to_unit_and_invalid_input_has_feedback_without_a_
     let root_pings = Arc::clone(&pings);
     let (port, capture) = Port::new([Script::Finite(text_facts(&["<pign/><ping/>"])), completed()]);
     let mut app = Application::mount(move || ping_action(Arc::clone(&root_pings)), port).unwrap();
-    let _ = app.react().unwrap().await.unwrap();
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     assert_eq!(*pings.lock().unwrap(), 1);
     assert!(capture.views()[1].has_attribute("element", "pign"));
     assert!(capture.views()[1].has_attribute("code", "unknown_element"));
@@ -724,7 +726,7 @@ async fn callback_invocation_and_async_poll_have_mount_context_and_unmount_retir
     let root_probe = probe.clone();
     let (port, _) = Port::new([Script::Finite(text_facts(&["<start/>"])), completed()]);
     let mut app = Application::mount(move || spawning_root(root_probe.clone()), port).unwrap();
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         probe.sync_started.notified().await;
         probe.async_started.notified().await;
@@ -741,7 +743,7 @@ async fn callback_invocation_and_async_poll_have_mount_context_and_unmount_retir
         .unwrap()
         .set(false)
         .unwrap();
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     assert!(probe.sync_dropped.load(Ordering::SeqCst));
     assert!(probe.async_dropped.load(Ordering::SeqCst));
     assert!(
@@ -855,7 +857,7 @@ async fn simple_and_managed_xml_actions_coexist_without_sibling_unknown_diagnost
     ]))]);
     let mut app =
         Application::mount(move || mixed_callbacks(root_probe.clone(), false), port).unwrap();
-    let _ = app.react().unwrap().await.unwrap();
+    let _ = app.react(false).unwrap().await.unwrap();
     assert_eq!(*probe.picks.lock().unwrap(), [7]);
     assert_eq!(*probe.published.lock().unwrap(), ["managed value"]);
     assert!(probe.diagnostics.lock().unwrap().is_empty());
@@ -866,7 +868,7 @@ async fn duplicate_names_between_simple_and_managed_actions_fail_before_submissi
     let probe = MixedProbe::default();
     let (port, capture) = Port::new([completed()]);
     let result = match Application::mount(move || mixed_callbacks(probe.clone(), true), port) {
-        Ok(mut application) => application.react().unwrap().await.map(|_| ()),
+        Ok(mut application) => application.react(false).unwrap().await.map(|_| ()),
         Err(error) => Err(error),
     };
     let error = result.expect_err("one action name cannot select direct and managed handlers");

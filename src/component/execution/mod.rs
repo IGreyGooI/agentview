@@ -14,13 +14,16 @@ mod command_parser;
 #[cfg(feature = "legacy-provider-port")]
 mod component_reaction;
 mod debug;
+mod decision;
 mod driver_demand;
 mod external;
 mod frame;
+mod frame_observation;
 mod integration;
 mod port;
 mod projection_diff;
 mod prompt_export;
+mod prompt_profile;
 #[cfg(feature = "legacy-provider-port")]
 mod prompt_render;
 mod stdin;
@@ -41,7 +44,8 @@ pub use admission::{ReactionAdmissionReason, ToolOutputStagingReason};
 pub use application::{
     ApplicationFault, ApplicationFaultCode, ApplicationFaultKind, ApplicationFaultReason,
     ApplicationFaultStage, ParallelApplication as Application, ProjectionSnapshot, Reaction,
-    ReactionOutcome, ReactionWait,
+    ReactionOutcome, ReactionWait, DefinitionUpdate, DefinitionUpdateError,
+    DefinitionUpdateErrorKind, DefinitionVersion,
 };
 #[cfg(feature = "legacy-provider-port")]
 #[allow(
@@ -67,6 +71,13 @@ pub use component_reaction::{
     ComponentReactionProps, ComponentReactionRuntime, ComponentReactionRuntimeFault,
 };
 pub use debug::{DebugFrameSnapshot, DebugPromptCapture, DebugProviderPort};
+pub use frame_observation::FrameObservation;
+pub use decision::{
+    ChoiceAnswer, DecisionAnswer, DecisionAnswers, DecisionBatchId, DecisionBox,
+    DecisionDeclaration, DecisionDeclarationError, DecisionFailure, DecisionNoulCriteria,
+    DecisionOutput, DecisionQuestion, DecisionSource, NoulAnswer, ProviderDecision,
+    QuestionOutcome, ScoreAnswer,
+};
 pub use external::{
     ExternalAct, ExternalApplication, ExternalApplicationFault, ExternalControl,
     ExternalControlFault, ExternalIngressGeneration, ExternalObservation, ExternalObservationKind,
@@ -85,7 +96,7 @@ pub use port::ProviderPort;
 #[cfg(feature = "legacy-provider-port")]
 pub(crate) use port::ToolOutputSink;
 pub(crate) use port::{
-    ProjectionExecutionScope, ProviderResponseOutputIdentityObservedSpan,
+    ProjectionExecutionScope, ProjectionProvenance, ProviderResponseOutputIdentityObservedSpan,
     RenderedProjectionFragment, RenderedProjectionItemTemplate,
 };
 pub use port::{
@@ -115,13 +126,17 @@ pub(crate) use projection_diff::{
     ProjectionDiffState, ProjectionReconciliationState, ReconciledProjectionPlan,
 };
 pub use prompt_export::PromptExportError;
+pub use prompt_profile::{
+    ComponentByteUsage, PromptByteProfile, PromptComponent, PromptSource, PromptSourceKind,
+    PromptSourceSpan, RenderedPrompt,
+};
 pub use reaction::{
-    ContextWindow, ForkableReactionPort, Frame, FrameBasis, FrameCapabilities, FrameConstraints,
-    FrameProfile, FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact,
-    ProviderFactStream, ProviderOutputKey, ProviderToolCall, ProviderToolCallError, ReactionPort,
-    ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason,
-    ResettableReactionPort, SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch,
-    TargetIdentity, ToolCatalog,
+    ContextWindow, ForkableReactionPort, Frame, FrameBasis, FrameCapabilities, FrameCapability,
+    FrameConstraints, FrameProfile, FrameRequirements, FrameRevision, FrameSubmission,
+    ProjectionSubmission, ProviderFact, ProviderFactStream, ProviderOutputKey, ProviderToolCall,
+    ProviderToolCallError, ReactionPort, ReactionPortFault, ReactionPortFaultCode,
+    ReactionPortFaultKind, ReactionPortFaultReason, ResettableReactionPort, SubmitFault,
+    TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
 };
 pub use stdin::{StdinApplication, StdinApplicationError, StdinApplicationOptions, StdinResponse};
 pub use streaming::{StreamingToolRecoveryReport, StreamingToolRecoveryStatus};

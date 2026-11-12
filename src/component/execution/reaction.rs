@@ -14,7 +14,7 @@ use futures::Stream;
 
 use crate::transcript::{AssistantPhase, CanonicalInputItem, CanonicalTranscriptError};
 
-use super::ToolDefinition;
+use super::{DecisionDeclaration, ProviderDecision, ToolDefinition};
 
 /// Mount-stable identity of the logical target owned by one reaction port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -146,6 +146,9 @@ pub struct FrameConstraints {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameCapabilities {
     supports_semantic_delta: bool,
+    native_tool_calls: bool,
+    text_delta_output: bool,
+    decision: bool,
 }
 
 impl FrameCapabilities {
@@ -154,11 +157,110 @@ impl FrameCapabilities {
     pub const fn new(supports_semantic_delta: bool) -> Self {
         Self {
             supports_semantic_delta,
+            native_tool_calls: false,
+            text_delta_output: false,
+            decision: false,
         }
     }
 
     pub const fn supports_semantic_delta(self) -> bool {
         self.supports_semantic_delta
+    }
+
+    pub const fn with_native_tool_calls(mut self, enabled: bool) -> Self {
+        self.native_tool_calls = enabled;
+        self
+    }
+
+    pub const fn with_text_delta_output(mut self, enabled: bool) -> Self {
+        self.text_delta_output = enabled;
+        self
+    }
+
+    pub const fn with_decision(mut self, enabled: bool) -> Self {
+        self.decision = enabled;
+        self
+    }
+
+    pub const fn supports_native_tool_calls(self) -> bool {
+        self.native_tool_calls
+    }
+    pub const fn supports_text_delta_output(self) -> bool {
+        self.text_delta_output
+    }
+    pub const fn supports_decision(self) -> bool {
+        self.decision
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameCapability {
+    NativeToolCalls,
+    TextDeltaOutput,
+    Decision,
+}
+
+/// Requirements collected from a complete current Component declaration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameRequirements {
+    native_tool_calls: bool,
+    text_delta_output: bool,
+    decision: bool,
+}
+
+impl FrameRequirements {
+    pub const NONE: Self = Self::new(false, false, false);
+    pub const fn new(native_tool_calls: bool, text_delta_output: bool, decision: bool) -> Self {
+        Self {
+            native_tool_calls,
+            text_delta_output,
+            decision,
+        }
+    }
+    pub const fn with_native_tool_calls(mut self, enabled: bool) -> Self {
+        self.native_tool_calls = enabled;
+        self
+    }
+    pub const fn with_text_delta_output(mut self, enabled: bool) -> Self {
+        self.text_delta_output = enabled;
+        self
+    }
+    pub const fn with_decision(mut self, enabled: bool) -> Self {
+        self.decision = enabled;
+        self
+    }
+    pub const fn requires_native_tool_calls(self) -> bool {
+        self.native_tool_calls
+    }
+    pub const fn requires_text_delta_output(self) -> bool {
+        self.text_delta_output
+    }
+    pub const fn requires_decision(self) -> bool {
+        self.decision
+    }
+    pub const fn is_empty(self) -> bool {
+        !self.native_tool_calls && !self.text_delta_output && !self.decision
+    }
+    pub const fn contains(self, capability: FrameCapability) -> bool {
+        match capability {
+            FrameCapability::NativeToolCalls => self.native_tool_calls,
+            FrameCapability::TextDeltaOutput => self.text_delta_output,
+            FrameCapability::Decision => self.decision,
+        }
+    }
+    pub const fn union(self, other: Self) -> Self {
+        Self::new(
+            self.native_tool_calls || other.native_tool_calls,
+            self.text_delta_output || other.text_delta_output,
+            self.decision || other.decision,
+        )
+    }
+    pub const fn missing_from(self, available: FrameCapabilities) -> Self {
+        Self::new(
+            self.native_tool_calls && !available.native_tool_calls,
+            self.text_delta_output && !available.text_delta_output,
+            self.decision && !available.decision,
+        )
     }
 }
 
@@ -354,6 +456,8 @@ pub struct FrameSubmission {
     ephemeral: Vec<CanonicalInputItem>,
     tools: ToolCatalog,
     canonical_bytes: Box<[u8]>,
+    requirements: FrameRequirements,
+    decision: Option<DecisionDeclaration>,
 }
 
 impl FrameSubmission {
@@ -373,6 +477,8 @@ impl FrameSubmission {
             ephemeral: Vec::new(),
             tools,
             canonical_bytes: canonical_bytes.into_boxed_slice(),
+            requirements: FrameRequirements::NONE,
+            decision: None,
         }
     }
 
@@ -389,6 +495,28 @@ impl FrameSubmission {
 
     pub fn projection(&self) -> &ProjectionSubmission {
         &self.projection
+    }
+
+    pub fn decision(&self) -> Option<&DecisionDeclaration> {
+        self.decision.as_ref()
+    }
+
+    pub(crate) fn with_decision(mut self, decision: Option<DecisionDeclaration>) -> Self {
+        self.decision = decision;
+        self
+    }
+
+    pub fn requirements(&self) -> FrameRequirements {
+        self.requirements.union(FrameRequirements::new(
+            !self.tools.definitions().is_empty(),
+            false,
+            self.decision().is_some(),
+        ))
+    }
+
+    pub(crate) fn with_requirements(mut self, requirements: FrameRequirements) -> Self {
+        self.requirements = requirements;
+        self
     }
 
     /// Complete request-only prompts, delivered after all retained input.
@@ -658,6 +786,10 @@ pub enum ProviderFact {
         ordinal: u64,
         call: ProviderToolCall,
     },
+    Decision {
+        output: ProviderOutputKey,
+        decision: ProviderDecision,
+    },
     ReactionCompleted {
         primary_text: Option<ProviderOutputKey>,
     },
@@ -898,10 +1030,10 @@ mod tests {
 
     use super::{
         ContextWindow, Frame, FrameBasis, FrameCapabilities, FrameConstraints, FrameInvariantFault,
-        FrameProfile, FrameRevision, FrameSubmission, ProjectionSubmission, ProviderFact,
-        ProviderFactStream, ProviderOutputKey, ProviderToolCall, ReactionPort, ReactionPortFault,
-        ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason, SubmitFault,
-        TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
+        FrameProfile, FrameRequirements, FrameRevision, FrameSubmission, ProjectionSubmission,
+        ProviderFact, ProviderFactStream, ProviderOutputKey, ProviderToolCall, ReactionPort,
+        ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultKind, ReactionPortFaultReason,
+        SubmitFault, TargetContinuity, TargetDeclaration, TargetEpoch, TargetIdentity, ToolCatalog,
         ToolCatalogFault,
     };
 
@@ -932,7 +1064,9 @@ mod tests {
                 context_window: ContextWindow::Tokens(std::num::NonZeroU64::new(8_192).unwrap()),
                 reserved_output_tokens: Some(1_024),
             },
-            FrameCapabilities::new(true),
+            FrameCapabilities::new(true)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
         )
     }
 
@@ -958,6 +1092,35 @@ mod tests {
             ephemeral: Vec::new(),
             tools: ToolCatalog::new(Vec::new()).unwrap(),
             canonical_bytes: b"test-only-canonical-frame".to_vec().into_boxed_slice(),
+            requirements: FrameRequirements::NONE,
+            decision: None,
+        }
+    }
+
+    #[test]
+    fn capability_requirements_validate_every_subset_without_semantic_delta_coupling() {
+        for required in 0u8..8 {
+            let requirements =
+                FrameRequirements::new(required & 1 != 0, required & 2 != 0, required & 4 != 0);
+            for available in 0u8..8 {
+                for semantic_delta in [false, true] {
+                    let capabilities = FrameCapabilities::new(semantic_delta)
+                        .with_native_tool_calls(available & 1 != 0)
+                        .with_text_delta_output(available & 2 != 0)
+                        .with_decision(available & 4 != 0);
+                    let missing = requirements.missing_from(capabilities);
+                    assert_eq!(missing.is_empty(), required & !available == 0);
+                    assert_eq!(
+                        missing.requires_native_tool_calls(),
+                        required & !available & 1 != 0
+                    );
+                    assert_eq!(
+                        missing.requires_text_delta_output(),
+                        required & !available & 2 != 0
+                    );
+                    assert_eq!(missing.requires_decision(), required & !available & 4 != 0);
+                }
+            }
         }
     }
 

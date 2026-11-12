@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let mut parent = Application::mount(move || counter(parent_snapshot.clone()), source_port)?;
 
     let result = async {
-        ensure!(parent.react()?.await?.is_continue(), "source exited");
+        ensure!(parent.react(false)?.await?.is_continue(), "source exited");
 
         let snapshot = business.clone();
         let (target_port, child_capture) = DebugProviderPort::new();
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         let submitted_during_fork = !child_capture.frame_snapshots().is_empty();
 
-        let child_turn = child.react()?.await;
+        let child_turn = child.react(false)?.await;
         let child_cleanup = child.shutdown().await;
         ensure!(child_turn?.is_continue(), "child exited");
         child_cleanup?;

@@ -1369,21 +1369,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declared_context_window_is_enforced_before_handoff() {
-        let mut provider = provider("http://127.0.0.1:1", None);
+    async fn estimated_context_window_does_not_reject_an_encodable_request() {
+        let (base, mut requests, shutdown, server) =
+            spawn_server(StatusCode::OK, "text/event-stream", completed_sse("ok")).await;
+        let mut provider = provider(&base, None);
         provider.reaction_target.profile.constraints.context_window =
             crate::component::execution::ContextWindow::Tokens(NonZeroU64::MIN);
         let initial = ReactionPort::declare(&mut provider).unwrap();
-        let error = match ReactionPort::submit(&mut provider, full_frame(&initial)).await {
-            Err(error) => error,
-            Ok(_) => panic!("request exceeding the declared window was accepted"),
-        };
-        let SubmitFault::Rejected(fault) = error else {
-            panic!("unexpected pre-handoff fault: {error:?}");
-        };
-        assert_eq!(fault.code(), ReactionPortFaultCode::Limit);
-        assert_eq!(fault.reason(), ReactionPortFaultReason::RequestPreparation);
-        assert_eq!(ReactionPort::declare(&mut provider).unwrap(), initial);
+        let mut stream = ReactionPort::submit(&mut provider, full_frame(&initial)).await.unwrap();
+        while let Some(fact) = stream.next().await { fact.unwrap(); }
+        drop(stream);
+        assert!(requests.recv().await.unwrap().len() > 4);
+        assert!(matches!(ReactionPort::declare(&mut provider).unwrap().continuity(), TargetContinuity::Accepted { .. }));
+        let _ = shutdown.send(());
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -106,22 +106,41 @@ async fn continuity_retry_attributes_callbacks_only_to_the_successful_handoff() 
                     context_window: ContextWindow::NotApplicable,
                     reserved_output_tokens: None,
                 },
-                FrameCapabilities::NONE,
+                FrameCapabilities::NONE
+                    .with_native_tool_calls(true)
+                    .with_text_delta_output(true),
             ),
         ),
         observations: Arc::clone(&observations),
         retry: true,
     };
     let state = Arc::clone(&observations);
-    let mut app = Application::mount(move || collect_sources(Arc::clone(&state)), port).unwrap();
+    let prepared = Arc::new(Mutex::new(Vec::new()));
+    let sink = prepared.clone();
+    let mut app = Application::mount(move || collect_sources(Arc::clone(&state)), port)
+        .unwrap()
+        .with_frame_observer(move |event| {
+            sink.lock().unwrap().push((
+                event.reaction_id(),
+                event.projection_revision(),
+                event.frame().revision(),
+            ))
+        });
     let application_id = app.application_id();
-    assert!(app.react().unwrap().await.unwrap().is_continue());
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     {
         let observed = observations.lock().unwrap();
         assert_eq!(observed.rejected.len(), 1);
         assert_eq!(observed.accepted.len(), 2);
         assert_eq!(observed.callbacks.len(), 6);
+        let attempts = prepared.lock().unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts[0].0, attempts[1].0);
+        assert_eq!(attempts[0].1, attempts[1].1);
+        assert_eq!(attempts[0].2, observed.rejected[0]);
+        assert_eq!(attempts[1].2, observed.accepted[0]);
+        assert_eq!(attempts[2].2, observed.accepted[1]);
         for (reaction, contexts) in observed.callbacks.chunks_exact(3).enumerate() {
             assert!(contexts[0].reaction_id().is_some());
             for context in contexts {

@@ -20,6 +20,31 @@ impl ComponentId {
         Self(format!("{}/{identity}", self.0).into())
     }
 
+    /// Length-prefix every owned segment so keys cannot collide through path
+    /// separators, punctuation, or ambiguity between type and instance names.
+    pub(crate) fn dynamic_child(
+        &self,
+        type_id: &str,
+        instance_key: &str,
+        compatibility_key: &str,
+        system: bool,
+    ) -> Self {
+        Self(
+            format!(
+                "{}/@dynamic:{}:{}:{}:{}:{}:{}:{};",
+                self.0,
+                u8::from(system),
+                type_id.len(),
+                type_id,
+                instance_key.len(),
+                instance_key,
+                compatibility_key.len(),
+                compatibility_key,
+            )
+            .into(),
+        )
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }

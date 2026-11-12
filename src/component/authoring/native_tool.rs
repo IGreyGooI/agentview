@@ -62,8 +62,22 @@ impl NativeToolCall {
             .build()
     }
 
-    pub fn named(name: &'static str) -> NativeToolCallNamed {
-        NativeToolCallNamed { name }
+    pub fn named(name: impl Into<String>) -> NativeToolCallNamed {
+        let name = name.into();
+        NativeToolCallNamed {
+            definition: ToolDefinition::legacy_name_only(name.clone()),
+            name,
+        }
+    }
+
+    /// Bind a dynamic schema and owned name to an ordinary native tool callback.
+    /// The callback receives the original EventContext and ToolCall, and must
+    /// decode/validate its arguments before executing business effects.
+    pub fn from_definition(definition: ToolDefinition) -> NativeToolCallNamed {
+        NativeToolCallNamed {
+            name: definition.name().to_owned(),
+            definition: Ok(definition),
+        }
     }
 }
 
@@ -82,9 +96,9 @@ pub struct NativeToolCallback {
 }
 
 impl<Name, Callback> NativeToolCallProps<Name, Callback> {
-    pub fn name(self, name: &'static str) -> NativeToolCallProps<&'static str, Callback> {
+    pub fn name(self, name: impl Into<String>) -> NativeToolCallProps<String, Callback> {
         NativeToolCallProps {
-            name,
+            name: name.into(),
             description: self.description,
             invoke: self.invoke,
         }
@@ -192,12 +206,16 @@ where
     })
 }
 
-impl NativeToolCallProps<&'static str, NativeToolCallback> {
+impl NativeToolCallProps<String, NativeToolCallback> {
     pub fn build(self) -> Component {
         Component::from_node(ComponentNode::NativeToolCall(Box::new(
             NativeToolCallDeclaration {
+                definition: ToolDefinition::new(
+                    self.name.clone(),
+                    self.description,
+                    self.invoke.schema,
+                ),
                 name: self.name,
-                definition: ToolDefinition::new(self.name, self.description, self.invoke.schema),
                 history: None,
                 round: Arc::new(()),
                 invoke: self.invoke.invoke,
@@ -251,7 +269,8 @@ where
 }
 
 pub struct NativeToolCallNamed {
-    name: &'static str,
+    name: String,
+    definition: Result<ToolDefinition, ToolDefinitionError>,
 }
 
 impl NativeToolCallNamed {
@@ -264,11 +283,7 @@ impl NativeToolCallNamed {
         Component::from_node(ComponentNode::NativeToolCall(Box::new(
             NativeToolCallDeclaration {
                 name: self.name,
-                definition: ToolDefinition::new(
-                    self.name,
-                    "AgentView native tool",
-                    serde_json::json!({"type": "object", "additionalProperties": true}),
-                ),
+                definition: self.definition,
                 history: None,
                 round: Arc::new(()),
                 invoke: Box::new(move |context, call| {
@@ -282,7 +297,7 @@ impl NativeToolCallNamed {
 }
 
 pub(crate) struct NativeToolCallDeclaration {
-    name: &'static str,
+    name: String,
     definition: Result<ToolDefinition, ToolDefinitionError>,
     history: Option<Signal<NativeToolHistory>>,
     // Render bindings serve one response; only dispatched calls retain this token.
@@ -291,8 +306,8 @@ pub(crate) struct NativeToolCallDeclaration {
 }
 
 impl NativeToolCallDeclaration {
-    pub(crate) fn name(&self) -> &'static str {
-        self.name
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     pub(crate) fn definition(&self) -> Result<&ToolDefinition, &ToolDefinitionError> {

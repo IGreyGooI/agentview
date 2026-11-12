@@ -106,6 +106,7 @@ impl ViewNode {
                 if is_markdown_path(&path, "paragraph") {
                     ViewNodeKind::MarkdownParagraph(MarkdownParagraph::parse_after_path(input)?)
                 } else if path_ends_with(&path, "NativeToolCall")
+                    || path_ends_with(&path, "Decision")
                     || path_ends_with(&path, "CliCommand")
                     || path_ends_with(&path, "Action")
                 {
@@ -271,7 +272,24 @@ impl ComponentProps {
                 content.parse::<Token![,]>()?;
             }
         }
-        if path_ends_with(&path, "NativeToolCall") {
+        if path_ends_with(&path, "Decision") {
+            for (name, _) in &properties {
+                if !matches!(
+                    identifier_text(name).as_str(),
+                    "name" | "question" | "on_result"
+                ) {
+                    return Err(syn::Error::new_spanned(name, "unknown Decision prop"));
+                }
+            }
+            for required in ["name", "question", "on_result"] {
+                if !property_names.contains(required) {
+                    return Err(syn::Error::new_spanned(
+                        &path,
+                        format!("missing Decision prop `{required}`"),
+                    ));
+                }
+            }
+        } else if path_ends_with(&path, "NativeToolCall") {
             for (name, _) in &properties {
                 if !matches!(
                     identifier_text(name).as_str(),
@@ -1174,6 +1192,43 @@ mod tests {
     }
 
     #[test]
+    fn decision_props_bind_question_answers_and_require_name_question_and_handler() {
+        assert!(expansion(quote! {
+            Decision {
+                name: "gate",
+                question: Noul::new("Should the gate open?"),
+                on_result: move |context, outcome: QuestionOutcome<NoulAnswer>| store(context, outcome),
+            }
+        }).is_ok());
+        for (input, expected) in [
+            (
+                quote! { Decision { name: "gate", question: question } },
+                "missing Decision prop `on_result`",
+            ),
+            (
+                quote! { Decision { on_result: handler } },
+                "missing Decision prop `name`",
+            ),
+            (
+                quote! { Decision { name: "gate", on_result: handler } },
+                "missing Decision prop `question`",
+            ),
+            (
+                quote! { Decision { name: "gate", question: question, on_result: handler, model: model } },
+                "unknown Decision prop",
+            ),
+        ] {
+            assert_eq!(
+                expansion(input)
+                    .err()
+                    .expect("invalid Decision declaration")
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn native_props_accept_typed_capturing_callbacks_and_literal_descriptions() {
         expansion(quote! {
             NativeToolCall {
@@ -1266,7 +1321,7 @@ mod tests {
                 "generic view root paths are supported only for XmlStreamingToolCall",
             ),
         ] {
-            let error = expansion(input).expect_err("invalid CLI declaration");
+            let error = expansion(input).err().expect("invalid CLI declaration");
             assert_eq!(error.to_string(), message);
         }
     }
@@ -1308,7 +1363,7 @@ mod tests {
                 "duplicate Component prop",
             ),
         ] {
-            let error = expansion(input).expect_err("invalid action declaration");
+            let error = expansion(input).err().expect("invalid action declaration");
             assert_eq!(error.to_string(), message);
         }
     }
@@ -1412,7 +1467,9 @@ mod tests {
                 "#[diff] can only annotate a POM root",
             ),
         ] {
-            let error = expansion(input).expect_err("invalid component declaration");
+            let error = expansion(input)
+                .err()
+                .expect("invalid component declaration");
             assert_eq!(error.to_string(), message);
         }
     }
@@ -1441,7 +1498,9 @@ mod tests {
                 "#[diff] can only annotate a POM root",
             ),
         ] {
-            let error = expansion(input).expect_err("invalid XML callback declaration");
+            let error = expansion(input)
+                .err()
+                .expect("invalid XML callback declaration");
             assert_eq!(error.to_string(), message);
         }
         for handler in [
@@ -1489,7 +1548,9 @@ mod tests {
                 "choose exactly one of `live_with` and `without_live`",
             ),
         ] {
-            let error = expansion(input).expect_err("incomplete streaming declaration");
+            let error = expansion(input)
+                .err()
+                .expect("incomplete streaming declaration");
             assert!(error.to_string().starts_with(message), "{error}");
         }
     }

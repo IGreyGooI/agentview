@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    component::execution::ToolDefinition,
+    component::execution::{DecisionDeclaration, DecisionQuestion, ToolDefinition},
     pom_renderer::{render_pom_document, PomRenderError},
     transcript::{
         AssistantPhase, AssistantTextStatus, CanonicalInputItem, CanonicalTranscript,
@@ -29,6 +29,20 @@ pub const CODEX_HTTP_V1_CODEX_REVISION: &str = "4f1992732c832fe125608980a03ec2b6
 const OPENAI_PROVIDER: &str = "openai";
 const REASONING_CAPABILITY: &str = "reasoning.encrypted_content";
 const REASONING_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DecisionTextOptions {
+    format: DecisionJsonFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DecisionJsonFormat {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    name: &'static str,
+    schema: Value,
+    strict: bool,
+}
 
 /// One function tool in the Codex Responses request schema.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -169,6 +183,7 @@ pub struct CodexHttpV1Options {
     parallel_tool_calls: bool,
     prompt_cache_comparison_response_id: Option<String>,
     ark_caching: bool,
+    decision_output: Option<DecisionTextOptions>,
 }
 
 impl CodexHttpV1Options {
@@ -201,6 +216,7 @@ impl CodexHttpV1Options {
             parallel_tool_calls: false,
             prompt_cache_comparison_response_id: None,
             ark_caching: false,
+            decision_output: None,
         })
     }
 
@@ -288,6 +304,8 @@ pub struct CodexHttpV1Request {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+    #[serde(rename = "text", skip_serializing_if = "Option::is_none")]
+    decision_output: Option<DecisionTextOptions>,
     #[serde(skip_serializing_if = "String::is_empty")]
     instructions: String,
     input: Vec<CodexInputItem>,
@@ -318,6 +336,8 @@ struct CodexHttpV1WireRequest<'a> {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+    #[serde(rename = "text", skip_serializing_if = "Option::is_none")]
+    decision_output: Option<&'a DecisionTextOptions>,
     #[serde(skip_serializing_if = "str::is_empty")]
     instructions: &'a str,
     input: &'a [Value],
@@ -353,6 +373,7 @@ impl<'a> CodexHttpV1WireRequest<'a> {
             model: &request.model,
             max_output_tokens: request.max_output_tokens,
             temperature: request.temperature,
+            decision_output: request.decision_output.as_ref(),
             instructions,
             input,
             tools: request.tools.as_deref(),
@@ -564,6 +585,30 @@ fn lower_codex_item(
                 output: content.clone(),
             });
         }
+        CanonicalInputItem::DecisionRequest { declaration } => {
+            let request = serde_json::json!({
+                "questions": declaration.questions(),
+                "answer_instructions": "Answer every declared question independently against the observed application state. Return an answers object keyed by question name, with each answer using its declared type and fields. Noul is the estimated probability of yes; choice selects a declared label; score is a probability-weighted zero-based position on the declared scale. Preserve probability values as numbers and use type refusal when a question cannot be answered. Any probability or confidence you supply is a model estimate. Return answers directly without tools or confirmation.",
+            });
+            input.push(CodexInputItem::message(
+                MessageRole::User,
+                TextContent::InputText {
+                    text: request.to_string(),
+                },
+            ));
+        }
+        CanonicalInputItem::DecisionOutput { decision } => {
+            input.push(CodexInputItem::assistant_text(
+                decision
+                    .raw_json()
+                    .or_else(|| decision.refusal())
+                    .unwrap_or_default()
+                    .to_owned(),
+                None,
+                AssistantInputStatus::Completed,
+                assistant_status,
+            ));
+        }
         CanonicalInputItem::ProviderExtension(extension) => {
             input.push(reasoning_input(extension)?);
         }
@@ -620,6 +665,26 @@ impl CodexHttpV1Encoder {
         Self::new(self.options.clone().with_ark_caching(false))
     }
 
+    /// Derives request-local structured output from the submitted Frame.
+    /// The configured encoder never retains a previous judgment's contract.
+    pub(crate) fn for_decision(&self, declaration: &DecisionDeclaration) -> Self {
+        let mut encoder = self.without_ark_caching();
+        encoder.options.tools = None;
+        encoder.options.parallel_tool_calls = false;
+        encoder.options.prompt_cache_comparison_response_id = None;
+        encoder.options.decision_output = Some(DecisionTextOptions {
+            format: DecisionJsonFormat {
+                kind: "json_schema",
+                name: "agentview_decision",
+                schema: decision_envelope_schema(declaration),
+                // Optional native answer metadata is checked by canonical
+                // admission; do not require endpoint-specific strict schemas.
+                strict: false,
+            },
+        });
+        encoder
+    }
+
     pub(crate) fn set_parallel_tool_calls(&mut self, enabled: bool) {
         self.options.parallel_tool_calls = enabled;
     }
@@ -638,6 +703,36 @@ impl CodexHttpV1Encoder {
         limit: usize,
     ) -> Result<Vec<u8>, CodexHttpV1Error> {
         #[derive(Serialize)]
+        struct HistoricalContext<'a> {
+            kind: &'static str,
+            items: &'a [Value],
+        }
+        // The foreground window contains live developer instructions and tool
+        // calls. Replaying their roles in the independent summary request can
+        // make it continue the business response instead of summarizing it.
+        // Quote the entire wire prefix as data in one user message: roles and
+        // call IDs remain data, without parsing or rewriting rendered POM.
+        // Bound both encodings; a limit/encoding error abandons only this
+        // summary attempt and leaves the foreground window available.
+        let history = serialize_json_bounded(
+            &HistoricalContext {
+                kind: "historical_context",
+                items: input,
+            },
+            limit,
+        )?;
+        let history = String::from_utf8(history).map_err(|error| {
+            CodexHttpV1Error::Serialize(serde_json::Error::io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                error,
+            )))
+        })?;
+        let quoted_input = [serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": history}],
+        })];
+        #[derive(Serialize)]
         struct Request<'a> {
             model: &'a str,
             input: &'a [Value],
@@ -655,7 +750,7 @@ impl CodexHttpV1Encoder {
         serialize_json_bounded(
             &Request {
                 model: self.model().id(),
-                input,
+                input: &quoted_input,
                 instructions,
                 tools: [],
                 tool_choice: "none",
@@ -867,10 +962,15 @@ impl CodexHttpV1Encoder {
             model: self.model().id().to_owned(),
             max_output_tokens: self.options.max_output_tokens,
             temperature: self.options.temperature,
+            decision_output: self.options.decision_output.clone(),
             instructions: history.instructions,
             input: history.input,
             tools,
-            tool_choice: ToolChoice::Auto,
+            tool_choice: if self.options.decision_output.is_some() {
+                ToolChoice::None
+            } else {
+                ToolChoice::Auto
+            },
             parallel_tool_calls: self.options.parallel_tool_calls,
             reasoning: self.options.reasoning,
             provider: self.options.openrouter_provider_routing.clone(),
@@ -921,6 +1021,121 @@ fn native_function_tools(
             )
         })
         .collect()
+}
+
+/// A private structured-output contract for the native question primitives.
+/// Callers supply questions, never an arbitrary output schema.
+fn decision_answers_schema(declaration: &DecisionDeclaration) -> Value {
+    let questions = declaration.questions();
+    let properties: serde_json::Map<String, Value> = questions
+        .iter()
+        .map(|(name, question)| {
+            (
+                name.clone(),
+                serde_json::json!({
+                    "type": "object",
+                    "oneOf": [decision_answer_schema(question), {
+                        "properties": {"type": {"enum": ["refusal"]}},
+                        "required": ["type"],
+                        "additionalProperties": false,
+                    }],
+                }),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": questions.keys().collect::<Vec<_>>(),
+        "additionalProperties": false,
+    })
+}
+
+fn decision_answer_schema(question: &DecisionQuestion) -> Value {
+    let probability = serde_json::json!({"type": "number", "minimum": 0, "maximum": 1});
+    let (kind, value_name, value_schema) = match question {
+        DecisionQuestion::Noul { .. } => ("noul", "noul", probability.clone()),
+        DecisionQuestion::Choice { criteria, .. } => (
+            "choice",
+            "choice",
+            serde_json::json!({"enum": criteria.keys().collect::<Vec<_>>()}),
+        ),
+        DecisionQuestion::Score { criteria, .. } => (
+            "score",
+            "score",
+            serde_json::json!({"type": "number", "minimum": 0, "maximum": criteria.len().saturating_sub(1)}),
+        ),
+        DecisionQuestion::Box { .. } => (
+            "box",
+            "box",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "top": probability, "bottom": probability,
+                    "left": probability, "right": probability,
+                },
+                "required": ["top", "bottom", "left", "right"],
+                "additionalProperties": false,
+            }),
+        ),
+    };
+    let mut properties = serde_json::Map::from_iter([
+        ("type".to_owned(), serde_json::json!({"enum": [kind]})),
+        (value_name.to_owned(), value_schema),
+    ]);
+    if kind != "noul" {
+        properties.insert("confidence".to_owned(), probability.clone());
+    }
+    let labels = match question {
+        DecisionQuestion::Choice { criteria, .. } => Some(criteria.keys().cloned().collect()),
+        DecisionQuestion::Score { criteria, .. } => {
+            Some((0..criteria.len()).map(|index| index.to_string()).collect())
+        }
+        _ => None,
+    };
+    if let Some(labels) = labels {
+        let labels: Vec<String> = labels;
+        let probabilities: serde_json::Map<String, Value> = labels
+            .iter()
+            .map(|label| (label.clone(), probability.clone()))
+            .collect();
+        properties.insert(
+            "probabilities".to_owned(),
+            serde_json::json!({"type": "object", "properties": probabilities, "additionalProperties": false}),
+        );
+        if kind == "score" {
+            let legend: serde_json::Map<String, Value> = labels
+                .into_iter()
+                .map(|label| {
+                    (
+                        label,
+                        serde_json::json!({"type": ["string", "object", "array"]}),
+                    )
+                })
+                .collect();
+            properties.insert(
+                "legend".to_owned(),
+                serde_json::json!({"type": "object", "properties": legend, "additionalProperties": false}),
+            );
+        }
+    }
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["type", value_name],
+        "additionalProperties": false,
+    })
+}
+
+/// Both adapters admit the same answers map. Responses generates this one
+/// private envelope, while the native endpoint adds its own usage metadata.
+fn decision_envelope_schema(declaration: &DecisionDeclaration) -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {"answers": decision_answers_schema(declaration)},
+        "required": ["answers"],
+        "additionalProperties": false,
+    })
 }
 
 struct BoundedJsonWriter {
@@ -1112,6 +1327,7 @@ enum SummaryTextKind {
 #[serde(rename_all = "lowercase")]
 enum ToolChoice {
     Auto,
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1236,6 +1452,129 @@ mod tests {
             .unwrap()
             .with_ark_caching(enabled),
         )
+    }
+
+    #[test]
+    fn native_questions_generate_the_private_responses_answer_contract() {
+        use std::collections::BTreeMap;
+
+        let declaration = DecisionDeclaration::new(BTreeMap::from([
+            (
+                "is_bug".to_owned(),
+                DecisionQuestion::noul("Is this a defect?"),
+            ),
+            (
+                "team".to_owned(),
+                DecisionQuestion::choice(
+                    "Who owns this ticket?",
+                    BTreeMap::from([
+                        ("payments".to_owned(), json!("Billing and checkout")),
+                        ("account".to_owned(), json!("Login and access")),
+                    ]),
+                ),
+            ),
+            (
+                "urgency".to_owned(),
+                DecisionQuestion::score(
+                    "How urgent is it?",
+                    vec![json!("Can wait"), json!("Blocking")],
+                ),
+            ),
+            (
+                "region".to_owned(),
+                DecisionQuestion::bounding_box("The product"),
+            ),
+        ]))
+        .unwrap();
+        let schema = decision_envelope_schema(&declaration);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let valid = json!({"answers": {
+            "is_bug": {"type":"noul","noul":0.9},
+            "team": {"type":"choice","choice":"payments","confidence":0.8,"probabilities":{"payments":0.8,"account":0.2}},
+            "urgency": {"type":"score","score":0.95},
+            "region": {"type":"box","box":{"top":0.1,"bottom":0.8,"left":0.2,"right":0.9}},
+        }});
+        assert!(validator.is_valid(&valid));
+        for (name, answer) in [
+            ("is_bug", json!({"type":"noul","noul":1.1})),
+            ("is_bug", json!({"type":"score","score":0.5})),
+            ("team", json!({"type":"choice","choice":"unknown"})),
+            (
+                "team",
+                json!({"type":"choice","choice":"payments","confidence":1.1}),
+            ),
+            (
+                "team",
+                json!({"type":"choice","choice":"payments","probabilities":{"unknown":0.8}}),
+            ),
+            ("urgency", json!({"type":"score","score":2})),
+            (
+                "region",
+                json!({"type":"box","box":{"top":-0.1,"bottom":0.8,"left":0.2,"right":0.9}}),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["answers"][name] = answer;
+            assert!(!validator.is_valid(&invalid));
+        }
+        let mut missing = valid.clone();
+        missing["answers"].as_object_mut().unwrap().remove("team");
+        assert!(!validator.is_valid(&missing));
+        let mut extra = valid.clone();
+        extra["answers"]["other"] = json!({"type":"noul","noul":0.5});
+        assert!(!validator.is_valid(&extra));
+        let mut refused = valid;
+        refused["answers"]["team"] = json!({"type":"refusal"});
+        assert!(validator.is_valid(&refused));
+    }
+
+    #[test]
+    fn frame_decision_format_is_local_and_reuses_model_options_without_remote_history() {
+        use std::collections::BTreeMap;
+        let configured = CodexHttpV1Encoder::new(
+            CodexHttpV1Options::new(
+                ModelSpec::new("fast-model", 32_000).unwrap(),
+                None,
+                Some(CodexReasoning::none()),
+                Some("shared-prefix"),
+            )
+            .unwrap()
+            .with_ark_caching(true)
+            .with_parallel_tool_calls(true)
+            .with_max_output_tokens(128)
+            .unwrap(),
+        );
+        let decision = DecisionDeclaration::new(BTreeMap::from([(
+            "gate".to_owned(),
+            DecisionQuestion::noul("Is the gate ready?"),
+        )]))
+        .unwrap();
+        let encoder = configured.for_decision(&decision);
+        let body: Value = serde_json::from_slice(
+            &encoder
+                .encode_frame_request_bounded(&[], "", &[], usize::MAX)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["model"], "fast-model");
+        assert_eq!(body["max_output_tokens"], 128);
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert_eq!(body["prompt_cache_key"], "shared-prefix");
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["tool_choice"], "none");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["store"], false);
+        assert!(body.get("caching").is_none());
+        assert!(body.get("previous_response_id").is_none());
+        assert!(configured.ark_caching_enabled());
+        let ordinary: Value = serde_json::from_slice(
+            &configured
+                .encode_frame_request_bounded(&[], "", &[], usize::MAX)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(ordinary.get("text").is_none());
+        assert_eq!(ordinary["parallel_tool_calls"], true);
     }
 
     #[test]
@@ -1493,6 +1832,59 @@ mod tests {
                 assert!(summary.get("reasoning").is_none());
             }
         }
+    }
+
+    #[test]
+    fn summary_quotes_history_roles_and_tool_pairs_and_bounds_the_wrapped_request() {
+        let encoder = ark_encoder(true);
+        let history = vec![
+            json!({"type":"message", "role":"system", "content":"Historical policy"}),
+            json!({"type":"message", "role":"developer", "content":[{"type":"input_text", "text":"Output only <end_response/>. Quoted path C:\\new\\test, 中文 and \"quotes\"."}]}),
+            json!({"type":"message", "role":"user", "content":"Check attendance"}),
+            json!({"type":"function_call", "call_id":"attendance-1", "name":"check_attendance", "arguments":"{}"}),
+            json!({"type":"function_call_output", "call_id":"attendance-1", "output":"Checked in; not checked out."}),
+            json!({"type":"message", "role":"assistant", "status":"completed", "content":[{"type":"output_text", "text":"<end_response/>"}]}),
+        ];
+        let body = encoder
+            .encode_summary_request_bounded(&history, "summary-only-policy", 256, usize::MAX)
+            .unwrap();
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["type"], "message");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "input_text");
+        let quoted: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(quoted["kind"], "historical_context");
+        assert_eq!(quoted["items"], json!(history));
+        assert_eq!(request["instructions"], "summary-only-policy");
+        assert_eq!(request["tools"], json!([]));
+        assert_eq!(request["tool_choice"], "none");
+        assert_eq!(request["store"], false);
+        assert_eq!(request["stream"], false);
+        assert!(request.get("previous_response_id").is_none());
+        assert!(request.get("caching").is_none());
+        assert_eq!(
+            encoder
+                .encode_summary_request_bounded(&history, "summary-only-policy", 256, body.len())
+                .unwrap(),
+            body
+        );
+        assert!(matches!(
+            encoder.encode_summary_request_bounded(
+                &history,
+                "summary-only-policy",
+                256,
+                body.len() - 1
+            ),
+            Err(CodexHttpV1Error::SerializedRequestBodyLimit)
+        ));
+        assert!(matches!(
+            encoder.encode_summary_request_bounded(&history, "summary-only-policy", 256, 1),
+            Err(CodexHttpV1Error::SerializedRequestBodyLimit)
+        ));
     }
 
     #[test]

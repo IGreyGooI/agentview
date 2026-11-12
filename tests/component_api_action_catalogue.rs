@@ -284,7 +284,7 @@ async fn handoff(
     capture: &DebugPromptCapture,
 ) -> DebugFrameSnapshot {
     let (reacted, observed) = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::join!(app.react().unwrap(), sender.observe())
+        tokio::join!(app.react(false).unwrap(), sender.observe())
     })
     .await
     .unwrap();
@@ -601,7 +601,7 @@ async fn full_replay_retains_action_feedback_and_excludes_prior_ephemeral_catalo
             );
         }
         let (reacted, observed) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(app.react().unwrap(), sender.observe())
+            tokio::join!(app.react(false).unwrap(), sender.observe())
         })
         .await
         .unwrap();

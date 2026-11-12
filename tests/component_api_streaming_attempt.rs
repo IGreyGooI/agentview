@@ -289,7 +289,9 @@ impl Port {
                         context_window: ContextWindow::NotApplicable,
                         reserved_output_tokens: None,
                     },
-                    FrameCapabilities::new(true),
+                    FrameCapabilities::new(true)
+                        .with_native_tool_calls(true)
+                        .with_text_delta_output(true),
                 ),
             ),
             scripts: scripts.into(),
@@ -424,8 +426,8 @@ async fn separate_components_independently_parse_the_same_tag_each_reaction() {
     assert_eq!(probe.states.load(Ordering::SeqCst), 0);
     assert_continue(app.prepare().await.unwrap());
     assert_eq!(probe.states.load(Ordering::SeqCst), 0);
-    assert_continue(app.react().unwrap().await.unwrap());
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     let mut actual = probe.published.lock().unwrap().clone();
     actual.sort();
     assert_eq!(
@@ -463,7 +465,7 @@ async fn managed_context_uses_the_successful_handoff_and_multicast_shares_event_
         ),
     )
     .unwrap();
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     assert_eq!(probe.submits.load(Ordering::SeqCst), 2);
     assert_eq!(probe.states.load(Ordering::SeqCst), 1);
     let revision = probe.handoff_revisions.lock().unwrap()[0];
@@ -544,7 +546,7 @@ async fn rejected_diagnostic_keeps_its_xml_source_after_the_next_reaction() {
         ),
     )
     .unwrap();
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     let diagnostic = probe
         .contexts
         .lock()
@@ -574,7 +576,7 @@ async fn rejected_diagnostic_keeps_its_xml_source_after_the_next_reaction() {
             ..
         }
     ));
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     let contexts = probe.contexts.lock().unwrap();
     let current = &contexts
         .iter()
@@ -598,7 +600,7 @@ async fn rejecting_one_contract_does_not_reject_or_rollback_another() {
         Port::new(probe.clone(), vec![text_facts(&["<say>accepted</say>"])]),
     )
     .unwrap();
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     assert_eq!(
         *probe.published.lock().unwrap(),
         vec![("second".into(), "accepted".into())]
@@ -619,7 +621,7 @@ async fn foreign_element_policy_is_local_to_each_contract() {
         ),
     )
     .unwrap();
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     let mut actual = probe.published.lock().unwrap().clone();
     actual.sort();
     assert_eq!(
@@ -671,7 +673,7 @@ async fn commentary_is_not_parsed_and_sealed_only_text_is_still_consumed() {
         Port::new(probe.clone(), vec![facts]),
     )
     .unwrap();
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     assert_eq!(
         *probe.published.lock().unwrap(),
         vec![("answer".into(), "answer".into())]
@@ -691,7 +693,7 @@ async fn empty_reactions_finalize_each_contract_without_fake_text_completion() {
         ),
     )
     .unwrap();
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     let mut rejected = probe.rejected.lock().unwrap().clone();
     rejected.sort();
     assert_eq!(rejected, vec!["first", "second"]);
@@ -733,14 +735,14 @@ async fn exit_from_a_continuity_rejection_prevents_retry_submission() {
     *exit.lock().unwrap() = Some(app.exit_handle());
 
     assert_eq!(
-        app.react().unwrap().await.unwrap(),
+        app.react(false).unwrap().await.unwrap(),
         ControlFlow::Break(ExitReason::Requested)
     );
     assert_eq!(probe.submits.load(Ordering::SeqCst), 1);
     assert_eq!(probe.handoffs.load(Ordering::SeqCst), 0);
     assert!(probe.published.lock().unwrap().is_empty());
     assert_eq!(
-        app.react().unwrap().await.unwrap(),
+        app.react(false).unwrap().await.unwrap(),
         ControlFlow::Break(ExitReason::Requested)
     );
     assert_eq!(probe.submits.load(Ordering::SeqCst), 1);
@@ -757,11 +759,12 @@ async fn reducer_panic_preserves_its_original_payload_at_the_react_boundary() {
     )
     .unwrap();
 
-    let panic =
-        std::panic::AssertUnwindSafe(std::future::IntoFuture::into_future(app.react().unwrap()))
-            .catch_unwind()
-            .await
-            .expect_err("the streaming reducer panic must escape Application::react");
+    let panic = std::panic::AssertUnwindSafe(std::future::IntoFuture::into_future(
+        app.react(false).unwrap(),
+    ))
+    .catch_unwind()
+    .await
+    .expect_err("the streaming reducer panic must escape Application::react");
     assert_eq!(
         panic.downcast_ref::<&str>(),
         Some(&"streaming reducer panic payload")
@@ -939,7 +942,7 @@ async fn accept_without_publication_still_confirms_live_receipts() {
         Port::new(Probe::default(), vec![text_facts(&["<say>hello</say>"])]),
     )
     .unwrap();
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     assert_eq!(live.confirmed.load(Ordering::SeqCst), 1);
     assert_eq!(live.rolled_back.load(Ordering::SeqCst), 0);
     app.shutdown().await.unwrap();
@@ -963,7 +966,7 @@ async fn interrupt_keeps_inflight_apply_owned_then_rolls_back_and_allows_reuse()
         ),
     )
     .unwrap();
-    let control = app.react().unwrap();
+    let control = app.react(false).unwrap();
     let mut waiter = Box::pin(control.clone().into_future());
     tokio::select! {
         _ = live.started.notified() => {},
@@ -996,7 +999,7 @@ async fn interrupt_keeps_inflight_apply_owned_then_rolls_back_and_allows_reuse()
     ));
     assert!(live.active.lock().unwrap().is_empty());
     assert_eq!(live.rolled_back.load(Ordering::SeqCst), 1);
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     assert_eq!(live.confirmed.load(Ordering::SeqCst), 1);
     app.shutdown().await.unwrap();
 }
@@ -1013,7 +1016,7 @@ async fn dropped_waiter_preserves_reducer_panic_until_cleanup_is_definitive() {
         Port::new(Probe::default(), vec![text_facts(&["<say>boom</say>"])]),
     )
     .unwrap();
-    let control = app.react().unwrap();
+    let control = app.react(false).unwrap();
     let mut waiter = Box::pin(control.clone().into_future());
     tokio::select! {
         _ = live.rollback_started.notified() => {},
@@ -1110,12 +1113,12 @@ async fn shared_state_enforces_think_before_say_and_coalesces_retry_after_cleanu
         ),
     )
     .unwrap();
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     assert!(probe.published.lock().unwrap().is_empty());
     assert_eq!(*probe.rejected.lock().unwrap(), vec!["ordered"]);
     assert!(app.take_reaction_request().unwrap());
     assert!(!app.take_reaction_request().unwrap());
-    assert_continue(app.react().unwrap().await.unwrap());
+    assert_continue(app.react(false).unwrap().await.unwrap());
     assert_eq!(
         *probe.published.lock().unwrap(),
         vec![("ordered".into(), "answer".into())]
@@ -1244,7 +1247,7 @@ async fn managed_completion_waits_for_publication_recovery_and_requires_success(
             Port::new(Probe::default(), vec![text_facts(&["<say>answer</say>"])]),
         )
         .unwrap();
-        let reaction = app.react().unwrap();
+        let reaction = app.react(false).unwrap();
         let mut recovery_waiter = Box::pin(recovery_started(&mut app));
         tokio::select! {
             _ = recovery.started.notified() => {},
@@ -1320,7 +1323,7 @@ async fn dropped_recovery_waiter_preserves_publication_and_settled_sibling() {
         Port::new(probe.clone(), vec![text_facts(&["<say>answer</say>"])]),
     )
     .unwrap();
-    let reaction = app.react().unwrap();
+    let reaction = app.react(false).unwrap();
     let mut reaction_waiter = Box::pin(reaction.clone().into_future());
     let mut waiter = Box::pin(recovery_started(&mut app));
     tokio::select! {
@@ -1404,7 +1407,7 @@ async fn exit_waits_for_indeterminate_publication_recovery_before_breaking() {
     .unwrap();
     let exit = app.exit_handle();
 
-    let reaction = app.react().unwrap();
+    let reaction = app.react(false).unwrap();
     let mut reaction_waiter = Box::pin(reaction.clone().into_future());
     let mut recovery_waiter = Box::pin(recovery_started(&mut app));
     tokio::select! {
@@ -1434,7 +1437,7 @@ async fn exit_waits_for_indeterminate_publication_recovery_before_breaking() {
         StreamingToolRecoveryStatus::NotRequired
     ));
     assert_eq!(
-        app.react().unwrap().await.unwrap(),
+        app.react(false).unwrap().await.unwrap(),
         ControlFlow::Break(ExitReason::Requested)
     );
     assert_eq!(probe.submits.load(Ordering::SeqCst), 1);
@@ -1494,7 +1497,7 @@ async fn failed_post_reconcile_retains_fence_and_never_replays_rejection() {
         Port::new(Probe::default(), vec![text_facts(&["<say>rejected</say>"])]),
     )
     .unwrap();
-    let reaction = app.react().unwrap();
+    let reaction = app.react(false).unwrap();
     let fault = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match app.recover_streaming_attempt().await {
@@ -1586,10 +1589,13 @@ async fn native_tool_lanes_keep_running_while_streaming_live_apply_waits() {
         Port::new(Probe::default(), vec![facts]),
     )
     .unwrap();
-    let flow = tokio::time::timeout(Duration::from_secs(5), app.react().unwrap().into_future())
-        .await
-        .expect("native lane must progress during Live apply")
-        .unwrap();
+    let flow = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.react(false).unwrap().into_future(),
+    )
+    .await
+    .expect("native lane must progress during Live apply")
+    .unwrap();
     assert_continue(flow);
     assert_eq!(live.confirmed.load(Ordering::SeqCst), 1);
     app.shutdown().await.unwrap();
@@ -1624,7 +1630,7 @@ async fn publication_recovery_not_published_reports_a_terminal_attempt_fault() {
     )
     .unwrap();
 
-    let reaction = app.react().unwrap();
+    let reaction = app.react(false).unwrap();
     recovery.release.notify_one();
     let attempts = recovery_settled(&mut app).await;
     assert_recovery_origin(&attempts[0], &reaction);
@@ -1656,7 +1662,7 @@ async fn indeterminate_live_apply_recovery_reports_a_terminal_attempt_fault() {
     )
     .unwrap();
 
-    let reaction = app.react().unwrap();
+    let reaction = app.react(false).unwrap();
     let attempts = recovery_settled(&mut app).await;
     assert_recovery_origin(&attempts[0], &reaction);
     assert_eq!(
@@ -1694,7 +1700,7 @@ async fn midstream_recovery_rolls_back_live_receipts_in_sibling_contracts() {
     )
     .unwrap();
 
-    let reaction = app.react().unwrap();
+    let reaction = app.react(false).unwrap();
     let attempts = recovery_settled(&mut app).await;
     assert_recovery_origin(&attempts[0], &reaction);
     assert_eq!(

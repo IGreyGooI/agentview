@@ -123,7 +123,7 @@ async fn run() -> Result<(), ApplicationFault> {
     )?;
 
     assert!(!application.current_projection().is_dirty());
-    assert!(application.react()?.await?.is_continue());
+    assert!(application.react(false)?.await?.is_continue());
     assert_eq!(capture.frame_snapshots().len(), 1);
     application.shutdown().await
 }
@@ -224,8 +224,8 @@ new root so it creates its own Signals and handlers:
 ```rust,ignore
 let snapshot = exported.lock().unwrap().clone();
 let mut child = parent.fork(move || restored_root(snapshot.clone())).await?;
-let parent_reaction = parent.react()?;
-let child_reaction = child.react()?;
+let parent_reaction = parent.react(false)?;
+let child_reaction = child.react(false)?;
 let (parent_turn, child_turn) = tokio::join!(
     async { parent_reaction.await },
     async { child_reaction.await },
@@ -271,7 +271,9 @@ Component can select feedback while preserving its original source. See
 `Temporary` reactions within one Application and Component tree. `EventContext::reaction_kind()`
 preserves the handle's history classification through callbacks and asynchronous feedback.
 A settled Temporary can continue its own context through `branch.react()?`; Main advances through
-`app.react()?`. Native Responses supports isolated temporary history, including fixed stored-parent
+`app.react(false)?`. Use `app.react(true)?` to require a new Temporary even while Main is idle;
+this preserves Main history and provider cache, and rejects admission without a usable checkpoint.
+Native Responses supports isolated temporary history, including fixed stored-parent
 references with `store:false` when Ark caching is enabled.
 Run `cargo run --no-default-features --example parallel_reactions` for an
 [offline interaction](examples/parallel_reactions.rs) with temporary tool feedback and targeted interruption.
@@ -296,6 +298,21 @@ and private session state. Raw handlers can still use `NativeToolCall::named(...
 
 See [HELP.md: Business History](HELP.md#business-history) for code, delta
 requirements, native tool usage, and adjacent snapshot rules.
+
+### Structured Decisions
+
+`Decision { name, question, on_result }` declares a typed question over the state displayed
+by ordinary Components in the same Frame. `Noul`, `Choice`, and `Score` determine their
+answer types. Several Decisions share one model request and receive separate outcomes;
+one question's refusal or invalid answer does not erase other valid results. The same
+Components work with ordinary Responses and native System1Provider.
+
+Native System 1 uses the Decisions/System One JSON API and declares only decision capability;
+native/XML actions and text-delta subscriptions are rejected before HTTP. Ordinary Responses
+retains its native/XML behavior. `system1::judge(provider, state, question)` is a single-question
+wrapper that renders an ordinary root view, drives one independent Application reaction, and
+awaits shutdown before returning. No confirmation call is scheduled. See
+[typed questions, events, and capabilities](docs/system1.md).
 
 ### Streaming XML
 

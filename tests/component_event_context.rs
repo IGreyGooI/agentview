@@ -52,7 +52,9 @@ impl ScriptedPort {
                 context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
-            FrameCapabilities::NONE,
+            FrameCapabilities::NONE
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
         );
         let frames = Arc::new(Mutex::new(Vec::new()));
         (
@@ -329,8 +331,8 @@ async fn parallel_applications_keep_async_feedback_with_its_origin_and_recipient
             first_gate.release.notify_one();
         };
         let (first_result, second_result, ()) = tokio::join!(
-            first.react().unwrap(),
-            second.react().unwrap(),
+            first.react(false).unwrap(),
+            second.react(false).unwrap(),
             release_in_reverse
         );
         assert!(first_result.unwrap().is_continue());
@@ -379,7 +381,7 @@ async fn parallel_applications_keep_async_feedback_with_its_origin_and_recipient
         };
 
         let (first_result, second_result) =
-            tokio::join!(first.react().unwrap(), second.react().unwrap());
+            tokio::join!(first.react(false).unwrap(), second.react(false).unwrap());
         assert!(first_result.unwrap().is_continue());
         assert!(second_result.unwrap().is_continue());
         for (frames, recipient, origin) in [
@@ -419,7 +421,7 @@ async fn parallel_applications_keep_async_feedback_with_its_origin_and_recipient
         }
 
         let (first_result, second_result) =
-            tokio::join!(first.react().unwrap(), second.react().unwrap());
+            tokio::join!(first.react(false).unwrap(), second.react(false).unwrap());
         assert!(first_result.unwrap().is_continue());
         assert!(second_result.unwrap().is_continue());
         {

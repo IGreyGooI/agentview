@@ -111,7 +111,9 @@ impl CapturingPort {
                 context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
-            FrameCapabilities::new(true),
+            FrameCapabilities::new(true)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
         );
         let identity = TargetIdentity::new(NonZeroU128::new(41).expect("non-zero target"));
         let epoch = TargetEpoch::new(NonZeroU64::new(1).expect("non-zero epoch"));
@@ -559,7 +561,7 @@ fn projection_documents(frame: &CapturedFrame) -> Vec<agentview::pom::ResolvedDo
 async fn react(application: &mut Application<CapturingPort>) {
     assert_eq!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("reaction succeeds"),
@@ -1272,7 +1274,7 @@ async fn cancelled_pre_handoff_submission_does_not_advance_the_complete_snapshot
     props.signal().set("B".to_owned()).expect("set B");
 
     let notified = capture.pre_handoff_started.notified();
-    let cancelled_control = application.react().unwrap();
+    let cancelled_control = application.react(false).unwrap();
     let mut cancelled = Box::pin(std::future::IntoFuture::into_future(
         cancelled_control.clone(),
     ));
@@ -1338,7 +1340,7 @@ async fn repeat_items_are_delivered_only_by_react_and_cancelled_frames_do_not_ad
     props.signal().set("B".to_owned()).expect("set B");
 
     let notified = capture.pre_handoff_started.notified();
-    let cancelled_control = application.react().unwrap();
+    let cancelled_control = application.react(false).unwrap();
     let mut cancelled = Box::pin(std::future::IntoFuture::into_future(
         cancelled_control.clone(),
     ));

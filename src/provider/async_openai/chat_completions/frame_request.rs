@@ -15,7 +15,6 @@ use super::{
     history::{encode_request, lower_item, ChatMessage},
     OpenAiChatCompletionsError, OpenAiChatCompletionsOptions,
 };
-use crate::provider::async_openai::parallel_compaction::ContextEstimate;
 use crate::provider::async_openai::reaction_fault::OpenAiFailureClass;
 
 #[derive(Clone)]
@@ -72,17 +71,12 @@ impl ChatFrameRequestState {
             max_serialized_request_body_bytes,
         )
         .map_err(ChatFrameRequestFault::Lowering)?;
-        let constraints = &frame.prepared_profile().constraints;
-        let limit = constraints
+        frame
+            .prepared_profile()
+            .constraints
             .context_window
             .tokens()
             .ok_or(ChatFrameRequestFault::MissingContextWindow)?;
-        if u128::from(ContextEstimate::from_bytes(request_body.len()).tokens)
-            + u128::from(constraints.reserved_output_tokens.unwrap_or(0))
-            > u128::from(limit.get())
-        {
-            return Err(ChatFrameRequestFault::ContextWindowLimit);
-        }
         Ok(PreparedChatFrameRequest {
             request_body,
             state: Self {
@@ -106,8 +100,6 @@ pub(super) struct PreparedChatFrameRequest {
 pub(super) enum ChatFrameRequestFault {
     #[error("Chat Completions requires a model context window")]
     MissingContextWindow,
-    #[error("Chat Completions request exceeds the model context window")]
-    ContextWindowLimit,
     #[error("Delta Frame has no accepted Chat Completions wire baseline")]
     MissingDeltaBaseline,
     #[error("Delta Frame base does not match the Chat Completions wire baseline")]
@@ -125,8 +117,9 @@ pub(super) enum ChatFrameRequestFault {
 impl ChatFrameRequestFault {
     pub(super) fn failure_class(&self) -> OpenAiFailureClass {
         match self {
-            Self::Lowering(OpenAiChatCompletionsError::SerializedRequestBodyLimit)
-            | Self::ContextWindowLimit => OpenAiFailureClass::RequestBodyLimit,
+            Self::Lowering(OpenAiChatCompletionsError::SerializedRequestBodyLimit) => {
+                OpenAiFailureClass::RequestBodyLimit
+            }
             Self::MissingContextWindow
             | Self::MissingDeltaBaseline
             | Self::DeltaBaselineMismatch

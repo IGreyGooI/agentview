@@ -1,5 +1,11 @@
 //! Application-owned asynchronous reactions over one mounted Component tree.
 
+#[path = "definition_update.rs"]
+mod definition_update;
+pub use definition_update::{
+    DefinitionUpdate, DefinitionUpdateError, DefinitionUpdateErrorKind, DefinitionVersion,
+};
+
 use std::{
     any::Any,
     borrow::Cow,
@@ -7,7 +13,7 @@ use std::{
     fmt,
     future::{Future, IntoFuture},
     ops::ControlFlow,
-    panic::{resume_unwind, AssertUnwindSafe},
+    panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     pin::Pin,
     sync::{Arc, Mutex, Weak},
     task::{Context, Poll},
@@ -32,9 +38,10 @@ use crate::component::{
         driver_demand::DriverDemand,
         frame::FrameSession,
         streaming::{StreamingSupervisor, StreamingToolRecoveryStatus},
-        CommandInput, ForkableReactionPort, Frame, ProviderEvent, ProviderFactStream, ReactionPort,
-        ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultReason, RenderedProjection,
-        ResettableReactionPort, SubmitFault, TargetDeclaration,
+        CommandInput, ForkableReactionPort, Frame, FrameObservation, ProviderEvent,
+        ProviderFactStream, ReactionPort, ReactionPortFault, ReactionPortFaultCode,
+        ReactionPortFaultReason, RenderedProjection, ResettableReactionPort, SubmitFault,
+        TargetDeclaration,
     },
     provenance::EventScope,
     task::TaskPanicMonitor,
@@ -74,6 +81,7 @@ impl PartialEq<ControlFlow<ExitReason>> for ReactionOutcome {
 }
 
 type PanicPayload = Box<dyn Any + Send + 'static>;
+type FrameObserver = dyn for<'a> Fn(FrameObservation<'a>) + Send + Sync;
 #[derive(Default)]
 struct PanicState(Mutex<Option<PanicPayload>>, std::sync::atomic::AtomicBool);
 impl PanicState {
@@ -354,9 +362,11 @@ struct Snapshot {
     prepared: bool,
 }
 struct Shared<P: ReactionPort + 'static> {
+    definition_version: std::sync::atomic::AtomicU64,
     core: AsyncMutex<Option<CoreApplication<PortSlot<P>>>>,
     admission: Mutex<Admission<P>>,
     snapshot: Mutex<Snapshot>,
+    frame_observer: Mutex<Option<Arc<FrameObserver>>>,
     app_id: ApplicationId,
     exit: ApplicationExitControl,
     demand: Arc<DriverDemand>,
@@ -474,6 +484,7 @@ impl<P: ReactionPort + 'static> Application<P> {
     fn from_core(core: CoreApplication<PortSlot<P>>) -> Self {
         let snapshot = snapshot(&core);
         let shared = Arc::new(Shared {
+            definition_version: std::sync::atomic::AtomicU64::new(1),
             app_id: core.application_id(),
             exit: core.application_exit.clone(),
             demand: core.driver_demand.clone(),
@@ -482,6 +493,7 @@ impl<P: ReactionPort + 'static> Application<P> {
             panic: Arc::new(PanicState::default()),
             core: AsyncMutex::new(Some(core)),
             snapshot: Mutex::new(snapshot),
+            frame_observer: Mutex::new(None),
             settled: Notify::new(),
             admission: Mutex::new(Admission {
                 closed: false,
@@ -503,6 +515,27 @@ impl<P: ReactionPort + 'static> Application<P> {
     }
     pub fn application_id(&self) -> ApplicationId {
         self.shared.app_id
+    }
+
+    /// Observe each prepared submission attempt before port handoff.
+    ///
+    /// Main and Temporary reactions share this observer. Its borrowed data
+    /// belongs to the exact attempt, including on continuity retries. It does
+    /// not describe provider HTTP bodies or retained history. No extra prepare
+    /// is run, and observer panics are ignored so diagnostics cannot fail a
+    /// reaction. Keep callbacks bounded; enqueue any external I/O separately.
+    /// Independent children from `fork`, `fork_with_commands`, `fork_to`, and
+    /// `fork_to_with_commands` register their own observers.
+    pub fn with_frame_observer(
+        self,
+        observer: impl for<'a> Fn(FrameObservation<'a>) + Send + Sync + 'static,
+    ) -> Self {
+        *self
+            .shared
+            .frame_observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(observer));
+        self
     }
     pub fn exit_handle(&self) -> ApplicationExitHandle {
         self.shared.exit.handle()
@@ -554,8 +587,11 @@ impl<P: ReactionPort + 'static> Application<P> {
     }
 
     /// Admit and start one operation without borrowing the application until EOF.
-    pub fn react(&mut self) -> Result<Reaction, ApplicationFault> {
-        self.shared.clone().admit(None)
+    /// With `ephemeral`, always use an independent Temporary from the last legal
+    /// checkpoint, including while Main is idle. Otherwise, use Main when idle
+    /// and Temporary while Main is occupied. Temporary requires a legal checkpoint.
+    pub fn react(&mut self, ephemeral: bool) -> Result<Reaction, ApplicationFault> {
+        self.shared.clone().admit(None, ephemeral)
     }
 
     pub async fn prepare(&mut self) -> Result<ControlFlow<ExitReason>, ApplicationFault> {
@@ -589,7 +625,7 @@ impl<P: ReactionPort + 'static> Application<P> {
                         owner: Arc::downgrade(&owner),
                     }
                 }
-                None => self.react()?,
+                None => self.react(false)?,
             };
             match reaction.await? {
                 ReactionOutcome::Exited(reason) => return Ok(reason),
@@ -890,6 +926,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
     fn admit(
         self: Arc<Self>,
         source: Option<&ReactionState>,
+        force_temporary: bool,
     ) -> Result<Reaction, ApplicationFault> {
         self.check()?;
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| owner_closed())?;
@@ -946,7 +983,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
                 .remove(&source.lineage)
                 .ok_or_else(not_ready)?;
             (ReactionKind::Temporary, source.lineage, Some(temporary))
-        } else if !admission.main {
+        } else if !force_temporary && !admission.main {
             admission.main = true;
             (ReactionKind::Main, id, None)
         } else {
@@ -1262,6 +1299,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
                 ControlFlow::Break(reason) => return Ok(ControlFlow::Break(reason)),
                 ControlFlow::Continue(prepared) => prepared,
             };
+            let projection_revision = core.current_projection().revision();
             if state.kind == ReactionKind::Main {
                 let session = FrameSession::new(&core.declaration).map_err(|fault| {
                     ApplicationFault::from_session(ApplicationFaultStage::Declaration, fault)
@@ -1282,7 +1320,12 @@ impl<P: ReactionPort + 'static> Shared<P> {
                         .map(CommandInput::feedback_receipt)
                 })
                 .flatten();
-            Ok::<_, ApplicationFault>(ControlFlow::Continue((projection, bindings, receipt)))
+            Ok::<_, ApplicationFault>(ControlFlow::Continue((
+                projection,
+                bindings,
+                receipt,
+                projection_revision,
+            )))
         };
         let prepared = tokio::select! {
             biased;
@@ -1290,7 +1333,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
             task = self.monitor.wait() => { let _ = task; cancellation.suppress(); self.check()?; return Err(owner_closed()); }
             prepared = prepare => prepared?,
         };
-        let (projection, mut bindings, receipt) = match prepared {
+        let (projection, mut bindings, receipt, projection_revision) = match prepared {
             ControlFlow::Break(reason) => return Ok(ReactionOutcome::Exited(reason)),
             ControlFlow::Continue(prepared) => prepared,
         };
@@ -1299,7 +1342,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
             let submission = self.submit(
                 state,
                 lane,
-                &projection,
+                (&projection, projection_revision),
                 &mut bindings,
                 cancellation,
                 receipt,
@@ -1326,11 +1369,12 @@ impl<P: ReactionPort + 'static> Shared<P> {
         &self,
         state: &ReactionState,
         lane: &mut Lane<P>,
-        projection: &RenderedProjection,
+        prepared_projection: (&RenderedProjection, u64),
         bindings: &mut RenderBindings<ProviderEvent>,
         cancellation: &ReactionCancellationControl,
         receipt: Option<crate::component::execution::command::CommandFeedbackReceipt>,
     ) -> Result<ReactionOutcome, ApplicationFault> {
+        let (projection, projection_revision) = prepared_projection;
         for attempt in 0..2 {
             if let Err(reason) = self.exit.try_begin_submission() {
                 return Ok(ReactionOutcome::Exited(reason));
@@ -1350,6 +1394,30 @@ impl<P: ReactionPort + 'static> Shared<P> {
                     ApplicationFault::from_session(ApplicationFaultStage::FramePrepare, fault)
                 })?;
             let revision = prepared.revision();
+            let observer = self
+                .frame_observer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if let Some(observer) = observer {
+                // This optional diagnostic runs between normal preparation and
+                // handoff. Its failure must not discard the prepared business
+                // input, poison the runtime, or interrupt another reaction.
+                if catch_unwind(AssertUnwindSafe(|| {
+                    observer(FrameObservation {
+                        application_id: self.app_id,
+                        reaction_id: state.id,
+                        reaction_kind: state.kind,
+                        projection_revision,
+                        projection,
+                        frame: prepared.frame(),
+                    })
+                }))
+                .is_err()
+                {
+                    tracing::warn!("frame observer panicked; continuing submission");
+                }
+            }
             let facts =
                 match submit_prepared_frame(&mut lane.port, &mut lane.session, prepared).await {
                     Ok(facts) => facts,
@@ -1637,6 +1705,6 @@ impl<P: ReactionPort + 'static> ReactionOwner for Shared<P> {
         self: Arc<Self>,
         source: &ReactionState,
     ) -> Result<Reaction, ApplicationFault> {
-        self.admit(Some(source))
+        self.admit(Some(source), true)
     }
 }

@@ -60,7 +60,7 @@ window 不等于压缩 canonical Frame，也不提供无限历史。
 
 触发策略可配置。当前保留至少最新一个 wire item；工具配对或未完成输出可以使 tail 更长。
 策略在 handoff 前同步判断，policy-triggered 后台 HTTP 只在普通 Frame 的真实 handoff 后启动。
-forced compaction 可在超窗 Frame 的 handoff 前启动并等待。两者共用一个 coordinator；压缩期间不重新
+forced compaction 可在估算越过容量指标的 Frame handoff 前启动并等待。两者共用一个 coordinator；压缩期间不重新
 复制 source 或启动第二个 attempt，同一个 source fingerprint 不无条件重试。
 
 两种触发统一调用 coordinator 的 `prepare_request` / `request`：`Background` 先判断策略，
@@ -94,7 +94,8 @@ let provider = AsyncOpenAiResponsesProvider::try_new(
 ```
 
 provider 从这份 `ModelSpec` 派生 `FrameConstraints.context_window = ContextWindow::Tokens(NonZeroU64)`；
-options 和 transport 都没有独立的容量覆盖值。窗口仅用于本地声明、预算检查和压缩策略，不序列化到 HTTP body。
+options 和 transport 都没有独立的容量覆盖值。窗口用于本地容量声明和压缩指标，不序列化到 HTTP body；
+字节估算不是精确 tokenizer，不能因估算越过窗口拒绝合法请求。
 模型 provider 不能声明 `NotApplicable`。声明在 mount 期间稳定。
 运行示例时用户必须设置 `AGENTVIEW_CONTEXT_WINDOW_TOKENS`，该值与 `AGENTVIEW_MODEL` 一起构造 `ModelSpec`。
 两个 estimate 都用 `ceil(bytes / 4)` 计算，
@@ -129,7 +130,7 @@ let provider = provider.with_parallel_compaction(DefaultCompactionPolicy {
 let mut monitor = provider.parallel_compaction_monitor().unwrap();
 ```
 
-显式 token 阈值最多取可用输入预算的 90%，避免把触发点设到硬上限之后。
+显式 token 阈值最多取可用输入容量指标的 90%，便于提前触发；该估算阈值不是 hard limit。
 仅想使用一种条件，可直接传入 `TokenThresholdPolicy` 或
 `ContextRatioPolicy`。用户也可实现 `CompactionPolicy`，或传入快速、同步、无阻塞的策略闭包。
 自定义策略会替换整个默认策略。例如保留默认判断，并在窗口估算占用超过 75% 时提前尝试：
@@ -150,10 +151,10 @@ let provider = provider.with_parallel_compaction(|ctx: &CompactionContext| {
 比例触发控制历史相对当前需求的膨胀，不能独自保证绝对 context 上限，也不保证后台压缩一定
 赶在增长前完成。模型窗口在 `ModelSpec` 中必填；canonical Frame 字节预算和
 output reserve 通过 `AsyncOpenAiTransportConfig::with_responses_frame_limits(max_frame_bytes,
-max_component_bytes, reserved_output_tokens)` 配置。前台会检查完整 request 的 bytes/4 estimate
-加 output reserve，超限则在 handoff 前返回 Limit/RequestPreparation fault。后台同样校验自身
-请求 bytes/4、transport request/response byte limits 和超时；不会超限后静默截断或阻塞等待压缩。
-若要对某模型的实际 token 数给出精确保证，仍需对应 tokenizer；bytes/4 是此处约定的估算。
+max_component_bytes, reserved_output_tokens)` 配置。完整有效上下文的 bytes/4 estimate 加 output
+reserve 用于触发压缩，不作为 foreground 或摘要请求的拒绝条件。transport request/response byte
+limits 和超时仍生效，不能静默截断；实际模型容量问题由 provider 返回。若要精确计量实际 token 数，
+仍需对应 tokenizer；bytes/4 只是此处约定的估算。
 
 普通请求和摘要请求均不发送 `context_management` 或 `compaction_trigger`，也不调用
 `/responses/compact`。只需 endpoint 支持当前模型的普通 Responses 推理。
@@ -168,7 +169,7 @@ max_component_bytes, reserved_output_tokens)` 配置。前台会检查完整 req
 `ParallelCompactionFault::Observation`，不安装该候选、不覆盖前台已接受的上下文。
 此 observer 与 `with_observer` 的前台调用身份独立；两者均不赋予 worker 业务工具或 history 写权限。
 
-`with_forced_compaction()` 独立开启一次有界的超窗恢复尝试，默认关闭。例如只使用 forced、关闭
+`with_forced_compaction()` 独立开启一次有界的容量指标触发尝试，默认关闭。例如只使用 forced、关闭
 policy-triggered background：
 
 ```rust
@@ -178,17 +179,17 @@ let provider = provider
 let monitor = provider.parallel_compaction_monitor().unwrap();
 ```
 
-它只处理 `ResponsesFrameRequestFault::ContextWindowLimit`。正常 under-limit Frame 沿用原 nonblocking
-路径；编码、coverage、System binding 等其他错误原样返回。检测到超窗时，provider 不构造或发送该
-foreground request：已有 worker 就等待它，没有 worker 才从当前 accepted wire window 的闭合前缀
-启动一次使用当前模型的普通 `/responses` 摘要请求。background 和 forced 始终合计至多一个 worker，
-并共享同源去重。
+仅当可编码请求的完整 context bytes/4 estimate 加 output reserve 超过声明容量时触发；其余合法
+Frame 沿用原 nonblocking 路径。已有 worker 就等待它，没有 worker 才从当前 accepted wire window
+的闭合前缀启动一次使用当前模型的普通 `/responses` 摘要请求。background 和 forced 始终合计至多
+一个 worker，并共享同源去重。Temporary 和 Decision 不启动、等待或安装额外摘要。
 
-等待上限是 transport `read_timeout`。失败、超时、没有闭合 source 或候选失效都返回原
-`ContextWindowLimit`。成功候选只重新准备和预算一次；若仍然超窗，返回原 limit，monitor 保持
-`Ready`，同一 source 不再启动 compact。准备和等待不会修改 accepted provider state、FrameSession、
-canonical history 或 receipt；压缩后的 foreground 在首次 transport poll handoff 时才标记
-`Installed` 并同步 commit。等待 future 被取消不会 detach worker，reset、shutdown 和 Drop 仍可取消，
+等待上限是 transport `read_timeout`。失败、超时、没有闭合 source 或候选失效均继续原合法请求，
+不会把压缩指标变成本地拒绝。成功候选只重新准备一次，压后估算仍高也继续 handoff。替换缓存
+前缀可能增大上传体积；候选超过真实字节上限时退回可编码的原请求，coverage、System binding
+等真实准备错误仍拒绝。准备和等待不会修改 accepted provider state、FrameSession、canonical
+history 或 receipt；foreground 在首次 transport poll handoff 时才安装选中候选、标记 `Installed`
+并同步 commit。等待 future 被取消不会 detach worker，reset、shutdown 和 Drop 仍可取消，
 其中正常 shutdown 收取 handle。
 
 ### Codex 源码对照
@@ -219,15 +220,28 @@ reserve 后再计算 90%。所有型号都由用户显式配置容量，没有�
 ```
 
 `compacted(A B C)` 是当前模型通过普通推理生成的文本摘要。后台请求使用专门的摘要 instructions，
-把闭合前缀作为历史输入，不提供业务工具，不使用前台 `previous_response_id`，并设置
+把闭合前缀整体作为单条 user `input_text` 内的
+`{"kind":"historical_context","items":[...]}` JSON 引用数据；原消息的 role、工具调用及回执
+仅是数据，不能继续作为有效业务指令或动作重放。引用编码不解析 POM；内层 JSON 与最终 HTTP
+body 都受现有字节上限约束。超限仅放弃摘要，保留前台上下文。
+不提供业务工具，不使用前台 `previous_response_id`，并设置
 `store: false` 和 `stream: false`。摘要提示词要求保留目标、约束、决定、最新状态、动作实际结果、
 待办与必要标识，区分过时信息、失败与不确定性；原 System instructions 在前台单独保留。
+旧输出格式和回合控制指令不作为当前规则或任务事实写入摘要；只有用户任务本身讨论的协议原文
+才以明确的引用数据保留，避免旧业务结束合同在摘要中重新取得当前指令的含义。
 
-输出预留为前缀 bytes/4 estimate 的四分之一（向上取整），最多 4096 tokens；必要时缩小到当前
-模型窗口减去实际摘要请求 estimate 后的剩余容量。没有输出容量则失败，不发送超窗摘要请求。
-只接受 completed response 的非空 assistant 文本；reasoning 不进入候选，工具调用、refusal、
-不完整响应和服务端压缩产物均被拒绝。AgentView 为摘要加历史标识并构造普通 assistant 上下文项，
-其序列化大小必须严格小于原前缀。摘要是有损模型推理，不能保证所有历史事实逐字保留。
+输出预留为前缀 bytes/4 estimate 的四分之一（向上取整），至少 1 token、最多 4096 tokens，
+且不超过声明的模型窗口。摘要输入的 estimate 不再扣减输出预留或拒绝请求；真实请求字节限制、
+响应字节限制、超时和上游容量错误仍然生效。
+摘要提示词以 `{"schema":"agentview.context-summary.v1","facts":["事实陈述"],"open_items":[]}`
+引导模型组织任务事实和待办。该格式只约束摘要任务的提示，不增加应用侧 JSON schema、业务结束
+标记或正文内容拒绝逻辑；应用不解析或规范化摘要正文。摘要任务使用当前模型普通推理，
+不新增 endpoint structured-output 参数或补偿重试链路。
+保留既有 completed response、非空 assistant 文本与缩减检查。reasoning 不进入候选，API 工具调用、
+refusal、不完整响应和服务端压缩产物仍按原协议处理。
+AgentView 为原样摘要文本加历史标识并构造普通 assistant 上下文项，
+其序列化大小必须严格小于原前缀，不以引用包装的额外体积计算压缩收益。
+摘要是有损模型推理，不能保证所有历史事实逐字保留。
 这些输出不作为 canonical assistant 事实、ProviderFact 或 Component 工具调用派发。
 
 来源之后仅追加 tail 不应使候选过期。安装时检查实际被覆盖前缀仍匹配、context generation
@@ -283,7 +297,7 @@ Running / Ready -> Cancelled
    不可变 source、owned worker、普通文本摘要校验与状态观察。
 2. [`codex_http_v1.rs`](../src/provider/codex_http_v1.rs)：使用当前模型、reasoning 和 provider routing、受 byte limit 限制的普通摘要请求编码。
 3. [`frame_request.rs`](../src/provider/async_openai/frame_request.rs)：闭合前缀选择、来源验证、
-   候选加最新 tail、canonical proofs 和请求窗口 estimate 检查。
+   候选加最新 tail、canonical proofs 和完整有效上下文计量。
 4. [`native_reaction.rs`](../src/provider/async_openai/native_reaction.rs)：handoff 时启动或安装候选，
    reset 失效处理与后台清理。
 5. `Frame::requested_context_bytes()`：沿用已有完整 Component meter 提供 advisory metadata；
@@ -299,9 +313,10 @@ Running / Ready -> Cancelled
 比例、协议、coverage 与生命周期边界另有单元测试。测试不需要真实 API key。
 
 - compact 请求保持 Pending 时，前台请求仍能送达并完成。
-- forced 未启用或 Frame 未超窗时不等待 compact；forced 超窗时已知 oversized foreground 不送达。
+- forced 未启用或估算未越过指标时不等待 compact；估算越界只触发一次压缩，不拒绝合法请求。
 - forced 与 background 共享一个 worker；等待取消后同一候选可重试，timeout/reset/shutdown 仍能收取任务。
-- forced 候选仍超窗时保持 Ready、不安装、不重复 compact，accepted revision 和 receipt 不提前推进。
+- forced 失败或没有 source 时原请求继续；候选估算仍高也可安装，不循环 compact，accepted revision
+  和 receipt 不提前推进。
 - compact 完成前后，前台均可追加新输入；安装结果精确保留最新 tail。
 - 测试服务器只支持普通 `/responses`；任何其他端点请求都失败，全部请求均不含服务端压缩配置。
 - 摘要使用当前模型、reasoning 及 provider routing，不继承业务工具或前台 continuation；摘要文本不触发 Component handler。

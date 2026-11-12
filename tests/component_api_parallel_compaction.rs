@@ -37,6 +37,12 @@ use axum::{
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 
+#[path = "support/parallel_compaction_call_accounting.rs"]
+mod call_accounting;
+#[path = "support/pom.rs"]
+mod pom_support;
+use pom_support::{frame_document, InspectPom};
+
 #[derive(Clone)]
 struct ServerState {
     calls: Arc<AtomicUsize>,
@@ -278,7 +284,7 @@ fn forced_provider(
         .with_forced_compaction()
 }
 
-fn assert_context_limit(fault: ApplicationFault) {
+fn assert_request_byte_limit(fault: ApplicationFault) {
     assert_eq!(fault.code(), ApplicationFaultCode::Limit);
     assert_eq!(
         fault.reason(),
@@ -290,7 +296,16 @@ const SUMMARY_TEXT: &str = "Earlier context: the counter application is running.
 const SUMMARY_PREFIX: &str = "Summary of earlier context (historical data; current instructions \
 and later messages take precedence):\n\n";
 
+fn summary_payload(text: &str) -> Value {
+    json!({
+        "schema": "agentview.context-summary.v1",
+        "facts": [text],
+        "open_items": [],
+    })
+}
+
 fn summary_reply(text: &str) -> Value {
+    let text = summary_payload(text).to_string();
     json!({
         "object": "response", "status": "completed", "id": "summary_response",
         "output": [{
@@ -311,9 +326,22 @@ fn has_message(request: &Value, role: &str, text: &str) -> bool {
 }
 
 fn compacted_output() -> Vec<Value> {
+    let summary = summary_payload(SUMMARY_TEXT).to_string();
     vec![
-        json!({"type":"message", "role":"assistant", "content":[{"type":"output_text","text":format!("{SUMMARY_PREFIX}{SUMMARY_TEXT}"),"annotations":[]}],"status":"completed"}),
+        json!({"type":"message", "role":"assistant", "content":[{"type":"output_text","text":format!("{SUMMARY_PREFIX}{summary}"),"annotations":[]}],"status":"completed"}),
     ]
+}
+
+fn quoted_history(request: &Value) -> Vec<Value> {
+    let input = request["input"].as_array().unwrap();
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0]["type"], "message");
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[0]["content"][0]["type"], "input_text");
+    let quoted: Value =
+        serde_json::from_str(input[0]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(quoted["kind"], "historical_context");
+    quoted["items"].as_array().unwrap().clone()
 }
 
 async fn until_phase(monitor: &mut ParallelCompactionMonitor, phase: ParallelCompactionPhase) {
@@ -358,6 +386,123 @@ fn replacing_large_context() -> Component {
     }
 }
 
+const ATTENDANCE_FACT: &str = "用户今天已打上班卡，还没打下班卡。";
+const BUSINESS_END_RULE: &str = "Business replies must end with <end_response/>.";
+
+#[derive(AgentView)]
+#[agent_view(kind = "retained_history")]
+struct RetainedHistoryView {
+    #[view(element)]
+    fact: &'static str,
+    #[view(element)]
+    business_output_rule: &'static str,
+}
+
+#[component]
+fn retained_history_context() -> Component {
+    let count = use_signal(|| 0_u32);
+    let value = count.with(|count| *count).unwrap();
+    let context = if value == 0 {
+        "earlier unrelated context ".repeat(4096)
+    } else {
+        "current context".into()
+    };
+    // Keep the stable history across a role boundary from the changing prompt.
+    // Contiguous developer inputs can merge and resend the old fact when the
+    // context changes, masking a lost prefix with newly transmitted history.
+    view! {
+        #[developer]
+        #[diff(slot = "retained_history")]
+        { RetainedHistoryView { fact: ATTENDANCE_FACT, business_output_rule: BUSINESS_END_RULE } }
+        #[user]
+        { format!("{context}\nfollow-up {value}") }
+        NativeToolCall {
+            name: "advance",
+            description: "Advance the discussion; the next view exposes the actual progress.",
+            on_call: move |_ctx| count.update(|value| { *value += 1; *value }),
+        }
+    }
+}
+
+fn contains_text(request: &Value, text: &str) -> bool {
+    request["input"].as_array().unwrap().iter().any(|item| {
+        item["content"].as_array().is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part["text"]
+                    .as_str()
+                    .is_some_and(|value| value.contains(text))
+            })
+        })
+    })
+}
+
+#[tokio::test]
+async fn factual_summary_preserves_known_state_and_the_latest_foreground_tail() {
+    let mut server = Server::start(summary_reply(ATTENDANCE_FACT)).await;
+    let provider = provider(&server.base, ContextRatioPolicy::default());
+    let mut monitor = provider.parallel_compaction_monitor().unwrap();
+    let transmitted_facts = Arc::new(Mutex::new(Vec::new()));
+    let capture = transmitted_facts.clone();
+    let mut app = Application::mount(retained_history_context, provider)
+        .unwrap()
+        .with_frame_observer(move |event| {
+            let projection = frame_document(event.frame().submission().canonical_bytes());
+            capture
+                .lock()
+                .unwrap()
+                .push(projection.has_field("fact", ATTENDANCE_FACT));
+        });
+
+    for _ in 0..2 {
+        assert!(app.react(false).unwrap().await.unwrap().is_continue());
+        server.requests.recv().await.unwrap();
+    }
+    let summary_request = server.compactions.recv().await.unwrap();
+    let source = quoted_history(&summary_request);
+    assert!(contains_text(&json!({"input": source}), ATTENDANCE_FACT));
+    assert!(contains_text(&json!({"input": source}), BUSINESS_END_RULE));
+    assert!(source.iter().any(|item| item["role"] == "developer"));
+
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
+    let while_compacting = server.requests.recv().await.unwrap();
+    server.release.add_permits(1);
+    until_phase(&mut monitor, ParallelCompactionPhase::Ready).await;
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
+    let compacted = server.requests.recv().await.unwrap();
+    assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
+    assert!(contains_text(&compacted, ATTENDANCE_FACT));
+    assert!(contains_text(&compacted, "follow-up 3"));
+    let input = compacted["input"].as_array().unwrap();
+    let summary_text = input[0]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        summary_text.strip_prefix(SUMMARY_PREFIX).unwrap(),
+        summary_payload(ATTENDANCE_FACT).to_string(),
+        "the model's summary body is retained verbatim"
+    );
+    let summary: Value =
+        serde_json::from_str(summary_text.strip_prefix(SUMMARY_PREFIX).unwrap()).unwrap();
+    assert_eq!(summary["facts"], json!([ATTENDANCE_FACT]));
+    assert_eq!(
+        *transmitted_facts.lock().unwrap(),
+        [true, false, false, false],
+        "the compacted request recovers the fact from the summary, not repeated projection input"
+    );
+    let previous_tail = &while_compacting["input"].as_array().unwrap()[source.len()..];
+    assert_eq!(&input[1..1 + previous_tail.len()], previous_tail);
+    for index in 1..=3 {
+        let id = format!("call_{index}");
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| { item["type"] == "function_call_output" && item["call_id"] == id })
+                .count(),
+            1
+        );
+    }
+    app.shutdown().await.unwrap();
+    server.finish().await;
+}
+
 #[tokio::test]
 async fn default_threshold_starts_compaction_without_a_small_requested_context() {
     let output = compacted_output();
@@ -365,12 +510,12 @@ async fn default_threshold_starts_compaction_without_a_small_requested_context()
     let provider = default_provider(&server.base);
     let mut monitor = provider.parallel_compaction_monitor().unwrap();
     let mut app = Application::mount(large_current_context, provider).unwrap();
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let first = server.requests.recv().await.unwrap();
     assert!(first.to_string().len().div_ceil(4) >= 244_800);
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Idle);
 
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let second = server.requests.recv().await.unwrap();
     // The complete current Component context still contains the entire large
     // developer message, so the 1/10 trigger cannot account for this attempt.
@@ -384,7 +529,7 @@ async fn default_threshold_starts_compaction_without_a_small_requested_context()
 
     server.release.add_permits(1);
     until_phase(&mut monitor, ParallelCompactionPhase::Ready).await;
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let next = server.requests.recv().await.unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     assert!(next["input"].as_array().unwrap().starts_with(&output));
@@ -406,7 +551,7 @@ async fn background_summarization_can_be_disabled_independently_of_request_limit
     let events = Arc::new(AtomicUsize::new(0));
     let mut app = Application::mount(move || counter(events.clone()), provider).unwrap();
     for _ in 0..3 {
-        assert!(app.react().unwrap().await.unwrap().is_continue());
+        assert!(app.react(false).unwrap().await.unwrap().is_continue());
         let request = server.requests.recv().await.unwrap();
         assert!(request.get("context_management").is_none());
         assert!(has_message(
@@ -421,17 +566,30 @@ async fn background_summarization_can_be_disabled_independently_of_request_limit
 }
 
 #[tokio::test]
-async fn declared_window_rejects_oversized_requests_even_with_compaction_disabled() {
+async fn context_estimates_do_not_reject_when_compaction_is_disabled_or_has_no_source() {
+    for forced in [false, true] {
+        let mut server = Server::start(json!({})).await;
+        let config = AsyncOpenAiTransportConfig::new(&server.base, "test-key").unwrap();
+        let mut provider = new_provider(config, 200_000).without_parallel_compaction();
+        if forced { provider = provider.with_forced_compaction(); }
+        let mut app = Application::mount(large_current_context, provider).unwrap();
+        assert!(app.react(false).unwrap().await.unwrap().is_continue());
+        let request = server.requests.recv().await.unwrap();
+        assert!(serde_json::to_vec(&request).unwrap().len().div_ceil(4) > 200_000);
+        assert!(server.compactions.try_recv().is_err());
+        app.shutdown().await.unwrap();
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn serialized_request_byte_limit_still_rejects_before_handoff() {
     let mut server = Server::start(json!({})).await;
-    let config = AsyncOpenAiTransportConfig::new(&server.base, "test-key").unwrap();
+    let config = AsyncOpenAiTransportConfig::new(&server.base, "test-key").unwrap()
+        .with_responses_serialized_request_body_limit(1).unwrap();
     let provider = new_provider(config, 200_000).without_parallel_compaction();
     let mut app = Application::mount(large_current_context, provider).unwrap();
-    let fault = app.react().unwrap().await.unwrap_err();
-    assert_eq!(fault.code(), ApplicationFaultCode::Limit);
-    assert_eq!(
-        fault.reason(),
-        ApplicationFaultReason::Port(ReactionPortFaultReason::RequestPreparation)
-    );
+    assert_request_byte_limit(app.react(false).unwrap().await.unwrap_err());
     assert!(server.requests.try_recv().is_err());
     assert!(server.compactions.try_recv().is_err());
     app.shutdown().await.unwrap();
@@ -446,13 +604,13 @@ async fn forced_only_compaction_waits_before_sending_the_oversized_foreground() 
     let monitor = provider.parallel_compaction_monitor().unwrap();
     let mut app = Application::mount(replacing_large_context, provider).unwrap();
 
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let first = server.requests.recv().await.unwrap();
     assert!(first.to_string().len().div_ceil(4) <= 20_000);
     assert!(server.compactions.try_recv().is_err());
 
     let compacted = {
-        let second = std::future::IntoFuture::into_future(app.react().unwrap());
+        let second = std::future::IntoFuture::into_future(app.react(false).unwrap());
         tokio::pin!(second);
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::select! {
@@ -490,9 +648,9 @@ async fn cancelling_a_forced_wait_keeps_the_same_candidate_for_retry() {
     let mut monitor = provider.parallel_compaction_monitor().unwrap();
     let mut app = Application::mount(replacing_large_context, provider).unwrap();
 
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     server.requests.recv().await.unwrap();
-    let pending_control = app.react().unwrap();
+    let pending_control = app.react(false).unwrap();
     {
         let pending = std::future::IntoFuture::into_future(pending_control.clone());
         tokio::pin!(pending);
@@ -516,7 +674,7 @@ async fn cancelling_a_forced_wait_keeps_the_same_candidate_for_retry() {
 
     server.release.add_permits(1);
     until_phase(&mut monitor, ParallelCompactionPhase::Ready).await;
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let retry = server.requests.recv().await.unwrap();
     assert!(retry["input"].as_array().unwrap().starts_with(&output));
     assert_eq!(
@@ -551,7 +709,7 @@ async fn forced_compaction_does_not_block_or_compact_an_under_limit_frame() {
 
     for _ in 0..2 {
         assert!(
-            tokio::time::timeout(Duration::from_secs(2), app.react().unwrap())
+            tokio::time::timeout(Duration::from_secs(2), app.react(false).unwrap())
                 .await
                 .unwrap()
                 .unwrap()
@@ -567,98 +725,98 @@ async fn forced_compaction_does_not_block_or_compact_an_under_limit_frame() {
 }
 
 #[tokio::test]
-async fn forced_compaction_timeout_rejects_before_handoff_and_does_not_retry_the_source() {
+async fn forced_compaction_timeout_continues_the_original_foreground_once() {
     let mut server = Server::start(summary_reply(SUMMARY_TEXT)).await;
     let provider = forced_provider(&server.base, 20_000, Duration::from_millis(100));
     let monitor = provider.parallel_compaction_monitor().unwrap();
     let mut app = Application::mount(replacing_large_context, provider).unwrap();
 
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     server.requests.recv().await.unwrap();
-    let fault = {
-        let pending = std::future::IntoFuture::into_future(app.react().unwrap());
+    {
+        let pending = std::future::IntoFuture::into_future(app.react(false).unwrap());
         tokio::pin!(pending);
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::select! {
                 request = server.compactions.recv() => request.expect("forced compact request"),
                 result = &mut pending => panic!("foreground completed before compact timeout: {result:?}"),
             }
-        })
-        .await
-        .unwrap();
+        }).await.unwrap();
         assert!(server.requests.try_recv().is_err());
-        tokio::time::timeout(Duration::from_secs(2), &mut pending)
-            .await
-            .unwrap()
-            .unwrap_err()
-    };
-    assert_context_limit(fault);
+        assert!(tokio::time::timeout(Duration::from_secs(2), &mut pending)
+            .await.unwrap().unwrap().is_continue());
+    }
+    let request = server.requests.recv().await.unwrap();
+    assert!(has_message(&request, "user", &format!("generation 1: {}", "needed context ".repeat(4_096))));
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Failed);
-    assert_eq!(
-        monitor.status().fault,
-        Some(ParallelCompactionFault::Timeout)
-    );
+    assert_eq!(monitor.status().fault, Some(ParallelCompactionFault::Timeout));
     assert_eq!(monitor.status().attempt, 1);
-    assert!(server.requests.try_recv().is_err());
-
-    let fault = tokio::time::timeout(Duration::from_secs(1), app.react().unwrap())
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_context_limit(fault);
-    assert_eq!(monitor.status().attempt, 1);
-    assert_eq!(monitor.status().phase, ParallelCompactionPhase::Failed);
     assert!(server.compactions.try_recv().is_err());
     assert!(server.requests.try_recv().is_err());
-
     app.shutdown().await.unwrap();
     server.finish().await;
 }
 
 #[tokio::test]
-async fn forced_candidate_that_is_still_oversized_stays_ready_without_retry_or_handoff() {
+async fn forced_candidate_with_a_high_estimate_is_installed_without_compacting_again() {
     let mut server = Server::start(summary_reply(&"x".repeat(30_000))).await;
     let provider = forced_provider(&server.base, 20_000, Duration::from_secs(5));
     let monitor = provider.parallel_compaction_monitor().unwrap();
     let mut app = Application::mount(replacing_large_context, provider).unwrap();
 
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     server.requests.recv().await.unwrap();
-    let fault = {
-        let pending = std::future::IntoFuture::into_future(app.react().unwrap());
+    {
+        let pending = std::future::IntoFuture::into_future(app.react(false).unwrap());
         tokio::pin!(pending);
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::select! {
                 request = server.compactions.recv() => request.expect("forced compact request"),
                 result = &mut pending => panic!("foreground completed before forced compaction: {result:?}"),
             }
-        })
-        .await
-        .unwrap();
+        }).await.unwrap();
         assert!(server.requests.try_recv().is_err());
         server.release.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(5), &mut pending)
-            .await
-            .unwrap()
-            .unwrap_err()
-    };
-    assert_context_limit(fault);
-    assert_eq!(monitor.status().phase, ParallelCompactionPhase::Ready);
-    assert_eq!(monitor.status().attempt, 1);
-    assert!(server.requests.try_recv().is_err());
-
-    let fault = tokio::time::timeout(Duration::from_secs(1), app.react().unwrap())
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_context_limit(fault);
-    assert_eq!(monitor.status().phase, ParallelCompactionPhase::Ready);
+        assert!(tokio::time::timeout(Duration::from_secs(5), &mut pending)
+            .await.unwrap().unwrap().is_continue());
+    }
+    let request = server.requests.recv().await.unwrap();
+    assert!(serde_json::to_vec(&request).unwrap().len().div_ceil(4) > 20_000);
+    assert!(has_message(&request, "user", &format!("generation 1: {}", "needed context ".repeat(4_096))));
+    assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     assert_eq!(monitor.status().attempt, 1);
     assert!(server.compactions.try_recv().is_err());
     assert!(server.requests.try_recv().is_err());
-
     app.shutdown().await.unwrap();
     server.finish().await;
+}
+
+#[tokio::test]
+async fn forced_compaction_http_protocol_and_no_reduction_failures_preserve_foreground() {
+    for (reply, status, expected) in [
+        (json!({}), StatusCode::TOO_MANY_REQUESTS, ParallelCompactionFault::HttpStatus(429)),
+        (json!({"status":"completed","output":[]}), StatusCode::OK, ParallelCompactionFault::Protocol),
+        (summary_reply(&"unreduced ".repeat(30_000)), StatusCode::OK, ParallelCompactionFault::NoReduction),
+    ] {
+        let mut server = Server::start_with_status(reply, status).await;
+        let provider = forced_provider(&server.base, 20_000, Duration::from_secs(5));
+        let monitor = provider.parallel_compaction_monitor().unwrap();
+        let mut app = Application::mount(replacing_large_context, provider).unwrap();
+        assert!(app.react(false).unwrap().await.unwrap().is_continue());
+        server.requests.recv().await.unwrap();
+        server.release.add_permits(1);
+        assert!(tokio::time::timeout(Duration::from_secs(5), app.react(false).unwrap())
+            .await.unwrap().unwrap().is_continue());
+        server.compactions.recv().await.unwrap();
+        let request = server.requests.recv().await.unwrap();
+        assert!(has_message(&request, "user", &format!("generation 1: {}", "needed context ".repeat(4_096))));
+        assert_eq!(monitor.status().phase, ParallelCompactionPhase::Failed);
+        assert_eq!(monitor.status().fault, Some(expected));
+        assert_eq!(monitor.status().attempt, 1);
+        assert!(server.compactions.try_recv().is_err());
+        app.shutdown().await.unwrap();
+        server.finish().await;
+    }
 }
 
 #[tokio::test]
@@ -680,14 +838,14 @@ async fn forced_limit_waits_for_the_existing_background_worker() {
     let mut app = Application::mount(replacing_large_context, provider).unwrap();
 
     for _ in 0..2 {
-        assert!(app.react().unwrap().await.unwrap().is_continue());
+        assert!(app.react(false).unwrap().await.unwrap().is_continue());
         server.requests.recv().await.unwrap();
     }
     server.compactions.recv().await.unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Running);
 
     let compacted = {
-        let third = std::future::IntoFuture::into_future(app.react().unwrap());
+        let third = std::future::IntoFuture::into_future(app.react(false).unwrap());
         tokio::pin!(third);
         server.release.add_permits(1);
         assert!(tokio::time::timeout(Duration::from_secs(5), &mut third)
@@ -734,9 +892,9 @@ async fn disabled_reasoning_and_endpoint_routing_survive_tool_feedback_and_compa
     let root_events = events.clone();
     let mut app = Application::mount(move || counter(root_events.clone()), provider).unwrap();
 
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let first = server.requests.recv().await.unwrap();
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let second = server.requests.recv().await.unwrap();
     let summary = tokio::time::timeout(Duration::from_secs(5), server.compactions.recv())
         .await
@@ -750,7 +908,7 @@ async fn disabled_reasoning_and_endpoint_routing_survive_tool_feedback_and_compa
     assert!(has_message(&second, "user", "counter value: 1"));
     server.release.add_permits(1);
     until_phase(&mut monitor, ParallelCompactionPhase::Ready).await;
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let compacted = server.requests.recv().await.unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     assert!(compacted["input"]
@@ -789,7 +947,7 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
     let root_events = events.clone();
     let mut app = Application::mount(move || counter(root_events.clone()), provider).unwrap();
 
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let first = server.requests.recv().await.unwrap();
     assert!(first.get("context_management").is_none());
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Idle);
@@ -797,7 +955,7 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
     // The compact handler stays blocked until explicitly released. The second
     // and third foreground reactions must still return with completed tools.
     assert!(
-        tokio::time::timeout(Duration::from_secs(5), app.react().unwrap())
+        tokio::time::timeout(Duration::from_secs(5), app.react(false).unwrap())
             .await
             .unwrap()
             .unwrap()
@@ -811,7 +969,7 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
     assert_eq!(compact_request["model"], "test-model");
     assert_eq!(compact_request["tools"], json!([]));
     assert_eq!(compact_request["stream"], false);
-    let prefix = compact_request["input"].as_array().unwrap();
+    let prefix = quoted_history(&compact_request);
     assert!(!prefix.iter().any(|item| item["type"] == "function_call"));
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Running);
     assert!(second["input"]
@@ -822,7 +980,7 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
     assert!(has_message(&second, "user", "counter value: 1"));
 
     assert!(
-        tokio::time::timeout(Duration::from_secs(5), app.react().unwrap())
+        tokio::time::timeout(Duration::from_secs(5), app.react(false).unwrap())
             .await
             .unwrap()
             .unwrap()
@@ -839,7 +997,7 @@ async fn default_parallel_compaction_keeps_foreground_interactive_and_preserves_
 
     server.release.add_permits(1);
     until_phase(&mut monitor, ParallelCompactionPhase::Ready).await;
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let fourth = server.requests.recv().await.unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     let input = fourth["input"].as_array().unwrap();
@@ -890,7 +1048,7 @@ async fn custom_policy_sees_complete_requested_context_even_when_delta_is_small(
     let events = Arc::new(AtomicUsize::new(0));
     let mut app = Application::mount(move || counter(events.clone()), provider).unwrap();
     for _ in 0..3 {
-        assert!(app.react().unwrap().await.unwrap().is_continue());
+        assert!(app.react(false).unwrap().await.unwrap().is_continue());
         server.requests.recv().await.unwrap();
     }
     {
@@ -922,9 +1080,9 @@ async fn failed_compaction_keeps_foreground_context_and_reports_failure() {
     let mut monitor = provider.parallel_compaction_monitor().unwrap();
     let events = Arc::new(AtomicUsize::new(0));
     let mut app = Application::mount(move || counter(events.clone()), provider).unwrap();
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     server.requests.recv().await.unwrap();
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     server.requests.recv().await.unwrap();
     server.compactions.recv().await.unwrap();
     server.release.add_permits(1);
@@ -933,7 +1091,7 @@ async fn failed_compaction_keeps_foreground_context_and_reports_failure() {
         monitor.status().fault,
         Some(ParallelCompactionFault::Protocol)
     );
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let next = server.requests.recv().await.unwrap();
     assert!(has_message(
         &next,
@@ -990,14 +1148,14 @@ async fn summary_receipt_barrier_blocks_installation_and_preserves_foreground_re
     let mut monitor = provider.parallel_compaction_monitor().unwrap();
     let events = Arc::new(AtomicUsize::new(0));
     let mut app = Application::mount(move || counter(events.clone()), provider).unwrap();
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let first = server.requests.recv().await.unwrap();
     assert_eq!(first["parallel_tool_calls"], true);
     assert_eq!(
         first["prompt_cache_options"]["comparison_response_id"],
         "foreground_baseline"
     );
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     server.requests.recv().await.unwrap();
     server.compactions.recv().await.unwrap();
     server.release.add_permits(1);
@@ -1005,7 +1163,7 @@ async fn summary_receipt_barrier_blocks_installation_and_preserves_foreground_re
         .await
         .unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Running);
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let while_receipt_pending = server.requests.recv().await.unwrap();
     assert!(has_message(
         &while_receipt_pending,
@@ -1024,7 +1182,7 @@ async fn summary_receipt_barrier_blocks_installation_and_preserves_foreground_re
         Some(ParallelCompactionFault::Observation)
     );
     assert_eq!(observer.requests.load(Ordering::SeqCst), 1);
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let after_refusal = server.requests.recv().await.unwrap();
     assert!(has_message(
         &after_refusal,
@@ -1047,8 +1205,8 @@ async fn shutdown_cancels_and_joins_a_pending_compaction() {
     let mut monitor = provider.parallel_compaction_monitor().unwrap();
     let events = Arc::new(AtomicUsize::new(0));
     let mut app = Application::mount(move || counter(events.clone()), provider).unwrap();
-    assert!(app.react().unwrap().await.unwrap().is_continue());
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     server.compactions.recv().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), app.shutdown())
         .await
@@ -1088,7 +1246,7 @@ async fn background_http_limits_and_timeouts_report_sanitized_faults_without_bre
         let events = Arc::new(AtomicUsize::new(0));
         let mut app = Application::mount(move || counter(events.clone()), provider).unwrap();
         for _ in 0..2 {
-            assert!(app.react().unwrap().await.unwrap().is_continue());
+            assert!(app.react(false).unwrap().await.unwrap().is_continue());
             server.requests.recv().await.unwrap();
         }
         server.compactions.recv().await.unwrap();
@@ -1097,7 +1255,7 @@ async fn background_http_limits_and_timeouts_report_sanitized_faults_without_bre
         }
         until_phase(&mut monitor, ParallelCompactionPhase::Failed).await;
         assert_eq!(monitor.status().fault, Some(expected));
-        assert!(app.react().unwrap().await.unwrap().is_continue());
+        assert!(app.react(false).unwrap().await.unwrap().is_continue());
         let next = server.requests.recv().await.unwrap();
         assert!(has_message(
             &next,
@@ -1122,7 +1280,7 @@ async fn reset_invalidates_a_pending_compaction_before_its_late_response() {
     let events = Arc::new(AtomicUsize::new(0));
     let mut app = Application::mount(move || counter(events.clone()), provider).unwrap();
     for _ in 0..4 {
-        assert!(app.react().unwrap().await.unwrap().is_continue());
+        assert!(app.react(false).unwrap().await.unwrap().is_continue());
         server.requests.recv().await.unwrap();
     }
     server.compactions.recv().await.unwrap();
@@ -1130,7 +1288,7 @@ async fn reset_invalidates_a_pending_compaction_before_its_late_response() {
     app.reset_model_context().unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Cancelled);
     server.release.add_permits(1);
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let next = server.requests.recv().await.unwrap();
     assert!(!next["input"]
         .as_array()
@@ -1182,14 +1340,14 @@ async fn cancelling_before_handoff_keeps_the_candidate_and_tool_receipts_for_ret
     let events = Arc::new(AtomicUsize::new(0));
     let mut app = Application::mount(move || counter(events.clone()), provider).unwrap();
     for _ in 0..2 {
-        assert!(app.react().unwrap().await.unwrap().is_continue());
+        assert!(app.react(false).unwrap().await.unwrap().is_continue());
         server.requests.recv().await.unwrap();
     }
     server.compactions.recv().await.unwrap();
     server.release.add_permits(1);
     until_phase(&mut monitor, ParallelCompactionPhase::Ready).await;
     observer.block.store(true, Ordering::SeqCst);
-    let pending_control = app.react().unwrap();
+    let pending_control = app.react(false).unwrap();
     {
         let pending = std::future::IntoFuture::into_future(pending_control.clone());
         tokio::pin!(pending);
@@ -1207,7 +1365,7 @@ async fn cancelling_before_handoff_keeps_the_candidate_and_tool_receipts_for_ret
     );
     assert!(server.requests.try_recv().is_err());
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Ready);
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let retry = server.requests.recv().await.unwrap();
     assert_eq!(monitor.status().phase, ParallelCompactionPhase::Installed);
     let input = retry["input"].as_array().unwrap();
@@ -1223,7 +1381,7 @@ async fn cancelling_before_handoff_keeps_the_candidate_and_tool_receipts_for_ret
         );
     }
     assert!(has_message(&retry, "user", "counter value: 2"));
-    assert!(app.react().unwrap().await.unwrap().is_continue());
+    assert!(app.react(false).unwrap().await.unwrap().is_continue());
     let feedback = server.requests.recv().await.unwrap();
     assert!(has_message(&feedback, "user", "counter value: 3"));
     assert!(feedback["input"]

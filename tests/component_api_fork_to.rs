@@ -219,7 +219,9 @@ fn source_profile() -> FrameProfile {
             context_window: ContextWindow::NotApplicable,
             reserved_output_tokens: None,
         },
-        FrameCapabilities::new(true),
+        FrameCapabilities::new(true)
+            .with_native_tool_calls(true)
+            .with_text_delta_output(true),
     )
 }
 
@@ -231,7 +233,9 @@ fn destination_profile() -> FrameProfile {
             context_window: ContextWindow::Tokens(NonZeroU64::new(8_192).unwrap()),
             reserved_output_tokens: Some(1_024),
         },
-        FrameCapabilities::new(true),
+        FrameCapabilities::new(true)
+            .with_native_tool_calls(true)
+            .with_text_delta_output(true),
     )
 }
 
@@ -403,7 +407,7 @@ async fn cross_provider_fork_keeps_staged_parent_work_and_delivers_independent_c
     let parent_props = CounterProps::new(10, "parent");
     let root_props = parent_props.clone();
     let mut parent = Application::mount(move || counter(root_props.clone()), source).unwrap();
-    assert!(parent.react().unwrap().await.unwrap().is_continue());
+    assert!(parent.react(false).unwrap().await.unwrap().is_continue());
     assert_eq!(parent_props.snapshot().value, 13);
     parent_props.request_reaction();
     let declared = parent.current_projection().projection().clone();
@@ -466,7 +470,7 @@ async fn cross_provider_fork_keeps_staged_parent_work_and_delivers_independent_c
     assert_eq!(child_props.task_starts.load(Ordering::SeqCst), 1);
     assert_eq!(parent_props.task_starts.load(Ordering::SeqCst), 1);
 
-    let pending_parent_control = parent.react().unwrap();
+    let pending_parent_control = parent.react(false).unwrap();
 
     let mut pending_parent = Box::pin(std::future::IntoFuture::into_future(
         pending_parent_control.clone(),
@@ -481,7 +485,7 @@ async fn cross_provider_fork_keeps_staged_parent_work_and_delivers_independent_c
     }).await.unwrap();
     assert!(poll!(pending_parent.as_mut()).is_pending());
     for _ in 0..3 {
-        assert!(child.react().unwrap().await.unwrap().is_continue());
+        assert!(child.react(false).unwrap().await.unwrap().is_continue());
     }
 
     let frames = destination_probe.frames();
@@ -560,7 +564,7 @@ async fn cross_provider_fork_keeps_staged_parent_work_and_delivers_independent_c
 
     child.exit_handle().request(ExitReason::Requested).unwrap();
     assert_eq!(
-        child.react().unwrap().await.unwrap(),
+        child.react(false).unwrap().await.unwrap(),
         ControlFlow::Break(ExitReason::Requested)
     );
     child.shutdown().await.unwrap();
@@ -572,8 +576,8 @@ async fn cross_provider_fork_keeps_staged_parent_work_and_delivers_independent_c
     assert!(poll!(pending_parent.as_mut()).is_pending());
     release_parent.notify_one();
     assert!(pending_parent.await.unwrap().is_continue());
-    assert!(parent.react().unwrap().await.unwrap().is_continue());
-    assert!(parent.react().unwrap().await.unwrap().is_continue());
+    assert!(parent.react(false).unwrap().await.unwrap().is_continue());
+    assert!(parent.react(false).unwrap().await.unwrap().is_continue());
     assert_eq!(parent_props.snapshot().value, 20);
     let frames = source_probe.frames();
     assert_eq!(
@@ -597,7 +601,7 @@ async fn invalid_destination_is_rejected_before_root_and_tasks_and_is_shut_down(
     let seed_probe = seed.0.probe.clone();
     let mut seed_app =
         Application::mount(|| view! { "Seed a distinct accepted target." }, seed).unwrap();
-    assert!(seed_app.react().unwrap().await.unwrap().is_continue());
+    assert!(seed_app.react(false).unwrap().await.unwrap().is_continue());
     let accepted =
         TargetDeclaration::resume(seed_probe.frames()[0].revision, destination_profile());
     seed_app.shutdown().await.unwrap();
@@ -649,7 +653,7 @@ async fn invalid_destination_is_rejected_before_root_and_tasks_and_is_shut_down(
     assert_eq!(props.preparations.load(Ordering::SeqCst), 0);
     assert!(source_probe.frames().is_empty());
     assert!(parent.take_reaction_request().unwrap());
-    assert!(parent.react().unwrap().await.unwrap().is_continue());
+    assert!(parent.react(false).unwrap().await.unwrap().is_continue());
     assert_eq!(source_probe.frames()[0].basis, FrameBasis::Full);
     parent.shutdown().await.unwrap();
 }
@@ -731,7 +735,7 @@ async fn destination_cleanup_survives_a_cancelled_waiter_and_parent_shutdown_dra
     );
     assert_eq!(source_probe.declarations.load(Ordering::SeqCst), 1);
     assert!(parent.take_reaction_request().unwrap());
-    assert!(parent.react().unwrap().await.unwrap().is_continue());
+    assert!(parent.react(false).unwrap().await.unwrap().is_continue());
     assert_eq!(source_probe.frames()[0].basis, FrameBasis::Full);
     let mut shutdown = Box::pin(parent.shutdown());
     assert!(poll!(shutdown.as_mut()).is_pending());
@@ -789,7 +793,7 @@ async fn destination_budget_failure_starts_no_child_tasks_and_leaves_parent_usab
     assert_eq!(source_probe.declarations.load(Ordering::SeqCst), 1);
     assert!(source_probe.frames().is_empty());
     assert!(destination_probe.frames().is_empty());
-    assert!(parent.react().unwrap().await.unwrap().is_continue());
+    assert!(parent.react(false).unwrap().await.unwrap().is_continue());
     parent.shutdown().await.unwrap();
 }
 
@@ -824,7 +828,7 @@ async fn child_root_panic_preserves_its_payload_and_parent_shutdown_drains_desti
         0
     );
     assert_eq!(
-        parent.react().unwrap_err().reason(),
+        parent.react(false).unwrap_err().reason(),
         ApplicationFaultReason::ForkCleanup
     );
     assert_eq!(source_probe.declarations.load(Ordering::SeqCst), 1);
@@ -913,7 +917,7 @@ async fn source_task_panic_interrupts_failed_destination_cleanup_without_detachi
         0
     );
     assert_eq!(
-        parent.react().unwrap_err().reason(),
+        parent.react(false).unwrap_err().reason(),
         ApplicationFaultReason::ComponentRuntime
     );
     assert!(source_probe.frames().is_empty());
@@ -1002,7 +1006,7 @@ async fn a_preexisting_source_panic_keeps_its_payload_and_runtime_fault_classifi
     assert_eq!(roots.load(Ordering::SeqCst), 0);
     assert_eq!(destination_probe.declarations.load(Ordering::SeqCst), 0);
     assert_eq!(
-        parent.react().unwrap_err().reason(),
+        parent.react(false).unwrap_err().reason(),
         ApplicationFaultReason::ComponentRuntime
     );
     assert!(tokio::time::timeout(TIMEOUT, parent.shutdown())

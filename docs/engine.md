@@ -178,6 +178,48 @@ Component 内先校验，再一次性写入自洽的新状态。
 retained fragment，但这只能是内部优化，不能让 projection 变成 partial。
 preparation completion仅属于当前显式operation；Runtime不保留key、readiness或其他跨operation cache。
 
+### 可替换定义与持续实例
+
+公开的 `ComponentDefinition` 拥有 logical type ID、compatibility key 和
+`Fn(&mut ComponentHooks) -> Result<Component, ComponentDefinitionError>` renderer。
+外部实现通过 `instantiate(instance_key)` 声明实例，通过公开 Component 构造方法和既有
+tool / Decision / action builder 生成同一套 typed POM 与 Frame 输入，不依赖 Rust authoring 宏。
+`ComponentHooks` 的显式 `u32` site 直接使用原生 Signal、preparation、task、handler、exit 和
+reaction-request lifecycle；AgentView 持有全部 retained slots 和 mount generation。
+
+实例身份由 parent、ordinary/System scope、instance key、logical type 和 compatibility key
+决定，使用 owned、length-prefixed segments，不能因分隔符而别名。相同 parent/scope 下重复 key
+拒绝。keyed sibling reorder 保留实例；definition version 不属于实例身份。一个 definition
+可在不同 key 下重复实例化，各自拥有独立状态。兼容 key 保留 hook order/site/kind/count/type；
+违反时以 fallible definition error 拒绝候选。更改 type 或 compatibility key 挂载整个新 subtree。
+
+`Application::mount_definition` 与 `update_definition` 是正式入口。update 提供包含 children
+的完整 root snapshot，在没有 active Main / Temporary 和其他 maintenance 的边界接纳；否则
+返回 typed `Busy`，由调用方在旧 operation 结算后显式重试。已提交 Frame 的 private bindings
+保留原实现、schema 和原 `EventContext`，全部结算之前不替换定义，不将旧事件重新路由到新实现。
+
+Runtime 在 retirement 之前完整 staging 并验证 renderer、key、hook shape 和当前 session/target
+的 Frame preparation；`Rejected` 不改变原定义、mounts、state、tasks、projection 或 version。
+验证不 handoff、不推进 canonical history、receipt 或 diff baseline。render 中 Signal write
+被拒绝；user renderer/initializer 的任意外部副作用不具有回滚保证。hook error 即使被 renderer
+忽略仍拒绝候选；user panic 沿用原有原 payload unwind 与 terminal 规则。
+
+验证通过后提交 topology 并 fence removed/incompatible mounts，安装新 root、推进
+application-local `DefinitionVersion`，abort 并 await 全部旧 mount tasks，然后发布 replacement
+projection 和启动新 mounts。
+兼容实例保留原 task/service/inbox；新 renderer 传入但未使用的 factory 被丢弃，不隐式交接 future。
+旧 capture 在其 callback / task 完成或 retirement 后按所有权释放。提交此 lifecycle transition
+之后的 infrastructure fault 是 terminal `Runtime`，不宣称恢复已经 fenced 或 abort 的旧实例。
+成功和错误都返回实际 `effective_version()`；version 从一开始，只在接受新定义时推进，独立于
+FrameRevision 和 projection revision。retirement 期间 accepted definition version 可以先于
+published projection；projection revision 仅在发布时推进。已接纳 update 的 waiter 被取消不取消
+独立 owner 的清理和发布。
+
+update 不执行 preparation、不 submit，也不建立 readiness cache；含 preparation 的新 projection
+按既有规则 provisional，下一次显式 prepare/reaction 执行 barrier。显式唤醒保持原生 sticky、
+coalesced、mount-fenced `ReactionRequest` 语义；更新或 task completion 不隐式启动 reaction。
+详见 [dynamic Component API](dynamic-components.md)。
+
 ### Application<P>
 
 `Application<P>` 是同一棵 mounted Component tree 的编排 owner，长期持有：
@@ -206,7 +248,7 @@ impl<P: ReactionPort + 'static> Application<P> {
     pub async fn wait_for_reaction_request(&mut self) -> Result<(), ApplicationFault>;
     pub fn take_reaction_request(&self) -> Result<bool, ApplicationFault>;
     pub async fn run(&mut self) -> Result<ExitReason, ApplicationFault>;
-    pub fn react(&mut self) -> Result<Reaction, ApplicationFault>;
+    pub fn react(&mut self, ephemeral: bool) -> Result<Reaction, ApplicationFault>;
     pub fn shutdown(self) -> impl Future<Output = Result<(), ApplicationFault>> + Send;
 }
 ```
@@ -220,10 +262,10 @@ operation 重试。丢弃 preparation future 会取消该 preparation；丢弃 R
 ### 异步 Reaction handle
 
 ```rust,ignore
-app.react()?.await?; // 建立已完成、工具协议闭合的 checkpoint。
-let main = app.react()?;
+app.react(false)?.await?; // 建立已完成、工具协议闭合的 checkpoint。
+let main = app.react(false)?;
 // 后续业务事件发生时，main 仍可能在 streaming。
-let branch = app.react()?;
+let branch = app.react(true)?;
 let id = branch.id();
 let kind = branch.kind(); // ReactionKind::Temporary
 branch.interrupt()?;
@@ -237,10 +279,16 @@ main.await?;
 同步错误表示准入失败，异步准备、提交和执行 fault 由 waiter 报告。
 `ReactionOutcome::{Completed, Interrupted, Exited(ExitReason)}` 表达 runtime 结算，不替代业务结果。
 
-准入原子分类：没有占用主线执行位时为 Main，否则为 Temporary。Main 正常完成且工具协议闭合、
+`app.react(ephemeral: bool)` 在准入时选择历史分支。`ephemeral=true` 始终创建 Temporary，
+即使没有活动 Main，也不领取或推进主 port/session；每次都从最近的合法主 checkpoint 创建新 sibling。
+`ephemeral=false` 保留自动分类：没有占用主线执行位时为 Main，否则为 Temporary。
+这里的参数控制整次 reaction 的历史与 provider 状态隔离，与 POM 的 ephemeral 输入留存属性独立；
+分支中的业务 Signal 和动作效果仍按下文共享规则执行。
+Main 正常完成且工具协议闭合、
 staging 为空后，成对保留 canonical history 和 provider 私有上下文作为新 checkpoint；没有新合法
 checkpoint 时保留旧版本。首次 Main 可以从空历史启动；尚无 checkpoint 或 port 不支持独立临时
-请求时，Temporary 明确拒绝。kind 一经返回固定，中断 Main 不提升其他 Temporary。
+请求时，Temporary 明确拒绝，包括显式 `ephemeral=true`，不得回退为 Main。
+父缓存过期或不兼容时同样保持此拒绝规则。kind 一经返回固定，中断 Main 不提升其他 Temporary。
 
 Main 按 handoff/admission 规则推进主 canonical history、continuation、staging、receipt 和 baseline。
 Temporary 使用固定 checkpoint 和独立协议状态，不消费、更新或重置主线状态。共享 tree 和 Signal
@@ -251,7 +299,7 @@ Temporary 使用固定 checkpoint 和独立协议状态，不消费、更新或�
 
 一个已结算 Temporary 用 `branch.react()?` 继续自己的 scratch，返回新的 ReactionId；同一 lineage
 至多有一轮活跃，后续需使用最新返回的 handle。可继续的 handle 存活时保留临时上下文，丢弃全部
-相关 handle 后可回收。Main 后续轮次仍通过 `app.react()?` 发起。
+相关 handle 后可回收。Main 后续轮次仍通过 `app.react(false)?` 发起。
 
 `interrupt()` 只请求中断指定 reaction，终态后幂等；不会中断其他 reaction、伪造 completion 或请求
 Application exit。等待在必要结算和清理完成后返回。managed recovery 未解决时，worker、执行位和
@@ -264,10 +312,33 @@ Application exit。等待在必要结算和清理完成后返回。managed recov
 或启动后台工作。Application 保留独立 template，Main streaming 借用主 port 时从 template 创建 sibling，
 不会用一把覆盖整个 stream 生命周期的锁串行化网络。native Responses 和 Debug 支持该能力。
 
-Ark caching 打开时，Temporary 继续固定已保存、未过期的父 `previous_response_id`，发送 `store:false`，
-后续只重放分支新增完整协议项；子响应 ID 不成为新父 checkpoint。普通非缓存 Responses 在独立分支
-重放其 wire history，仍 `store:false`。详细来源、资源生命周期与交互契约见
+Ark caching 打开且有合法远端父节点时，Temporary 继续固定已保存、未过期的父 `previous_response_id`，发送 `store:false`，
+每次补发该远端父 prefix 之后的完整 retained suffix，包括 checkpoint 中尚未存储的 Main 内容和
+分支新增协议项；子响应 ID 不成为新父 checkpoint。普通非缓存 Responses 在独立分支重放其 wire
+history，仍 `store:false`。详细来源、资源生命周期与交互契约见
 [parallel-reactions-design.md](parallel-reactions-design.md)。
+
+首次 Main 含 ephemeral 输入而明确未存储、没有远端父节点时，只有完整 terminal envelope、output
+ledger 和 usage 验证通过，才封存完整 retained wire 的本地 proof，允许创建 Local Temporary。
+Local 固定完整 wire prefix、System、工具定义及 parallel-tool 设置，每次上传完整 retained context；
+即使子轮没有 ephemeral，也保持 `store:false`，不发送 caching 或 `previous_response_id`。
+原始 ephemeral 输入不进入该 prefix。未完成、协议未闭合、proof 不匹配的窗口不可分叉；已有远端
+父节点过期或损坏也不可直接降级为 Local。Local 与 Remote 均不得推进 Main 或兄弟分支的 cursor。
+
+普通 Main 中的 POM ephemeral 输入不改变 reaction kind。Ark 请求发送 `store:false`，同时尽量保留
+最近一次已完成、已存储且兼容的父 `previous_response_id`；本轮未存储的响应 ID 不替换该父节点。
+父节点覆盖 retained wire 的精确前缀，以 item count 和 JCS SHA-256 proof 验证，包含 private artifacts；
+不能把当前全部本地 wire history 视为远端已覆盖。其后的普通输入、assistant output、reasoning、
+ToolCall 和 ToolOutput 按既有规则保留，每轮按原协议顺序补发该 suffix，最后追加完整当前 ephemeral
+prompts。旧 ephemeral 原始输入不在下一轮 suffix 中。下一轮不含 ephemeral 的 Main 可以发送
+`store:true`，继续同一父节点并补齐该 durable suffix；只有完整 terminal envelope、output ledger 和
+usage 都验证通过后才安装新父响应及覆盖 proof。
+
+Main 复用父节点仍要求 Delta、相同 System、完整工具定义及 parallel-tool 设置、未过期的已完成响应和
+匹配的 wire prefix proof。Full、不兼容配置、失效 prefix 或已安装 compaction 不复用旧节点；无可用父
+节点时发送完整 retained context，含 ephemeral 时仍 `store:false`。失败、取消和未完成响应不安装新
+cursor，保留既有 continuity loss、恢复和结算规则。可用父节点之后的完整 durable suffix 同样进入
+Temporary checkpoint，但不会被错误标为已远端存储，也不会改变 Temporary 的固定父节点规则。
 
 `run()` 是默认顺序 Main driver；若已有 Main，先等待它结算，再发起下一 Main，直到正常 exit 或首个
 fault。run waiter 被丢弃不取消已接纳的 reaction。owner 仍需停止业务资源并 consuming shutdown。
@@ -830,7 +901,11 @@ provider claims，并重置diff baseline。消失的diff地址也随成功handof
 
 原生 POM 集合 delta 将相邻同类操作合并为一个 `insert`、`remove` 或 `update` 节点，
 每个节点可包含多个目标 child；操作对全部 children 生效，并保留原有顺序和重复 occurrence。
-keyed remove 仍只携带目标名称及 key，insert/update 携带完整当前值。
+keyed remove 仍只携带目标名称及 key，insert 携带完整当前值。keyed update 对显式声明的嵌套
+diff 字段递归应用其策略；局部更新的目标 child 标记 `rendering_mode=delta`，保留 key 属性，
+只更新给出的字段。没有局部 delta 标记的 update child 是完整当前值并替换旧记录；未标记字段的
+变化、结构变化仍回退到完整记录。若局部 patch 的标记属性与业务 key 属性同名且值冲突，
+也回退完整记录，保留真实 key。没有变化的记录省略。
 
 普通projection item默认对比同scope内上一次成功handoff的完整`RenderedProjection`，不查询累计authored
 历史。相同前缀省略；长度相同且只有一个同role item变化时比较其POM，其后的相等item继续保留；
@@ -906,14 +981,14 @@ Native `AsyncOpenAiResponsesProvider` 默认使用 `DefaultCompactionPolicy` 在
 禁止使用 `/responses/compact`、`context_management`、`compaction_trigger` 或其他服务端压缩能力；
 也不提供 server compaction 分支或 fallback。此约束同样适用于 forced compaction 和未来 runtime
 checkpoint；见 [design.md](../design.md)。`with_parallel_compaction(policy)` 替换默认策略，
-`without_parallel_compaction()` 关闭后台摘要；这些配置不影响独立的请求上限检查。
+`without_parallel_compaction()` 关闭后台摘要；这些配置不影响独立的请求字节上限检查。
 此功能只影响对应 port 的 wire window，不改变 Main/Temporary 历史归属，也不适用于 legacy port。
 Temporary 禁用后台及 forced compaction，以保留固定父 prefix。
 
 Forced compaction 是同一 native provider 的独立 opt-in：`with_forced_compaction()` 默认关闭，
-且不受 `without_parallel_compaction()` 影响。它只在一个本来可编码的前台 Frame 因
-`ContextWindowLimit` 被拒绝时介入；低于上限、其他准备错误和 legacy port 均不触发。forced
-路径不会发送已知超窗的 foreground request。
+且不受 `without_parallel_compaction()` 影响。它在可编码前台 Frame 的上下文估算加输出预留超过
+声明容量时，先尝试一次有界摘要；低于指标、其他准备错误和 legacy port 均不触发。估算是压缩
+指标，不是提交限制；没有可压缩来源、摘要失败或压后估算仍高时，合法请求继续提交。
 
 `CompactionPolicy`（也可传 `Fn(&CompactionContext) -> bool + Send + Sync` 闭包）在 handoff 前
 同步判断是否允许尝试，必须快速、有界；policy panic 原样传播。默认策略包含两项 OR 条件：
@@ -927,8 +1002,9 @@ Forced compaction 是同一 native provider 的独立 opt-in：`with_forced_comp
 `ceil(bytes / 4)`：requested 使用完整 Component envelope；provider 使用本次准备后的完整 Responses
 JSON body，包括历史、私有 artifact、instructions 和工具定义。两种编码的开销不同，不能当精确 tokenizer。
 策略还可读取可压缩前缀大小、必填的非零 context window 和 output reserve。缺少 requested 计量时，
-比例条件不触发，token 阈值仍可触发。提前压缩不能保证一定赶在上下文增长前完成；绝对上限仍由
-独立的预算检查执行。token 阈值是启动后台计算的条件，不是等待压缩完成的阻塞屏障。
+比例条件不触发，token 阈值仍可触发。提前压缩不能保证一定赶在上下文增长前完成。字节估算不
+等同模型实际 token 数，不因估算越过窗口拒绝请求；真实容量错误由 provider 返回。token 阈值
+是启动后台计算的条件，不是等待压缩完成的阻塞屏障。
 
 模型描述使用 `agentview::provider::ModelSpec`。用户必须通过
 `ModelSpec::new(model_id, context_window_tokens)` 同时提供非空模型 ID 和当前部署的非零容量；
@@ -945,9 +1021,10 @@ JSON body，包括历史、私有 artifact、instructions 和工具定义。两�
 明确关闭 reasoning。`with_openrouter_provider_routing(OpenRouterProviderRouting::new(only, order,
 require_parameters)?)` 提供 typed OpenRouter `provider` 设置，默认省略该字段；eligible endpoints 和
 preference order 保留完整 endpoint slug（包括 `/us` 等 variant suffix）。这些设置随前台、continuation
-和后台/forced 摘要请求发送，并计入完整 HTTP body 的字节与窗口预算。
+和后台/forced 摘要请求发送，并计入完整 HTTP body 的字节计量与上下文估算。
 `AsyncOpenAiTransportConfig::new(api_base, api_key)` 只接收连接参数，transport 不持有或覆盖窗口。
-provider 从 encoder 的 `ModelSpec` 派生稳定的 FrameProfile，同时用于 compaction 阈值和请求预算检查。
+provider 从 encoder 的 `ModelSpec` 派生稳定的 FrameProfile，用于 compaction 指标；窗口 metadata
+不提供 tokenizer 计量，也不把字节估算变成 hard limit。
 只有 ID 编码为 HTTP body 的 `model` 字段，窗口是本地 metadata。
 运行示例时 `AGENTVIEW_CONTEXT_WINDOW_TOKENS` 必填，与 `AGENTVIEW_MODEL` 一起构造 `ModelSpec`。
 
@@ -956,26 +1033,37 @@ provider 从 encoder 的 `ModelSpec` 派生稳定的 FrameProfile，同时用于
 background 和 forced compaction 的 source、摘要和安装后的 baseline 均不包含它；当前临时 prompt
 只在前台请求的完整输入末尾追加。模型输出和工具事实仍按既有 source 规则保留。
 policy-triggered background attempt 只在普通 Frame 真实
-handoff 后启动，不阻塞该前台反应。forced attempt 在超窗 Frame handoff 前启动并等待；若已有
+handoff 后启动，不阻塞该前台反应。forced attempt 在估算越过容量的 Frame handoff 前启动并等待；若已有
 background worker，则等待同一个 worker，不复制 source 或启动第二个 worker。两种路径共用 source
 fingerprint 去重，同一 accepted source 至多尝试一次。worker 不拥有 Component、canonical history、
 receipt 或前台 continuation 的写能力。
 
 forced 等待以 provider 的 `read_timeout` 为上限。没有闭合 source、worker 失败或超时、候选失效时，
-返回原 `ContextWindowLimit`；不发送 foreground request，也不推进 provider accepted state 或
-FrameSession commit。候选成功后只重新准备并检查预算一次。若候选仍超窗，同样返回原 limit，候选和
-monitor 保持 `Ready`，同一 source 不再 compact。只有压缩后 foreground request 的首次 transport poll
-才把候选标为 `Installed` 并进入既有同步 commit。等待中的 submit future 被取消时，worker handle
+保留原合法 foreground request。候选成功后只重新准备一次，压后估算仍高也继续提交。替换缓存
+前缀可能增大上传体积；候选超过真实序列化字节上限时退回可编码的原请求。canonical coverage、
+System binding 等真实准备错误仍拒绝。候选和原请求均不能绕过字节上限，不能静默截断。
+只有 foreground request 的首次 transport poll 才安装实际选中的候选，标为 `Installed` 并同步
+commit。等待中的 submit future 被取消时，worker handle
 仍由 provider 持有；reset、shutdown 和 Drop 沿用统一的取消与收取规则。
 
-摘要请求使用专门的摘要 instructions、闭合历史前缀及空工具列表、`tool_choice: "none"`，
+摘要请求使用专门的摘要 instructions。闭合历史前缀整体编码为单条 user `input_text` 中的
+`{"kind":"historical_context","items":[...]}` JSON 数据；原 role、工具调用及回执仅是数据字段，
+不得作为该摘要请求的有效 developer/system 指令或工具执行项重放。引用不解析或改写 POM。
+摘要指令要求省略旧输出格式和回合控制规则；用户任务所讨论的协议原文仅作为引用数据保留。
+请求使用空工具列表、`tool_choice: "none"`，
 `store: false`、`stream: false`，
 不复用前台 `previous_response_id`。请求的输出预留为输入估算 token 数的四分之一（向上取整），
-最多 4096，并按当前窗口扣除实际请求估算占用后的剩余容量进一步缩小；无剩余容量则失败。
-只有 completed response 的非空 assistant 文本可以形成候选；reasoning 不进入候选，拒绝工具调用、
-refusal、服务端 compaction 产物和不完整结果。客户端把文本标记为历史摘要，包装成普通 assistant
+最多 4096，且不超过声明窗口的 token 数。摘要输入的字节估算不构成请求拒绝条件；真实字节
+上限和 provider 返回的容量错误仍生效。
+摘要提示词引导模型用 `{"schema":"agentview.context-summary.v1","facts":["事实陈述"],"open_items":[]}`
+组织任务事实与待办。这只是模型侧的摘要格式指引，应用不解析此 JSON、不按字段、业务结束标记
+或正文内容新增拒绝条件，也不依赖端点支持额外的 structured-output 参数。
+候选沿用原有 completed response、非空 assistant 文本及体积缩减处理。reasoning 不进入候选，
+API 工具调用、refusal、服务端 compaction 产物和不完整结果仍按原有协议处理。
+客户端为原样文本加历史摘要标识，包装成普通 assistant
 上下文项；它不成为 canonical 事实、不派发为 ProviderFact 或 Component action。
-候选必须严格缩小输入前缀的 JSON bytes。摘要是有损推理结果，不能承诺逐字保留全部历史事实。
+候选必须严格缩小原输入前缀的 JSON bytes，不以引用包装后的体积作为分母。
+摘要是有损推理结果，不能承诺逐字保留全部历史事实。
 worker 完成仅生成候选；后续 `submit()` 非阻塞收取已结束的 worker，以候选替换仍匹配的前缀，
 再拼接**当前**最新 tail。前缀替换、reset 或 System binding 变化使旧候选无效。原 canonical coverage
 proof、pending calls 和 receipt 保持原有语义，Full recovery 仍须验证精确 coverage 与 instructions。
@@ -983,7 +1071,7 @@ proof、pending calls 和 receipt 保持原有语义，Full recovery 仍须验�
 准备候选不修改 accepted state。前台真实 handoff 才安装，随后正常同步 Frame commit；pre-handoff
 失败或取消保留兼容候选供重试，post-handoff fault 不回滚已安装窗口。同一来源不重复尝试；普通压缩
 失败通过 monitor 报告并保留原前台窗口。后台 HTTP 有独立请求/响应字节限制与超时，
-请求 bytes/4 加摘要输出预留不得超过当前模型窗口。
+摘要输入 bytes/4 仍只是估算，不把估算超窗转为本地 hard limit。
 
 `parallel_compaction_monitor()` 返回无 payload/credentials 的状态观察句柄，区分 Running、Ready、
 Installed、Discarded、Failed 和 Cancelled。通知可能合并，Ready 不表示已经交付给模型，也不主动驱动
@@ -1078,12 +1166,11 @@ mount先对空transcript/staging验证；每次TextDelta、ToolCall和ToolOutput
 Delta也必须证明hypothetical next-Full成立。prepare最后验证actual JCS bytes。checked arithmetic失败、零值、
 Component limit大于Frame limit或初始reserve失败都是typed invalid-profile fault。
 
-port随后独立校验private artifact、真实wire bytes和context预算。Native OpenAI ports 对完整 JSON body
-按 `ceil(bytes / 4)` 估算，再加 `reserved_output_tokens`；必须不超过声明的 context window，
-相等合法。这不是精确 tokenizer 保证。独立 compact 请求也检查
-其 request bytes/4 是否超过同一 window，并遵守 transport request/response byte limits。
-任何一层超限都是typed pre-handoff fault（后台 compact 超限只使该 attempt 失败），
-任何一层都不能静默truncate。
+port随后独立校验private artifact及真实wire bytes。Native OpenAI ports 对完整有效上下文按
+`ceil(bytes / 4)` 估算，结合 `reserved_output_tokens` 和声明窗口触发压缩；估算超指标不会
+拒绝 foreground、Temporary、Decision 或独立摘要请求。模型实际容量问题由 provider 返回，
+不能把估算值当成真实 token 使用量。canonical Component/Frame 和 transport request/response
+byte limits 继续作为 hard limit，超限返回 typed fault；任何一层都不能静默 truncate。
 
 ## 4. Target declaration 与 handoff
 
@@ -1237,6 +1324,10 @@ pub enum ProviderFact {
         ordinal: u64,
         call: ProviderToolCall,
     },
+    Decision {
+        output: ProviderOutputKey,
+        decision: ProviderDecision,
+    },
     ReactionCompleted {
         primary_text: Option<ProviderOutputKey>,
     },
@@ -1253,6 +1344,7 @@ canonical publication顺序：一个key的first fact固定其output position；�
 | `TextDelta` | append partial | `TextDelta` |
 | `TextSealed` | validate accumulated text and seal | none |
 | `ToolCall` | register completed call and ordinal | `ToolCall` |
+| `Decision` | commit sealed batch-correlated answers and validate JSON/typed question contracts | `Decision` |
 | completed with `Some(key)` | validate sealed primary output | derive `TextComplete` from sealed text |
 | completed with `None` | validate no-primary-text completion | none |
 
@@ -1261,8 +1353,8 @@ Observer或Component看见，之后才写history；handler fault不回滚已经c
 
 terminal/ordering grammar固定如下：
 
-- 一个output key标识一个lifecycle；first fact固定kind和canonical position，同一key不能在text与
-  ToolCall之间复用；
+- 一个output key标识一个lifecycle；first fact固定kind和canonical position，同一key不能在text、
+  ToolCall和Decision之间复用；
 - text lifecycle可以包含多个delta和一个seal；所有fact的AssistantPhase必须exact相同；没有delta时
   `TextSealed`可以作为first fact并直接建立sealed text；
 - seal恰好一次并校验accumulated text，seal后不能再delta；
@@ -1276,8 +1368,66 @@ terminal/ordering grammar固定如下：
 公开OpenAI provider使用Responses API；Chat Completions保留为私有兼容实现。
 Built-in target capability在v1仍可比公共fact grammar更窄。内部Chat Completions target当前是text-only：
 非空`ToolCatalog`必须在handoff前typed reject，上游返回tool call也必须作为terminal upstream rejection；
-这不表示Responses或公共`ReactionPort`失去ToolCall能力。`FrameCapabilities`尚未表达tool support，后续若让
-Chat支持streamed tool calls，必须先扩展mount-stable capability negotiation，不能静默改变现有profile。
+这不表示Responses或公共`ReactionPort`失去ToolCall能力。`FrameCapabilities`分别声明native tool calls、
+text delta output和decision能力；Chat当前不声明native或decision。能力在mount期间固定。
+
+### Frame 能力与结构化 Decision
+
+`FrameCapabilities`在既有semantic delta之外独立声明`native_tool_calls`、`text_delta_output`和
+`decision`。完整当前Component projection汇总`FrameRequirements`；`FrameSession::prepare`在handoff
+前验证requirements是capabilities的子集。缺失能力返回可恢复的明确准备拒绝，零submit、不推进
+revision/history/diff baseline或消费tool receipts。后续显式操作可以在组件声明改变后重试。
+semantic delta仍是传输优化，不支持时可以Full，并非业务能力缺失。
+
+NativeToolCall要求native tool calls。显式`ProviderEvent::TEXT_DELTA`订阅要求text delta output；
+已有`ProviderEvent::TEXT`不要求本轮一定存在delta。XML parser可以从sealed/complete文本补齐未观察
+后缀，因此XML声明不自动要求delta；complete-only provider上的回调发生在最终文本到达后。
+
+`Decision`是provider-neutral built-in。`Decision { name, question, on_result }`和
+`Decision::new(name, question).on_result(handler).build()`声明同一种具名问题。普通Component的
+视图、System、历史和ephemeral共同构成Frame的有效观察，是唯一state来源；Decision不再另收
+context、全局instruction、调用方request ID或任意输出schema。Noul、Choice、Score的类型决定各自
+的NoulAnswer、ChoiceAnswer、ScoreAnswer，业务无需Deserialize或JsonSchema来定义问题语义。
+
+Frame汇总所有具名问题为一个DecisionDeclaration，内部生成DecisionBatchId；重名或无效问题在
+Frame准备期返回可恢复拒绝，允许修正声明后显式重试。每次Full/Delta都交付完整问题目录，参与Component/Frame/wire/token预算。原生端每次
+获得完整有效观察，不能只把Delta片段当作state。问题的instructions及criteria属于独立questions
+lane，不把当前问题目录重复嵌入state，也不从渲染后的POM反向解析问题。handler和typed decoder
+保持mount-local，冻结在实际提交的Frame bindings内；迟到输出不能用最新render的同名问题解码。
+
+NoulAnswer保留“是”的概率，ChoiceAnswer保留选项及可选概率、confidence，ScoreAnswer保留从0
+开始的有序criteria连续位置及可选分布，不自动阈值化或取整。业务enum映射和结果结构组合在本地
+完成，不追加模型调用。Frame可以包含多个独立Decision；Decision输出模式仍与主动native/XML
+actions互斥，被动observer及普通POM可以共存。
+
+Provider从已提交Frame绑定batch ID，将完整答案包归一化为独立封口的Decision fact。共享admission
+验证batch关联、output key、重复及terminal语法，并逐题验证答案类型、候选项和数值范围。
+单题refusal、缺失或非法答案分别形成Refused、MissingResult或InvalidAnswer，不吞掉其他有效题；
+未知题保留UnknownQuestion反馈。整包JSON或envelope错误属于reaction协议故障。真实完整输出先
+进入canonical history，再派发含逐题outcomes的事件。Decision key不与text/tool key复用，不充当
+primary text；decision-only terminal的primary_text为None，ReactionCompleted仍恰好一次。
+
+各组件暂存其具名问题的outcome，在正常completion调用on_result(context, QuestionOutcome<Answer>)，
+EventContext复用实际application/reaction/frame身份。transport/observation/handler故障仍由Reaction
+返回；和既有handler一样，回调不提供整个reaction的事务保证。system1::judge(provider,state,question)
+将显式state渲染为普通视图，并挂载同样的Decision，在独立fresh Application中驱动一次reaction。
+等待ReactionOutcome::Completed及consuming shutdown后才向调用方发布成功；取消waiter也必须移交
+唯一Application owner执行cleanup，不发起修复或确认调用。
+
+普通Responses Provider将共同问题声明编码为Responses输入及Provider内部生成的answers schema，
+保留普通native/XML/text Component行为。独立System1Provider只接System1Options，将Frame完整有效
+观察编码为state，将问题目录编码为questions，调用OpenRouter POST /api/alpha/decisions或TypeSafe
+兼容POST /api/v1/systemone。两种Provider复用HTTP、认证、预算及观测，保留各自的wire协议。原生
+成功响应是完整JSON；Responses使用自己的SSE。两者均经相同admission和组件事件交付结果。
+Responses中的概率是模型估计，不承诺与Jev校准一致。
+
+System1仅声明decision能力，不声明native tool calls或text delta output；缺失能力在提交前拒绝，
+无问题的普通输出模式也在原生HTTP前明确拒绝。两Provider的Decision模式均禁止后台/forced
+compaction或其他额外模型调用；上下文估算越过指标仍使用当前完整观察直接提交，不因估算拒绝。
+Temporary 同样保留固定父 prefix，不为估算越界改写父上下文。真实字节上限和 provider 错误仍生效。
+fresh_session复用连接池和observers，
+创建新target与空history。Responses沿用自身prompt cache选项；原生协议没有对应cache key/TTL字段，
+仅记录实际cached_tokens，不发送Responses专属选项。第一版不实现结果缓存。见[System 1 guide](system1.md)。
 
 异常EOF、stream fault或reaction future drop不能依赖adapter再yield Abort。Runtime的RAII canonical
 guard独占一份已经验证的transaction buffer；每个可见TextDelta发布前，buffer中对应item已经是
@@ -1811,6 +1961,29 @@ Component remount创建新runtime identity。旧canonical facts不撤回；新id
 
 ## 11. Observability
 
+### Component prompt byte profiling
+
+`RenderedProjection::render_prompt_with_sources()` 与 `ProjectionSnapshot` 的同名方法
+返回当前完整导出 prompt 及其 byte source map。来源在 typed projection 渲染时记录，
+不得反向解析 prompt、插入身份标记或改变 POM 文本。runtime 保留显式 Component parent 关系，
+以及 normalized System 各 block、native tool definition、Decision question 的声明 owner；
+不能通过拆分 identity 字符串推断 parent。框架 role heading 与共享 separator 单独标识，
+手工构造且无 owner 的 catalog 项标为 unattributed。
+
+`RenderedPrompt::profile_bytes()` 直接返回 `PromptByteProfile`，无失败分支，精确统计
+UTF-8 bytes。Component self bytes 来自它自身的 source spans；inclusive bytes 通过显式
+parent 累加后代的 self bytes，不能再次相加作为总量。Component self bytes 加 framework
+和 unattributed bytes 等于 `total_bytes()`，也等于完整导出 prompt 的 UTF-8 字节长度。
+没有输出内容的 Component 仍保留零用量行；原有 byte source map 可继续定位任意范围的来源。
+
+此诊断只度量当前完整 projection 的导出视图，不是实际 Full/Delta Frame、canonical history、
+provider wire request 或 provider-reported usage。读取与 profiling 不 prepare、不 reconcile、
+不提交 Frame、不推进 diff baseline；dirty/prepared snapshot 语义保持不变，既有预算检查不变。
+无需额外 feature 或 tokenizer。离线示例通过
+`cargo run --no-default-features --example prompt_profile` 运行。
+
+### Runtime and provider observers
+
 Observer观察与Engine相同的因果顺序，但不拥有或修改state。至少记录：
 
 - reaction identity、TargetIdentity、epoch和FrameRevision；
@@ -1835,6 +2008,25 @@ Native Responses 的 `with_observer` 观察精确、有界的请求和响应 bod
 worker 必须完成配置的审计回执后才能发布 Ready；回执错误使候选以 `Observation` 失败，
 保留前台既有上下文。callback panic 仍按 worker panic 的取回规则原样传播。此选项不改变摘要
 选源、验证、安装或 reset/shutdown 所有权。
+
+`with_call_observer` 是独立的 Frame-native HTTP accounting 通知接口，不替代上述审计回执、
+raw-body request observer 或现有 validated usage callback。每次实际 transport 首次 poll 产生一个
+全局唯一 `call_id` 的 `Started`，随后产生一次 `Finished`，区分 completed、cancelled、failed 和
+incomplete。准备拒绝和 handoff 前 continuity retry 不生成 HTTP call；重新发送的实际 HTTP attempt
+各有独立 ID。reqwest 的透明 retry 和 redirect 均关闭。Main/Temporary 与后台/forced summary 使用
+同一通知接口；summary worker 在创建时保留不可变的触发 Frame target、revision 和 basis，不能绑定为
+之后的前台调用。已有 background worker 被 forced wait 复用时仍保持最初 kind 和 origin。
+
+accounting snapshot 仅含模型、时间、状态、Frame identity、有界 response/request ID 及受入站字节
+上限约束的结构化原始 usage；不包含 prompt、模型正文、URL、认证或任意 headers。仅提取明确的
+request-ID headers。供应商扩展 token/cost 字段完整保留在 usage 内，不以四个标准计数替代原始数据；
+缺失 usage（包括取消或失败）为未知，不能记作零。此接口不设定价格、币种或业务 Turn/Plan 归属，
+也不把 upstream completed 等同于 Application commit。
+
+accounting sink 是有界、非阻塞的诊断通知，明确采用 panic-contained 契约，不能因通知失败而取消、
+重试已发送请求或改变业务输出。这是新诊断接口自身的契约，不改变 Engine/usage callback 的原有
+panic 传播。正常取消通过 HTTP future/stream/worker 的 RAII guard 发 terminal；其他 panic 的 unwind
+不再次进入任何 callback，因此该异常路径不承诺 terminal 通知。
 
 `with_parallel_tool_calls(bool)` 控制 foreground Responses 的多调用请求选项，默认 false，
 不绕过 Application 的工具准入。`set_prompt_cache_comparison_response_id` 为后续 foreground

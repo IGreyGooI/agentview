@@ -89,7 +89,7 @@ async fn run_debug_tool(
     let operation = tokio::time::timeout(Duration::from_secs(120), async {
         println!("reaction 1: request native tool call");
         capture_projection_before_reaction(&mut application, run_dir, 1).await?;
-        let _ = application.react()?.await?;
+        let _ = application.react(false)?.await?;
         let records = native_records(&application);
         let [CanonicalInputItem::ToolCall {
             call_id,
@@ -115,7 +115,7 @@ async fn run_debug_tool(
 
         println!("reaction 2: submit tool result continuation");
         capture_projection_before_reaction(&mut application, run_dir, 2).await?;
-        let _ = application.react()?.await?;
+        let _ = application.react(false)?.await?;
         anyhow::ensure!(
             answer.lock().expect("answer lock").trim() == "42",
             "model did not answer with the tool result"

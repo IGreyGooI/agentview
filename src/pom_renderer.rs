@@ -49,6 +49,17 @@ pub fn render_pom_document(document: &ResolvedDocument) -> Result<String, PomRen
     Renderer.render_block_children(document.children(), false)
 }
 
+/// Keep top-level block boundaries available to diagnostic source maps.
+pub(crate) fn render_pom_blocks(
+    document: &ResolvedDocument,
+) -> Result<Vec<String>, PomRenderError> {
+    document
+        .children()
+        .iter()
+        .map(|content| Renderer.render_block_content(content, false))
+        .collect()
+}
+
 struct Renderer;
 
 impl Renderer {

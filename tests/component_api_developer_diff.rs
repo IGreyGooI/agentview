@@ -110,16 +110,16 @@ async fn retained_application_emits_developer_sequence_delta_and_suppresses_no_c
     .unwrap();
 
     assert_eq!(
-        app.react().unwrap().await.unwrap(),
+        app.react(false).unwrap().await.unwrap(),
         ControlFlow::Continue(())
     );
     entries.lock().unwrap().push(String::from("second"));
     assert_eq!(
-        app.react().unwrap().await.unwrap(),
+        app.react(false).unwrap().await.unwrap(),
         ControlFlow::Continue(())
     );
     assert_eq!(
-        app.react().unwrap().await.unwrap(),
+        app.react(false).unwrap().await.unwrap(),
         ControlFlow::Continue(())
     );
 

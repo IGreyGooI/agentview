@@ -53,6 +53,7 @@ pub struct XmlStreamingAttemptBuilder<
     implementation_version: &'static str,
     envelope: XmlEnvelope,
     ignore_unknown_elements: bool,
+    ignored_elements: Vec<&'static str>,
     state_factory: Option<StateFactory<State>>,
     elements: Vec<Box<dyn ErasedElement<C, State>>>,
     finish_reducer: Option<FinalReducer<C, State>>,
@@ -69,6 +70,7 @@ impl<C: StreamingToolChannels> XmlStreamingAttemptBuilder<C> {
             implementation_version: "v1",
             envelope: XmlEnvelope::strict_fragment(),
             ignore_unknown_elements: false,
+            ignored_elements: Vec::new(),
             state_factory: None,
             elements: Vec::new(),
             finish_reducer: None,
@@ -113,6 +115,15 @@ where
         self
     }
 
+    /// Silently discard one undeclared top-level element and its complete subtree.
+    ///
+    /// The name is not advertised in the prompt. Other undeclared elements keep
+    /// their existing diagnostics; a name cannot also declare an executable element.
+    pub fn ignore_element(mut self, name: &'static str) -> Self {
+        self.ignored_elements.push(name);
+        self
+    }
+
     /// Let this independently parsed contract ignore top-level elements it did
     /// not declare.
     pub fn ignore_unknown_elements(mut self) -> Self {
@@ -140,6 +151,7 @@ where
             implementation_version: self.implementation_version,
             envelope: self.envelope,
             ignore_unknown_elements: self.ignore_unknown_elements,
+            ignored_elements: self.ignored_elements,
             state_factory: Some(Box::new(move |start| {
                 factory(start).map_err(|error| error.to_string())
             })),
@@ -180,6 +192,7 @@ where
             implementation_version: self.implementation_version,
             envelope: self.envelope,
             ignore_unknown_elements: self.ignore_unknown_elements,
+            ignored_elements: self.ignored_elements,
             state_factory: self.state_factory,
             elements: self.elements,
             finish_reducer: self.finish_reducer,
@@ -233,6 +246,7 @@ where
             implementation_version: self.implementation_version,
             envelope: self.envelope,
             ignore_unknown_elements: self.ignore_unknown_elements,
+            ignored_elements: self.ignored_elements,
             state_factory: self.state_factory,
             elements: self.elements,
             finish_reducer: Some(Box::new(reducer)),
@@ -264,6 +278,7 @@ where
             implementation_version: self.implementation_version,
             envelope: self.envelope,
             ignore_unknown_elements: self.ignore_unknown_elements,
+            ignored_elements: self.ignored_elements,
             state_factory: self.state_factory,
             elements: self.elements,
             finish_reducer: self.finish_reducer,
@@ -300,6 +315,7 @@ where
             implementation_version: self.implementation_version,
             envelope: self.envelope,
             ignore_unknown_elements: self.ignore_unknown_elements,
+            ignored_elements: self.ignored_elements,
             state_factory: self.state_factory,
             elements: self.elements,
             finish_reducer: self.finish_reducer,
@@ -331,6 +347,7 @@ where
             implementation_version: self.implementation_version,
             envelope: self.envelope,
             ignore_unknown_elements: self.ignore_unknown_elements,
+            ignored_elements: self.ignored_elements,
             state_factory: self.state_factory,
             elements: self.elements,
             finish_reducer: self.finish_reducer,
@@ -367,6 +384,7 @@ where
             implementation_version: self.implementation_version,
             envelope: self.envelope,
             ignore_unknown_elements: self.ignore_unknown_elements,
+            ignored_elements: self.ignored_elements,
             state_factory: self.state_factory,
             elements: self.elements,
             finish_reducer: self.finish_reducer,
@@ -392,6 +410,7 @@ where
                 implementation_version: self.implementation_version,
                 envelope: self.envelope,
                 ignore_unknown_elements: self.ignore_unknown_elements,
+                ignored_elements: self.ignored_elements,
                 state_factory: self.state_factory,
                 elements: self.elements,
                 finish_reducer: self.finish_reducer,
@@ -414,6 +433,7 @@ where
     implementation_version: &'static str,
     envelope: XmlEnvelope,
     ignore_unknown_elements: bool,
+    ignored_elements: Vec<&'static str>,
     state_factory: Option<StateFactory<State>>,
     elements: Vec<Box<dyn ErasedElement<C, State>>>,
     finish_reducer: Option<FinalReducer<C, State>>,
@@ -442,7 +462,7 @@ where
     }
 
     fn validate_and_prompt(&self) -> Result<crate::pom::Document, StreamingToolDeclarationFault> {
-        validate_elements(self.identity, &self.elements)
+        validate_elements(self.identity, &self.elements, &self.ignored_elements)
     }
 
     fn start(
@@ -454,6 +474,7 @@ where
             implementation_version: _,
             envelope,
             ignore_unknown_elements,
+            ignored_elements,
             state_factory,
             elements,
             finish_reducer,
@@ -464,7 +485,8 @@ where
         // `start` is public to the Application layer as well as being reached
         // after render-time prompt validation. Keep this check here so state
         // construction can never precede declaration validation.
-        validate_elements(identity, &elements).map_err(StreamingToolDriverFault::Declaration)?;
+        validate_elements(identity, &elements, &ignored_elements)
+            .map_err(StreamingToolDriverFault::Declaration)?;
         let state_factory = state_factory.ok_or_else(|| {
             StreamingToolDriverFault::Declaration(StreamingToolDeclarationFault::Prompt {
                 contract: identity,
@@ -486,6 +508,7 @@ where
             start,
             envelope,
             ignore_unknown_elements,
+            ignored_elements,
             state,
             elements,
             finish_reducer,

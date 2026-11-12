@@ -439,7 +439,7 @@ impl AcceptanceHarness {
         let requests_before = mock.request_count();
         let handlers_before = self.completed_handlers.load(Ordering::SeqCst);
         anyhow::ensure!(
-            application.react().unwrap().await?.is_continue(),
+            application.react(false).unwrap().await?.is_continue(),
             "Responses application exited"
         );
         let request_delta = mock.request_count() - requests_before;
@@ -763,7 +763,7 @@ async fn run_error_application(
         Application::mount(move || acceptance_application(props.clone()), provider)?;
     let application_operation = AssertUnwindSafe(async {
         wait_for_task_start(&task_started).await?;
-        let operation_failed = application.react().unwrap().await.is_err();
+        let operation_failed = application.react(false).unwrap().await.is_err();
         let request_received = if mock.request_count() == 1 {
             mock.next_request().await.is_ok()
         } else {

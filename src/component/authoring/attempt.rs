@@ -1,13 +1,14 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     pin::Pin,
 };
 
 use crate::{
     component::{
         execution::{
-            CommandOutcome, DriverDemandHandle, ProviderOutputKey, RenderedProjection,
-            RenderedProjectionNode,
+            CommandOutcome, DecisionDeclaration, DecisionDeclarationError, DecisionQuestion,
+            DriverDemandHandle, FrameRequirements, ProjectionProvenance, ProviderOutputKey,
+            RenderedProjection, RenderedProjectionNode,
         },
         provenance::EventScope,
         signal::{
@@ -32,6 +33,7 @@ use super::{
     cli_command::{action_catalogue, CliCommandDeclaration},
     command_feedback::command_feedback,
     declaration::{ComponentNode, Placement, RepeatableRender, ScopeRender},
+    definition::{validate_key, ComponentDefinition},
     event_input::EventInputOrigin,
     event_listener::EventListenerDispatchFault,
     native_tool::{
@@ -49,16 +51,23 @@ use super::{
         MountedStreamingRoute, ParsedContractEvent, StreamingXmlDispatchFault,
         StreamingXmlMountFault,
     },
-    Component, Signal,
+    Component, ComponentHooks, Signal,
 };
 
 #[cfg(test)]
 mod bindings_tests;
 mod listener;
+#[cfg(test)]
+mod provenance_tests;
 
 use listener::{build_streaming_routes, MountedListener};
 
 const MAX_DECLARATION_DEPTH: usize = 64;
+
+enum ScopeInvocation {
+    Static(ScopeRender),
+    Dynamic(ComponentDefinition),
+}
 type NativeToolFuture = Pin<
     Box<
         dyn futures::Future<
@@ -269,6 +278,24 @@ where
         }
 
         let streaming_routes = build_streaming_routes(&listeners)?;
+        let questions = std::mem::take(&mut capture.questions);
+        let mut decision_error = capture.decision_error;
+        let decision = if questions.is_empty() {
+            None
+        } else {
+            match DecisionDeclaration::new(questions) {
+                Ok(declaration) => Some(declaration),
+                Err(error) => {
+                    decision_error.get_or_insert(error);
+                    None
+                }
+            }
+        };
+        let has_xml_actions = !capture.xml_callbacks.is_empty()
+            || !capture.streaming_contracts.is_empty()
+            || listeners.iter().any(MountedListener::is_xml_action);
+        let requirements = FrameRequirements::NONE
+            .with_text_delta_output(listeners.iter().any(MountedListener::requires_text_deltas));
         let streaming_contracts = std::mem::take(&mut capture.streaming_contracts);
         let xml_callbacks = match std::mem::take(&mut capture.xml_callbacks) {
             declarations if declarations.is_empty() => None,
@@ -300,7 +327,21 @@ where
         )
         .map_err(|error| ComponentAttemptFault::RuntimeInvariant {
             message: error.to_string(),
-        })?;
+        })?
+        .with_runtime_metadata_from(&projection);
+        let mut projection = projection
+            .with_requirements(requirements)
+            .with_xml_actions(has_xml_actions);
+        if let Some(error) = decision_error {
+            projection = projection.with_decision_error(error);
+        }
+        if let Some(decision) = decision {
+            projection = projection.with_decision(decision).map_err(|error| {
+                ComponentAttemptFault::RuntimeInvariant {
+                    message: error.to_string(),
+                }
+            })?;
+        }
         Ok((
             Self {
                 projection,
@@ -781,33 +822,85 @@ fn visit_render(
                 .into_document()
                 .map_err(ComponentCaptureError::from)?;
             if placement == Placement::SystemOnce {
-                capture.system.extend(document.into_children());
+                capture.system.push((owner.clone(), document));
             } else {
                 capture.push(owner, placement, document.into_children(), None)?;
             }
         }
-        ComponentNode::Scope { function, render } => {
+        node @ (ComponentNode::Scope { .. } | ComponentNode::DynamicScope { .. }) => {
             let is_system_scope = forced == Some(Placement::SystemOnce);
-            let scope_cursor = if is_system_scope {
-                system_scope_cursor
-            } else {
-                scope_cursor
+            let (component_id, render) = match node {
+                ComponentNode::Scope { function, render } => {
+                    let cursor = if is_system_scope {
+                        system_scope_cursor
+                    } else {
+                        scope_cursor
+                    };
+                    let position = *cursor;
+                    *cursor = cursor.saturating_add(1);
+                    let identity = if is_system_scope {
+                        owner.system_child(function, position)
+                    } else {
+                        owner.child(function, position)
+                    };
+                    (identity, ScopeInvocation::Static(render))
+                }
+                ComponentNode::DynamicScope {
+                    definition,
+                    instance_key,
+                } => {
+                    validate_key("Component instance", &instance_key).map_err(|error| {
+                        ComponentAttemptFault::Definition {
+                            definition: definition.type_id().to_owned(),
+                            message: error.to_string(),
+                        }
+                    })?;
+                    if !capture.dynamic_keys.insert((
+                        owner.clone(),
+                        is_system_scope,
+                        instance_key.clone(),
+                    )) {
+                        return Err(ComponentAttemptFault::Definition {
+                            definition: definition.type_id().to_owned(),
+                            message: format!(
+                                "duplicate Component instance key `{instance_key}` under `{owner}`"
+                            ),
+                        });
+                    }
+                    let identity = owner.dynamic_child(
+                        definition.type_id(),
+                        &instance_key,
+                        definition.compatibility_key(),
+                        is_system_scope,
+                    );
+                    (identity, ScopeInvocation::Dynamic(definition))
+                }
+                _ => unreachable!("scope match accepts only Component scopes"),
             };
-            let position = *scope_cursor;
-            *scope_cursor = scope_cursor.saturating_add(1);
-            let component_id = if is_system_scope {
-                owner.system_child(function, position)
-            } else {
-                owner.child(function, position)
-            };
-            capture.register_component(component_id.clone())?;
+            capture.register_component(component_id.clone(), owner)?;
             let rendered = match render {
-                ScopeRender::Fresh(render) => invoke_fresh(render),
-                ScopeRender::Repeatable(renderer) => invoke_repeatable(
+                ScopeInvocation::Static(ScopeRender::Fresh(render)) => invoke_fresh(render),
+                ScopeInvocation::Static(ScopeRender::Repeatable(renderer)) => invoke_repeatable(
                     signal_render,
                     component_id.clone(),
                     &renderer,
                     forced != Some(Placement::SystemOnce),
+                    HookInvocationContext {
+                        event_origin,
+                        driver_demand,
+                        tasks,
+                        application_exit,
+                        listeners,
+                        reaction_completions,
+                        preparations,
+                        task_starts,
+                    },
+                )?,
+                ScopeInvocation::Dynamic(definition) => invoke_dynamic(
+                    signal_render,
+                    component_id.clone(),
+                    &definition,
+                    !is_system_scope,
                     HookInvocationContext {
                         event_origin,
                         driver_demand,
@@ -1017,7 +1110,7 @@ fn visit_render(
                 .map(|tasks| ComponentTaskContext::new(mount.clone(), tasks));
             declaration.mount(history, mount, task_context);
             let document = declaration.prompt_document(capture.native_history_scope)?;
-            capture.register_component(component_id.clone())?;
+            capture.register_component(component_id.clone(), owner)?;
             capture.push(&component_id, placement, document.into_children(), None)?;
             capture.xml_callbacks.push(*declaration);
         }
@@ -1054,11 +1147,34 @@ fn visit_render(
                 .map_err(|error| ComponentAttemptFault::RuntimeInvariant {
                     message: error.to_string(),
                 })?;
-            capture.register_component(component_id.clone())?;
+            capture.register_component(component_id.clone(), owner)?;
+            capture
+                .provenance
+                .native_tool_owners
+                .insert(declaration.name().to_owned(), component_id.to_string());
             let index = capture.node_indexes[&component_id];
             capture.nodes[index].native_items = items;
             declaration.mount(history);
             native_tools.push(*declaration);
+        }
+        ComponentNode::Decision(declaration) => {
+            if forced == Some(Placement::SystemOnce) {
+                return Err(ComponentAttemptFault::SystemAttemptLocal {
+                    component: owner.to_string(),
+                    capability: "Decision",
+                });
+            }
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                capture.questions.entry(declaration.name)
+            {
+                capture
+                    .provenance
+                    .decision_owners
+                    .insert(entry.key().clone(), owner.to_string());
+                entry.insert(declaration.question);
+            } else {
+                capture.decision_error = Some(DecisionDeclarationError::DuplicateNames);
+            }
         }
         ComponentNode::CliCommand(mut declaration) => {
             let placement = forced.unwrap_or(Placement::User);
@@ -1087,7 +1203,7 @@ fn visit_render(
                 capture.actions.push((placement, action));
             } else {
                 let document = declaration.prompt_document(&capture.command_prefix)?;
-                capture.register_component(component_id.clone())?;
+                capture.register_component(component_id.clone(), owner)?;
                 capture.push(&component_id, placement, document.into_children(), None)?;
             }
             capture.cli_commands.push(*declaration);
@@ -1115,6 +1231,48 @@ fn invoke_repeatable(
     signals: &mut SignalRenderTransaction<'_>,
     component: ComponentId,
     renderer: &RepeatableRender,
+    attempt_local_allowed: bool,
+    context: HookInvocationContext<'_>,
+) -> Result<Component, ComponentAttemptFault> {
+    invoke_with_hooks(
+        signals,
+        component,
+        |hooks| Ok(renderer(hooks)),
+        attempt_local_allowed,
+        context,
+    )
+}
+
+fn invoke_dynamic(
+    signals: &mut SignalRenderTransaction<'_>,
+    component: ComponentId,
+    definition: &ComponentDefinition,
+    attempt_local_allowed: bool,
+    context: HookInvocationContext<'_>,
+) -> Result<Component, ComponentAttemptFault> {
+    invoke_with_hooks(
+        signals,
+        component,
+        |hooks| {
+            let mut public = ComponentHooks::new(hooks);
+            let rendered = definition.render(&mut public);
+            let hooks_result = public.finish();
+            rendered
+                .and_then(|component| hooks_result.map(|()| component))
+                .map_err(|error| ComponentAttemptFault::Definition {
+                    definition: definition.type_id().to_owned(),
+                    message: error.to_string(),
+                })
+        },
+        attempt_local_allowed,
+        context,
+    )
+}
+
+fn invoke_with_hooks(
+    signals: &mut SignalRenderTransaction<'_>,
+    component: ComponentId,
+    renderer: impl FnOnce(&mut HookRenderContext<'_>) -> Result<Component, ComponentAttemptFault>,
     attempt_local_allowed: bool,
     context: HookInvocationContext<'_>,
 ) -> Result<Component, ComponentAttemptFault> {
@@ -1159,7 +1317,7 @@ fn invoke_repeatable(
             };
             Ok(renderer(&mut hooks))
         })
-        .map_err(ComponentAttemptFault::signal)?;
+        .map_err(ComponentAttemptFault::signal)??;
     for declaration in provider_handlers {
         listeners.push(MountedListener::new_event(declaration, event_origin)?);
     }
@@ -1179,16 +1337,20 @@ fn ensure_depth(depth: usize) -> Result<(), ComponentAttemptFault> {
 }
 
 struct RenderCapture {
+    questions: BTreeMap<String, DecisionQuestion>,
+    decision_error: Option<DecisionDeclarationError>,
     command_prefix: String,
     native_history_scope: Option<ReactionId>,
     streaming_contracts: Vec<ContractDeclaration>,
     xml_callbacks: Vec<XmlCallbackDeclaration>,
     cli_commands: Vec<CliCommandDeclaration>,
     actions: Vec<(Placement, XmlNode)>,
-    system: BlockChildren,
+    system: Vec<(ComponentId, Document)>,
+    provenance: ProjectionProvenance,
     nodes: Vec<ProjectionNodeCapture>,
     last_run: Option<ProjectionRunAddress>,
     node_indexes: HashMap<ComponentId, usize>,
+    dynamic_keys: HashSet<(ComponentId, bool, String)>,
     diff_addresses: HashSet<DiffAddress>,
 }
 
@@ -1197,13 +1359,19 @@ impl RenderCapture {
         let mut node_indexes = HashMap::new();
         node_indexes.insert(root.clone(), 0);
         Self {
+            questions: BTreeMap::new(),
+            decision_error: None,
             command_prefix: command_prefix.to_owned(),
             native_history_scope: None,
             streaming_contracts: Vec::new(),
             xml_callbacks: Vec::new(),
             cli_commands: Vec::new(),
             actions: Vec::new(),
-            system: BlockChildren::new(),
+            system: Vec::new(),
+            provenance: ProjectionProvenance {
+                parents: BTreeMap::from([(root.to_string(), None)]),
+                ..ProjectionProvenance::default()
+            },
             nodes: vec![ProjectionNodeCapture {
                 identity: root,
                 runs: Vec::new(),
@@ -1211,16 +1379,24 @@ impl RenderCapture {
             }],
             last_run: None,
             node_indexes,
+            dynamic_keys: HashSet::new(),
             diff_addresses: HashSet::new(),
         }
     }
 
-    fn register_component(&mut self, identity: ComponentId) -> Result<(), ComponentAttemptFault> {
+    fn register_component(
+        &mut self,
+        identity: ComponentId,
+        parent: &ComponentId,
+    ) -> Result<(), ComponentAttemptFault> {
         if self.node_indexes.contains_key(&identity) {
             return Err(ComponentAttemptFault::RuntimeInvariant {
                 message: format!("duplicate mounted Component identity `{identity}`"),
             });
         }
+        self.provenance
+            .parents
+            .insert(identity.to_string(), Some(parent.to_string()));
         let index = self.nodes.len();
         self.nodes.push(ProjectionNodeCapture {
             identity: identity.clone(),
@@ -1262,7 +1438,7 @@ impl RenderCapture {
                 continue;
             }
             let identity = root.child("agentview::ActionCatalogue", position);
-            self.register_component(identity.clone())?;
+            self.register_component(identity.clone(), root)?;
             self.push(
                 &identity,
                 placement,
@@ -1343,13 +1519,16 @@ impl RenderCapture {
     fn resolve_system_candidate(
         &mut self,
     ) -> Result<Option<ResolvedDocument>, ComponentAttemptFault> {
-        if self.system.is_empty() {
-            return Ok(None);
+        let mut system = BlockChildren::new();
+        for (owner, document) in std::mem::take(&mut self.system) {
+            let resolved =
+                resolve_artifact_document(document).map_err(ComponentCaptureError::from)?;
+            self.provenance.system_sources.extend(
+                std::iter::repeat_with(|| owner.to_string()).take(resolved.children().len()),
+            );
+            system.extend(resolved.children().clone());
         }
-        resolve_artifact_document(Document::new(std::mem::take(&mut self.system)))
-            .map(Some)
-            .map_err(ComponentCaptureError::from)
-            .map_err(ComponentAttemptFault::from)
+        Ok((!system.is_empty()).then(|| ResolvedDocument::new(system)))
     }
 
     fn into_projection(
@@ -1375,6 +1554,7 @@ impl RenderCapture {
             })
             .collect::<Result<Vec<_>, ComponentCaptureError>>()?;
         RenderedProjection::from_nodes(nodes)
+            .map(|projection| projection.with_provenance(self.provenance))
             .map_err(ComponentCaptureError::from)
             .map_err(ComponentAttemptFault::from)
     }
@@ -1442,6 +1622,8 @@ fn validate_diff_slot(slot: &'static str) -> Result<(), ComponentAttemptFault> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ComponentAttemptFault {
+    #[error("Component definition `{definition}` failed: {message}")]
+    Definition { definition: String, message: String },
     #[error("invalid streaming element declaration in contract `{contract}`")]
     InvalidStreamingToolElementName {
         contract: &'static str,

@@ -76,7 +76,9 @@ impl Port {
                 context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
-            FrameCapabilities::new(true),
+            FrameCapabilities::new(true)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
         );
         (
             Self {

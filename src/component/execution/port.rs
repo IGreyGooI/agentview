@@ -1,4 +1,7 @@
-use std::{collections::HashSet, str::FromStr};
+use std::{
+    collections::{BTreeMap, HashSet},
+    str::FromStr,
+};
 #[cfg(feature = "legacy-provider-port")]
 use std::{pin::Pin, sync::Arc};
 
@@ -17,7 +20,7 @@ use crate::{
     },
 };
 
-use super::ToolDefinition;
+use super::{DecisionDeclaration, DecisionOutput, FrameRequirements, ToolDefinition};
 
 /// The complete current Component delivery declaration, not the full model context or history.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +28,11 @@ pub struct RenderedProjection {
     nodes: Vec<RenderedProjectionNode>,
     native_tools: Vec<ToolDefinition>,
     execution_scope: Option<ProjectionExecutionScope>,
+    requirements: FrameRequirements,
+    decision: Option<DecisionDeclaration>,
+    decision_error: Option<super::DecisionDeclarationError>,
+    xml_actions: bool,
+    provenance: ProjectionProvenance,
 }
 
 /// Neutral runtime provenance for a ComponentHost mount. Providers may use it
@@ -33,6 +41,18 @@ pub struct RenderedProjection {
 pub(crate) struct ProjectionExecutionScope {
     pub(crate) host_instance: u64,
     pub(crate) mount_generation: u64,
+}
+
+/// Rendering diagnostics retained beside the typed projection, never sent to
+/// the model or used to decide delivery semantics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProjectionProvenance {
+    /// Explicit traversal parentage; Component identities are opaque strings.
+    pub(crate) parents: BTreeMap<String, Option<String>>,
+    /// Owner of each top-level block in the normalized System document.
+    pub(crate) system_sources: Vec<String>,
+    pub(crate) native_tool_owners: BTreeMap<String, String>,
+    pub(crate) decision_owners: BTreeMap<String, String>,
 }
 
 impl RenderedProjection {
@@ -53,6 +73,11 @@ impl RenderedProjection {
             nodes,
             native_tools: Vec::new(),
             execution_scope: None,
+            requirements: FrameRequirements::NONE,
+            decision: None,
+            decision_error: None,
+            xml_actions: false,
+            provenance: ProjectionProvenance::default(),
         })
     }
 
@@ -102,6 +127,74 @@ impl RenderedProjection {
         &self.native_tools
     }
 
+    pub fn decision(&self) -> Option<&DecisionDeclaration> {
+        self.decision.as_ref()
+    }
+
+    pub(crate) fn decision_error(&self) -> Option<super::DecisionDeclarationError> {
+        self.decision_error
+    }
+
+    pub(crate) fn with_decision_error(mut self, error: super::DecisionDeclarationError) -> Self {
+        self.decision_error = Some(error);
+        self
+    }
+
+    pub fn with_decision(
+        mut self,
+        decision: DecisionDeclaration,
+    ) -> Result<Self, RenderedProjectionError> {
+        if let Some(current) = &mut self.decision {
+            current
+                .merge(decision)
+                .map_err(|name| RenderedProjectionError::DuplicateDecisionName { name })?;
+        } else {
+            self.decision = Some(decision);
+        }
+        Ok(self)
+    }
+
+    pub fn requirements(&self) -> FrameRequirements {
+        self.requirements.union(FrameRequirements::new(
+            !self.native_tools.is_empty(),
+            false,
+            self.decision.is_some(),
+        ))
+    }
+
+    pub fn with_requirements(mut self, requirements: FrameRequirements) -> Self {
+        self.requirements = self.requirements.union(requirements);
+        self
+    }
+
+    pub fn with_xml_actions(mut self, active: bool) -> Self {
+        self.xml_actions = active;
+        self
+    }
+
+    pub const fn has_xml_actions(&self) -> bool {
+        self.xml_actions
+    }
+
+    pub(crate) fn with_runtime_metadata_from(mut self, complete: &Self) -> Self {
+        self.requirements = complete.requirements;
+        self.decision = complete.decision.clone();
+        self.decision_error = complete.decision_error;
+        self.execution_scope = complete.execution_scope;
+        self.xml_actions = complete.xml_actions;
+        self.provenance = complete.provenance.clone();
+        self
+    }
+
+    pub(crate) fn provenance(&self) -> &ProjectionProvenance {
+        &self.provenance
+    }
+
+    pub(crate) fn with_provenance(mut self, provenance: ProjectionProvenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
     pub(crate) fn with_execution_scope(mut self, scope: ProjectionExecutionScope) -> Self {
         self.execution_scope = Some(scope);
         self
@@ -112,8 +205,16 @@ impl RenderedProjection {
     }
 
     pub fn to_transcript(&self) -> Result<CanonicalTranscript, CanonicalTranscriptError> {
+        let decision = self
+            .decision()
+            .map(|declaration| CanonicalInputItem::DecisionRequest {
+                declaration: declaration.clone(),
+            });
         CanonicalTranscript::try_from_item_refs(
-            self.nodes.iter().flat_map(|node| node.items.iter()),
+            self.nodes
+                .iter()
+                .flat_map(|node| node.items.iter())
+                .chain(decision.iter()),
         )
     }
 }
@@ -392,6 +493,8 @@ pub(crate) enum RenderedProjectionFragment {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RenderedProjectionError {
+    #[error("rendered projection contains duplicate decision question `{name}`")]
+    DuplicateDecisionName { name: String },
     #[error("rendered projection node identity must be non-empty")]
     EmptyNodeIdentity,
     #[error("rendered projection contains duplicate node identity `{identity}`")]
@@ -533,11 +636,12 @@ impl PartialEq for ToolCall {
 impl Eq for ToolCall {}
 
 /// One framework-owned, provider-neutral LLM output event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum ProviderEvent {
     Text(TextTurnEvent),
     ToolCall(ToolCall),
+    Decision(DecisionOutput),
 }
 
 impl ProviderEvent {
@@ -546,9 +650,25 @@ impl ProviderEvent {
         0,
         |event| match event {
             Self::Text(text) => Some(text),
-            Self::ToolCall(_) => None,
+            Self::ToolCall(_) | Self::Decision(_) => None,
         },
     );
+
+    pub const TEXT_DELTA: EventSelector<Self, String> =
+        EventSelector::__component_events_v1("agentview.provider-event.text-delta", 2, |event| {
+            match event {
+                Self::Text(TextTurnEvent::TextDelta(delta)) => Some(delta),
+                _ => None,
+            }
+        });
+
+    pub const DECISION: EventSelector<Self, DecisionOutput> =
+        EventSelector::__component_events_v1("agentview.provider-event.decision", 3, |event| {
+            match event {
+                Self::Decision(decision) => Some(decision),
+                _ => None,
+            }
+        });
 }
 
 #[cfg(feature = "legacy-provider-port")]

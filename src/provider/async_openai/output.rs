@@ -2137,7 +2137,7 @@ fn validate_terminal_item(item: &ParsedOutputItem) -> Result<(), ResponseOutputL
     match &item.body {
         ParsedOutputItemBody::TerminalMessage(_) => Ok(()),
         ParsedOutputItemBody::Sdk(OutputItem::Reasoning(reasoning))
-            if reasoning.status != Some(OutputStatus::InProgress)
+            if matches!(reasoning.status, None | Some(OutputStatus::Completed))
                 && valid_reasoning_content(&item.raw, reasoning)
                 && (reasoning
                     .encrypted_content
@@ -2146,7 +2146,10 @@ fn validate_terminal_item(item: &ParsedOutputItem) -> Result<(), ResponseOutputL
                     || reasoning
                         .content
                         .as_ref()
-                        .is_some_and(|content| !content.is_empty()))
+                        .is_some_and(|content| !content.is_empty())
+                    // Some compatible providers expose reasoning only as a summary.
+                    // It is still a private, replayable artifact sealed at item.done.
+                    || !reasoning.summary.is_empty())
                 && valid_reasoning_summary(reasoning) =>
         {
             Ok(())
@@ -2263,7 +2266,7 @@ fn retain_terminal_message_phase(item: &mut ParsedOutputItemBody, phase: Option<
 
 fn valid_reasoning_summary(reasoning: &ReasoningItem) -> bool {
     reasoning.summary.iter().all(|part| match part {
-        SummaryPart::SummaryText(summary) => !summary.text.is_empty(),
+        SummaryPart::SummaryText(summary) => !summary.text.trim().is_empty(),
     })
 }
 
@@ -4527,6 +4530,105 @@ mod tests {
     }
 
     #[test]
+    fn summary_only_reasoning_is_sealed_privately_without_public_text() {
+        for content in [None, Some(json!([]))] {
+            for status in [Some("completed"), None] {
+                let mut ledger = OpenAiOutputLedger::default();
+                ledger
+                    .record_added(&lifecycle(0, reasoning("rs_1", "in_progress", None, None)))
+                    .unwrap();
+                let mut done_reasoning = reasoning_with_content(
+                    reasoning("rs_1", "completed", Some("private-summary-sentinel"), None),
+                    content.clone(),
+                );
+                if status.is_none() {
+                    done_reasoning.as_object_mut().unwrap().remove("status");
+                }
+                let sealed = ledger
+                    .record_done(&lifecycle(0, done_reasoning.clone()))
+                    .unwrap()
+                    .expect("a summary is retained as private reasoning");
+                assert_eq!(sealed.output_index, 0);
+                assert_eq!(sealed.wire_item["summary"], done_reasoning["summary"]);
+                assert!(sealed.wire_item.get("content").is_none());
+                assert!(sealed.wire_item.get("encrypted_content").is_none());
+                #[cfg(feature = "legacy-provider-port")]
+                assert!(sealed.output_item.is_none());
+
+                ledger
+                    .record_added(&lifecycle(1, message("msg_1", "in_progress", None)))
+                    .unwrap();
+                let frame = text_frame("msg_1", 1, 0);
+                ledger.record_text_delta(&frame, "public answer").unwrap();
+                ledger.record_text_done(&frame, "public answer").unwrap();
+                let done_message = message("msg_1", "completed", Some("public answer"));
+                ledger
+                    .record_done(&lifecycle(1, done_message.clone()))
+                    .unwrap();
+                let complete = ledger
+                    .complete(&completed(vec![done_reasoning, done_message]))
+                    .unwrap();
+                assert_eq!(complete.final_text, "public answer");
+                assert_eq!(complete.output_items.len(), 1);
+                assert!(complete.wire_items.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn summary_only_reasoning_rejects_empty_malformed_and_unfinished_items() {
+        let valid = reasoning("rs_1", "completed", Some("private summary"), None);
+        let mut invalid = Vec::new();
+        for summary in [
+            json!([]),
+            json!([{"type":"summary_text", "text":""}]),
+            json!([{"type":"summary_text", "text":" \n\t"}]),
+            json!([{"type":"summary_text", "text":42}]),
+            json!([{"type":"summary_text"}]),
+            json!([{"type":"output_text", "text":"invalid kind"}]),
+            json!({"type":"summary_text", "text":"not an array"}),
+            Value::Null,
+        ] {
+            let mut item = valid.clone();
+            item["summary"] = summary;
+            invalid.push(item);
+        }
+        for status in ["in_progress", "incomplete"] {
+            let mut item = valid.clone();
+            item["status"] = json!(status);
+            invalid.push(item);
+        }
+        for item in invalid {
+            let mut ledger = OpenAiOutputLedger::default();
+            ledger
+                .record_added(&lifecycle(0, reasoning("rs_1", "in_progress", None, None)))
+                .unwrap();
+            assert!(ledger.record_done(&lifecycle(0, item)).is_err());
+        }
+    }
+
+    #[test]
+    fn summary_only_reasoning_requires_done_and_exact_terminal_reconciliation() {
+        let done = reasoning("rs_1", "completed", Some("sealed private summary"), None);
+        let mut ledger = OpenAiOutputLedger::default();
+        ledger
+            .record_added(&lifecycle(0, reasoning("rs_1", "in_progress", None, None)))
+            .unwrap();
+        assert!(ledger
+            .validate_completed_allowing_no_primary(&completed(vec![done.clone()]))
+            .is_err());
+        ledger.record_done(&lifecycle(0, done.clone())).unwrap();
+        ledger
+            .validate_completed_allowing_no_primary(&completed(vec![done.clone()]))
+            .unwrap();
+        let mut changed = done;
+        changed["summary"][0]["text"] = json!("different private summary");
+        assert!(ledger
+            .validate_completed_allowing_no_primary(&completed(vec![changed]))
+            .is_err());
+    }
+
+    #[test]
     fn compaction_is_retained_in_canonical_request_shape_without_becoming_semantic_history() {
         let mut ledger = OpenAiOutputLedger::default();
         let compacted = compaction("cmp_1", "opaque-compaction-payload");
@@ -4597,12 +4699,12 @@ mod tests {
             )]))
             .is_err());
 
-        let mut missing_encrypted = OpenAiOutputLedger::default();
-        missing_encrypted
+        let mut empty_reasoning = OpenAiOutputLedger::default();
+        empty_reasoning
             .record_added(&lifecycle(0, reasoning("rs_1", "in_progress", None, None)))
             .unwrap();
-        let observed = reasoning("rs_1", "completed", Some("summary"), None);
-        assert!(missing_encrypted
+        let observed = reasoning("rs_1", "completed", None, None);
+        assert!(empty_reasoning
             .record_done(&lifecycle(0, observed))
             .is_err());
 

@@ -67,13 +67,13 @@ async fn main() -> anyhow::Result<()> {
     let application_id = app.application_id();
 
     let result = async {
-        ensure!(app.react()?.await? == ReactionOutcome::Completed);
-        let main = app.react()?;
+        ensure!(app.react(false)?.await? == ReactionOutcome::Completed);
+        let main = app.react(false)?;
         capture.wait_for_frames(2).await;
 
         // A later business event starts this operation immediately. Both handles
         // refer to the same mounted counter and carry their own ReactionId.
-        let branch = app.react()?;
+        let branch = app.react(true)?;
         ensure!(main.kind() == ReactionKind::Main);
         ensure!(branch.kind() == ReactionKind::Temporary);
         let branch_id = branch.id();
@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         main.interrupt()?;
         ensure!(main.await? == ReactionOutcome::Interrupted);
 
-        ensure!(app.react()?.await? == ReactionOutcome::Completed);
+        ensure!(app.react(false)?.await? == ReactionOutcome::Completed);
         let current = observed.total.lock().unwrap().clone().context("counter Signal")?;
         ensure!(current.with(|value| *value)? == 7);
         let actions = observed.actions.lock().unwrap();

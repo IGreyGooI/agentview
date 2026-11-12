@@ -130,7 +130,9 @@ fn port(parent: Arc<PortProbe>, child: Arc<PortProbe>) -> ForkPort {
                 context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
-            FrameCapabilities::new(true),
+            FrameCapabilities::new(true)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
         )),
         history: Vec::new(),
         probe: parent,

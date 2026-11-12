@@ -27,6 +27,7 @@ use super::{
     frame::{FrameBudgetFault, FullReserveBudget, FullReserveCandidate, FullReserveTracker},
     port::{ProviderEvent, ToolCall, ToolOutput},
     reaction::{ProviderFact, ProviderOutputKey, ProviderToolCall},
+    DecisionDeclaration,
 };
 
 pub(super) const CANCELLATION_FALLBACK_CONTENT: &str =
@@ -59,7 +60,7 @@ fn take_admission_work() -> usize {
 ///
 /// A ToolCall fact produces both values: the event starts the handler and the
 /// ticket later authorizes exactly one result for that lane.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(super) struct AdmittedProviderFact {
     event: Option<ProviderEvent>,
     tool_lane: Option<ToolLaneTicket>,
@@ -109,6 +110,7 @@ enum TextLifecycle {
 
 #[derive(Debug, PartialEq, Eq)]
 enum AdmittedOutput {
+    Decision,
     Text {
         phase: Option<AssistantPhase>,
         text: String,
@@ -125,6 +127,7 @@ enum AdmittedOutput {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AdmissionState {
+    decision_output: Option<ProviderOutputKey>,
     output_order: Vec<ProviderOutputKey>,
     outputs: HashMap<ProviderOutputKey, AdmittedOutput>,
     tool_ordinals: HashSet<u64>,
@@ -462,6 +465,7 @@ pub(super) struct ReactionAdmissionGuard<'a> {
     state: AdmissionState,
     tool_registrations: Vec<u64>,
     finished: bool,
+    decision: Option<DecisionDeclaration>,
 }
 
 impl<'a> ReactionAdmissionGuard<'a> {
@@ -507,7 +511,13 @@ impl<'a> ReactionAdmissionGuard<'a> {
             },
             tool_registrations: Vec::new(),
             finished: false,
+            decision: None,
         }
+    }
+
+    pub(super) fn with_decision(mut self, decision: Option<DecisionDeclaration>) -> Self {
+        self.decision = decision;
+        self
     }
 
     /// Validate and atomically commit one fact before exposing its event.
@@ -522,6 +532,16 @@ impl<'a> ReactionAdmissionGuard<'a> {
                 }
                 _ => ReactionAdmissionFault::FactAfterCompletion,
             });
+        }
+        if self.decision.is_some()
+            && matches!(
+                &fact,
+                ProviderFact::TextDelta { .. }
+                    | ProviderFact::TextSealed { .. }
+                    | ProviderFact::ToolCall { .. }
+            )
+        {
+            return Err(ReactionAdmissionFault::DecisionModeConflict);
         }
 
         let mut structured_text = None;
@@ -603,7 +623,36 @@ impl<'a> ReactionAdmissionGuard<'a> {
                 self.tool_registrations.push(ticket.registration);
                 (Some(ProviderEvent::ToolCall(component_call)), Some(ticket))
             }
+            ProviderFact::Decision { output, decision } => {
+                let declaration = self
+                    .decision
+                    .as_ref()
+                    .ok_or(ReactionAdmissionFault::UnknownDecisionRequest)?;
+                if declaration.batch_id() != decision.batch_id() {
+                    return Err(ReactionAdmissionFault::UnknownDecisionRequest);
+                }
+                if self.state.decision_output.is_some() {
+                    return Err(ReactionAdmissionFault::DuplicateDecision);
+                }
+                if self.state.outputs.contains_key(&output) {
+                    return Err(ReactionAdmissionFault::OutputKindReuse { output });
+                }
+                let event = declaration
+                    .admit(&decision)
+                    .map_err(|_| ReactionAdmissionFault::InvalidDecisionEnvelope)?;
+                let item = CanonicalInputItem::DecisionOutput { decision };
+                let budget = self.prepare_replay_budget(None, &item)?;
+                self.commit_budget(budget);
+                self.canonical_items.push(item);
+                self.state.output_order.push(output);
+                self.state.outputs.insert(output, AdmittedOutput::Decision);
+                self.state.decision_output = Some(output);
+                (Some(ProviderEvent::Decision(event)), None)
+            }
             ProviderFact::ReactionCompleted { primary_text } => {
+                if self.decision.is_some() && primary_text.is_some() {
+                    return Err(ReactionAdmissionFault::DecisionModeConflict);
+                }
                 let complete = Self::validate_completion(&self.state, primary_text)?;
                 self.state.terminal = Some(primary_text);
                 (
@@ -814,7 +863,7 @@ impl<'a> ReactionAdmissionGuard<'a> {
                 *budget_item_bytes = next_budget_bytes;
                 self.commit_budget(budget_candidate);
             }
-            Some(AdmittedOutput::Tool { .. }) => {
+            Some(AdmittedOutput::Tool { .. } | AdmittedOutput::Decision) => {
                 return Err(ReactionAdmissionFault::OutputKindReuse { output });
             }
             None => {
@@ -920,7 +969,7 @@ impl<'a> ReactionAdmissionGuard<'a> {
                 *budget_item_bytes = next_budget_bytes;
                 self.commit_budget(budget_candidate);
             }
-            Some(AdmittedOutput::Tool { .. }) => {
+            Some(AdmittedOutput::Tool { .. } | AdmittedOutput::Decision) => {
                 return Err(ReactionAdmissionFault::OutputKindReuse { output });
             }
             None => {
@@ -981,7 +1030,9 @@ impl<'a> ReactionAdmissionGuard<'a> {
     ) -> Result<(), ReactionAdmissionFault> {
         if let Some(existing) = state.outputs.get(&output) {
             return Err(match existing {
-                AdmittedOutput::Text { .. } => ReactionAdmissionFault::OutputKindReuse { output },
+                AdmittedOutput::Text { .. } | AdmittedOutput::Decision => {
+                    ReactionAdmissionFault::OutputKindReuse { output }
+                }
                 AdmittedOutput::Tool { .. } => {
                     ReactionAdmissionFault::DuplicateToolCallOutput { output }
                 }
@@ -1110,6 +1161,14 @@ fn is_commentary(phase: Option<AssistantPhase>) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(super) enum ReactionAdmissionFault {
+    #[error("decision output references no active request")]
+    UnknownDecisionRequest,
+    #[error("decision output has an invalid response envelope")]
+    InvalidDecisionEnvelope,
+    #[error("a decision request produced more than one result")]
+    DuplicateDecision,
+    #[error("a decision reaction emitted ordinary text or tools")]
+    DecisionModeConflict,
     #[error("provider fact appeared after ReactionCompleted")]
     FactAfterCompletion,
     #[error("ReactionCompleted appeared more than once")]
@@ -1195,6 +1254,10 @@ pub(super) enum ReactionAdmissionFault {
 impl ReactionAdmissionFault {
     pub(super) const fn reason(&self) -> ReactionAdmissionReason {
         match self {
+            Self::UnknownDecisionRequest => ReactionAdmissionReason::UnknownDecisionRequest,
+            Self::InvalidDecisionEnvelope => ReactionAdmissionReason::InvalidDecisionEnvelope,
+            Self::DuplicateDecision => ReactionAdmissionReason::DuplicateDecision,
+            Self::DecisionModeConflict => ReactionAdmissionReason::DecisionModeConflict,
             Self::FactAfterCompletion => ReactionAdmissionReason::FactAfterCompletion,
             Self::DuplicateCompletion => ReactionAdmissionReason::DuplicateCompletion,
             Self::OutputKindReuse { .. } => ReactionAdmissionReason::OutputKindReuse,
@@ -1237,6 +1300,10 @@ impl ReactionAdmissionFault {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReactionAdmissionReason {
+    UnknownDecisionRequest,
+    InvalidDecisionEnvelope,
+    DuplicateDecision,
+    DecisionModeConflict,
     FactAfterCompletion,
     DuplicateCompletion,
     OutputKindReuse,
@@ -1277,6 +1344,9 @@ pub(super) enum AdmissionBudgetReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CanonicalAdmissionReason {
+    InvalidDecisionDeclaration,
+    UnknownDecisionRequest,
+    DuplicateDecisionOutput,
     InvalidIdentifier,
     InvalidToolArguments,
     ToolArgumentsMustBeObject,
@@ -1288,6 +1358,15 @@ pub(super) enum CanonicalAdmissionReason {
 
 fn canonical_admission_reason(error: &CanonicalTranscriptError) -> CanonicalAdmissionReason {
     match error {
+        CanonicalTranscriptError::InvalidDecisionDeclaration => {
+            CanonicalAdmissionReason::InvalidDecisionDeclaration
+        }
+        CanonicalTranscriptError::UnknownDecisionRequest => {
+            CanonicalAdmissionReason::UnknownDecisionRequest
+        }
+        CanonicalTranscriptError::DuplicateDecisionOutput => {
+            CanonicalAdmissionReason::DuplicateDecisionOutput
+        }
         CanonicalTranscriptError::InvalidIdentifier { .. } => {
             CanonicalAdmissionReason::InvalidIdentifier
         }
@@ -1369,8 +1448,182 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn decision_facts_commit_actual_output_before_events_and_enforce_request_terminal_rules() {
+        use crate::component::execution::{
+            DecisionAnswer, DecisionQuestion, DecisionSource, ProviderDecision,
+        };
+        use std::collections::BTreeMap;
+
+        let declaration = DecisionDeclaration::new(BTreeMap::from([(
+            "q".into(),
+            DecisionQuestion::noul("Check the evidence."),
+        )]))
+        .unwrap();
+        let decision = ProviderDecision::json_envelope(
+            declaration.batch_id().clone(),
+            r#"{"answers":{"q":{"type":"noul","noul":0.98}}}"#,
+        );
+        let mut transcript = CanonicalTranscript::new()
+            .appended(CanonicalInputItem::DecisionRequest {
+                declaration: declaration.clone(),
+            })
+            .unwrap();
+        let mut staging = ToolOutputStaging::default();
+        {
+            let mut guard = ReactionAdmissionGuard::new(&mut transcript, &mut staging)
+                .with_decision(Some(declaration.clone()));
+            let unrelated = ProviderDecision::json_envelope(
+                DecisionDeclaration::new(BTreeMap::from([(
+                    "q".into(),
+                    DecisionQuestion::noul("Other question."),
+                )]))
+                .unwrap()
+                .batch_id()
+                .clone(),
+                r#"{"answers":{"q":{"type":"noul","noul":0.98}}}"#,
+            );
+            assert_eq!(
+                guard
+                    .admit(ProviderFact::Decision {
+                        output: key(1),
+                        decision: unrelated
+                    })
+                    .unwrap_err()
+                    .reason(),
+                ReactionAdmissionReason::UnknownDecisionRequest
+            );
+            assert_eq!(
+                guard.admit(delta(2, None, "true")).unwrap_err().reason(),
+                ReactionAdmissionReason::DecisionModeConflict
+            );
+            assert_eq!(
+                guard
+                    .admit(ProviderFact::Decision {
+                        output: key(1),
+                        decision: ProviderDecision::json_envelope(
+                            declaration.batch_id().clone(),
+                            r#"{"answers":[]}"#,
+                        ),
+                    })
+                    .unwrap_err()
+                    .reason(),
+                ReactionAdmissionReason::InvalidDecisionEnvelope
+            );
+            assert_eq!(guard.canonical_items.len(), 1);
+            assert_eq!(guard.committed_output_count(), 0);
+            let admitted = guard
+                .admit(ProviderFact::Decision {
+                    output: key(1),
+                    decision: decision.clone(),
+                })
+                .unwrap();
+            assert_eq!(
+                guard.canonical_items.last(),
+                Some(&CanonicalInputItem::DecisionOutput {
+                    decision: decision.clone()
+                })
+            );
+            let (event, lane) = admitted.into_parts();
+            assert!(lane.is_none());
+            assert!(
+                matches!(event, Some(ProviderEvent::Decision(output)) if output.outcomes["q"] == Ok(DecisionAnswer::Noul {noul:0.98}) && output.source == DecisionSource::Model)
+            );
+            assert_eq!(
+                guard
+                    .admit(ProviderFact::Decision {
+                        output: key(3),
+                        decision: decision.clone()
+                    })
+                    .unwrap_err()
+                    .reason(),
+                ReactionAdmissionReason::DuplicateDecision
+            );
+            guard
+                .admit(ProviderFact::ReactionCompleted { primary_text: None })
+                .unwrap();
+            assert_eq!(
+                guard
+                    .admit(ProviderFact::Decision {
+                        output: key(4),
+                        decision: decision.clone()
+                    })
+                    .unwrap_err()
+                    .reason(),
+                ReactionAdmissionReason::FactAfterCompletion
+            );
+            guard.finish_normal().unwrap();
+        }
+        assert_eq!(transcript.items().len(), 2);
+        assert!(staging.slots.is_empty());
+        let restored: CanonicalTranscript =
+            serde_json::from_value(serde_json::to_value(&transcript).unwrap()).unwrap();
+        assert_eq!(restored, transcript);
+    }
+
     fn key(value: u64) -> ProviderOutputKey {
         ProviderOutputKey::new(value)
+    }
+
+    #[test]
+    fn oversized_decision_is_rejected_without_publication_or_consuming_its_output_identity() {
+        use crate::component::execution::{DecisionAnswer, DecisionQuestion, ProviderDecision};
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        let declaration = DecisionDeclaration::new(BTreeMap::from([(
+            "q".into(),
+            DecisionQuestion::noul("Check."),
+        )]))
+        .unwrap();
+        let mut transcript = CanonicalTranscript::new()
+            .appended(CanonicalInputItem::DecisionRequest {
+                declaration: declaration.clone(),
+            })
+            .unwrap();
+        let mut staging = ToolOutputStaging::default();
+        {
+            let mut guard = ReactionAdmissionGuard::with_budget(
+                &mut transcript,
+                &mut staging,
+                full_reserve(512, 4096),
+            )
+            .unwrap()
+            .with_decision(Some(declaration.clone()));
+            let oversized = ProviderDecision::json_envelope(
+                declaration.batch_id().clone(),
+                json!({"answers":{"q":{"type":"noul","noul":0.98},"unknown":"x".repeat(8192)}})
+                    .to_string(),
+            );
+            assert_eq!(
+                guard
+                    .admit(ProviderFact::Decision {
+                        output: key(1),
+                        decision: oversized
+                    })
+                    .unwrap_err()
+                    .reason(),
+                ReactionAdmissionReason::Budget
+            );
+            assert_eq!(guard.canonical_items.len(), 1);
+            assert_eq!(guard.committed_output_count(), 0);
+            let valid = ProviderDecision::json_envelope(
+                declaration.batch_id().clone(),
+                r#"{"answers":{"q":{"type":"noul","noul":0.98}}}"#,
+            );
+            let (event, _) = guard
+                .admit(ProviderFact::Decision {
+                    output: key(1),
+                    decision: valid,
+                })
+                .unwrap()
+                .into_parts();
+            assert!(
+                matches!(event, Some(ProviderEvent::Decision(output)) if output.outcomes["q"] == Ok(DecisionAnswer::Noul {noul:0.98}))
+            );
+            guard.admit(completed(None)).unwrap();
+            guard.finish_normal().unwrap();
+        }
+        assert_eq!(transcript.items().len(), 2);
     }
 
     fn call(call_id: &str) -> ProviderToolCall {

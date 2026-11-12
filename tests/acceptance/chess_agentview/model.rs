@@ -233,7 +233,7 @@ where
         }) {
             return abort_before_dispatch(attempts, stage, reason_code);
         }
-        let reaction = match white.react() {
+        let reaction = match white.react(false) {
             Ok(reaction) => reaction,
             Err(fault) => {
                 return complete_dispatch_abort(
@@ -660,7 +660,9 @@ mod tests {
                 context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
-            FrameCapabilities::new(true),
+            FrameCapabilities::new(true)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
         );
         (
             ScriptedChessPort {
@@ -775,7 +777,7 @@ mod tests {
         assert!(application.current_projection().is_dirty());
 
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), application.react().unwrap())
+            tokio::time::timeout(Duration::from_secs(1), application.react(false).unwrap())
                 .await
                 .expect("offline Chess reaction stays bounded")
                 .expect("scripted Chess reaction completes")
@@ -841,7 +843,7 @@ mod tests {
             .begin_attempt(snapshot, context)
             .expect("retry state writes atomically");
         assert!(application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("retry projection reaches the provider")
@@ -877,7 +879,7 @@ mod tests {
             .push(LifecycleEvent::StateWritten);
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(25), application.react().unwrap())
+            tokio::time::timeout(Duration::from_millis(25), application.react(false).unwrap())
                 .await
                 .is_err()
         );
@@ -914,7 +916,7 @@ mod tests {
             .clone();
 
         let fault = application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect_err("injected failure must reject before handoff");
@@ -960,7 +962,7 @@ mod tests {
 
         capture.reject_before_handoff.store(false, Ordering::SeqCst);
         assert!(application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("same Application retries the original response plan")

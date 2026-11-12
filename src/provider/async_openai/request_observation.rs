@@ -5,7 +5,7 @@ use std::{
 
 use crate::component::execution::reaction::{Frame, FrameBasis, FrameRevision};
 
-pub(super) type RequestObserver = dyn Fn(OpenAiResponsesRequestSnapshot) + Send + Sync;
+pub(in crate::provider) type RequestObserver = dyn Fn(OpenAiResponsesRequestSnapshot) + Send + Sync;
 
 /// The exact JSON body of one Frame-native Responses request handed to transport.
 ///
@@ -20,7 +20,7 @@ pub struct OpenAiResponsesRequestSnapshot {
 }
 
 impl OpenAiResponsesRequestSnapshot {
-    pub(super) fn new(frame: &Frame, body: &[u8]) -> Self {
+    pub(in crate::provider) fn new(frame: &Frame, body: &[u8]) -> Self {
         Self {
             frame_revision: frame.revision(),
             frame_basis: frame.basis(),
@@ -42,7 +42,7 @@ impl OpenAiResponsesRequestSnapshot {
     }
 }
 
-pub(super) fn observe_request(
+pub(in crate::provider) fn observe_request(
     observer: &Option<Arc<RequestObserver>>,
     snapshot: Option<OpenAiResponsesRequestSnapshot>,
 ) {

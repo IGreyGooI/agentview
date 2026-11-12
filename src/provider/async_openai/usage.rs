@@ -6,7 +6,7 @@ use crate::component::execution::ProviderFault;
 
 use super::faults::{response_event_shape_fault, ResponseEventReason};
 
-pub(super) type ResponseUsageObserver = dyn Fn(OpenAiResponsesUsage) + Send + Sync;
+pub(in crate::provider) type ResponseUsageObserver = dyn Fn(OpenAiResponsesUsage) + Send + Sync;
 
 /// Validated accounting reported by one accepted OpenAI Responses terminal event.
 ///
@@ -40,7 +40,7 @@ impl OpenAiResponsesUsage {
     }
 }
 
-pub(super) fn validated_response_usage(
+pub(in crate::provider) fn validated_response_usage(
     payload: &Map<String, Value>,
 ) -> Result<OpenAiResponsesUsage, ProviderFault> {
     let response = payload
@@ -91,6 +91,43 @@ pub(super) fn validated_response_usage(
     })
 }
 
+/// Native decisions may report only input tokens. Unreported output and total
+/// counts stay unknown; when output is reported, derive the checked total.
+pub(in crate::provider) fn validated_decision_usage(
+    response: &Map<String, Value>,
+) -> Result<OpenAiResponsesUsage, ()> {
+    let usage = response.get("usage").and_then(Value::as_object).ok_or(())?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or(())?;
+    let output_tokens = optional_usage_count(usage, "output_tokens").map_err(|_| ())?;
+    let total_tokens = output_tokens
+        .map(|output| input_tokens.checked_add(output).ok_or(()))
+        .transpose()?;
+    let cached_tokens = match usage.get("input_tokens_details") {
+        None | Some(Value::Null) => None,
+        Some(details) => {
+            let details = details.as_object().ok_or(())?;
+            match details.get("cached_tokens") {
+                None | Some(Value::Null) => None,
+                Some(tokens) => Some(
+                    tokens
+                        .as_u64()
+                        .filter(|tokens| *tokens <= input_tokens)
+                        .ok_or(())?,
+                ),
+            }
+        }
+    };
+    Ok(OpenAiResponsesUsage {
+        input_tokens: Some(input_tokens),
+        cached_tokens,
+        output_tokens,
+        total_tokens,
+    })
+}
+
 fn unreported_usage() -> OpenAiResponsesUsage {
     OpenAiResponsesUsage {
         input_tokens: None,
@@ -121,7 +158,7 @@ fn invalid_response_usage_fault() -> ProviderFault {
     )
 }
 
-pub(super) fn observe_response_usage(
+pub(in crate::provider) fn observe_response_usage(
     observer: &Option<Arc<ResponseUsageObserver>>,
     usage: OpenAiResponsesUsage,
 ) {

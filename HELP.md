@@ -42,6 +42,7 @@ demonstrate interactivity. Error handling is one part of this experience; see
 | Need | Use |
 | --- | --- |
 | Render current business state | `#[component]`, `view!`, and typed `AgentView` POM |
+| Author without Rust macros or replace a definition while retaining instances | `ComponentDefinition`, `ComponentHooks`, and `Application::update_definition`; see [dynamic Components](docs/dynamic-components.md) |
 | Keep retained business state | `use_signal`, then `Signal::with` |
 | Mark a semantic state region | `#[diff(slot = "...")]` around one POM root |
 | Describe field changes | `#[view(diff)]`, `#[view(diff(append))]`, or another field strategy |
@@ -56,26 +57,31 @@ demonstrate interactivity. Error handling is one part of this experience; see
 | Branch the current model history into an independent application | `app.fork(root).await`, or `fork_with_commands(root, input)` with a new inbox; requires `ForkableReactionPort` |
 | Wait for required business inputs | `use_preparation` inside the owning Component |
 | End normal application work | `use_application_exit`, then owner calls `shutdown()` |
-| Start and control a model turn | `let reaction = app.react()?; reaction.interrupt()?; reaction.await` |
+| Start and control a model turn | `let reaction = app.react(false)?; reaction.interrupt()?; reaction.await` |
 | Receive ordinary provider output | `use_provider_event_handler` |
 | Declare a native model action with captured state | `NativeToolCall { name, description, on_call }` inside `view!` |
 | Declare a streaming XML action with captured state | `XmlStreamingToolCall { element, on_delta, on_complete, ... }` inside `view!` |
 | Run a stdin/stdout application | `StdinApplication::run(root).await` inside a Tokio main; the framework owns CLI, daemon, input, output, and cleanup |
 | Wait for application-owned CLI input | One `use_wait_for_command()` in the root Component; root and child Components declare inline `Action { name, description, on_call }` in `view!` |
 | Encode a provider request or retain remote state | a `ReactionPort`, outside the business Component |
+| Declare a structured natural-language judgment | `Decision { name, question, on_result }` inside `view!` |
+| Return one independent judgment directly to a caller | `system1::judge(provider, state, question).await` |
 
-`app.react()?` immediately starts an Application-owned reaction and returns a cloneable
-`Reaction` handle. It provides `id()`, `kind()`, `interrupt()`, and direct `await`; dropping a
-handle or waiter does not cancel the operation. Each idle admission is `Main`; while
-Main is active, another call creates `Temporary` from the last completed, protocol-closed
-checkpoint. Without a checkpoint or provider capability, the temporary call is rejected.
+`app.react(ephemeral: bool)?` immediately starts an Application-owned reaction and returns a
+cloneable `Reaction` handle. It provides `id()`, `kind()`, `interrupt()`, and direct `await`;
+dropping a handle or waiter does not cancel the operation. `react(true)` always creates a
+`Temporary` from the last completed, protocol-closed Main checkpoint, even while Main is idle.
+Use it for decisions that must preserve Main history and provider cache. `react(false)` keeps
+automatic admission: idle calls are `Main`, and calls while Main is active are `Temporary`.
+Without a usable checkpoint or provider capability, a temporary call is rejected; it never
+falls back to Main. This parameter selects reaction isolation independently of POM ephemeral inputs.
 Temporary reactions share the Component tree and business Signals, and keep model history,
 provider continuation, and receipts separate from Main.
 
 ```rust,ignore
-app.react()?.await?; // Establish a completed checkpoint first.
-let main = app.react()?;
-let branch = app.react()?; // A later event arrives while Main is active.
+app.react(false)?.await?; // Establish a completed checkpoint first.
+let main = app.react(false)?;
+let branch = app.react(true)?; // Always Temporary, including while Main is idle.
 let result = branch.clone().await?;
 let next = branch.react()?; // Continue this Temporary's history with a new ReactionId.
 next.await?;
@@ -89,6 +95,38 @@ resolves the effects. See [asynchronous reactions](docs/parallel-reactions-desig
 The credential-free [parallel_reactions example](examples/parallel_reactions.rs) shows
 temporary tool continuation, shared business feedback, and directed interruption:
 `cargo run --no-default-features --example parallel_reactions`.
+
+## Structured Decisions
+
+Render the state to judge in ordinary Components and POM. Declare each named question with
+`Decision { name, question, on_result }` in that same view. The submitted Frame's effective
+observation is the only state input; Decision does not attach another context or request body.
+Several Decisions share one Frame, one `questions` map, and one model request. Duplicate names
+and invalid names/criteria produce a recoverable `FramePrepare` rejection before submission;
+update the declaration and explicitly react again to retry.
+
+`Noul`, `Choice`, and `Score` determine `NoulAnswer`, `ChoiceAnswer`, and `ScoreAnswer` respectively.
+The handler receives `QuestionOutcome<Answer>` after its EventContext. Use
+`Decision::new(name, question).on_result(handler).build()` for a builder; its answer type is
+inferred from the question. A reusable factory is an ordinary function returning a question.
+Do not register an arbitrary output JsonSchema or maintain a second copy of the displayed state.
+The current public authoring scope is text judgments; Box remains a lower-level protocol type.
+
+Questions travel as typed Frame declarations; callbacks stay in the mounted runtime and bind
+to the actual submitted Frame. Per-question refusal, missing output, or invalid answers retain
+the other questions' valid results. Transport, malformed envelopes, observation, and handler
+failures remain reaction errors. Active native/XML actions use their ordinary output mode in a
+separate Frame. Native System1Provider declares only decision capability and uses the actual
+Decisions/System One JSON protocol; it rejects native tools, XML action output, and explicit
+text-delta subscriptions before HTTP. Ordinary Responses supports the same Decision Components
+and keeps its existing native/XML behavior.
+
+`system1::judge(provider, state, question)` is a single-question convenience wrapper. It renders
+the explicit state into an ordinary root view beside the same Decision, mounts an independent
+Application, drives one reaction, and awaits consuming shutdown before returning the typed
+answer. It does not schedule a confirmation call. Retain useful results and provenance in
+application state and render them in the receiving application's next Frame when its model
+needs to act on them. See [the System 1 guide](docs/system1.md).
 
 ## Event Sources and Shared Business State
 
@@ -211,6 +249,65 @@ advance history, invoke a model, or execute tools. The caller chooses how to sen
 handle the model's response. Applications must still admit actions through their normal runtime
 path and deliver actual results in a subsequent observation. Treat the exported prompt as model
 input; consume typed POM and structured tools in application code and tests.
+
+## Profile Prompt Bytes by Component
+
+`projection.render_prompt_with_sources()?` (also available on `ProjectionSnapshot`) returns
+the current exported prompt and a byte source map. Each span names its owning Component instance,
+including System content after normalization, native tool definitions, and Decision questions.
+Role headings and shared separators are framework formatting. Manually supplied tools or questions
+without runtime ownership are explicitly unattributed. The source map is diagnostic data; it adds
+no markers to the prompt and does not parse POM text.
+
+Call `RenderedPrompt::profile_bytes()` to get a `PromptByteProfile`:
+
+```rust,ignore
+let prompt = app.current_projection().render_prompt_with_sources()?;
+let profile = prompt.profile_bytes();
+for component in profile.components() {
+    println!("{}: own={} bytes, subtree={} bytes", component.identity(),
+        component.self_bytes(), component.inclusive_bytes());
+}
+```
+
+Profiling is infallible and counts exact UTF-8 bytes. Each Component's self count covers its own
+source spans; its inclusive count adds its descendants using the recorded Component tree. Do not
+sum inclusive rows together. Components that emit no content remain visible with zero own bytes.
+Component self bytes plus `framework_bytes()` and `unattributed_bytes()` equal `total_bytes()`,
+which equals the exported prompt's UTF-8 length. The byte source map remains available for tracing
+any range back to its owner.
+
+This measures the **complete current exported declaration**. It does not measure a Full/Delta
+submission, retained model history, provider wire envelopes, cached tokens, or provider billing.
+Like prompt export, it does not prepare or reconcile dirty state. For a fresh report, explicitly
+prepare first. After an action, inspect the updated projection/report and submit the next Frame
+to deliver the application's feedback to the model.
+
+Run the credential-free example with
+`cargo run --no-default-features --example prompt_profile`.
+
+For request-correlated diagnostics, register an observer on the mounted Application:
+
+```rust,ignore
+let app = app.with_frame_observer(|attempt| {
+    match attempt.projection().render_prompt_with_sources() {
+        Ok(prompt) => {
+            let profile = prompt.profile_bytes();
+            // Record the profile with attempt.application_id(), reaction_id(),
+            // reaction_kind(), projection_revision(), and frame().revision().
+        }
+        Err(error) => { /* Record unavailable diagnostics; keep the reaction running. */ }
+    }
+});
+```
+
+The callback runs after normal preparation and Frame compilation, before each port handoff.
+It receives that attempt's immutable projection, including for Main and Temporary reactions;
+reading `current_projection()` after `react()` instead can observe a different reaction's state.
+Continuity retries share a projection revision but have distinct Frame revisions and callbacks.
+An attempt may be rejected before HTTP; correlate actual provider usage separately. Callback
+panics do not fail a reaction. Keep the callback bounded and send external I/O to your normal
+diagnostic transport. Independent applications from any `fork*` API register their own observer.
 
 ## Forking an Application
 
@@ -450,6 +547,14 @@ output, reasoning, tool calls, or tool results produced while that prompt was vi
 outcomes in Component state and declare the updated ephemeral view on the next submitted frame so the
 model can inspect the actual result and select its next action.
 
+With Ark caching enabled, a Main containing POM ephemeral inputs sends `store:false` while reusing
+its last compatible, completed stored parent. Ordinary input and model output remain in Main history.
+Later requests upload all retained items after the parent's verified wire prefix, followed by only
+their current ephemeral prompts. The next Main without ephemeral inputs can store that durable
+suffix and replace the parent only after its completed response passes validation. Without a usable
+stored parent, the request sends the complete retained context. This input retention rule is separate
+from `app.react(true)`, which creates an independent Temporary reaction.
+
 The legacy `ApplicationHost` / `ProviderPort` execution path rejects ephemeral projections. Use
 `Application` with a `ReactionPort` to enforce this history contract.
 
@@ -566,6 +671,29 @@ Use native POM fields and diff metadata for those semantics. Manually constructe
 select a strategy. A generic JSON-to-POM adapter needs an explicit mapping for fields that require
 different update behavior. Derive collection nodes from the agent-facing view model and preserve
 extra transport fields only where they are useful to the agent.
+
+## Dynamic Definitions and Retained Instances
+
+`ComponentDefinition::new(type_id, compatibility_key, renderer)` is a public,
+owned declaration API. The fallible renderer receives `ComponentHooks`; use
+`definition.instantiate(instance_key)` for each independently retained instance.
+Compose `Component::fragment`, typed `document`/`view`, text, ordinary tools,
+Decisions and child definitions without `#[component]` or `view!`.
+
+`Application::mount_definition` mounts the root. `update_definition` supplies a
+complete replacement root snapshot at an idle boundary; an active Main or
+Temporary reaction returns `Busy` and retains its submitted Frame callbacks.
+Compatible keyed instances keep state and running tasks. Removed or incompatible
+subtrees are fenced, their tasks aborted and joined, then the new view is
+published. Candidate rejection preserves the installed definition and version;
+both success and errors expose `effective_version()`. An admitted update remains
+owned if its waiter is cancelled. The next explicit preparation/reaction runs
+native readiness and delivery rules; installation does not submit a Frame.
+
+Keep external hook sites, order, kind and types stable under the same
+compatibility key; change the key to request a fresh subtree. See the
+[dynamic Component guide](docs/dynamic-components.md) for the API, failure
+boundary, original task retention and explicit wakeup contract.
 
 ## Stable Identity and Adjacent Snapshots
 
@@ -1090,8 +1218,8 @@ run its handler, and stage output; it does not start another provider request. T
 ```rust
 # use agentview::component::execution::{Application, ApplicationFault, ReactionPort};
 # async fn continue_after_tool<P: ReactionPort + 'static>(app: &mut Application<P>) -> Result<(), ApplicationFault> {
-app.react()?.await?; // handles the tool call and stages its result
-app.react()?.await?; // submits that staged result on the next reaction
+app.react(false)?.await?; // handles the tool call and stages its result
+app.react(false)?.await?; // submits that staged result on the next reaction
 # Ok(())
 # }
 ```

@@ -279,6 +279,16 @@ where
     pub(crate) fn begin_managed_render(
         &mut self,
     ) -> Result<CommittedRenderTransition, ComponentHostFault> {
+        self.begin_validated_render(None, |_| Ok(()))
+    }
+
+    /// Validate a replacement against the live state before retiring any mount.
+    /// An error drops the candidate transaction and retains the committed tree.
+    pub(crate) fn begin_validated_render(
+        &mut self,
+        replacement: Option<Component>,
+        validate: impl FnOnce(&RenderedProjection) -> Result<(), ComponentHostFault>,
+    ) -> Result<CommittedRenderTransition, ComponentHostFault> {
         self.signals
             .preflight_render()
             .map_err(ComponentHostFault::signal)?;
@@ -292,11 +302,13 @@ where
 
         let input = EventInput::for_application(generation, self.application_id);
         let origin = input.origin();
-        let props = self.props.clone();
-        let root = match self.root {
-            ComponentRoot::Native(root) => root(props),
-            ComponentRoot::WithEvents(root) => root(props, input),
-        };
+        let root = replacement.unwrap_or_else(|| {
+            let props = self.props.clone();
+            match self.root {
+                ComponentRoot::Native(root) => root(props),
+                ComponentRoot::WithEvents(root) => root(props, input),
+            }
+        });
         let mut candidate =
             ComponentRenderStage::prepare_complete_root_candidate_with_command_prefix(
                 root,
@@ -325,6 +337,7 @@ where
                     mount_generation: self.mount_generation,
                 });
         candidate.stage_mut().set_projection(projection.clone());
+        validate(&projection)?;
         let has_command_wait = candidate.stage().has_command_wait();
         let (stage, _, mounts) = candidate.commit_deferred();
         self.current_has_command_wait = has_command_wait;
@@ -341,6 +354,11 @@ where
             task_starts,
             mounts,
         })
+    }
+
+    /// Install the factory whose output was already validated and committed.
+    pub(crate) fn install_rendered_props(&mut self, props: Props) {
+        self.props = props;
     }
 
     /// Activate a committed topology and atomically publish its render output.

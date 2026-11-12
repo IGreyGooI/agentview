@@ -9,15 +9,15 @@
 ## 1. 入口与分类
 
 一个 Application 保留同一棵 Component tree、mount 和业务 Signals，允许多个 reaction 的运行时间重叠。
-已有请求 streaming 时，之后发生的业务事件可以再次调用 `app.react()`；不要求提前收集固定批次。
+已有请求 streaming 时，之后发生的业务事件可以再次调用 `app.react(false)`；不要求提前收集固定批次。
 
 ```rust,ignore
 // 先建立一个完成且工具协议闭合的主线 checkpoint。
-app.react()?.await?;
+app.react(false)?.await?;
 
-let a = app.react()?; // 当前没有 Main，占用主线执行位。
+let a = app.react(false)?; // 当前没有 Main，占用主线执行位。
 // 之后的业务事件到来；a 此时仍可能在 streaming。
-let b = app.react()?; // 当前已有 Main，创建 Temporary。
+let b = app.react(true)?; // 显式创建 Temporary，Main 空闲时也保持独立。
 let id = b.id();
 let kind = b.kind();
 
@@ -26,10 +26,12 @@ let outcome = b.await?;
 let main_outcome = a.await?;
 ```
 
-同步准入原子决定分类：没有占用主线执行位时为 `ReactionKind::Main`，否则为
-`ReactionKind::Temporary`。Temporary 固定使用准入时最后一份合法 checkpoint；没有 checkpoint 或
+`react(ephemeral: bool)` 在同步准入时原子决定分类：`true` 始终创建 `ReactionKind::Temporary`，
+即使主线空闲也不取得主 port/session；`false` 保留自动分类，没有占用主线执行位时为
+`ReactionKind::Main`，否则为 `ReactionKind::Temporary`。Temporary 固定使用准入时最后一份合法 checkpoint；没有 checkpoint 或
 port 不支持独立请求时明确拒绝。首次 Main 可以从空历史开始；它尚未完成时不能把其正在生成的状态
-当作 Temporary 的分支点。
+当作 Temporary 的分支点。显式临时请求在没有合法 checkpoint、父缓存过期或不兼容时拒绝，
+不回退到 Main。这里的 ephemeral 参数控制整次 reaction 的分支归属，与 POM 输入的 ephemeral 属性独立。
 
 Main 直到必要结算、恢复和清理完成才释放执行位。kind 返回后不变；中断 Main 不把已存在的
 Temporary 升格为 Main。已有 Application fork 仍然创建另一棵独立 mounted tree。
@@ -38,7 +40,7 @@ Temporary 升格为 Main。已有 Application fork 仍然创建另一棵独立 m
 
 ```rust,ignore
 impl<P: ReactionPort + 'static> Application<P> {
-    pub fn react(&mut self) -> Result<Reaction, ApplicationFault>;
+    pub fn react(&mut self, ephemeral: bool) -> Result<Reaction, ApplicationFault>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +128,7 @@ lineage 选择。Temporary 的记录不会因为处在同一 mounted tree 就自
 模型才能据此继续操作。使用已结算的 Temporary handle 发起其下一轮：
 
 ```rust,ignore
-let branch = app.react()?; // 此时 Main 活跃，且已有合法 checkpoint。
+let branch = app.react(true)?; // 已有合法 checkpoint；Main 可以活跃或空闲。
 let first = branch.clone().await?;
 // 应用声明实际结果、进度或失败及当前可用动作。
 let next = branch.react()?;
@@ -135,7 +137,8 @@ let second = next.await?;
 
 `branch.react()` 只继续已结算的 Temporary；它使用同一临时 lineage 的 session、工具 receipt 和
 provider scratch，返回新的 ReactionId。该 lineage 同时只能有一轮活跃，后续需使用最新返回的 handle，旧 handle 不重复消费已接续的 scratch。
-Main 的下一轮由 `app.react()` 发起；新的独立 Temporary 也由当前 Main 活跃时的 `app.react()` 发起。
+Main 的下一轮由 `app.react(false)` 发起；新的独立 Temporary 由 `app.react(true)` 发起，
+每次从主 checkpoint 创建 sibling，不续接先前临时输出。
 
 活跃任务始终由 Application 持有。已结算 Temporary 的 scratch 随可继续它的存活 handle 保留；
 不再有相关 handle 时可回收。持有已完成 handle 不保留已完成网络流和工具 lane。
@@ -170,7 +173,13 @@ input = 本分支新增的完整协议项
 只上传本分支新增的完整输入、reasoning、phase、工具调用与结果。当前临时响应不会建立可持久续接的
 新父 ID，也不污染主 port。当前 ephemeral prompt 只加入这一请求，后续 scratch 不重放它。
 
-父响应过期、未存储、System/工具定义不兼容时明确拒绝；不偷偷改写主 port 或重建不存在的上下文。
+已保存的父响应过期、prefix proof 损坏、System/工具定义不兼容时明确拒绝，不直接降级为本地父节点。
+若 Main 因当前 ephemeral 输入明确发送 `store:false`，且没有远端父节点，则完整 terminal envelope、
+output ledger 和 usage 验证后可以封存完整 retained wire 的 Local checkpoint。它冻结完整 prefix、
+System、工具定义及 parallel-tool 设置；每个子轮完整上传 retained context，强制 `store:false`，
+不发送 caching 或 `previous_response_id`，即使该子轮没有 ephemeral 也一样。当前 ephemeral 仅追加到
+当前请求，不进入本地 prefix。准备中、失败、取消、工具协议未闭合或 proof 不匹配的窗口仍拒绝分叉。
+Local 不改写 Main 或兄弟分支，也不把未存储响应 ID 冒充远端父节点。
 Temporary 禁用会改写固定父 prefix 的后台和 forced compaction。
 `response.created` 提前给出的 ID 不表示当前输出已经成为 checkpoint；只有完整成功验证的 terminal
 response 才可建立已保存父响应。中断当前请求不使上一份已保存的父 ID 自动失效。

@@ -56,6 +56,7 @@ use crate::{
     llm_call::TextTurnEvent,
 };
 
+use self::call_observation::CallObserver;
 #[cfg(feature = "legacy-provider-port")]
 use self::continuation::{OpenAiContinuation, ResponsesInputGateReady};
 use self::request_observation::RequestObserver;
@@ -68,6 +69,7 @@ use self::{
 
 #[cfg(feature = "legacy-provider-port")]
 mod artifact_binding;
+pub(super) mod call_observation;
 #[allow(
     dead_code,
     reason = "Chat Completions is retained as a private compatibility implementation"
@@ -80,14 +82,18 @@ mod frame_request;
 mod native_reaction;
 mod output;
 mod parallel_compaction;
-mod reaction_fault;
-mod request_observation;
+pub(super) mod reaction_fault;
+pub(super) mod request_observation;
 mod responses_observation;
 mod transport;
-mod usage;
+pub(super) mod usage;
 
 #[cfg(feature = "legacy-provider-port")]
 use self::artifact_binding::OpenAiInlineArtifactBinding;
+pub use self::call_observation::{
+    OpenAiResponsesCallEvent, OpenAiResponsesCallKind, OpenAiResponsesCallOutcome,
+    OpenAiResponsesCallSnapshot,
+};
 use self::faults::{
     has_unsupported_completed_item, has_unsupported_content_part, has_unsupported_lifecycle_item,
     is_native_tool_event, OpenAiBodyStreamFault,
@@ -129,11 +135,26 @@ const DEFAULT_MAX_CHAT_COMPLETIONS_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_CHAT_COMPLETIONS_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
 static NEXT_RESPONSES_TARGET_ID: AtomicU64 = AtomicU64::new(1);
 
+/// IP address family used for the HTTP client's first TCP connection.
+///
+/// With an HTTP proxy this controls the connection to the proxy; the proxy
+/// chooses its own upstream address family. This does not bind a network
+/// interface: the operating system still selects the route.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenAiIpFamily {
+    /// Preserve the system resolver and HTTP client's address selection.
+    #[default]
+    Auto,
+    /// Connect using IPv4 only, with no fallback to IPv6.
+    Ipv4,
+}
+
 /// Validated connection inputs shared by the OpenAI HTTP adapters.
 pub struct AsyncOpenAiTransportConfig {
     api_base: String,
     api_key: String,
     bypass_environment_proxy: bool,
+    ip_family: OpenAiIpFamily,
     connect_timeout: Duration,
     request_timeout: Duration,
     read_timeout: Duration,
@@ -210,6 +231,7 @@ impl AsyncOpenAiTransportConfig {
             api_base: api_base.trim_end_matches('/').to_owned(),
             api_key,
             bypass_environment_proxy,
+            ip_family: OpenAiIpFamily::default(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             read_timeout: DEFAULT_READ_TIMEOUT,
@@ -231,6 +253,15 @@ impl AsyncOpenAiTransportConfig {
                 reserved_output_tokens: None,
             },
         })
+    }
+
+    /// Selects the IP address family for the client's first TCP connection.
+    ///
+    /// Defaults to [`OpenAiIpFamily::Auto`]. This also applies to the connection
+    /// to an environment-configured proxy, but does not control the proxy's
+    /// upstream connection or bind a network interface.
+    pub fn with_ip_family(self, ip_family: OpenAiIpFamily) -> Self {
+        Self { ip_family, ..self }
     }
 
     /// Replaces all transport deadlines with explicit non-zero values.
@@ -289,9 +320,9 @@ impl AsyncOpenAiTransportConfig {
     /// Replaces canonical Frame byte budgets and the reserved output budget.
     ///
     /// Byte limits apply to AgentView's canonical Frame encoding. The native
-    /// Responses port also checks ceil(serialized request bytes / 4) plus the
-    /// output reserve against the declared context window. This is an estimate,
-    /// not tokenizer accounting. The exact wire body has its own byte limit.
+    /// Responses port uses ceil(serialized context bytes / 4) plus the output
+    /// reserve to trigger compaction. This estimate never rejects a request;
+    /// the exact wire body retains its independent byte limit.
     /// Context capacity always comes from the [`ModelSpec`](super::ModelSpec)
     /// supplied to the encoder's request options.
     pub fn with_responses_frame_limits(
@@ -363,7 +394,13 @@ impl AsyncOpenAiTransportConfig {
 fn responses_frame_profile(
     constraints: FrameConstraints,
 ) -> Result<FrameProfile, AsyncOpenAiConfigError> {
-    let profile = FrameProfile::new(constraints, FrameCapabilities::new(true));
+    let profile = FrameProfile::new(
+        constraints,
+        FrameCapabilities::new(true)
+            .with_native_tool_calls(true)
+            .with_text_delta_output(true)
+            .with_decision(true),
+    );
     profile
         .validate()
         .map_err(|_| AsyncOpenAiConfigError::InvalidResponsesFrameProfile)?;
@@ -373,7 +410,10 @@ fn responses_frame_profile(
 fn chat_completions_frame_profile(
     constraints: FrameConstraints,
 ) -> Result<FrameProfile, chat_completions::ChatCompletionsConfigError> {
-    let profile = FrameProfile::new(constraints, FrameCapabilities::new(true));
+    let profile = FrameProfile::new(
+        constraints,
+        FrameCapabilities::new(true).with_text_delta_output(true),
+    );
     profile
         .validate()
         .map_err(|_| chat_completions::ChatCompletionsConfigError::InvalidFrameProfile)?;
@@ -442,6 +482,7 @@ pub struct AsyncOpenAiResponsesProvider {
     tool_outputs: Arc<Mutex<ToolOutputStaging>>,
     response_usage_observer: Option<Arc<ResponseUsageObserver>>,
     request_observer: Option<Arc<RequestObserver>>,
+    call_observer: Option<Arc<CallObserver>>,
     observer: Option<Arc<dyn OpenAiResponsesObserver>>,
     compaction_observer: Option<Arc<dyn OpenAiResponsesObserver>>,
     observation_failed: Arc<AtomicBool>,
@@ -453,6 +494,47 @@ pub struct AsyncOpenAiResponsesProvider {
     forced_compaction_enabled: bool,
 }
 
+/// HTTP connection policy and observation sinks shared by JSON and SSE adapters.
+/// No Responses history, remote cursor, worker or target identity crosses here.
+#[derive(Clone)]
+pub(super) struct SharedHttpTransport {
+    pub(super) client: reqwest::Client,
+    pub(super) config: OpenAIConfig,
+    pub(super) constraints: FrameConstraints,
+    pub(super) read_timeout: Duration,
+    pub(super) max_response_body_bytes: usize,
+    pub(super) max_serialized_request_body_bytes: usize,
+    pub(super) response_usage_observer: Option<Arc<ResponseUsageObserver>>,
+    pub(super) request_observer: Option<Arc<RequestObserver>>,
+    pub(super) call_observer: Option<Arc<CallObserver>>,
+    pub(super) observer: Option<Arc<dyn OpenAiResponsesObserver>>,
+}
+
+impl SharedHttpTransport {
+    pub(super) fn initialize(
+        config: AsyncOpenAiTransportConfig,
+        model: super::ModelSpec,
+    ) -> Result<Self, AsyncOpenAiConfigError> {
+        let constraints = config
+            .responses_frame_limits
+            .constraints(ContextWindow::Tokens(model.context_window_tokens()));
+        let initialized = transport::initialize(config)?;
+        Ok(Self {
+            client: initialized.client,
+            config: initialized.config,
+            constraints,
+            read_timeout: initialized.read_timeout,
+            max_response_body_bytes: initialized.max_response_body_bytes,
+            max_serialized_request_body_bytes: initialized
+                .max_responses_serialized_request_body_bytes,
+            response_usage_observer: None,
+            request_observer: None,
+            call_observer: None,
+            observer: None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponsesExecutionMode {
     Unclaimed,
@@ -462,7 +544,7 @@ enum ResponsesExecutionMode {
 }
 
 #[derive(Debug)]
-struct ResponsesReactionTarget {
+pub(super) struct ResponsesReactionTarget {
     identity: TargetIdentity,
     epoch: TargetEpoch,
     accepted_revision: Option<FrameRevision>,
@@ -471,7 +553,7 @@ struct ResponsesReactionTarget {
 }
 
 impl ResponsesReactionTarget {
-    fn new(profile: FrameProfile) -> Result<Self, AsyncOpenAiConfigError> {
+    pub(super) fn new(profile: FrameProfile) -> Result<Self, AsyncOpenAiConfigError> {
         Ok(Self {
             identity: next_responses_target_identity()?,
             epoch: TargetEpoch::new(NonZeroU64::MIN),
@@ -481,7 +563,7 @@ impl ResponsesReactionTarget {
         })
     }
 
-    fn declaration(&self) -> Result<TargetDeclaration, ReactionPortFault> {
+    pub(super) fn declaration(&self) -> Result<TargetDeclaration, ReactionPortFault> {
         if let Some(fault) = self.terminal_fault {
             return Err(fault);
         }
@@ -491,14 +573,14 @@ impl ResponsesReactionTarget {
         })
     }
 
-    fn accept(&mut self, revision: FrameRevision) {
+    pub(super) fn accept(&mut self, revision: FrameRevision) {
         let accepted = TargetDeclaration::resume(revision, self.profile.clone());
         debug_assert_eq!(accepted.identity(), self.identity);
         debug_assert_eq!(accepted.continuity().epoch(), self.epoch);
         self.accepted_revision = Some(revision);
     }
 
-    fn lose_continuity(&mut self) {
+    pub(super) fn lose_continuity(&mut self) {
         if self.terminal_fault.is_some() {
             return;
         }
@@ -516,7 +598,7 @@ impl ResponsesReactionTarget {
         }
     }
 
-    fn record_fault(&mut self, fault: ReactionPortFault) {
+    pub(super) fn record_fault(&mut self, fault: ReactionPortFault) {
         self.accepted_revision = None;
         match fault.kind() {
             ReactionPortFaultKind::Retryable => self.lose_continuity(),
@@ -649,6 +731,7 @@ impl AsyncOpenAiResponsesProvider {
             tool_outputs: Arc::new(Mutex::new(ToolOutputStaging::default())),
             response_usage_observer: None,
             request_observer: None,
+            call_observer: None,
             observer: None,
             compaction_observer: None,
             observation_failed: Arc::new(AtomicBool::new(false)),
@@ -665,6 +748,42 @@ impl AsyncOpenAiResponsesProvider {
 
     pub fn identity(&self) -> &ProviderIdentity {
         &self.identity
+    }
+
+    /// Creates an independent, history-free target sharing this client's
+    /// connection pool, model configuration, limits and observer sinks.
+    /// No HTTP request, observer notification or background task starts here.
+    pub fn fresh_session(&self) -> Result<Self, AsyncOpenAiConfigError> {
+        Ok(Self {
+            client: self.client.clone(),
+            config: self.config.clone(),
+            identity: self.identity.clone(),
+            encoder: self.encoder.clone(),
+            read_timeout: self.read_timeout,
+            max_response_body_bytes: self.max_response_body_bytes,
+            max_sse_event_bytes: self.max_sse_event_bytes,
+            max_output_text_bytes: self.max_output_text_bytes,
+            max_responses_serialized_request_body_bytes: self
+                .max_responses_serialized_request_body_bytes,
+            #[cfg(feature = "legacy-provider-port")]
+            artifact_binding: None,
+            #[cfg(feature = "legacy-provider-port")]
+            continuation: None,
+            #[cfg(feature = "legacy-provider-port")]
+            tool_outputs: Arc::new(Mutex::new(ToolOutputStaging::default())),
+            response_usage_observer: self.response_usage_observer.clone(),
+            request_observer: self.request_observer.clone(),
+            call_observer: self.call_observer.clone(),
+            observer: self.observer.clone(),
+            compaction_observer: self.compaction_observer.clone(),
+            observation_failed: Arc::new(AtomicBool::new(false)),
+            execution_mode: ResponsesExecutionMode::Unclaimed,
+            reaction_target: ResponsesReactionTarget::new(self.reaction_target.profile.clone())?,
+            reaction_frame: None,
+            parallel_compaction: self.parallel_compaction.fork(),
+            parallel_compaction_enabled: self.parallel_compaction_enabled,
+            forced_compaction_enabled: self.forced_compaction_enabled,
+        })
     }
 
     /// Replace the default local background compaction admission policy.
@@ -711,9 +830,10 @@ impl AsyncOpenAiResponsesProvider {
     }
 
     /// Enable one bounded local summary attempt with the current model when an otherwise valid
-    /// Frame exceeds the configured context window. The attempt shares the
+    /// Frame's byte-based estimate exceeds the configured context window. The attempt shares the
     /// background worker and source deduplication, but remains enabled when
-    /// `without_parallel_compaction()` disables policy-triggered work.
+    /// `without_parallel_compaction()` disables policy-triggered work. A missing
+    /// or failed summary does not reject an otherwise encodable request.
     pub fn with_forced_compaction(mut self) -> Self {
         self.forced_compaction_enabled = true;
         self
@@ -776,6 +896,26 @@ impl AsyncOpenAiResponsesProvider {
         observer: impl Fn(OpenAiResponsesRequestSnapshot) + Send + Sync + 'static,
     ) -> Self {
         self.request_observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Observes every actual Frame-native foreground or summary HTTP attempt.
+    ///
+    /// Each first transport poll emits a Started event with a unique call ID;
+    /// completion, failure, incomplete output and cancellation emit Finished.
+    /// Summary workers retain their triggering Frame identity across tasks.
+    /// Usage is provider-reported structured JSON; absent usage remains unknown.
+    /// No prompt, output, URL, credentials or arbitrary headers are exposed.
+    ///
+    /// The callback must be bounded and nonblocking. Its panic is contained so
+    /// diagnostics cannot alter a sent request or application output. Cleanup
+    /// during another panic does not invoke the callback. Legacy ProviderPort
+    /// calls are outside this native lifecycle contract.
+    pub fn with_call_observer(
+        mut self,
+        observer: impl Fn(OpenAiResponsesCallEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.call_observer = Some(Arc::new(observer));
         self
     }
 
@@ -1628,6 +1768,22 @@ impl ProviderPort for AsyncOpenAiResponsesProvider {
         projection: RenderedProjection,
     ) -> Result<ProviderEventStream<'a>, ProviderFault> {
         self.ensure_legacy_mode()?;
+        if projection.decision().is_some()
+            || projection.nodes().iter().any(|node| {
+                node.items().iter().any(|item| {
+                    matches!(
+                        item,
+                        crate::transcript::CanonicalInputItem::DecisionRequest { .. }
+                            | crate::transcript::CanonicalInputItem::DecisionOutput { .. }
+                    )
+                })
+            })
+        {
+            return Err(ProviderFault::model_rejected(
+                "Decision declarations require the frame-native ReactionPort",
+            )
+            .with_code(ProviderFaultCode::RequestPreparation));
+        }
         if projection.nodes().iter().any(|node| {
             node.items()
                 .iter()

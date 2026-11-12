@@ -64,7 +64,7 @@ fn main() {
             let _ = application.take_reaction_request().unwrap();
             let wait = application.wait_for_reaction_request();
             drop(wait);
-            match application.react().unwrap().await {
+            match application.react(false).unwrap().await {
                 Ok(
                     agentview::component::execution::ReactionOutcome::Completed
                     | agentview::component::execution::ReactionOutcome::Interrupted

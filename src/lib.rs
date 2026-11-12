@@ -51,6 +51,7 @@ mod semantic_diff;
 pub mod semantic_view;
 pub mod stream_parser;
 pub mod streaming_tool;
+pub mod system1;
 pub mod templates;
 pub mod transcript;
 pub mod view_app;

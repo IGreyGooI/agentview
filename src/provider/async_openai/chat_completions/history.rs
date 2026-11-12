@@ -403,6 +403,9 @@ pub(super) fn lower_item(
                 content: content.clone(),
             })])
         }
+        CanonicalInputItem::DecisionRequest { .. } | CanonicalInputItem::DecisionOutput { .. } => {
+            Err(OpenAiChatCompletionsError::UnsupportedDecision)
+        }
         CanonicalInputItem::ProviderExtension(extension) => {
             Err(OpenAiChatCompletionsError::UnsupportedProviderExtension {
                 provider: extension.provider().to_owned(),

@@ -292,9 +292,18 @@ fn diff_keyed_list(
             .iter()
             .find(|(previous_key, _)| previous_key == key)
         {
-            if item != previous_item {
-                delta.push_child(operation_node("update", item.clone()));
+            let mut patch = match diff_node(item, previous_item) {
+                SemanticPatch::Unchanged => continue,
+                SemanticPatch::DeltaNode(node)
+                | SemanticPatch::ReplaceRoot(SemanticFragment::Node(node)) => node,
+                _ => unreachable!("XML node comparison returns a node patch"),
+            };
+            match patch.attr(key_attr) {
+                Some(value) if value != key.as_str() => patch = item.clone(),
+                None => patch.push_attr(key_attr, key),
+                Some(_) => {}
             }
+            delta.push_child(operation_node("update", patch));
         }
     }
     delta_or_unchanged(delta)
@@ -484,5 +493,107 @@ fn fragment_as_node(fragment: SemanticFragment) -> SemanticNode {
             node.push_comment(comment);
             node
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::semantic_view::SemanticField;
+
+    fn sessions(ongoing: bool, messages: &[&str]) -> SemanticFragment {
+        sessions_with_identity("id", "active", ongoing, messages)
+    }
+
+    fn sessions_with_identity(
+        key: &str,
+        identity: &str,
+        ongoing: bool,
+        messages: &[&str],
+    ) -> SemanticFragment {
+        let mut session = SemanticNode::new("session");
+        session.push_attr(key, identity);
+        session.push_diff_field(
+            "ongoing",
+            SemanticDiffStrategy::Recursive,
+            SemanticField::Attr {
+                name: "ongoing".into(),
+                value: ongoing.to_string(),
+            },
+        );
+        let mut entries = SemanticNode::new("messages");
+        for message in messages {
+            entries.push_child(SemanticNode::element("item", *message));
+        }
+        session.push_diff_field(
+            "messages",
+            SemanticDiffStrategy::Sequence,
+            SemanticField::Fragment(SemanticFragment::Node(entries)),
+        );
+        let mut collection = SemanticNode::new("sessions");
+        collection.push_child(session);
+        SemanticFragment::Node(collection)
+    }
+
+    #[test]
+    fn legacy_keyed_nested_deltas_preserve_identity_and_omit_old_messages() {
+        let before = sessions(true, &["original"]);
+        let appended = sessions(true, &["original", "new"]);
+        let mut messages = SemanticNode::new("messages");
+        messages.push_attr("rendering_mode", "delta");
+        messages.push_child(operation_node(
+            "insert",
+            SemanticNode::element("item", "new"),
+        ));
+        let mut session = SemanticNode::new("session");
+        session.push_attr("rendering_mode", "delta");
+        session.push_attr("id", "active");
+        session.push_child(messages);
+        let mut expected = SemanticNode::new("sessions");
+        expected.push_attr("rendering_mode", "delta");
+        expected.push_child(operation_node("update", session));
+        assert_eq!(
+            diff_keyed_list("sessions", &appended, &before, "id"),
+            SemanticPatch::DeltaNode(expected),
+        );
+
+        let completed = sessions(false, &["original", "new"]);
+        let mut session = SemanticNode::new("session");
+        session.push_attr("rendering_mode", "delta");
+        session.push_attr("id", "active");
+        session.push_child(SemanticNode::element("ongoing", "false"));
+        let mut expected = SemanticNode::new("sessions");
+        expected.push_attr("rendering_mode", "delta");
+        expected.push_child(operation_node("update", session));
+        assert_eq!(
+            diff_keyed_list("sessions", &completed, &appended, "id"),
+            SemanticPatch::DeltaNode(expected),
+        );
+    }
+
+    #[test]
+    fn legacy_rendering_mode_key_collision_keeps_complete_record_identity() {
+        let before = sessions_with_identity("rendering_mode", "business-key", true, &["original"]);
+        let current = sessions_with_identity(
+            "rendering_mode",
+            "business-key",
+            false,
+            &["original", "new"],
+        );
+        let SemanticFragment::Node(collection) = &current else {
+            panic!("collection root");
+        };
+        let complete_record = visible_child_nodes(collection).pop().unwrap();
+        let mut expected = SemanticNode::new("sessions");
+        expected.push_attr("rendering_mode", "delta");
+        expected.push_child(operation_node("update", complete_record));
+        assert_eq!(
+            diff_keyed_list("sessions", &current, &before, "rendering_mode"),
+            SemanticPatch::DeltaNode(expected),
+        );
+        assert_eq!(
+            diff_keyed_list("sessions", &current, &current, "rendering_mode"),
+            SemanticPatch::Unchanged,
+        );
     }
 }

@@ -24,10 +24,12 @@ pub mod prelude {
         spawn, use_application_exit, use_application_id, use_coroutine, use_future,
         use_preparation, use_provider_event_handler, use_reaction_completion, use_reaction_request,
         use_signal, use_wait_for_command, Action, ApplicationExitError, ApplicationExitHandle,
-        CliCommand, Command, CommandArgument, CommandDefinition, Component, Coroutine,
-        CoroutineInbox, CoroutineSendError, ExitReason, NativeTool, NativeToolCall,
-        ProviderEventSelector, ReactionRequest, ReactionRequestError, Signal, SpawnError,
-        StreamingXml, StreamingXmlTag, ToolError, XmlContractDiagnostic, XmlStreamingToolCall,
+        Choice, CliCommand, Command, CommandArgument, CommandDefinition, Component,
+        ComponentDefinition, ComponentDefinitionError, ComponentHooks, Coroutine,
+        CoroutineInbox, CoroutineSendError, Decision, DecisionQuestionSpec, ExitReason, NativeTool,
+        NativeToolCall, Noul, ProviderEventSelector, ReactionRequest, ReactionRequestError, Score,
+        Signal, SpawnError, StreamingXml, StreamingXmlTag, ToolError, XmlContractDiagnostic,
+        XmlStreamingToolCall,
     };
     #[cfg(feature = "legacy-provider-port")]
     #[allow(
@@ -36,7 +38,12 @@ pub mod prelude {
     )]
     #[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
     pub use super::authoring::{EventInput, EventListener};
-    pub use super::execution::{ForkableReactionPort, ProviderEvent};
+    pub use super::execution::{
+        ChoiceAnswer, DecisionAnswer, DecisionAnswers, DecisionBox, DecisionFailure,
+        DecisionNoulCriteria, DecisionQuestion, DecisionSource, ForkableReactionPort, NoulAnswer,
+        ProviderEvent, QuestionOutcome, ScoreAnswer, DefinitionVersion, DefinitionUpdate,
+        DefinitionUpdateError, DefinitionUpdateErrorKind,
+    };
     pub use super::{
         ApplicationId, EventContext, EventId, EventSource, ReactionId, ReactionKind,
         SignalAccessError,

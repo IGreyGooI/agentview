@@ -163,12 +163,12 @@ async fn request_observer_captures_handed_off_bodies_and_frame_context() -> anyh
         Application::mount(move || two_turn_application(root_props.clone()), provider)?;
 
     assert!(matches!(
-        application.react().unwrap().await?,
+        application.react(false).unwrap().await?,
         agentview::component::execution::ReactionOutcome::Completed
     ));
     let first_body = next_request(&mut server).await?;
     assert!(matches!(
-        application.react().unwrap().await?,
+        application.react(false).unwrap().await?,
         agentview::component::execution::ReactionOutcome::Completed
     ));
     let second_body = next_request(&mut server).await?;
@@ -227,7 +227,7 @@ async fn request_observer_does_not_publish_pre_handoff_preparation_failures() ->
         Application::mount(move || two_turn_application(root_props.clone()), provider)?;
 
     let _fault = application
-        .react()
+        .react(false)
         .unwrap()
         .await
         .expect_err("one-byte request body limit must reject before handoff");
@@ -267,7 +267,7 @@ async fn request_observer_captures_handed_off_requests_before_http_failure() -> 
         Application::mount(move || two_turn_application(root_props.clone()), provider)?;
 
     let _fault = application
-        .react()
+        .react(false)
         .unwrap()
         .await
         .expect_err("service failure follows a completed transport handoff");
@@ -314,12 +314,12 @@ async fn request_observer_panics_do_not_break_reactions_or_continuity() -> anyho
         Application::mount(move || two_turn_application(root_props.clone()), provider)?;
 
     assert!(matches!(
-        application.react().unwrap().await?,
+        application.react(false).unwrap().await?,
         agentview::component::execution::ReactionOutcome::Completed
     ));
     let first_body = next_request(&mut server).await?;
     assert!(matches!(
-        application.react().unwrap().await?,
+        application.react(false).unwrap().await?,
         agentview::component::execution::ReactionOutcome::Completed
     ));
     let second_body = next_request(&mut server).await?;

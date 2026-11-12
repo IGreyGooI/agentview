@@ -267,6 +267,12 @@ pub(super) struct FrameSession {
 }
 
 impl FrameSession {
+    pub(super) fn decision(&self) -> Option<&super::DecisionDeclaration> {
+        self.target_delivery
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.complete_projection.decision())
+    }
     pub(super) fn new(declaration: &TargetDeclaration) -> Result<Self, FrameSessionFault> {
         let namespace = NEXT_FRAME_SESSION_NAMESPACE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -330,6 +336,20 @@ impl FrameSession {
         complete_projection: &RenderedProjection,
     ) -> Result<PreparedFrame, FrameSessionFault> {
         self.validate_declaration(declaration)?;
+        if let Some(reason) = complete_projection.decision_error() {
+            return Err(FrameSessionFault::InvalidDecisionDeclaration { reason });
+        }
+        let requirements = complete_projection.requirements();
+        let missing = requirements.missing_from(declaration.profile().capabilities);
+        if !missing.is_empty() {
+            return Err(FrameSessionFault::UnsupportedCapabilities { missing });
+        }
+        if complete_projection.decision().is_some()
+            && (!complete_projection.native_tools().is_empty()
+                || complete_projection.has_xml_actions())
+        {
+            return Err(FrameSessionFault::DecisionActionConflict);
+        }
         let epoch = declaration.continuity().epoch();
         let sequence = self
             .target_delivery
@@ -394,9 +414,20 @@ impl FrameSession {
             current_scope_outputs,
             complete_projection,
         )?;
-        let canonical_projection_items = flatten_non_system_projection(&projection_plan.submission);
+        let mut canonical_projection_items =
+            flatten_non_system_projection(&projection_plan.submission);
+        if let Some(decision) = complete_projection.decision() {
+            canonical_projection_items.push(CanonicalInputItem::DecisionRequest {
+                declaration: decision.clone(),
+            });
+        }
         let mut projection_items = canonical_projection_items.clone();
         let mut complete_component_items = flatten_non_system_projection(complete_projection);
+        if let Some(decision) = complete_projection.decision() {
+            complete_component_items.push(CanonicalInputItem::DecisionRequest {
+                declaration: decision.clone(),
+            });
+        }
         let ephemeral = flatten_ephemeral_projection(complete_projection);
         if let Some(snapshot) = system_snapshot.as_ref() {
             complete_component_items.insert(0, system_snapshot_item(snapshot));
@@ -435,7 +466,9 @@ impl FrameSession {
         let committed_transcript = CanonicalTranscript::try_from_items(committed_items)?;
         FrameMeter::validate_full_reserve(committed_transcript.items(), &[], constraints)?;
         let submission =
-            FrameMeter::compile_submission(replay, staged_inputs, component, constraints)?;
+            FrameMeter::compile_submission(replay, staged_inputs, component, constraints)?
+                .with_requirements(requirements);
+        let submission = submission.with_decision(complete_projection.decision().cloned());
         let frame = Frame::from_compiled(
             revision,
             declaration.identity(),
@@ -856,6 +889,10 @@ pub(super) struct PreparedFrame {
 }
 
 impl PreparedFrame {
+    pub(super) fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
     pub(super) fn revision(&self) -> super::reaction::FrameRevision {
         self.frame.revision()
     }
@@ -953,6 +990,14 @@ fn ensure_pending_tool_calls_closed(
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum FrameSessionFault {
+    #[error("invalid decision declaration: {reason}")]
+    InvalidDecisionDeclaration {
+        reason: super::DecisionDeclarationError,
+    },
+    #[error("the target lacks required Frame capabilities: {missing:?}")]
+    UnsupportedCapabilities { missing: super::FrameRequirements },
+    #[error("a decision cannot be combined with active native or XML actions")]
+    DecisionActionConflict,
     #[error("FrameSession namespace identity space is exhausted")]
     NamespaceExhausted,
     #[error("reaction target identity changed within one Application")]
@@ -1175,11 +1220,155 @@ mod tests {
     }
 
     fn profile(delta: bool) -> FrameProfile {
-        FrameProfile::new(constraints(2_048, 16_384), FrameCapabilities::new(delta))
+        FrameProfile::new(
+            constraints(2_048, 16_384),
+            FrameCapabilities::new(delta)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
+        )
     }
 
     fn identity() -> TargetIdentity {
         TargetIdentity::new(NonZeroU128::new(41).unwrap())
+    }
+
+    #[test]
+    fn decision_contract_is_complete_on_full_and_delta_and_is_measured_before_handoff() {
+        use crate::component::execution::{DecisionDeclaration, DecisionQuestion};
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        let declaration = DecisionDeclaration::new(BTreeMap::from([
+            ("bug".into(), DecisionQuestion::noul(json!({"instruction":"Check the evidence", "boundary":9_007_199_254_740_993u64}))),
+            ("urgency".into(), DecisionQuestion::score("Rate urgency.", vec![json!("Low"), json!("High")])) ,
+        ])).unwrap();
+        let mut profile = profile(true);
+        profile.capabilities = profile.capabilities.with_decision(true);
+        let target = full(profile.clone(), 1);
+        let mut session = FrameSession::new(&target).unwrap();
+        let projection = projection(None).with_decision(declaration.clone()).unwrap();
+        let prepared = session.prepare(&target, &projection).unwrap();
+        let (frame, commit) = prepared.into_parts();
+        assert_eq!(frame.submission().decision(), Some(&declaration));
+        assert!(frame.submission().requirements().requires_decision());
+        assert_eq!(
+            frame
+                .submission()
+                .projection()
+                .items()
+                .iter()
+                .filter(|item| matches!(item, CanonicalInputItem::DecisionRequest { .. }))
+                .count(),
+            1
+        );
+        let revision = frame.revision();
+        session.commit(commit);
+        assert_eq!(
+            session.canonical_history.transcript.items(),
+            &[CanonicalInputItem::DecisionRequest {
+                declaration: declaration.clone()
+            }]
+        );
+        let resumed = TargetDeclaration::resume(revision, profile.clone());
+        let next = session.prepare(&resumed, &projection).unwrap();
+        assert!(matches!(next.frame.basis(), FrameBasis::DeltaFrom(_)));
+        assert_eq!(next.frame.submission().decision(), Some(&declaration));
+        assert_eq!(next.frame.submission().projection().items().len(), 1);
+
+        let mut limited = profile.clone();
+        limited.constraints.max_component_bytes = 64;
+        let limited_target = full(limited, 1);
+        let limited_session = FrameSession::new(&limited_target).unwrap();
+        assert!(matches!(
+            limited_session.prepare(&limited_target, &projection),
+            Err(FrameSessionFault::Budget(
+                FrameBudgetFault::ComponentTooLarge { .. }
+            ))
+        ));
+
+        let mut unsupported = profile;
+        unsupported.capabilities = unsupported.capabilities.with_decision(false);
+        let unsupported_target = full(unsupported, 1);
+        let session = FrameSession::new(&unsupported_target).unwrap();
+        let sequence = session.target_delivery.next_sequence;
+        assert!(
+            matches!(session.prepare(&unsupported_target, &projection), Err(FrameSessionFault::UnsupportedCapabilities { missing }) if missing.requires_decision())
+        );
+        assert_eq!(session.target_delivery.next_sequence, sequence);
+        assert!(session.canonical_history.transcript.items().is_empty());
+        assert!(session
+            .prepare(
+                &unsupported_target,
+                &RenderedProjection::from_nodes(Vec::new()).unwrap()
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn decision_canonical_meter_preserves_adjacent_large_integers_exactly() {
+        use crate::component::execution::{DecisionDeclaration, DecisionQuestion};
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        let make = |id| {
+            DecisionDeclaration::new(BTreeMap::from([(
+                "q".into(),
+                DecisionQuestion::noul(json!({"boundary":id,"limit":u64::MAX})),
+            )]))
+            .unwrap()
+        };
+        let first = make(9_007_199_254_740_992u64);
+        let second = make(9_007_199_254_740_993u64);
+        let first_item = CanonicalInputItem::DecisionRequest {
+            declaration: first.clone(),
+        };
+        let second_item = CanonicalInputItem::DecisionRequest {
+            declaration: second.clone(),
+        };
+        let first_bytes = super::canonicalize(&first_item).unwrap();
+        let second_bytes = super::canonicalize(&second_item).unwrap();
+        assert_ne!(first_bytes, second_bytes);
+        let restored: CanonicalInputItem = serde_json::from_slice(&second_bytes).unwrap();
+        assert_eq!(restored, second_item);
+    }
+
+    #[test]
+    fn frame_merges_complete_question_catalogs_and_rejects_duplicate_names_before_submission() {
+        use crate::component::execution::{
+            DecisionDeclaration, DecisionQuestion, RenderedProjectionError,
+        };
+        use std::collections::BTreeMap;
+        let first = DecisionDeclaration::new(BTreeMap::from([(
+            "bug".into(),
+            DecisionQuestion::noul("Is this a defect?"),
+        )]))
+        .unwrap();
+        let second = DecisionDeclaration::new(BTreeMap::from([(
+            "urgent".into(),
+            DecisionQuestion::noul("Is it urgent?"),
+        )]))
+        .unwrap();
+        let projection = projection(None).with_decision(first.clone()).unwrap();
+        let merged = projection.clone().with_decision(second).unwrap();
+        assert_eq!(merged.decision().unwrap().questions().len(), 2);
+        assert_eq!(merged.decision().unwrap().batch_id(), first.batch_id());
+        assert!(
+            matches!(projection.with_decision(first), Err(RenderedProjectionError::DuplicateDecisionName {name}) if name == "bug")
+        );
+        let mut profile = profile(true);
+        profile.capabilities = profile.capabilities.with_decision(true);
+        let target = full(profile, 1);
+        let session = FrameSession::new(&target).unwrap();
+        let prepared = session.prepare(&target, &merged).unwrap();
+        assert_eq!(
+            prepared
+                .frame
+                .submission()
+                .decision()
+                .unwrap()
+                .questions()
+                .len(),
+            2
+        );
+        assert!(session.canonical_history.transcript.items().is_empty());
     }
 
     fn epoch(value: u64) -> TargetEpoch {
@@ -1629,7 +1818,9 @@ mod tests {
             assert_eq!(frame.requested_context_bytes(), Some(measured));
             let limited = FrameProfile::new(
                 constraints(measured - 1, 16_384),
-                FrameCapabilities::new(true),
+                FrameCapabilities::new(true)
+                    .with_native_tool_calls(true)
+                    .with_text_delta_output(true),
             );
             let limited_declaration = full(limited, 1);
             assert!(matches!(
@@ -2785,7 +2976,12 @@ mod tests {
 
     #[test]
     fn prepare_budget_failure_does_not_advance_session() {
-        let tiny_profile = FrameProfile::new(constraints(64, 4_096), FrameCapabilities::new(true));
+        let tiny_profile = FrameProfile::new(
+            constraints(64, 4_096),
+            FrameCapabilities::new(true)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
+        );
         let declaration = full(tiny_profile, 1);
         let session = FrameSession::new(&declaration).unwrap();
         let fault = match session.prepare(&declaration, &projection(Some(&"x".repeat(512)))) {

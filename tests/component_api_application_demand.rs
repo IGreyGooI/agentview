@@ -93,7 +93,9 @@ fn declaration() -> TargetDeclaration {
                 context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
-            FrameCapabilities::NONE,
+            FrameCapabilities::NONE
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
         ),
     )
 }

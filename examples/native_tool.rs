@@ -135,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
                 (2, "undo", 17, serde_json::json!({"expected_value": 42})),
             ] {
                 println!("reaction {step}: observe the counter, then call {tool}");
-                let _ = application.react()?.await?;
+                let _ = application.react(false)?.await?;
                 let current_projection = application.current_projection();
                 let items: Vec<_> = current_projection
                     .projection()
@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             println!("reaction 3: deliver the undo result and restored state");
-            let _ = application.react()?.await?;
+            let _ = application.react(false)?.await?;
             let call_count = application
                 .current_projection()
                 .projection()

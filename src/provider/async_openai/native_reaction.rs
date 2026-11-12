@@ -1,7 +1,7 @@
 //! Frame-native `ReactionPort` implementation for OpenAI Responses.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     num::NonZeroU64,
     sync::{atomic::Ordering, Arc, Mutex},
@@ -21,10 +21,15 @@ use crate::{
         ReactionPortFaultCode, ReactionPortFaultReason, ResettableReactionPort, SubmitFault,
         TargetContinuity, TargetDeclaration,
     },
+    component::execution::{DecisionBatchId, ProviderDecision},
+    provider::codex_http_v1::CodexHttpV1Error,
     transcript::{AssistantPhase, CanonicalInputItem},
 };
 
 use super::{
+    call_observation::{
+        CallAccounting, CallOrigin, OpenAiResponsesCallKind, OpenAiResponsesCallOutcome,
+    },
     declaration_state_lost_fault, exceeds_limit,
     frame_request::{
         PreparedResponsesFrameRequest, PrivateOutputKind, ResponsesFrameRequestFault,
@@ -62,6 +67,11 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             .frame_native_declaration()
             .map_err(SubmitFault::Rejected)?;
         frame.check_handoff_precondition(&declaration)?;
+        let decision_batch = frame
+            .submission()
+            .decision()
+            .map(|decision| decision.batch_id().clone());
+        let is_decision = decision_batch.is_some();
         let Some(context_window_tokens) =
             frame.prepared_profile().constraints.context_window.tokens()
         else {
@@ -74,16 +84,26 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 )
                 .await);
         };
-        let mut compacted_base = match self.parallel_compaction.prepare_base(
-            self.reaction_frame.as_ref(),
-            &frame,
-            &self.encoder,
-        ) {
-            Ok(base) => base,
-            Err(error) => {
-                return Err(self
-                    .reject_frame_preparation(&frame, error, None, false)
-                    .await);
+        // Decision Frames never start, await, or install model summaries.
+        // A previously running background attempt loses its installation
+        // eligibility; its owned cleanup remains part of port shutdown.
+        if is_decision {
+            self.parallel_compaction.reset();
+        }
+        let mut compacted_base = if is_decision {
+            None
+        } else {
+            match self.parallel_compaction.prepare_base(
+                self.reaction_frame.as_ref(),
+                &frame,
+                &self.encoder,
+            ) {
+                Ok(base) => base,
+                Err(error) => {
+                    return Err(self
+                        .reject_frame_preparation(&frame, error, None, false)
+                        .await);
+                }
             }
         };
         let base = compacted_base
@@ -92,39 +112,72 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             .or(self.reaction_frame.as_ref());
         let mut compacted_base_used = base.is_some_and(ResponsesFrameRequestState::is_compacted);
         let mut request_body_bytes = None;
-        let prepared = ResponsesFrameRequestState::prepare_with_measurements(
+        let mut prepared = ResponsesFrameRequestState::prepare_with_measurements(
             base,
             &frame,
             &self.encoder,
             self.max_responses_serialized_request_body_bytes,
             &mut request_body_bytes,
         );
-        let prepared = match prepared {
+        if matches!(
+            &prepared,
+            Err(ResponsesFrameRequestFault::Encoding(
+                CodexHttpV1Error::SerializedRequestBodyLimit
+            ))
+        ) && compacted_base.is_some()
+        {
+            // Replacing a cached prefix can enlarge the upload. An optional
+            // summary must not prevent a valid original request from proceeding.
+            compacted_base = None;
+            compacted_base_used = self
+                .reaction_frame
+                .as_ref()
+                .is_some_and(ResponsesFrameRequestState::is_compacted);
+            prepared = ResponsesFrameRequestState::prepare_with_measurements(
+                self.reaction_frame.as_ref(),
+                &frame,
+                &self.encoder,
+                self.max_responses_serialized_request_body_bytes,
+                &mut request_body_bytes,
+            );
+        }
+        let mut prepared = match prepared {
             Ok(prepared) => prepared,
-            Err(ResponsesFrameRequestFault::ContextWindowLimit)
-                if self.forced_compaction_enabled && compacted_base.is_none() =>
-            {
-                let source = self
-                    .reaction_frame
-                    .as_ref()
-                    .and_then(ResponsesFrameRequestState::compaction_source);
-                let request = self.parallel_compaction.prepare_request(
-                    source,
-                    CompactionMode::Required {
-                        wait_timeout: self.read_timeout,
-                    },
-                );
-                let transport = self.compaction_transport(context_window_tokens);
-                if !self.parallel_compaction.request(request, transport).await {
-                    return Err(self
-                        .reject_frame_preparation(
-                            &frame,
-                            ResponsesFrameRequestFault::ContextWindowLimit,
-                            request_body_bytes,
-                            compacted_base_used,
-                        )
-                        .await);
-                }
+            Err(error) => {
+                return Err(self
+                    .reject_frame_preparation(
+                        &frame,
+                        error,
+                        request_body_bytes,
+                        compacted_base_used,
+                    )
+                    .await);
+            }
+        };
+        let estimate = ContextEstimate::from_bytes(prepared.context_bytes);
+        let reserve = frame.prepared_profile().constraints.reserved_output_tokens.unwrap_or(0);
+        if !is_decision
+            && self.forced_compaction_enabled
+            && compacted_base.is_none()
+            && u128::from(estimate.tokens) + u128::from(reserve)
+                > u128::from(context_window_tokens.get())
+        {
+            let source = self
+                .reaction_frame
+                .as_ref()
+                .and_then(ResponsesFrameRequestState::compaction_source);
+            let request = self.parallel_compaction.prepare_request(
+                source,
+                CompactionMode::Required {
+                    wait_timeout: self.read_timeout,
+                },
+            );
+            let transport = self.compaction_transport(
+                context_window_tokens,
+                &frame,
+                OpenAiResponsesCallKind::ForcedCompaction,
+            );
+            if self.parallel_compaction.request(request, transport).await {
                 compacted_base = match self.parallel_compaction.prepare_base(
                     self.reaction_frame.as_ref(),
                     &frame,
@@ -137,49 +190,42 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                             .await);
                     }
                 };
-                let Some((_, forced_base)) = compacted_base.as_ref() else {
-                    return Err(self
-                        .reject_frame_preparation(
-                            &frame,
-                            ResponsesFrameRequestFault::ContextWindowLimit,
-                            request_body_bytes,
-                            compacted_base_used,
-                        )
-                        .await);
-                };
-                compacted_base_used = forced_base.is_compacted();
-                match ResponsesFrameRequestState::prepare_with_measurements(
-                    Some(forced_base),
-                    &frame,
-                    &self.encoder,
-                    self.max_responses_serialized_request_body_bytes,
-                    &mut request_body_bytes,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        return Err(self
-                            .reject_frame_preparation(
-                                &frame,
-                                error,
-                                request_body_bytes,
-                                compacted_base_used,
-                            )
-                            .await);
+                if let Some((_, forced_base)) = compacted_base.as_ref() {
+                    let mut compacted_bytes = None;
+                    match ResponsesFrameRequestState::prepare_with_measurements(
+                        Some(forced_base),
+                        &frame,
+                        &self.encoder,
+                        self.max_responses_serialized_request_body_bytes,
+                        &mut compacted_bytes,
+                    ) {
+                        Ok(compacted) => {
+                            compacted_base_used = forced_base.is_compacted();
+                            request_body_bytes = compacted_bytes;
+                            prepared = compacted;
+                        }
+                        Err(ResponsesFrameRequestFault::Encoding(
+                            CodexHttpV1Error::SerializedRequestBodyLimit,
+                        )) => compacted_base = None,
+                        Err(error) => {
+                            return Err(self
+                                .reject_frame_preparation(
+                                    &frame,
+                                    error,
+                                    compacted_bytes,
+                                    true,
+                                )
+                                .await);
+                        }
                     }
                 }
             }
-            Err(error) => {
-                return Err(self
-                    .reject_frame_preparation(
-                        &frame,
-                        error,
-                        request_body_bytes,
-                        compacted_base_used,
-                    )
-                    .await);
-            }
-        };
-        let compaction_request = if compacted_base.is_none()
+            // The estimate is a compaction trigger, never an admission gate.
+            // Missing/failed summaries and high post-compaction estimates leave
+            // the original or compacted request eligible for actual handoff.
+        }
+        let compaction_request = if !is_decision
+            && compacted_base.is_none()
             && self.parallel_compaction_enabled
             && !self.parallel_compaction.has_attempt()
         {
@@ -205,9 +251,13 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         } else {
             None
         };
-        let compaction_transport = compaction_request
-            .as_ref()
-            .map(|_| self.compaction_transport(context_window_tokens));
+        let compaction_transport = compaction_request.as_ref().map(|_| {
+            self.compaction_transport(
+                context_window_tokens,
+                &frame,
+                OpenAiResponsesCallKind::BackgroundCompaction,
+            )
+        });
         if serde_json::from_slice::<Value>(&prepared.request_body).is_err() {
             let fault = port_fault(
                 OpenAiFailureClass::RequestPreparation,
@@ -272,6 +322,12 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         let request_snapshot = request_observer
             .as_ref()
             .map(|_| OpenAiResponsesRequestSnapshot::new(&frame, &prepared.request_body));
+        let mut accounting = CallAccounting::new(
+            &self.call_observer,
+            CallOrigin::from_frame(&frame),
+            OpenAiResponsesCallKind::Foreground,
+            self.encoder.model().id(),
+        );
         let client = self.client.clone();
         let execution_mode = &mut self.execution_mode;
         let target = &mut self.reaction_target;
@@ -310,7 +366,15 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                     return Poll::Ready(Err(SubmitFault::Rejected(declaration_state_lost_fault())));
                 }
             }
+            accounting.start();
             let response = transport.as_mut().poll(cx);
+            match &response {
+                Poll::Ready(Ok(response)) => {
+                    accounting.headers(response.status().as_u16(), response.headers());
+                }
+                Poll::Ready(Err(_)) => accounting.finish(OpenAiResponsesCallOutcome::Failed),
+                Poll::Pending => {}
+            }
             *frame_slot = Some(state);
             target.accept(revision);
             Poll::Ready(Ok::<_, SubmitFault>(response))
@@ -329,6 +393,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             let response = match first_response {
                 Poll::Ready(Ok(response)) => response,
                 Poll::Ready(Err(error)) => {
+                    accounting.finish(OpenAiResponsesCallOutcome::Failed);
                     if observe_transport_failure(&transport_observer, &error, transport_started)
                         .await
                         .is_err()
@@ -344,6 +409,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 Poll::Pending => match transport.await {
                     Ok(response) => response,
                     Err(error) => {
+                        accounting.finish(OpenAiResponsesCallOutcome::Failed);
                         if observe_transport_failure(&transport_observer, &error, transport_started)
                             .await
                             .is_err()
@@ -360,6 +426,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             };
 
             let status = response.status();
+            accounting.headers(status.as_u16(), response.headers());
             stream_capture
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -367,7 +434,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             if !status.is_success() {
                 let possible_cache_miss =
                     cache_continuation && status == reqwest::StatusCode::BAD_REQUEST;
-                if capture_enabled || possible_cache_miss {
+                if capture_enabled || possible_cache_miss || accounting.is_enabled() {
                     capture_error_response(
                         response,
                         &stream_capture,
@@ -375,7 +442,14 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                         max_response_body_bytes,
                     )
                     .await;
+                    accounting.response_body(
+                        &stream_capture
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .body,
+                    );
                 }
+                accounting.finish(OpenAiResponsesCallOutcome::Failed);
                 if possible_cache_miss {
                     let missing = {
                         let captured = stream_capture
@@ -410,7 +484,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                     media_type.trim().eq_ignore_ascii_case("text/event-stream")
                 });
             if !is_event_stream {
-                if capture_enabled {
+                if capture_enabled || accounting.is_enabled() {
                     capture_error_response(
                         response,
                         &stream_capture,
@@ -418,7 +492,14 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                         max_response_body_bytes,
                     )
                     .await;
+                    accounting.response_body(
+                        &stream_capture
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .body,
+                    );
                 }
+                accounting.finish(OpenAiResponsesCallOutcome::Failed);
                 return continuity.fail(port_fault(
                     OpenAiFailureClass::ResponseProtocolRetryable,
                     "successful response did not use text/event-stream",
@@ -427,6 +508,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             if response.content_length().is_some_and(|content_length| {
                 content_length > u64::try_from(max_response_body_bytes).unwrap_or(u64::MAX)
             }) {
+                accounting.finish(OpenAiResponsesCallOutcome::Failed);
                 return continuity.fail(port_fault(
                     OpenAiFailureClass::ResponseBodyLimit,
                     "response Content-Length exceeded the configured limit",
@@ -460,12 +542,14 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 Ok(chunk)
             });
             let Some(frame_state) = frame_slot.as_mut() else {
+                accounting.finish(OpenAiResponsesCallOutcome::Failed);
                 return continuity.fail(port_fault(
                     OpenAiFailureClass::Internal,
                     "native Frame state was unavailable after handoff",
                 ));
             };
             let Some(target) = continuity.transfer() else {
+                accounting.finish(OpenAiResponsesCallOutcome::Failed);
                 return continuity.fail(port_fault(
                     OpenAiFailureClass::Internal,
                     "native target continuity was transferred more than once",
@@ -487,11 +571,17 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 buffered_deltas: BTreeMap::new(),
                 emissions: VecDeque::new(),
                 primary_text: None,
+                decision_batch,
+                decision_output: None,
+                decision_refusals: BTreeSet::new(),
+                decision_text_outputs: BTreeSet::new(),
+                decision_wire_outputs: BTreeMap::new(),
                 output_text_bytes: 0,
                 read_timeout,
                 max_sse_event_bytes,
                 max_output_text_bytes,
                 response_usage_observer,
+                accounting,
             };
             Box::pin(futures::stream::unfold(state, next_native_fact)) as ProviderFactStream<'a>
         };
@@ -650,6 +740,7 @@ impl AsyncOpenAiResponsesProvider {
             tool_outputs: Arc::new(Mutex::new(super::ToolOutputStaging::default())),
             response_usage_observer: self.response_usage_observer.clone(),
             request_observer: self.request_observer.clone(),
+            call_observer: self.call_observer.clone(),
             observer: self.observer.clone(),
             compaction_observer: self.compaction_observer.clone(),
             observation_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -671,7 +762,6 @@ impl AsyncOpenAiResponsesProvider {
     ) -> SubmitFault {
         use OpenAiResponsesRequestPreparationReason as Reason;
         let reason = match &error {
-            ResponsesFrameRequestFault::ContextWindowLimit => Reason::ContextWindowLimit,
             ResponsesFrameRequestFault::MissingContextWindow => Reason::MissingContextWindow,
             ResponsesFrameRequestFault::Encoding(
                 crate::provider::codex_http_v1::CodexHttpV1Error::SerializedRequestBodyLimit,
@@ -733,7 +823,12 @@ impl AsyncOpenAiResponsesProvider {
         SubmitFault::Rejected(fault)
     }
 
-    fn compaction_transport(&self, context_window_tokens: NonZeroU64) -> CompactionTransport {
+    fn compaction_transport(
+        &self,
+        context_window_tokens: NonZeroU64,
+        frame: &Frame,
+        kind: OpenAiResponsesCallKind,
+    ) -> CompactionTransport {
         CompactionTransport {
             client: self.client.clone(),
             config: self.config.clone(),
@@ -743,6 +838,12 @@ impl AsyncOpenAiResponsesProvider {
             read_timeout: self.read_timeout,
             context_window_tokens,
             observer: self.compaction_observer.clone(),
+            accounting: CallAccounting::new(
+                &self.call_observer,
+                CallOrigin::from_frame(frame),
+                kind,
+                self.encoder.model().id(),
+            ),
         }
     }
 
@@ -866,11 +967,17 @@ struct NativeOpenAiStreamState<'a, S> {
     buffered_deltas: BTreeMap<u64, VecDeque<ProviderFact>>,
     emissions: VecDeque<NativeEmission>,
     primary_text: Option<ProviderOutputKey>,
+    decision_batch: Option<DecisionBatchId>,
+    decision_output: Option<ProviderOutputKey>,
+    decision_refusals: BTreeSet<u64>,
+    decision_text_outputs: BTreeSet<u64>,
+    decision_wire_outputs: BTreeMap<u64, Value>,
     output_text_bytes: usize,
     read_timeout: std::time::Duration,
     max_sse_event_bytes: usize,
     max_output_text_bytes: usize,
     response_usage_observer: Option<Arc<ResponseUsageObserver>>,
+    accounting: CallAccounting,
 }
 
 enum ReadyOutput {
@@ -1041,12 +1148,133 @@ fn failed_native_stream<S>(
     NativeOpenAiStreamState<'_, S>,
 )> {
     state.finished = true;
+    state.accounting.finish(OpenAiResponsesCallOutcome::Failed);
     state.target.record_fault(fault);
     state.fault_recorded = true;
     Some((Err(fault), state))
 }
 
 impl<S> NativeOpenAiStreamState<'_, S> {
+    fn bind_decision_content_kind(
+        &mut self,
+        output_index: u64,
+        refusal: bool,
+    ) -> Result<(), ReactionPortFault> {
+        if refusal {
+            if self.decision_text_outputs.contains(&output_index) {
+                return Err(protocol(
+                    "decision output mixed JSON text and model refusal",
+                ));
+            }
+            self.decision_refusals.insert(output_index);
+        } else {
+            if self.decision_refusals.contains(&output_index) {
+                return Err(protocol(
+                    "decision output mixed model refusal and JSON text",
+                ));
+            }
+            self.decision_text_outputs.insert(output_index);
+        }
+        Ok(())
+    }
+
+    /// The shared message ledger validates refusal lifecycles through the same
+    /// single-text-part rules. Raw HTTP receipts and retained wire output keep
+    /// the real refusal representation; only this local validation view changes.
+    fn normalize_decision_refusal(
+        &mut self,
+        frame: &mut OpenAiWireEvent,
+    ) -> Result<(), ReactionPortFault> {
+        match frame.event_type.as_str() {
+            "response.refusal.delta" | "response.refusal.done" => {
+                let output_index = output_index(&frame.payload)?;
+                self.bind_decision_content_kind(output_index, true)?;
+                if frame.event_type == "response.refusal.delta" {
+                    frame.event_type = "response.output_text.delta".to_owned();
+                } else {
+                    let text = frame
+                        .payload
+                        .remove("refusal")
+                        .ok_or_else(|| protocol("refusal.done is missing refusal"))?;
+                    frame.payload.insert("text".to_owned(), text);
+                    frame.event_type = "response.output_text.done".to_owned();
+                }
+            }
+            "response.output_text.delta" | "response.output_text.done" => {
+                self.bind_decision_content_kind(output_index(&frame.payload)?, false)?;
+            }
+            "response.content_part.added" | "response.content_part.done" => {
+                let output_index = output_index(&frame.payload)?;
+                let kind = frame
+                    .payload
+                    .get("part")
+                    .and_then(|part| part.get("type"))
+                    .and_then(Value::as_str);
+                if kind == Some("output_text") {
+                    self.bind_decision_content_kind(output_index, false)?;
+                }
+                if frame
+                    .payload
+                    .get_mut("part")
+                    .is_some_and(normalize_refusal_part)
+                {
+                    self.bind_decision_content_kind(output_index, true)?;
+                }
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                let output_index = output_index(&frame.payload)?;
+                if let Some(item) = frame.payload.get_mut("item") {
+                    let original = item.clone();
+                    let has_text =
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .is_some_and(|content| {
+                                content.iter().any(|part| {
+                                    part.get("type").and_then(Value::as_str) == Some("output_text")
+                                })
+                            });
+                    if has_text {
+                        self.bind_decision_content_kind(output_index, false)?;
+                    }
+                    if normalize_refusal_message(item) {
+                        self.bind_decision_content_kind(output_index, true)?;
+                        if frame.event_type == "response.output_item.done" {
+                            self.decision_wire_outputs.insert(output_index, original);
+                        }
+                    }
+                }
+            }
+            "response.completed" => {
+                if let Some(output) = frame
+                    .payload
+                    .get_mut("response")
+                    .and_then(|response| response.get_mut("output"))
+                    .and_then(Value::as_array_mut)
+                {
+                    for (output_index, item) in output.iter_mut().enumerate() {
+                        let has_text =
+                            item.get("content")
+                                .and_then(Value::as_array)
+                                .is_some_and(|content| {
+                                    content.iter().any(|part| {
+                                        part.get("type").and_then(Value::as_str)
+                                            == Some("output_text")
+                                    })
+                                });
+                        if has_text {
+                            self.bind_decision_content_kind(output_index as u64, false)?;
+                        }
+                        if normalize_refusal_message(item) {
+                            self.bind_decision_content_kind(output_index as u64, true)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn next_emission(&mut self) -> Result<Option<ProviderFact>, ReactionPortFault> {
         while let Some(emission) = self.emissions.pop_front() {
             match emission {
@@ -1080,13 +1308,20 @@ impl<S> NativeOpenAiStreamState<'_, S> {
         Ok(None)
     }
 
-    fn process_wire_event(&mut self, frame: OpenAiWireEvent) -> Result<(), ReactionPortFault> {
+    fn process_wire_event(&mut self, mut frame: OpenAiWireEvent) -> Result<(), ReactionPortFault> {
+        if let Some(response) = frame.payload.get("response").and_then(Value::as_object) {
+            self.accounting.response(response);
+        }
         self.advance_sequence(&frame.payload)?;
         if self.response_completed {
             return Err(port_fault(
                 OpenAiFailureClass::ResponseProtocolViolation,
                 "event followed response.completed",
             ));
+        }
+
+        if self.decision_batch.is_some() {
+            self.normalize_decision_refusal(&mut frame)?;
         }
 
         match frame.event_type.as_str() {
@@ -1140,12 +1375,15 @@ impl<S> NativeOpenAiStreamState<'_, S> {
             "response.output_item.done" => self.record_output_done(&frame.payload)?,
             "response.completed" => self.record_completed(&frame.payload)?,
             "response.incomplete" => {
+                self.accounting
+                    .finish(OpenAiResponsesCallOutcome::Incomplete);
                 return Err(port_fault(
                     OpenAiFailureClass::ResponseIncomplete,
                     "upstream response reached an incomplete terminal state",
                 ));
             }
             "response.failed" | "error" => {
+                self.accounting.finish(OpenAiResponsesCallOutcome::Failed);
                 return Err(upstream_rejected(
                     "upstream response terminated unsuccessfully",
                 ));
@@ -1201,6 +1439,11 @@ impl<S> NativeOpenAiStreamState<'_, S> {
             .record_text_delta(payload, &delta)
             .map_err(protocol_fault)?;
         self.output_text_bytes += delta.len();
+        if self.decision_batch.is_some() {
+            // The complete JSON envelope is a Decision fact; fragments must
+            // not acquire independent canonical TextDelta identities.
+            return Ok(());
+        }
         let output_index = output_index(payload)?;
         let next = self
             .next_output_index
@@ -1245,6 +1488,11 @@ impl<S> NativeOpenAiStreamState<'_, S> {
             return Err(upstream_rejected("unsupported output item"));
         }
         if native_function_call(payload).is_some() {
+            if self.decision_batch.is_some() {
+                return Err(upstream_rejected(
+                    "decision response requested an undeclared tool",
+                ));
+            }
             self.native_tools.added(payload).map_err(protocol_fault)
         } else {
             self.output_ledger
@@ -1261,10 +1509,13 @@ impl<S> NativeOpenAiStreamState<'_, S> {
             return Err(upstream_rejected("unsupported output item"));
         }
         let output_index = output_index(payload)?;
-        let wire_item = payload
+        let mut wire_item = payload
             .get("item")
             .cloned()
             .ok_or_else(|| protocol("output_item.done is missing item"))?;
+        if let Some(original) = self.decision_wire_outputs.remove(&output_index) {
+            wire_item = original;
+        }
         let ready = if native_function_call(payload).is_some() {
             let call = self
                 .native_tools
@@ -1322,6 +1573,33 @@ impl<S> NativeOpenAiStreamState<'_, S> {
                     wire_item,
                 } => {
                     let key = ProviderOutputKey::new(next);
+                    if phase != Some(AssistantPhase::Commentary) {
+                        if let Some(batch_id) = &self.decision_batch {
+                            if self.decision_output.replace(key).is_some() {
+                                return Err(protocol(
+                                    "response produced multiple decision outputs",
+                                ));
+                            }
+                            let decision = if self.decision_refusals.contains(&next) {
+                                ProviderDecision::refused(batch_id.clone(), text)
+                            } else {
+                                ProviderDecision::json_envelope(batch_id.clone(), text)
+                            };
+                            self.emissions.push_back(NativeEmission::Public {
+                                output_index: next,
+                                canonical_item: CanonicalInputItem::DecisionOutput {
+                                    decision: decision.clone(),
+                                },
+                                wire_item,
+                                fact: ProviderFact::Decision {
+                                    output: key,
+                                    decision,
+                                },
+                            });
+                            self.next_output_index = next.checked_add(1);
+                            continue;
+                        }
+                    }
                     if phase != Some(AssistantPhase::Commentary)
                         && self.primary_text.replace(key).is_some()
                     {
@@ -1404,6 +1682,8 @@ impl<S> NativeOpenAiStreamState<'_, S> {
             response.get("expire_at").and_then(Value::as_u64),
         );
         self.response_completed = true;
+        self.accounting
+            .finish(OpenAiResponsesCallOutcome::Completed);
         self.emissions
             .push_back(NativeEmission::Fact(ProviderFact::ReactionCompleted {
                 primary_text: self.primary_text,
@@ -1430,6 +1710,32 @@ fn ready_private(private: SealedOpenAiPrivateOutput) -> Result<ReadyOutput, Reac
         kind,
         wire_item: private.wire_item,
     })
+}
+
+fn normalize_refusal_message(item: &mut Value) -> bool {
+    if item.get("type").and_then(Value::as_str) != Some("message") {
+        return false;
+    }
+    let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut refusal = false;
+    for part in content {
+        refusal |= normalize_refusal_part(part);
+    }
+    refusal
+}
+
+fn normalize_refusal_part(part: &mut Value) -> bool {
+    if part.get("type").and_then(Value::as_str) != Some("refusal") {
+        return false;
+    }
+    let Some(text) = part.get("refusal").and_then(Value::as_str) else {
+        // Preserve invalid data for the ordinary protocol validator.
+        return false;
+    };
+    *part = serde_json::json!({"type": "output_text", "text": text, "annotations": []});
+    true
 }
 
 fn output_index(payload: &Map<String, Value>) -> Result<u64, ReactionPortFault> {
@@ -1493,6 +1799,8 @@ fn upstream_rejected(diagnostic: impl Into<String>) -> ReactionPortFault {
 
 #[cfg(test)]
 mod tests {
+    mod call_accounting;
+    mod main_ephemeral_cache;
     use std::{
         collections::{BTreeMap, VecDeque},
         num::{NonZeroU128, NonZeroU64},
@@ -1500,6 +1808,10 @@ mod tests {
         task::Poll,
     };
 
+    use crate::component::{
+        execution::{Application, ReactionKind, ReactionOutcome},
+        prelude::{component, view, Component, Signal},
+    };
     use crate::provider::async_openai::{
         OpenAiResponsesObservation, OpenAiResponsesObservationError, OpenAiResponsesObserver,
     };
@@ -1544,8 +1856,8 @@ mod tests {
     };
 
     use super::{
-        NativeBodyStreamFault, NativeOpenAiStreamState, OpenAiOutputLedger, ReadyOutput,
-        ResponsesFrameRequestState,
+        CallAccounting, NativeBodyStreamFault, NativeOpenAiStreamState, OpenAiOutputLedger,
+        ReadyOutput, ResponsesFrameRequestState,
     };
     use crate::provider::async_openai::{NativeToolLedger, ResponsesReactionTarget};
 
@@ -1907,6 +2219,340 @@ mod tests {
         sibling.shutdown().await;
         checkpoint.shutdown().await;
         parent.shutdown().await;
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[derive(Clone)]
+    struct ArkApplicationInput {
+        main: String,
+        observation: Option<String>,
+    }
+
+    #[component]
+    fn ark_ephemeral_application(
+        signal: Arc<Mutex<Option<Signal<ArkApplicationInput>>>>,
+    ) -> Component {
+        let input = use_signal(|| ArkApplicationInput {
+            main: "main input".into(),
+            observation: None,
+        });
+        *signal.lock().unwrap() = Some(input.clone());
+        let input = input.with(Clone::clone).unwrap();
+        let observation = input
+            .observation
+            .map(|text| {
+                view! {
+                    #[developer(ephemeral, repeat)]
+                    { text }
+                }
+            })
+            .unwrap_or_else(|| view! {});
+        view! {
+            #[system_once]
+            { "retained application policy" }
+            #[user]
+            { input.main }
+            { observation }
+        }
+    }
+
+    fn ark_application_text_sse(response_id: &str, text: &str) -> String {
+        let completed = json!({
+            "id":"application_message", "type":"message", "status":"completed",
+            "role":"assistant", "content":[{"type":"output_text", "text":text}]
+        });
+        encode_sse([
+            json!({"type":"response.created", "response":{"id":response_id}}),
+            json!({"type":"response.output_item.added", "output_index":0,
+                "item":{"id":"application_message", "type":"message", "status":"in_progress", "role":"assistant", "content":[]}}),
+            json!({"type":"response.output_text.delta", "output_index":0, "content_index":0,
+                "item_id":"application_message", "delta":text}),
+            json!({"type":"response.output_text.done", "output_index":0, "content_index":0,
+                "item_id":"application_message", "text":text}),
+            json!({"type":"response.output_item.done", "output_index":0, "item":completed.clone()}),
+            json!({"type":"response.completed", "response":{"id":response_id, "status":"completed", "output":[completed]}}),
+        ])
+    }
+
+    #[tokio::test]
+    async fn application_local_ark_checkpoint_supports_siblings_continuation_and_reset() {
+        let (base, requests, shutdown, server) = spawn_ark_response_sequence_server(
+            [
+                ("main_1", "first main reply"),
+                ("scratch_1", "first scratch reply"),
+                ("scratch_2", "sibling scratch reply"),
+                ("main_2", "second main reply"),
+                ("scratch_continued", "continued scratch reply"),
+                ("new_checkpoint", "new checkpoint scratch reply"),
+                ("reset_main", "reset main reply"),
+                ("reset_scratch", "reset scratch reply"),
+            ]
+            .map(|(id, text)| {
+                (
+                    StatusCode::OK,
+                    "text/event-stream",
+                    ark_application_text_sse(id, text),
+                )
+            })
+            .into(),
+        )
+        .await;
+        let signal = Arc::new(Mutex::new(None));
+        let root_signal = signal.clone();
+        let mut application = Application::mount(
+            move || ark_ephemeral_application(root_signal.clone()),
+            ark_provider(&base),
+        )
+        .unwrap();
+        assert!(application.prepare().await.unwrap().is_continue());
+        let input = signal.lock().unwrap().clone().unwrap();
+        input
+            .update(|input| {
+                input.observation = Some("initial speech\ninitial judgment".into());
+            })
+            .unwrap();
+        application.react(false).unwrap().await.unwrap();
+
+        input
+            .update(|input| input.observation = Some("current first judgment".into()))
+            .unwrap();
+        let first = application.react(true).unwrap();
+        assert_eq!(first.kind(), ReactionKind::Temporary);
+        assert_eq!(first.clone().await.unwrap(), ReactionOutcome::Completed);
+        input
+            .update(|input| input.observation = Some("current sibling judgment".into()))
+            .unwrap();
+        let sibling = application.react(true).unwrap();
+        assert_eq!(sibling.kind(), ReactionKind::Temporary);
+        sibling.await.unwrap();
+
+        input
+            .set(ArkApplicationInput {
+                main: "advanced main input".into(),
+                observation: Some("advanced main chronology".into()),
+            })
+            .unwrap();
+        application.react(false).unwrap().await.unwrap();
+        input.update(|input| input.observation = None).unwrap();
+        first.react().unwrap().await.unwrap();
+        application.react(true).unwrap().await.unwrap();
+        drop(first);
+
+        application.reset_model_context().unwrap();
+        input
+            .set(ArkApplicationInput {
+                main: "reset main input".into(),
+                observation: Some("reset speech one\nreset speech two\nreset judgment".into()),
+            })
+            .unwrap();
+        application.react(false).unwrap().await.unwrap();
+        input
+            .update(|input| input.observation = Some("current reset judgment".into()))
+            .unwrap();
+        application.react(true).unwrap().await.unwrap();
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 8, "every Temporary must reach transport");
+            let wire_input = |index: usize| requests[index]["input"].as_array().unwrap();
+            let assistant_texts = |index: usize| -> Vec<&str> {
+                wire_input(index)
+                    .iter()
+                    .filter(|item| item["role"] == "assistant")
+                    .flat_map(|item| item["content"].as_array().unwrap())
+                    .map(|part| part["text"].as_str().unwrap())
+                    .collect()
+            };
+            for request in requests.iter() {
+                assert_eq!(request["store"], false);
+                assert!(request.get("caching").is_none());
+                assert!(request.get("previous_response_id").is_none());
+            }
+            assert_eq!(wire_input(0).len(), 2);
+            for index in [1, 2] {
+                assert_eq!(wire_input(index).len(), 3);
+                assert_eq!(assistant_texts(index), ["first main reply"]);
+                assert!(!wire_input(index).contains(&wire_input(0)[1]));
+            }
+            assert_eq!(assistant_texts(3), ["first main reply"]);
+            assert_eq!(
+                assistant_texts(4),
+                ["first main reply", "first scratch reply"]
+            );
+            assert_eq!(
+                assistant_texts(5),
+                ["first main reply", "second main reply"]
+            );
+            for index in [4, 5] {
+                assert!(wire_input(index)
+                    .iter()
+                    .all(|item| item["role"] != "developer"));
+                for previous in [0, 1, 2, 3] {
+                    assert!(!wire_input(index).contains(wire_input(previous).last().unwrap()));
+                }
+            }
+            assert_eq!(wire_input(6).len(), 2);
+            assert!(assistant_texts(6).is_empty());
+            assert_eq!(assistant_texts(7), ["reset main reply"]);
+            assert!(!wire_input(7).contains(wire_input(6).last().unwrap()));
+        }
+        application.shutdown().await.unwrap();
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn application_temporary_over_estimates_preserve_the_main_stored_parent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (base, requests, shutdown, server) = spawn_ark_response_sequence_server(
+            [
+                ("stored_main", "main reply"),
+                ("scratch_1", "temporary output 1"),
+                ("scratch_2", "temporary output 2"),
+                ("scratch_3", "temporary output 3"),
+                ("continued_main", "main continuation reply"),
+            ]
+            .map(|(id, text)| {
+                (
+                    StatusCode::OK,
+                    "text/event-stream",
+                    ark_application_text_sse(id, text),
+                )
+            })
+            .into(),
+        )
+        .await;
+        let policy_calls = Arc::new(AtomicUsize::new(0));
+        let observed = policy_calls.clone();
+        let mut provider = ark_provider(&base)
+            .with_parallel_compaction(move |_: &super::CompactionContext| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                false
+            })
+            .with_forced_compaction();
+        provider.reaction_target.profile.constraints.context_window =
+            crate::component::execution::ContextWindow::Tokens(NonZeroU64::new(1024).unwrap());
+        let signal = Arc::new(Mutex::new(None));
+        let root_signal = signal.clone();
+        let mut application = Application::mount(
+            move || ark_ephemeral_application(root_signal.clone()),
+            provider,
+        )
+        .unwrap();
+        assert_eq!(
+            application.react(false).unwrap().await.unwrap(),
+            ReactionOutcome::Completed
+        );
+        let input = signal.lock().unwrap().clone().unwrap();
+        for candidate in 1..=3 {
+            input
+                .update(|input| {
+                    input.observation = Some(format!("ASR candidate {candidate}: {}", "历史记录中保留中文、引号\"和换行\n".repeat(1024)));
+                })
+                .unwrap();
+            let reaction = application.react(true).unwrap();
+            assert_eq!(reaction.kind(), ReactionKind::Temporary);
+            assert_eq!(reaction.await.unwrap(), ReactionOutcome::Completed);
+        }
+        assert_eq!(policy_calls.load(Ordering::Relaxed), 0);
+        input
+            .set(ArkApplicationInput {
+                main: "main continuation".into(),
+                observation: None,
+            })
+            .unwrap();
+        let main = application.react(false).unwrap();
+        assert_eq!(main.kind(), ReactionKind::Main);
+        assert_eq!(main.await.unwrap(), ReactionOutcome::Completed);
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 5);
+            assert_eq!(requests[0]["store"], true);
+            for request in &requests[1..4] {
+                assert!(serde_json::to_vec(request).unwrap().len().div_ceil(4) > 1024);
+                assert_eq!(request["store"], false);
+                assert_eq!(request["previous_response_id"], "stored_main");
+                assert!(request.get("caching").is_none());
+                let input = request["input"].as_array().unwrap();
+                assert_eq!(
+                    input.len(),
+                    1,
+                    "siblings must not inherit prior scratch output"
+                );
+                assert_eq!(input[0]["role"], "developer");
+            }
+            let continued = &requests[4];
+            assert_eq!(continued["store"], true);
+            assert_eq!(continued["previous_response_id"], "stored_main");
+            let input = continued["input"].as_array().unwrap();
+            assert_eq!(
+                input.len(),
+                1,
+                "temporary output must not enter main history"
+            );
+            assert_eq!(input[0]["role"], "user");
+        }
+        application.shutdown().await.unwrap();
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn application_failed_idle_ephemeral_request_preserves_the_main_stored_parent() {
+        let (base, requests, shutdown, server) = spawn_ark_response_sequence_server(vec![
+            (
+                StatusCode::OK,
+                "text/event-stream",
+                ark_application_text_sse("stored_main", "main reply"),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                json!({"error":{"code":"InvalidParameter", "message":"fixture rejection"}})
+                    .to_string(),
+            ),
+            (
+                StatusCode::OK,
+                "text/event-stream",
+                ark_application_text_sse("continued_main", "main continuation reply"),
+            ),
+        ])
+        .await;
+        let signal = Arc::new(Mutex::new(None));
+        let root_signal = signal.clone();
+        let mut application = Application::mount(
+            move || ark_ephemeral_application(root_signal.clone()),
+            ark_provider(&base),
+        )
+        .unwrap();
+        application.react(false).unwrap().await.unwrap();
+        let input = signal.lock().unwrap().clone().unwrap();
+        input
+            .update(|input| input.observation = Some("ASR candidate".into()))
+            .unwrap();
+        let temporary = application.react(true).unwrap();
+        assert_eq!(temporary.kind(), ReactionKind::Temporary);
+        assert!(temporary.await.is_err());
+        input
+            .set(ArkApplicationInput {
+                main: "main continuation".into(),
+                observation: None,
+            })
+            .unwrap();
+        let main = application.react(false).unwrap();
+        assert_eq!(main.kind(), ReactionKind::Main);
+        assert_eq!(main.await.unwrap(), ReactionOutcome::Completed);
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(requests[1]["store"], false);
+            assert_eq!(requests[1]["previous_response_id"], "stored_main");
+            assert_eq!(requests[2]["store"], true);
+            assert_eq!(requests[2]["previous_response_id"], "stored_main");
+            assert_eq!(requests[2]["input"].as_array().unwrap().len(), 1);
+            assert_eq!(requests[2]["input"][0]["role"], "user");
+        }
+        application.shutdown().await.unwrap();
         shutdown.send(()).unwrap();
         server.await.unwrap();
     }
@@ -4477,6 +5123,126 @@ mod tests {
         server.await.unwrap();
     }
 
+    fn summary_only_reasoning_and_text_events() -> Vec<serde_json::Value> {
+        let reasoning = json!({
+            "id":"rs_summary", "type":"reasoning", "status":"completed",
+            "summary":[{"type":"summary_text", "text":"private-summary-sentinel"}]
+        });
+        let message = json!({
+            "id":"msg_after_summary", "type":"message", "status":"completed", "role":"assistant",
+            "content":[{"type":"output_text", "text":"public answer", "annotations":[]}]
+        });
+        vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":{"id":"rs_summary","type":"reasoning","status":"in_progress","summary":[]}}),
+            json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_summary","output_index":0,"summary_index":0,"delta":"private-summary-sentinel"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":reasoning.clone()}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"id":"msg_after_summary","type":"message","status":"in_progress","role":"assistant","content":[]}}),
+            json!({"type":"response.output_text.delta","item_id":"msg_after_summary","output_index":1,"content_index":0,"delta":"public answer"}),
+            json!({"type":"response.output_text.done","item_id":"msg_after_summary","output_index":1,"content_index":0,"text":"public answer"}),
+            json!({"type":"response.output_item.done","output_index":1,"item":message.clone()}),
+            json!({"type":"response.completed","response":{"id":"resp_summary","status":"completed","output":[reasoning,message]}}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn summary_only_reasoning_remains_private_and_replays_before_public_text() {
+        let events = summary_only_reasoning_and_text_events();
+        let expected_reasoning = events[2]["item"].clone();
+        let (base, shutdown, server) =
+            spawn_sse_sequence_server(vec![encode_sse(events), completed_text_sse()]).await;
+        let audit = Arc::new(Audit::default());
+        let mut provider = provider(&base, None).with_observer(audit.clone());
+        let initial = ReactionPort::declare(&mut provider).unwrap();
+        let first: Vec<_> = ReactionPort::submit(&mut provider, full_frame(&initial))
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let first: Vec<_> = first.into_iter().map(Result::unwrap).collect();
+        assert_eq!(
+            first,
+            vec![
+                ProviderFact::TextDelta {
+                    output: ProviderOutputKey::new(1),
+                    phase: None,
+                    delta: "public answer".to_owned(),
+                },
+                ProviderFact::TextSealed {
+                    output: ProviderOutputKey::new(1),
+                    phase: None,
+                    text: "public answer".to_owned(),
+                },
+                ProviderFact::ReactionCompleted {
+                    primary_text: Some(ProviderOutputKey::new(1))
+                },
+            ]
+        );
+
+        let accepted = ReactionPort::declare(&mut provider).unwrap();
+        let next = full_frame_with_replay(
+            &accepted,
+            2,
+            vec![crate::transcript::CanonicalInputItem::assistant_text(
+                "public answer",
+                None,
+            )],
+        );
+        let second: Vec<_> = ReactionPort::submit(&mut provider, next)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(second.iter().all(Result::is_ok));
+        assert!(matches!(
+            second.last(),
+            Some(Ok(ProviderFact::ReactionCompleted { .. }))
+        ));
+        let requests: Vec<serde_json::Value> = audit
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                OpenAiResponsesObservation::Request { body, .. } => {
+                    Some(serde_json::from_slice(body).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 2);
+        let input = requests[1]["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0], expected_reasoning);
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["content"][0]["text"], "public answer");
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn summary_only_reasoning_rejects_terminal_body_drift_without_leaking_summary() {
+        let mut events = summary_only_reasoning_and_text_events();
+        events[7]["response"]["output"][0]["summary"][0]["text"] =
+            json!("changed-private-summary-sentinel");
+        let (base, shutdown, server) = spawn_sse_server(encode_sse(events)).await;
+        let mut provider = provider(&base, None);
+        let initial = ReactionPort::declare(&mut provider).unwrap();
+        let facts: Vec<_> = ReactionPort::submit(&mut provider, full_frame(&initial))
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let fault = facts.iter().find_map(|fact| fact.as_ref().err()).unwrap();
+        assert_eq!(fault.code(), ReactionPortFaultCode::Protocol);
+        assert_eq!(fault.reason(), ReactionPortFaultReason::ResponseProtocol);
+        assert!(!facts
+            .iter()
+            .any(|fact| matches!(fact, Ok(ProviderFact::ReactionCompleted { .. }))));
+        assert!(!format!("{facts:?}").contains("summary-sentinel"));
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn plaintext_reasoning_content_parts_require_a_matching_completed_lifecycle() {
         let mut complete = plaintext_reasoning_and_tool_events();
@@ -4653,11 +5419,17 @@ mod tests {
             buffered_deltas: BTreeMap::new(),
             emissions: VecDeque::new(),
             primary_text: None,
+            decision_batch: None,
+            decision_output: None,
+            decision_refusals: std::collections::BTreeSet::new(),
+            decision_text_outputs: std::collections::BTreeSet::new(),
+            decision_wire_outputs: BTreeMap::new(),
             output_text_bytes: 0,
             read_timeout: std::time::Duration::from_secs(1),
             max_sse_event_bytes: 1024 * 1024,
             max_output_text_bytes: 1024 * 1024,
             response_usage_observer: None,
+            accounting: CallAccounting::default(),
         };
 
         for value in [

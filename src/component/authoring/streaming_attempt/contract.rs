@@ -601,6 +601,7 @@ where
         start: StreamingToolAttemptStart,
         envelope: XmlEnvelope,
         ignore_unknown_elements: bool,
+        ignored_elements: Vec<&'static str>,
         state: State,
         elements: Vec<Box<dyn ErasedElement<C, State>>>,
         finish_reducer: FinalReducer<C, State>,
@@ -617,6 +618,7 @@ where
             .collect();
         let mut parser_contract = ParserContract::strict(parser_elements);
         parser_contract.allow_implicit_text_eof = envelope.allows_unclosed_text_at_eof();
+        parser_contract.ignored_known_elements = ignored_elements.into_iter().collect();
         if ignore_unknown_elements {
             parser_contract.unknown_top_level = UnknownTopLevel::IgnoreSubtree;
         }
@@ -971,7 +973,7 @@ where
                         self.invalidate_occurrence(occurrence).await?;
                     }
                     ElementCompleteDispatch::Invariant(fault) => {
-                        return Err(self.element_fault(fault))
+                        return Err(self.element_fault(fault));
                     }
                 }
             }
@@ -1400,6 +1402,7 @@ where
 pub(super) fn validate_elements<C, State>(
     identity: &'static str,
     elements: &[Box<dyn ErasedElement<C, State>>],
+    ignored_elements: &[&'static str],
 ) -> Result<Document, StreamingToolDeclarationFault>
 where
     C: StreamingToolChannels,
@@ -1412,6 +1415,18 @@ where
         });
     }
     let mut names = HashSet::new();
+    // Both lists belong to this declaration. Reject an overlap before a reaction
+    // starts so an executable action cannot be silently discarded by its parser.
+    for &name in ignored_elements {
+        if !is_xml_name(name) {
+            return Err(StreamingToolDeclarationFault::InvalidElementName {
+                contract: identity,
+                element: name,
+                detail: "expected an unqualified ASCII XML name".to_owned(),
+            });
+        }
+        names.insert(name);
+    }
     let mut children = BlockChildren::new();
     for element in elements {
         element.validate_declaration(identity)?;
@@ -1558,6 +1573,7 @@ mod tests {
             ),
             XmlEnvelope::strict_fragment(),
             ignore_unknown_elements,
+            Vec::new(),
             state,
             vec![text_element(observed)],
             Box::new(|_, _| StreamingToolDecision::Accept(StreamingToolUpdate::none())),
@@ -1741,6 +1757,7 @@ mod tests {
             ),
             XmlEnvelope::strict_fragment(),
             false,
+            Vec::new(),
             state,
             vec![sequence_element()],
             Box::new(|capture, summary| {
@@ -1812,12 +1829,104 @@ mod tests {
         assert!(contract.accepted());
     }
 
+    #[tokio::test]
+    async fn ignored_element_is_not_advertised_and_leaves_other_unknown_feedback_intact() {
+        use crate::{
+            component::authoring::{
+                declaration::ComponentNode, streaming_attempt::builder::XmlStreamingAttemptBuilder,
+            },
+            pom::{ContentNode, ContentRef},
+        };
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::clone(&observed);
+        let component = XmlStreamingAttemptBuilder::<TestChannels>::new("ignored-xml")
+            .ignore_element("cue")
+            .state_with(move |_| Ok::<_, Infallible>(Arc::clone(&state)))
+            .element(
+                XmlToolElement::text("say").decode(
+                    |_| Ok::<_, XmlDecodeViolation>(()),
+                    |_, text| Ok::<_, XmlDecodeViolation>(text.to_owned()),
+                ),
+                |handlers| {
+                    handlers.on_complete(|state, complete| {
+                        state.lock().unwrap().push(complete.value);
+                        StreamingToolUpdate::none()
+                    })
+                },
+            )
+            .finish(|_, summary| {
+                assert_eq!(summary.diagnostics.len(), 1);
+                assert!(matches!(
+                    &summary.diagnostics[0].diagnostic,
+                    StreamingToolDiagnostic::Contract(violation)
+                        if violation.kind() == XmlContractViolationKind::UnknownElement
+                ));
+                assert!(matches!(
+                    &summary.diagnostics[0].origin,
+                    StreamingToolDiagnosticOrigin::Parser { span: Some(span), .. }
+                        if span.slice(summary.raw_output) == Some("<typo/>")
+                ));
+                StreamingToolDecision::Accept(StreamingToolUpdate::none())
+            })
+            .without_live()
+            .without_publication()
+            .build();
+        let ComponentNode::StreamingAttempt(declaration) = component.node else {
+            panic!("expected a managed XML contract");
+        };
+        let document = declaration.validate_and_prompt().unwrap();
+        let names = document
+            .children()
+            .iter()
+            .filter_map(|child| match child {
+                ContentRef::Node(ContentNode::Xml(node)) => Some(node.name().as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["say"]);
+        assert_eq!(declaration.element_names(), ["say"]);
+        let mut contract = declaration
+            .start(StreamingToolAttemptStart::new(
+                StreamingToolAttemptId::new(1),
+                "ignored-xml",
+                "v1",
+                crate::component::provenance::EventScope::application(
+                    crate::component::ApplicationId::fresh(),
+                ),
+            ))
+            .unwrap();
+        let xml = concat!(
+            "<cue words=\"ok\"/><cu",
+            "e><say>hidden</say>&not_an_entity;</cue>",
+            "<typo/><say>visible</say>",
+        );
+        for chunk in xml.as_bytes().chunks(1) {
+            contract
+                .push(std::str::from_utf8(chunk).unwrap())
+                .await
+                .unwrap();
+        }
+        contract.seal(xml).await.unwrap();
+        contract.finish().await.unwrap();
+        assert_eq!(*observed.lock().unwrap(), ["visible"]);
+        assert!(contract.accepted());
+    }
+
     #[test]
     fn duplicate_element_names_are_rejected_inside_one_contract_only() {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let elements = vec![text_element(Arc::clone(&observed)), text_element(observed)];
 
-        let error = validate_elements("test", &elements).unwrap_err();
+        let overlap = validate_elements("test", &elements[..1], &["say"]).unwrap_err();
+        assert!(matches!(
+            overlap,
+            StreamingToolDeclarationFault::DuplicateElement {
+                contract: "test",
+                element: "say",
+            }
+        ));
+        let error = validate_elements("test", &elements, &[]).unwrap_err();
         assert!(matches!(
             error,
             StreamingToolDeclarationFault::DuplicateElement {

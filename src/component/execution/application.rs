@@ -59,7 +59,10 @@ mod fork_to;
 
 #[path = "application_parallel.rs"]
 mod parallel;
-pub use parallel::{Application as ParallelApplication, Reaction, ReactionOutcome, ReactionWait};
+pub use parallel::{
+    Application as ParallelApplication, DefinitionUpdate, DefinitionUpdateError,
+    DefinitionUpdateErrorKind, DefinitionVersion, Reaction, ReactionOutcome, ReactionWait,
+};
 
 fn render_root(root: RootFactory, events: EventInput<ProviderEvent>) -> Component {
     root(events)
@@ -69,6 +72,7 @@ const APPLICATION_READY: u8 = 0;
 const APPLICATION_TERMINATED_AFTER_TASK_PANIC: u8 = 2;
 const APPLICATION_TERMINATED_AFTER_CONTEXT_RESET: u8 = 3;
 const APPLICATION_TERMINATED_AFTER_FORK_PANIC: u8 = 4;
+const APPLICATION_TERMINATED_AFTER_DEFINITION_UPDATE: u8 = 5;
 const MAX_PREPARATION_WAVES: usize = 16;
 
 fn consume_supervised_task_panic(application_state: &Arc<AtomicU8>, monitor: &TaskPanicMonitor) {
@@ -376,6 +380,14 @@ impl ProjectionSnapshot<'_> {
     /// See [`RenderedProjection::render_prompt`] for the exported content.
     pub fn render_prompt(&self) -> Result<String, super::PromptExportError> {
         self.projection.render_prompt()
+    }
+
+    /// Export this snapshot's prompt and Component source map without preparing
+    /// or reconciling dirty state. See [`RenderedProjection::render_prompt_with_sources`].
+    pub fn render_prompt_with_sources(
+        &self,
+    ) -> Result<super::RenderedPrompt, super::PromptExportError> {
+        self.projection.render_prompt_with_sources()
     }
 }
 
@@ -1720,11 +1732,13 @@ async fn pump_provider_facts(
     defer_completion: bool,
 ) -> Result<(), ApplicationFault> {
     let budget = session.full_reserve_budget();
+    let decision = session.decision().cloned();
     let admission = ReactionAdmissionGuard::with_budget(
         &mut session.canonical_history.transcript,
         &mut session.target_delivery.tool_outputs,
         budget,
-    )?;
+    )?
+    .with_decision(decision);
     let mut recovery = ReactionCancellationRecovery::new(admission, cancellation);
     let mut facts = Some(facts);
     let mut lanes = FuturesUnordered::<ToolLane>::new();
@@ -1769,7 +1783,8 @@ async fn pump_provider_facts(
                             output, ordinal, ..
                         } => (Some(*output), Some(*ordinal)),
                         super::reaction::ProviderFact::TextDelta { output, .. }
-                        | super::reaction::ProviderFact::TextSealed { output, .. } => {
+                        | super::reaction::ProviderFact::TextSealed { output, .. }
+                        | super::reaction::ProviderFact::Decision { output, .. } => {
                             (Some(*output), None)
                         }
                         super::reaction::ProviderFact::ReactionCompleted { primary_text } => {
@@ -1992,6 +2007,9 @@ pub enum ApplicationFaultStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApplicationFaultReason {
+    InvalidDecisionDeclaration(super::DecisionDeclarationError),
+    UnsupportedCapabilities { missing: super::FrameRequirements },
+    DecisionActionConflict,
     Port(ReactionPortFaultReason),
     InvalidDeclaration,
     InvalidFrameProfile,
@@ -2151,6 +2169,30 @@ impl ApplicationFault {
 
     fn from_session(stage: ApplicationFaultStage, fault: FrameSessionFault) -> Self {
         let (code, reason) = match fault {
+            FrameSessionFault::InvalidDecisionDeclaration { reason } => {
+                return Self {
+                    stage,
+                    kind: ApplicationFaultKind::Retryable,
+                    code: ApplicationFaultCode::Rejected,
+                    reason: ApplicationFaultReason::InvalidDecisionDeclaration(reason),
+                }
+            }
+            FrameSessionFault::UnsupportedCapabilities { missing } => {
+                return Self {
+                    stage,
+                    kind: ApplicationFaultKind::Retryable,
+                    code: ApplicationFaultCode::Rejected,
+                    reason: ApplicationFaultReason::UnsupportedCapabilities { missing },
+                }
+            }
+            FrameSessionFault::DecisionActionConflict => {
+                return Self {
+                    stage,
+                    kind: ApplicationFaultKind::Retryable,
+                    code: ApplicationFaultCode::Rejected,
+                    reason: ApplicationFaultReason::DecisionActionConflict,
+                }
+            }
             FrameSessionFault::ForkNotReady => return Self::fork_not_ready(),
             FrameSessionFault::ForkSnapshotIncompatible => (
                 ApplicationFaultCode::Rejected,
@@ -2330,6 +2372,7 @@ impl ApplicationFault {
                 ApplicationFaultReason::BindingLifecycle
             }
             ComponentAttemptFault::InvalidListenerToken { .. }
+            | ComponentAttemptFault::Definition { .. }
             | ComponentAttemptFault::ForeignEventInput { .. }
             | ComponentAttemptFault::EventSelectorCollision { .. }
             | ComponentAttemptFault::SystemAttemptLocal { .. }
@@ -2754,7 +2797,12 @@ mod tests {
         continuity_rejections: usize,
     ) -> (ScriptedPort, Arc<ScriptProbe>) {
         let probe = Arc::new(ScriptProbe::default());
-        let profile = FrameProfile::new(valid_profile().constraints, FrameCapabilities::new(true));
+        let profile = FrameProfile::new(
+            valid_profile().constraints,
+            FrameCapabilities::new(true)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
+        );
         (
             ScriptedPort {
                 declaration: target_declaration(profile),

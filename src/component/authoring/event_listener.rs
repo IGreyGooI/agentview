@@ -85,6 +85,7 @@ where
             }),
             mount: None,
             task_context: None,
+            requires_text_deltas: false,
         }))
     }
 }
@@ -96,6 +97,7 @@ pub(crate) struct EventListenerDeclaration {
     handler: Box<dyn ErasedEventHandler>,
     mount: Option<HookMount>,
     task_context: Option<ComponentTaskContext>,
+    requires_text_deltas: bool,
 }
 
 impl EventListenerDeclaration {
@@ -113,6 +115,7 @@ impl EventListenerDeclaration {
         Error: fmt::Display + Send + 'static,
     {
         let mut handler = handler;
+        let requires_text_deltas = selector.route_id() == ProviderEvent::TEXT_DELTA.route_id();
         let route = EventInput::<ProviderEvent>::from_origin(origin)
             .select(selector)
             .route_descriptor();
@@ -125,7 +128,12 @@ impl EventListenerDeclaration {
             }),
             mount: Some(mount),
             task_context,
+            requires_text_deltas,
         }
+    }
+
+    pub(crate) fn requires_text_deltas(&self) -> bool {
+        self.requires_text_deltas
     }
 
     pub(crate) fn identity(&self) -> &'static str {

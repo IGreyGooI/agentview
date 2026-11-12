@@ -42,7 +42,7 @@ async fn handoff(
     capture: &DebugPromptCapture,
 ) -> anyhow::Result<DebugFrameSnapshot> {
     // Observation releases the command barrier without adding another result.
-    let (reacted, observed) = tokio::join!(app.react()?, sender.observe());
+    let (reacted, observed) = tokio::join!(app.react(false)?, sender.observe());
     ensure!(reacted?.is_continue(), "application exited before handoff");
     observed?;
     capture

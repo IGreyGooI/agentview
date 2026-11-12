@@ -256,6 +256,9 @@ where
 {
     let prepared = components.render()?;
     let (projection, preparations, bindings) = prepared.into_execution_parts();
+    if projection.decision().is_some() {
+        return Err(ApplicationHostFault::DecisionsUnsupported);
+    }
     if projection.nodes().iter().any(|node| {
         node.items()
             .iter()
@@ -342,6 +345,7 @@ where
             ordinal: event_ordinal,
         });
         match event {
+            ProviderEvent::Decision(_) => return Err(ApplicationHostFault::DecisionsUnsupported),
             ProviderEvent::Text(event) => {
                 if matches!(event, crate::llm_call::TextTurnEvent::TextDelta(_)) {
                     lifecycle.observe(EngineObservation::PartialCommitted);
@@ -458,6 +462,10 @@ where
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ApplicationHostFault {
+    #[error(
+        "decisions require Application<P> with ReactionPort and are unsupported by ApplicationHost"
+    )]
+    DecisionsUnsupported,
     #[error("ephemeral prompts require Application<P> with ReactionPort and are unsupported by ApplicationHost")]
     EphemeralPromptsUnsupported,
     #[error("CLI commands and command waits require Application<P> and are unsupported by ApplicationHost")]

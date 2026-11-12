@@ -129,7 +129,9 @@ impl CapturingPort {
                 context_window: ContextWindow::NotApplicable,
                 reserved_output_tokens: None,
             },
-            FrameCapabilities::new(true),
+            FrameCapabilities::new(true)
+                .with_native_tool_calls(true)
+                .with_text_delta_output(true),
         );
         (
             Self {
@@ -237,7 +239,7 @@ fn assert_ephemeral_not_retained(frames: &[CapturedFrame]) {
 async fn react(application: &mut Application<CapturingPort>) {
     assert_eq!(
         application
-            .react()
+            .react(false)
             .unwrap()
             .await
             .expect("reaction succeeds"),
@@ -567,7 +569,7 @@ async fn preparation_and_pre_handoff_cancellation_do_not_consume_ephemeral_or_or
     props.signal().set("B".to_owned()).expect("set B");
 
     let notified = capture.pre_handoff_started.notified();
-    let cancelled_control = application.react().unwrap();
+    let cancelled_control = application.react(false).unwrap();
     let mut cancelled = Box::pin(std::future::IntoFuture::into_future(
         cancelled_control.clone(),
     ));

@@ -108,7 +108,8 @@ async fn public_text_and_empty_completion_are_ordered_stale_fenced_and_consuming
     wait_for_task_start(&task_started).await;
 
     let first_ingress = {
-        let first_reaction = std::future::IntoFuture::into_future(application.react().unwrap());
+        let first_reaction =
+            std::future::IntoFuture::into_future(application.react(false).unwrap());
         tokio::pin!(first_reaction);
         let first = tokio::select! {
             observation = control.next_observation() => observation.unwrap(),
@@ -133,7 +134,8 @@ async fn public_text_and_empty_completion_are_ordered_stale_fenced_and_consuming
     };
 
     let second_ingress = {
-        let second_reaction = std::future::IntoFuture::into_future(application.react().unwrap());
+        let second_reaction =
+            std::future::IntoFuture::into_future(application.react(false).unwrap());
         tokio::pin!(second_reaction);
         let second = tokio::select! {
             observation = control.next_observation() => observation.unwrap(),
@@ -165,7 +167,8 @@ async fn public_text_and_empty_completion_are_ordered_stale_fenced_and_consuming
     };
 
     {
-        let third_reaction = std::future::IntoFuture::into_future(application.react().unwrap());
+        let third_reaction =
+            std::future::IntoFuture::into_future(application.react(false).unwrap());
         tokio::pin!(third_reaction);
         let third = tokio::select! {
             observation = control.next_observation() => observation.unwrap(),

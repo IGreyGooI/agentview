@@ -99,7 +99,8 @@ impl ProjectionDiffState {
             .collect();
         let submission =
             RenderedProjection::with_native_tools(nodes, complete.native_tools().to_vec())
-                .expect("lowering a validated projection preserves node identities");
+                .expect("lowering a validated projection preserves node identities")
+                .with_runtime_metadata_from(complete);
         let submission = match complete.execution_scope() {
             Some(scope) => submission.with_execution_scope(scope),
             None => submission,
@@ -421,7 +422,8 @@ fn reconcile_projection_submission(
         .filter_map(|(output, claimed)| (!claimed).then_some(output))
         .collect();
     let submission = RenderedProjection::with_native_tools(nodes, complete.native_tools().to_vec())
-        .expect("reconciling a validated projection preserves its identities");
+        .expect("reconciling a validated projection preserves its identities")
+        .with_runtime_metadata_from(complete);
     let submission = match complete.execution_scope() {
         Some(scope) => submission.with_execution_scope(scope),
         None => submission,
@@ -841,6 +843,8 @@ fn replace_item_pom(item: &CanonicalInputItem, pom: ResolvedDocument) -> Canonic
         CanonicalInputItem::AssistantText { .. }
         | CanonicalInputItem::ToolCall { .. }
         | CanonicalInputItem::ToolResult { .. }
+        | CanonicalInputItem::DecisionRequest { .. }
+        | CanonicalInputItem::DecisionOutput { .. }
         | CanonicalInputItem::ProviderExtension(_) => item.clone(),
     }
 }

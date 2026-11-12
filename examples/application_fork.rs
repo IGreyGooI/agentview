@@ -212,7 +212,7 @@ async fn scenario(base: &str, audit: &fixture::Fixture) -> anyhow::Result<()> {
     let mut parent = Application::mount(move || planning(props.clone()), provider)?;
     let mut child = None;
     let operation = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        ensure!(parent.react()?.await?.is_continue()); // the common assistant output is now settled history
+        ensure!(parent.react(false)?.await?.is_continue()); // the common assistant output is now settled history
         let snapshot = exported.lock().unwrap().clone(); // owned values, no parent Signal handles
         let worker_export = Arc::new(Mutex::new(snapshot.clone()));
         let worker_props = Props {
@@ -231,7 +231,7 @@ async fn scenario(base: &str, audit: &fixture::Fixture) -> anyhow::Result<()> {
                         .wait_for(|report| report.progress == Progress::Running)
                         .await?,
                 );
-                ensure!(parent.react()?.await?.is_continue()); // progress reaches the parent model while child work is Pending
+                ensure!(parent.react(false)?.await?.is_continue()); // progress reaches the parent model while child work is Pending
                 ensure!(exported.lock().unwrap().report.progress == Progress::Running);
                 println!(
                     "Parent observed: comparison running while the child reaction is Pending."
@@ -242,13 +242,13 @@ async fn scenario(base: &str, audit: &fixture::Fixture) -> anyhow::Result<()> {
                         .wait_for(|report| report.progress == Progress::Completed)
                         .await?,
                 );
-                ensure!(parent.react()?.await?.is_continue()); // observe the completed report, then accept its displayed cost
-                ensure!(parent.react()?.await?.is_continue()); // deliver the actual acceptance result and updated view
+                ensure!(parent.react(false)?.await?.is_continue()); // observe the completed report, then accept its displayed cost
+                ensure!(parent.react(false)?.await?.is_continue()); // deliver the actual acceptance result and updated view
                 Ok::<_, anyhow::Error>(())
             },
             async {
-                ensure!(worker.react()?.await?.is_continue());
-                ensure!(worker.react()?.await?.is_continue()); // deliver compare_plans output and completed worker state
+                ensure!(worker.react(false)?.await?.is_continue());
+                ensure!(worker.react(false)?.await?.is_continue()); // deliver compare_plans output and completed worker state
                 Ok::<_, anyhow::Error>(())
             },
         );

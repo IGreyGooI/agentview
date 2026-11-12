@@ -200,6 +200,22 @@ fn render_item(
             let _ = writeln!(output, "call_id: {call_id}\n");
             append_content(output, "content", content);
         }
+        CanonicalInputItem::DecisionRequest { declaration } => {
+            let _ = writeln!(output, "### Item {index}: decision_request\n");
+            let _ = writeln!(output, "batch_id: {}\n", declaration.batch_id());
+            append_content(
+                output,
+                "questions",
+                &serde_json::to_string_pretty(declaration.questions())?,
+            );
+        }
+        CanonicalInputItem::DecisionOutput { decision } => {
+            let _ = writeln!(output, "### Item {index}: decision_output\n");
+            let _ = writeln!(output, "batch_id: {}\n", decision.batch_id());
+            let raw =
+                serde_json::to_string_pretty(decision).context("serialize decision output")?;
+            append_content(output, "decision", &raw);
+        }
         CanonicalInputItem::ProviderExtension(_) => {
             let _ = writeln!(output, "### Item {index}: provider_extension\n");
             let raw = serde_json::to_string_pretty(item)

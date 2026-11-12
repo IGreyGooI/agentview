@@ -62,7 +62,7 @@ async fn multiline_prompt_strings_reach_the_provider_request_unchanged() -> anyh
     let mut application = Application::mount(raw_prompt_application, provider)?;
 
     for _ in 0..2 {
-        assert!(application.react().unwrap().await?.is_continue());
+        assert!(application.react(false).unwrap().await?.is_continue());
         let bytes = tokio::time::timeout(Duration::from_secs(5), server.next_request()).await??;
         let body: Value = serde_json::from_slice(&bytes)?;
         assert_eq!(body["instructions"].as_str(), Some(SYSTEM));

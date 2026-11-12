@@ -10,6 +10,7 @@ use crate::transcript::CanonicalTranscript;
 pub mod async_openai;
 pub mod codex_http_v1;
 mod model;
+pub mod system1;
 
 pub use model::{ModelSpec, ModelSpecError};
 
