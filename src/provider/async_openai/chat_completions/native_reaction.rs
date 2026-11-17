@@ -93,6 +93,7 @@ impl ReactionPort for AsyncOpenAiChatCompletionsProvider {
         let frame_slot = &mut self.reaction_frame;
         let revision = frame.revision();
         let read_timeout = self.read_timeout;
+        let sse_event_timeout = self.sse_event_timeout;
         let max_response_body_bytes = self.max_response_body_bytes;
         let max_sse_event_bytes = self.max_sse_event_bytes;
         let max_output_text_bytes = self.max_output_text_bytes;
@@ -249,7 +250,7 @@ impl ReactionPort for AsyncOpenAiChatCompletionsProvider {
                 terminal_published: false,
                 fault_recorded: false,
                 finished: false,
-                read_timeout,
+                sse_event_timeout,
                 max_sse_event_bytes,
                 max_output_text_bytes,
                 capture: stream_capture,
@@ -401,7 +402,7 @@ struct NativeChatStreamState<'a, S> {
     terminal_published: bool,
     fault_recorded: bool,
     finished: bool,
-    read_timeout: std::time::Duration,
+    sse_event_timeout: Option<std::time::Duration>,
     max_sse_event_bytes: usize,
     max_output_text_bytes: usize,
     capture: ResponseCapture,
@@ -434,7 +435,12 @@ where
     }
 
     loop {
-        let event = match tokio::time::timeout(state.read_timeout, state.stream.next()).await {
+        let event = match super::super::transport::next_sse_event(
+            state.stream.next(),
+            state.sse_event_timeout,
+        )
+        .await
+        {
             Err(_) => {
                 return failed_native_chat_stream(
                     state,

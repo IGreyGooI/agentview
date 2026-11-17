@@ -387,6 +387,12 @@ names never fill in a default capacity. Use the actual capacity of your deployme
 reasoning and request output limits remain request options.
 Transport configuration is independent of the model and cannot override its window.
 The window is local metadata and is not sent in the HTTP body.
+The default transport retains its 300-second total request deadline.
+`with_timeouts(connect, request, read)` sets an explicit total deadline.
+For generation bounded only by connection establishment and network inactivity, use
+`with_stream_timeouts(connect, read)` instead. It removes the total deadline;
+incoming bytes, including partial SSE events and heartbeat comments, reset the idle
+read budget even when no complete model event is available yet.
 Requests and background compaction use that same declared window for their byte/4
 token estimates. See [compaction configuration](docs/parallel-compaction-design.md).
 All compaction is local: AgentView manages history replacement, and summaries use

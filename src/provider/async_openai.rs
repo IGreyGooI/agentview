@@ -156,7 +156,7 @@ pub struct AsyncOpenAiTransportConfig {
     bypass_environment_proxy: bool,
     ip_family: OpenAiIpFamily,
     connect_timeout: Duration,
-    request_timeout: Duration,
+    request_timeout: Option<Duration>,
     read_timeout: Duration,
     max_response_body_bytes: usize,
     max_sse_event_bytes: usize,
@@ -233,7 +233,7 @@ impl AsyncOpenAiTransportConfig {
             bypass_environment_proxy,
             ip_family: OpenAiIpFamily::default(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
             read_timeout: DEFAULT_READ_TIMEOUT,
             max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
             max_sse_event_bytes: DEFAULT_MAX_SSE_EVENT_BYTES,
@@ -271,12 +271,39 @@ impl AsyncOpenAiTransportConfig {
         request_timeout: Duration,
         read_timeout: Duration,
     ) -> Result<Self, AsyncOpenAiConfigError> {
+        // Callers supply these budgets before transport initialization. Reject
+        // only the invalid configuration: a zero budget would immediately end
+        // every request/read instead of letting an accepted reaction proceed.
         validate_timeout("connect_timeout", connect_timeout)?;
         validate_timeout("request_timeout", request_timeout)?;
         validate_timeout("read_timeout", read_timeout)?;
         Ok(Self {
             connect_timeout,
-            request_timeout,
+            request_timeout: Some(request_timeout),
+            read_timeout,
+            ..self
+        })
+    }
+
+    /// Uses connection and idle-read deadlines without a total request deadline.
+    ///
+    /// Each successful network read resets the idle budget. A reply can keep
+    /// streaming for as long as data arrives within that budget; its length
+    /// alone does not cause a timeout. This also removes any total deadline
+    /// previously supplied through [`Self::with_timeouts`].
+    pub fn with_stream_timeouts(
+        self,
+        connect_timeout: Duration,
+        read_timeout: Duration,
+    ) -> Result<Self, AsyncOpenAiConfigError> {
+        // Callers own these deployment budgets before transport initialization.
+        // Zero would fail every connection/read immediately, so reject only this
+        // invalid configuration instead of interrupting an accepted reaction.
+        validate_timeout("connect_timeout", connect_timeout)?;
+        validate_timeout("read_timeout", read_timeout)?;
+        Ok(Self {
+            connect_timeout,
+            request_timeout: None,
             read_timeout,
             ..self
         })
@@ -470,6 +497,7 @@ pub struct AsyncOpenAiResponsesProvider {
     identity: ProviderIdentity,
     encoder: CodexHttpV1Encoder,
     read_timeout: Duration,
+    sse_event_timeout: Option<Duration>,
     max_response_body_bytes: usize,
     max_sse_event_bytes: usize,
     max_output_text_bytes: usize,
@@ -718,6 +746,7 @@ impl AsyncOpenAiResponsesProvider {
             identity,
             encoder,
             read_timeout: initialized.read_timeout,
+            sse_event_timeout: initialized.sse_event_timeout,
             max_response_body_bytes: initialized.max_response_body_bytes,
             max_sse_event_bytes: initialized.max_sse_event_bytes,
             max_output_text_bytes: initialized.max_output_text_bytes,
@@ -760,6 +789,7 @@ impl AsyncOpenAiResponsesProvider {
             identity: self.identity.clone(),
             encoder: self.encoder.clone(),
             read_timeout: self.read_timeout,
+            sse_event_timeout: self.sse_event_timeout,
             max_response_body_bytes: self.max_response_body_bytes,
             max_sse_event_bytes: self.max_sse_event_bytes,
             max_output_text_bytes: self.max_output_text_bytes,
@@ -996,7 +1026,7 @@ impl AsyncOpenAiResponsesProvider {
         let continuation_slot = &mut self.continuation;
         let artifact_binding_slot = &mut self.artifact_binding;
         let encoder = self.encoder.clone();
-        let read_timeout = self.read_timeout;
+        let sse_event_timeout = self.sse_event_timeout;
         let max_response_body_bytes = self.max_response_body_bytes;
         let max_sse_event_bytes = self.max_sse_event_bytes;
         let max_output_text_bytes = self.max_output_text_bytes;
@@ -1120,7 +1150,7 @@ impl AsyncOpenAiResponsesProvider {
                 native_tools: NativeToolLedger::default(),
                 output_text_bytes: 0,
                 encoder,
-                read_timeout,
+                sse_event_timeout,
                 max_sse_event_bytes,
                 max_output_text_bytes,
                 max_serialized_request_body_bytes,
@@ -1133,65 +1163,69 @@ impl AsyncOpenAiResponsesProvider {
                 }
 
                 loop {
-                    let event =
-                        match tokio::time::timeout(state.read_timeout, state.stream.next()).await {
-                            Err(_) => {
-                                state.finished = true;
-                                return Some((
-                                    Err(ProviderFault::retryable_transport(
-                                        "OpenAI streaming response read timed out",
-                                    )
-                                    .with_code(ProviderFaultCode::StreamTimeout)),
-                                    state,
-                                ));
+                    let event = match transport::next_sse_event(
+                        state.stream.next(),
+                        state.sse_event_timeout,
+                    )
+                    .await
+                    {
+                        Err(_) => {
+                            state.finished = true;
+                            return Some((
+                                Err(ProviderFault::retryable_transport(
+                                    "OpenAI streaming response read timed out",
+                                )
+                                .with_code(ProviderFaultCode::StreamTimeout)),
+                                state,
+                            ));
+                        }
+                        Ok(Some(Err(EventStreamError::Transport(
+                            OpenAiBodyStreamFault::ClassifiedTransport(code),
+                        )))) => {
+                            state.finished = true;
+                            return Some((
+                                Err(stream_transport_fault(OpenAiApi::Responses, code)),
+                                state,
+                            ));
+                        }
+                        Ok(Some(Err(EventStreamError::Transport(
+                            OpenAiBodyStreamFault::BodyLimit,
+                        )))) => {
+                            state.finished = true;
+                            return Some((
+                                Err(response_body_limit_fault(OpenAiApi::Responses)),
+                                state,
+                            ));
+                        }
+                        Ok(Some(Err(EventStreamError::Transport(
+                            OpenAiBodyStreamFault::EventLimit,
+                        )))) => {
+                            state.finished = true;
+                            return Some((
+                                Err(stream_event_limit_fault(OpenAiApi::Responses)),
+                                state,
+                            ));
+                        }
+                        Ok(Some(Ok(event))) => event,
+                        Ok(None) => {
+                            if state.terminal_published {
+                                return None;
                             }
-                            Ok(Some(Err(EventStreamError::Transport(
-                                OpenAiBodyStreamFault::ClassifiedTransport(code),
-                            )))) => {
-                                state.finished = true;
-                                return Some((
-                                    Err(stream_transport_fault(OpenAiApi::Responses, code)),
-                                    state,
-                                ));
-                            }
-                            Ok(Some(Err(EventStreamError::Transport(
-                                OpenAiBodyStreamFault::BodyLimit,
-                            )))) => {
-                                state.finished = true;
-                                return Some((
-                                    Err(response_body_limit_fault(OpenAiApi::Responses)),
-                                    state,
-                                ));
-                            }
-                            Ok(Some(Err(EventStreamError::Transport(
-                                OpenAiBodyStreamFault::EventLimit,
-                            )))) => {
-                                state.finished = true;
-                                return Some((
-                                    Err(stream_event_limit_fault(OpenAiApi::Responses)),
-                                    state,
-                                ));
-                            }
-                            Ok(Some(Ok(event))) => event,
-                            Ok(None) => {
-                                if state.terminal_published {
-                                    return None;
-                                }
-                                let result = finish_openai_stream(&mut state);
-                                state.finished = true;
-                                return Some((result, state));
-                            }
-                            Ok(Some(Err(_))) => {
-                                state.finished = true;
-                                return Some((
-                                    Err(ProviderFault::retryable_transport(
-                                        "OpenAI API returned an invalid streaming response",
-                                    )
-                                    .with_code(ProviderFaultCode::StreamDecode)),
-                                    state,
-                                ));
-                            }
-                        };
+                            let result = finish_openai_stream(&mut state);
+                            state.finished = true;
+                            return Some((result, state));
+                        }
+                        Ok(Some(Err(_))) => {
+                            state.finished = true;
+                            return Some((
+                                Err(ProviderFault::retryable_transport(
+                                    "OpenAI API returned an invalid streaming response",
+                                )
+                                .with_code(ProviderFaultCode::StreamDecode)),
+                                state,
+                            ));
+                        }
+                    };
                     if sse_event_size(&event)
                         .is_none_or(|event_size| event_size > state.max_sse_event_bytes)
                     {
@@ -1833,7 +1867,7 @@ struct OpenAiStreamState<'a, S> {
     native_tools: NativeToolLedger,
     output_text_bytes: usize,
     encoder: CodexHttpV1Encoder,
-    read_timeout: Duration,
+    sse_event_timeout: Option<Duration>,
     max_sse_event_bytes: usize,
     max_output_text_bytes: usize,
     max_serialized_request_body_bytes: usize,
@@ -2341,7 +2375,7 @@ mod terminal_precedence_tests {
             native_tools: NativeToolLedger::default(),
             output_text_bytes: 0,
             encoder: CodexHttpV1Encoder::new(options),
-            read_timeout: Duration::from_secs(1),
+            sse_event_timeout: Some(Duration::from_secs(1)),
             max_sse_event_bytes: 1024,
             max_output_text_bytes: 8,
             max_serialized_request_body_bytes: 1024,

@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     net::{IpAddr, Ipv4Addr},
     time::Duration,
 };
@@ -11,6 +12,7 @@ pub(super) struct InitializedOpenAiTransport {
     pub(super) client: reqwest::Client,
     pub(super) config: OpenAIConfig,
     pub(super) read_timeout: Duration,
+    pub(super) sse_event_timeout: Option<Duration>,
     pub(super) max_response_body_bytes: usize,
     pub(super) max_sse_event_bytes: usize,
     pub(super) max_output_text_bytes: usize,
@@ -22,6 +24,10 @@ pub(super) fn initialize(
     config: AsyncOpenAiTransportConfig,
 ) -> Result<InitializedOpenAiTransport, AsyncOpenAiConfigError> {
     let client = finish_client_build(client_builder(&config))?;
+    // Existing callers retain their complete-event wait bound. Stream-only
+    // callers need raw byte activity (including fragments/heartbeats) to reset
+    // the idle deadline, which reqwest already enforces below the SSE parser.
+    let sse_event_timeout = config.request_timeout.map(|_| config.read_timeout);
     let AsyncOpenAiTransportConfig {
         api_base,
         api_key,
@@ -48,6 +54,7 @@ pub(super) fn initialize(
         client,
         config,
         read_timeout,
+        sse_event_timeout,
         max_response_body_bytes,
         max_sse_event_bytes,
         max_output_text_bytes,
@@ -56,13 +63,29 @@ pub(super) fn initialize(
     })
 }
 
+pub(super) async fn next_sse_event<F: Future>(
+    event: F,
+    timeout: Option<Duration>,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, event).await,
+        None => Ok(event.await),
+    }
+}
+
 fn client_builder(config: &AsyncOpenAiTransportConfig) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(config.connect_timeout)
-        .timeout(config.request_timeout)
         .read_timeout(config.read_timeout);
+    // A continuously arriving reply may outlive the idle-read budget. Only
+    // callers that requested a cumulative deadline should have that reply cut
+    // off by reqwest's total timer; stream-only callers retain connect/idle bounds.
+    let builder = match config.request_timeout {
+        Some(timeout) => builder.timeout(timeout),
+        None => builder,
+    };
     let builder = match config.ip_family {
         OpenAiIpFamily::Auto => builder,
         OpenAiIpFamily::Ipv4 => builder.local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
@@ -85,13 +108,14 @@ fn finish_client_build(
 #[cfg(test)]
 mod tests {
     use std::{
+        convert::Infallible,
         error::Error,
         io::ErrorKind,
         net::{Ipv4Addr, Ipv6Addr},
         time::Duration,
     };
 
-    use axum::{routing::get, Router};
+    use axum::{body::Body, http::header, response::Response, routing::get, Router};
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use crate::provider::async_openai::{
@@ -133,6 +157,145 @@ mod tests {
                 .await
                 .expect("serve loopback HTTP responses");
         }))
+    }
+
+    fn serve_sse_loopback(
+        listener: TcpListener,
+        interval: Duration,
+        count: usize,
+    ) -> LoopbackServer {
+        LoopbackServer(tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                get(move || async move {
+                    let chunks = futures::stream::unfold(0, move |index| async move {
+                        if index == count {
+                            return None;
+                        }
+                        if index > 0 {
+                            tokio::time::sleep(interval).await;
+                        }
+                        Some((
+                            Ok::<_, Infallible>(format!("data: chunk-{index}\n\n")),
+                            index + 1,
+                        ))
+                    });
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(chunks))
+                        .unwrap()
+                }),
+            );
+            axum::serve(listener, app)
+                .await
+                .expect("serve loopback SSE responses");
+        }))
+    }
+
+    #[tokio::test]
+    async fn finite_request_deadline_still_stops_a_continuously_arriving_body() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = serve_sse_loopback(listener, Duration::from_millis(100), 8);
+        let config = AsyncOpenAiTransportConfig::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_stream_timeouts(Duration::from_secs(1), Duration::from_millis(400))
+            .unwrap()
+            .with_timeouts(
+                Duration::from_secs(1),
+                Duration::from_millis(300),
+                Duration::from_millis(400),
+            )
+            .unwrap();
+        let mut response = initialize(config)
+            .unwrap()
+            .client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        let first = response.chunk().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("chunk-0"));
+        let error = loop {
+            match response.chunk().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("finite request deadline did not stop the long response"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            error.is_timeout(),
+            "expected total request timeout: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_deadlines_allow_progress_past_an_earlier_total_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = serve_sse_loopback(listener, Duration::from_millis(100), 8);
+        let config = AsyncOpenAiTransportConfig::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_timeouts(
+                Duration::from_secs(1),
+                Duration::from_millis(300),
+                Duration::from_millis(400),
+            )
+            .unwrap()
+            .with_stream_timeouts(Duration::from_secs(1), Duration::from_millis(400))
+            .unwrap();
+        let response = initialize(config)
+            .unwrap()
+            .client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        let body = response.text().await.unwrap();
+        let expected = (0..8)
+            .map(|index| format!("data: chunk-{index}\n\n"))
+            .collect::<String>();
+        assert_eq!(body, expected);
+    }
+
+    #[tokio::test]
+    async fn stream_deadlines_still_stop_an_idle_body_without_a_total_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = serve_sse_loopback(listener, Duration::from_millis(600), 2);
+        let config = AsyncOpenAiTransportConfig::new(format!("http://{addr}"), "test-key")
+            .unwrap()
+            .with_stream_timeouts(Duration::from_secs(1), Duration::from_millis(150))
+            .unwrap();
+        let mut response = initialize(config)
+            .unwrap()
+            .client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&response.chunk().await.unwrap().unwrap()).contains("chunk-0")
+        );
+        let error = response.chunk().await.unwrap_err();
+        assert!(error.is_timeout(), "expected idle read timeout: {error}");
+    }
+
+    #[test]
+    fn stream_deadlines_reject_zero_connection_or_read_budgets() {
+        for (connect, read, expected_name) in [
+            (Duration::ZERO, Duration::from_secs(1), "connect_timeout"),
+            (Duration::from_secs(1), Duration::ZERO, "read_timeout"),
+        ] {
+            let error = match AsyncOpenAiTransportConfig::new("http://localhost", "test-key")
+                .unwrap()
+                .with_stream_timeouts(connect, read)
+            {
+                Ok(_) => panic!("zero {expected_name} unexpectedly accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(expected_name));
+        }
     }
 
     fn loopback_config(port: u16) -> AsyncOpenAiTransportConfig {

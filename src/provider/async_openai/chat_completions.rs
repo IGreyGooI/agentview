@@ -151,6 +151,7 @@ pub(super) struct AsyncOpenAiChatCompletionsProvider {
     identity: ProviderIdentity,
     options: OpenAiChatCompletionsOptions,
     read_timeout: Duration,
+    sse_event_timeout: Option<Duration>,
     max_response_body_bytes: usize,
     max_sse_event_bytes: usize,
     max_output_text_bytes: usize,
@@ -197,6 +198,7 @@ impl AsyncOpenAiChatCompletionsProvider {
             identity,
             options,
             read_timeout: initialized.read_timeout,
+            sse_event_timeout: initialized.sse_event_timeout,
             max_response_body_bytes: initialized.max_response_body_bytes,
             max_sse_event_bytes: initialized.max_sse_event_bytes,
             max_output_text_bytes: initialized.max_output_text_bytes,
@@ -273,7 +275,7 @@ impl AsyncOpenAiChatCompletionsProvider {
         let history_slot = &mut self.history;
         let diff_memo_slot = &mut self.diff_memo;
         let execution_mode = &mut self.execution_mode;
-        let read_timeout = self.read_timeout;
+        let sse_event_timeout = self.sse_event_timeout;
         let max_response_body_bytes = self.max_response_body_bytes;
         let max_sse_event_bytes = self.max_sse_event_bytes;
         let max_output_text_bytes = self.max_output_text_bytes;
@@ -374,7 +376,7 @@ impl AsyncOpenAiChatCompletionsProvider {
                 response_model: None,
                 finish_seen: false,
                 finished: false,
-                read_timeout,
+                sse_event_timeout,
                 max_sse_event_bytes,
                 max_output_text_bytes,
             };
@@ -384,59 +386,63 @@ impl AsyncOpenAiChatCompletionsProvider {
                 }
 
                 loop {
-                    let event =
-                        match tokio::time::timeout(state.read_timeout, state.stream.next()).await {
-                            Err(_) => {
-                                state.finished = true;
-                                return Some((
-                                    Err(ProviderFault::retryable_transport(
-                                        "Chat Completions streaming response read timed out",
-                                    )
-                                    .with_code(ProviderFaultCode::StreamTimeout)),
-                                    state,
-                                ));
-                            }
-                            Ok(Some(Err(EventStreamError::Transport(
-                                OpenAiBodyStreamFault::ClassifiedTransport(code),
-                            )))) => {
-                                state.finished = true;
-                                return Some((
-                                    Err(stream_transport_fault(OpenAiApi::ChatCompletions, code)),
-                                    state,
-                                ));
-                            }
-                            Ok(Some(Err(EventStreamError::Transport(
-                                OpenAiBodyStreamFault::BodyLimit,
-                            )))) => {
-                                state.finished = true;
-                                return Some((
-                                    Err(response_body_limit_fault(OpenAiApi::ChatCompletions)),
-                                    state,
-                                ));
-                            }
-                            Ok(Some(Err(EventStreamError::Transport(
-                                OpenAiBodyStreamFault::EventLimit,
-                            )))) => {
-                                state.finished = true;
-                                return Some((
-                                    Err(stream_event_limit_fault(OpenAiApi::ChatCompletions)),
-                                    state,
-                                ));
-                            }
-                            Ok(Some(Ok(event))) => event,
-                            Ok(None) => {
-                                state.finished = true;
-                                return Some((
-                                    Err(ProviderFault::retryable_transport(
-                                        "Chat Completions stream ended before [DONE]",
-                                    )
-                                    .with_code(ProviderFaultCode::ResponseProtocol)),
-                                    state,
-                                ));
-                            }
-                            Ok(Some(Err(_))) => {
-                                state.finished = true;
-                                return Some((
+                    let event = match super::transport::next_sse_event(
+                        state.stream.next(),
+                        state.sse_event_timeout,
+                    )
+                    .await
+                    {
+                        Err(_) => {
+                            state.finished = true;
+                            return Some((
+                                Err(ProviderFault::retryable_transport(
+                                    "Chat Completions streaming response read timed out",
+                                )
+                                .with_code(ProviderFaultCode::StreamTimeout)),
+                                state,
+                            ));
+                        }
+                        Ok(Some(Err(EventStreamError::Transport(
+                            OpenAiBodyStreamFault::ClassifiedTransport(code),
+                        )))) => {
+                            state.finished = true;
+                            return Some((
+                                Err(stream_transport_fault(OpenAiApi::ChatCompletions, code)),
+                                state,
+                            ));
+                        }
+                        Ok(Some(Err(EventStreamError::Transport(
+                            OpenAiBodyStreamFault::BodyLimit,
+                        )))) => {
+                            state.finished = true;
+                            return Some((
+                                Err(response_body_limit_fault(OpenAiApi::ChatCompletions)),
+                                state,
+                            ));
+                        }
+                        Ok(Some(Err(EventStreamError::Transport(
+                            OpenAiBodyStreamFault::EventLimit,
+                        )))) => {
+                            state.finished = true;
+                            return Some((
+                                Err(stream_event_limit_fault(OpenAiApi::ChatCompletions)),
+                                state,
+                            ));
+                        }
+                        Ok(Some(Ok(event))) => event,
+                        Ok(None) => {
+                            state.finished = true;
+                            return Some((
+                                Err(ProviderFault::retryable_transport(
+                                    "Chat Completions stream ended before [DONE]",
+                                )
+                                .with_code(ProviderFaultCode::ResponseProtocol)),
+                                state,
+                            ));
+                        }
+                        Ok(Some(Err(_))) => {
+                            state.finished = true;
+                            return Some((
                                 Err(ProviderFault::retryable_transport(
                                     "Chat Completions API returned an invalid streaming response",
                                 )
@@ -716,7 +722,7 @@ struct ChatStreamState<'a, S> {
     response_model: Option<String>,
     finish_seen: bool,
     finished: bool,
-    read_timeout: Duration,
+    sse_event_timeout: Option<Duration>,
     max_sse_event_bytes: usize,
     max_output_text_bytes: usize,
 }

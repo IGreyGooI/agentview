@@ -1023,6 +1023,11 @@ require_parameters)?)` 提供 typed OpenRouter `provider` 设置，默认省略�
 preference order 保留完整 endpoint slug（包括 `/us` 等 variant suffix）。这些设置随前台、continuation
 和后台/forced 摘要请求发送，并计入完整 HTTP body 的字节计量与上下文估算。
 `AsyncOpenAiTransportConfig::new(api_base, api_key)` 只接收连接参数，transport 不持有或覆盖窗口。
+默认 transport 保留 300 秒的请求总时限；`with_timeouts(connect, request, read)` 可显式设置总时限。
+`with_stream_timeouts(connect, read)` 清除请求总时限，仅限制连接建立和连续无网络数据的时间。
+每次收到原始响应字节都会重置 idle-read 计时；SSE 未完整的事件片段和 heartbeat 注释也计入活动，
+不能因等待完整 SSE 事件而截断持续收到数据的生成。该策略同时用于 Responses 和 Chat Completions，
+并随 fresh session 和 provider fork 保留；已有默认配置和 `with_timeouts` 的行为保持兼容。
 provider 从 encoder 的 `ModelSpec` 派生稳定的 FrameProfile，用于 compaction 指标；窗口 metadata
 不提供 tokenizer 计量，也不把字节估算变成 hard limit。
 只有 ID 编码为 HTTP body 的 `model` 字段，窗口是本地 metadata。

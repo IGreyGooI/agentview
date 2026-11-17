@@ -334,6 +334,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
         let frame_slot = &mut self.reaction_frame;
         let revision = frame.revision();
         let read_timeout = self.read_timeout;
+        let sse_event_timeout = self.sse_event_timeout;
         let max_response_body_bytes = self.max_response_body_bytes;
         let max_sse_event_bytes = self.max_sse_event_bytes;
         let max_output_text_bytes = self.max_output_text_bytes;
@@ -577,7 +578,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 decision_text_outputs: BTreeSet::new(),
                 decision_wire_outputs: BTreeMap::new(),
                 output_text_bytes: 0,
-                read_timeout,
+                sse_event_timeout,
                 max_sse_event_bytes,
                 max_output_text_bytes,
                 response_usage_observer,
@@ -727,6 +728,7 @@ impl AsyncOpenAiResponsesProvider {
             identity: self.identity.clone(),
             encoder: self.encoder.clone(),
             read_timeout: self.read_timeout,
+            sse_event_timeout: self.sse_event_timeout,
             max_response_body_bytes: self.max_response_body_bytes,
             max_sse_event_bytes: self.max_sse_event_bytes,
             max_output_text_bytes: self.max_output_text_bytes,
@@ -973,7 +975,7 @@ struct NativeOpenAiStreamState<'a, S> {
     decision_text_outputs: BTreeSet<u64>,
     decision_wire_outputs: BTreeMap<u64, Value>,
     output_text_bytes: usize,
-    read_timeout: std::time::Duration,
+    sse_event_timeout: Option<std::time::Duration>,
     max_sse_event_bytes: usize,
     max_output_text_bytes: usize,
     response_usage_observer: Option<Arc<ResponseUsageObserver>>,
@@ -1032,62 +1034,65 @@ where
             return None;
         }
 
-        let event = match tokio::time::timeout(state.read_timeout, state.stream.next()).await {
-            Err(_) => {
-                return failed_native_stream(
-                    state,
-                    port_fault(OpenAiFailureClass::StreamTimeout, "stream read timed out"),
-                );
-            }
-            Ok(Some(Err(EventStreamError::Transport(NativeBodyStreamFault::Transport(
-                diagnostic,
-            ))))) => {
-                return failed_native_stream(
-                    state,
-                    port_fault(OpenAiFailureClass::StreamTransport, diagnostic),
-                );
-            }
-            Ok(Some(Err(EventStreamError::Transport(NativeBodyStreamFault::BodyLimit)))) => {
-                return failed_native_stream(
-                    state,
-                    port_fault(
-                        OpenAiFailureClass::ResponseBodyLimit,
-                        "stream body limit exceeded",
-                    ),
-                );
-            }
-            Ok(Some(Err(EventStreamError::Transport(NativeBodyStreamFault::EventLimit)))) => {
-                return failed_native_stream(
-                    state,
-                    port_fault(
-                        OpenAiFailureClass::StreamEventLimit,
-                        "SSE event wire limit exceeded",
-                    ),
-                );
-            }
-            Ok(Some(Err(error))) => {
-                return failed_native_stream(
-                    state,
-                    port_fault(
-                        OpenAiFailureClass::ResponseProtocolRetryable,
-                        format!("SSE decode failed: {error:?}"),
-                    ),
-                );
-            }
-            Ok(Some(Ok(event))) => event,
-            Ok(None) => {
-                if state.terminal_published {
-                    return None;
+        let event =
+            match super::transport::next_sse_event(state.stream.next(), state.sse_event_timeout)
+                .await
+            {
+                Err(_) => {
+                    return failed_native_stream(
+                        state,
+                        port_fault(OpenAiFailureClass::StreamTimeout, "stream read timed out"),
+                    );
                 }
-                return failed_native_stream(
-                    state,
-                    port_fault(
-                        OpenAiFailureClass::ResponseProtocolRetryable,
-                        "stream ended before a validated terminal fact",
-                    ),
-                );
-            }
-        };
+                Ok(Some(Err(EventStreamError::Transport(NativeBodyStreamFault::Transport(
+                    diagnostic,
+                ))))) => {
+                    return failed_native_stream(
+                        state,
+                        port_fault(OpenAiFailureClass::StreamTransport, diagnostic),
+                    );
+                }
+                Ok(Some(Err(EventStreamError::Transport(NativeBodyStreamFault::BodyLimit)))) => {
+                    return failed_native_stream(
+                        state,
+                        port_fault(
+                            OpenAiFailureClass::ResponseBodyLimit,
+                            "stream body limit exceeded",
+                        ),
+                    );
+                }
+                Ok(Some(Err(EventStreamError::Transport(NativeBodyStreamFault::EventLimit)))) => {
+                    return failed_native_stream(
+                        state,
+                        port_fault(
+                            OpenAiFailureClass::StreamEventLimit,
+                            "SSE event wire limit exceeded",
+                        ),
+                    );
+                }
+                Ok(Some(Err(error))) => {
+                    return failed_native_stream(
+                        state,
+                        port_fault(
+                            OpenAiFailureClass::ResponseProtocolRetryable,
+                            format!("SSE decode failed: {error:?}"),
+                        ),
+                    );
+                }
+                Ok(Some(Ok(event))) => event,
+                Ok(None) => {
+                    if state.terminal_published {
+                        return None;
+                    }
+                    return failed_native_stream(
+                        state,
+                        port_fault(
+                            OpenAiFailureClass::ResponseProtocolRetryable,
+                            "stream ended before a validated terminal fact",
+                        ),
+                    );
+                }
+            };
 
         if sse_event_size(&event).is_none_or(|event_size| event_size > state.max_sse_event_bytes) {
             return failed_native_stream(
@@ -1801,6 +1806,7 @@ fn upstream_rejected(diagnostic: impl Into<String>) -> ReactionPortFault {
 mod tests {
     mod call_accounting;
     mod main_ephemeral_cache;
+    mod stream_timeouts;
     use std::{
         collections::{BTreeMap, VecDeque},
         num::{NonZeroU128, NonZeroU64},
@@ -5425,7 +5431,7 @@ mod tests {
             decision_text_outputs: std::collections::BTreeSet::new(),
             decision_wire_outputs: BTreeMap::new(),
             output_text_bytes: 0,
-            read_timeout: std::time::Duration::from_secs(1),
+            sse_event_timeout: Some(std::time::Duration::from_secs(1)),
             max_sse_event_bytes: 1024 * 1024,
             max_output_text_bytes: 1024 * 1024,
             response_usage_observer: None,
