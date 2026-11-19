@@ -11,6 +11,9 @@ use std::{
 
 use serde_json::{Map, Value};
 
+use super::stream_observation::{
+    OpenAiResponsesStreamEventKind, StreamDiagnostics, StreamObserver,
+};
 use crate::component::execution::reaction::{Frame, FrameBasis, FrameRevision, TargetIdentity};
 
 pub(in crate::provider) type CallObserver = dyn Fn(OpenAiResponsesCallEvent) + Send + Sync;
@@ -109,7 +112,9 @@ impl CallOrigin {
 }
 
 struct ActiveCall {
-    observer: Arc<CallObserver>,
+    observer: Option<Arc<CallObserver>>,
+    stream_observer: Option<Arc<StreamObserver>>,
+    stream: Option<StreamDiagnostics>,
     snapshot: OpenAiResponsesCallSnapshot,
     started: Option<Instant>,
     finished: bool,
@@ -122,32 +127,37 @@ pub(in crate::provider) struct CallAccounting(Option<ActiveCall>);
 impl CallAccounting {
     pub(in crate::provider) fn new(
         observer: &Option<Arc<CallObserver>>,
+        stream_observer: &Option<Arc<StreamObserver>>,
         origin: CallOrigin,
         kind: OpenAiResponsesCallKind,
         model: &str,
     ) -> Self {
-        Self(observer.as_ref().map(|observer| ActiveCall {
-            observer: Arc::clone(observer),
-            snapshot: OpenAiResponsesCallSnapshot {
-                call_id: String::new(),
-                kind,
-                target: origin.target,
-                frame_revision: origin.revision,
-                frame_basis: origin.basis,
-                model: model.to_owned(),
-                started_at_unix_ms: 0,
-                finished_at_unix_ms: None,
-                elapsed_ms: None,
-                outcome: None,
-                http_status: None,
-                response_id: None,
-                request_id: None,
-                response_model: None,
-                usage: None,
-            },
-            started: None,
-            finished: false,
-        }))
+        Self(
+            (observer.is_some() || stream_observer.is_some()).then(|| ActiveCall {
+                observer: observer.clone(),
+                stream_observer: stream_observer.clone(),
+                stream: None,
+                snapshot: OpenAiResponsesCallSnapshot {
+                    call_id: String::new(),
+                    kind,
+                    target: origin.target,
+                    frame_revision: origin.revision,
+                    frame_basis: origin.basis,
+                    model: model.to_owned(),
+                    started_at_unix_ms: 0,
+                    finished_at_unix_ms: None,
+                    elapsed_ms: None,
+                    outcome: None,
+                    http_status: None,
+                    response_id: None,
+                    request_id: None,
+                    response_model: None,
+                    usage: None,
+                },
+                started: None,
+                finished: false,
+            }),
+        )
     }
 
     /// Call immediately before the first poll that can hand work to HTTP.
@@ -158,11 +168,23 @@ impl CallAccounting {
         }
         call.snapshot.call_id = next_call_id();
         call.snapshot.started_at_unix_ms = unix_ms();
-        call.started = Some(Instant::now());
-        notify(
-            &call.observer,
-            OpenAiResponsesCallEvent::Started(call.snapshot.clone()),
-        );
+        let started = Instant::now();
+        call.started = Some(started);
+        call.stream = call.stream_observer.as_ref().map(|observer| {
+            StreamDiagnostics::new(
+                Arc::clone(observer),
+                call.snapshot.call_id.clone(),
+                call.snapshot.frame_revision,
+                call.snapshot.kind,
+                started,
+            )
+        });
+        if let Some(observer) = &call.observer {
+            notify(
+                observer,
+                OpenAiResponsesCallEvent::Started(call.snapshot.clone()),
+            );
+        }
     }
 
     pub(in crate::provider) fn is_enabled(&self) -> bool {
@@ -175,6 +197,7 @@ impl CallAccounting {
         headers: &reqwest::header::HeaderMap,
     ) {
         let Some(call) = &mut self.0 else { return };
+        let first = call.snapshot.http_status.is_none();
         call.snapshot.http_status = Some(status);
         call.snapshot.request_id = [
             "x-request-id",
@@ -184,6 +207,36 @@ impl CallAccounting {
         ]
         .into_iter()
         .find_map(|name| headers.get(name)?.to_str().ok().and_then(bounded_id));
+        if first {
+            if let Some(stream) = &call.stream {
+                stream.emit(OpenAiResponsesStreamEventKind::Headers {
+                    status,
+                    request_id: call.snapshot.request_id.clone(),
+                });
+            }
+        }
+    }
+
+    pub(super) fn stream(&self) -> Option<StreamDiagnostics> {
+        self.0.as_ref().and_then(|call| call.stream.clone())
+    }
+
+    pub(super) fn request(&self, body: &[u8]) {
+        if let Some(stream) = self.stream() {
+            stream.emit(OpenAiResponsesStreamEventKind::Request {
+                body: Arc::from(body),
+            });
+        }
+    }
+
+    pub(super) fn sse(&self, event: &eventsource_stream::Event) {
+        if let Some(stream) = self.stream() {
+            stream.emit(OpenAiResponsesStreamEventKind::Sse {
+                event: event.event.clone(),
+                id: event.id.clone(),
+                data: event.data.clone(),
+            });
+        }
     }
 
     /// Retain only accounting fields from an already size-limited JSON body.
@@ -218,6 +271,11 @@ impl CallAccounting {
         if !self.is_enabled() {
             return;
         }
+        if let Some(stream) = self.stream() {
+            stream.emit(OpenAiResponsesStreamEventKind::ResponseBody {
+                body: Arc::from(body),
+            });
+        }
         if let Ok(Value::Object(body)) = serde_json::from_slice(body) {
             let response = body
                 .get("response")
@@ -238,10 +296,15 @@ impl CallAccounting {
         call.snapshot.elapsed_ms =
             Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
         call.snapshot.outcome = Some(outcome);
-        notify(
-            &call.observer,
-            OpenAiResponsesCallEvent::Finished(call.snapshot.clone()),
-        );
+        if let Some(stream) = &call.stream {
+            stream.emit(OpenAiResponsesStreamEventKind::Finished { outcome });
+        }
+        if let Some(observer) = &call.observer {
+            notify(
+                observer,
+                OpenAiResponsesCallEvent::Finished(call.snapshot.clone()),
+            );
+        }
     }
 }
 

@@ -279,6 +279,14 @@ main.await?;
 同步错误表示准入失败，异步准备、提交和执行 fault 由 waiter 报告。
 `ReactionOutcome::{Completed, Interrupted, Exited(ExitReason)}` 表达 runtime 结算，不替代业务结果。
 
+port 可通过 `next_session_frame()` 延长当前 handle。每个有限 fact stream 正常闭合、工具与回调
+结算、Component post-reconcile 完成后，Application 调用该 hook。`true` 在同一 port、
+FrameSession 和 ReactionId 上执行新的 preparation 与 Frame 提交；每个提交保留独立的
+FrameRevision、generation-exact bindings 和 streaming contract attempts。`false` 完成 handle。
+hook 等待期间继续仲裁定向中断、Component exit 和 task panic；丢弃 waiter 仍不取消 operation。
+`use_reaction_completion` 在每个有限 Frame exchange 正常结算时运行，事件来源携带该 Frame 的
+revision。其状态更新先完成 post-reconcile，再进入会话 hook。
+
 `app.react(ephemeral: bool)` 在准入时选择历史分支。`ephemeral=true` 始终创建 Temporary，
 即使没有活动 Main，也不领取或推进主 port/session；每次都从最近的合法主 checkpoint 创建新 sibling。
 `ephemeral=false` 保留自动分类：没有占用主线执行位时为 Main，否则为 Temporary。
@@ -502,6 +510,12 @@ pub trait ReactionPort: Send {
         frame: Frame,
     ) -> Result<ProviderFactStream<'a>, SubmitFault>;
 
+    async fn next_session_frame(&mut self, feedback_pending: bool) -> Result<bool, ReactionPortFault> {
+        Ok(false)
+    }
+
+    async fn finish_session(&mut self) {}
+
     async fn shutdown(&mut self) {}
 }
 
@@ -643,6 +657,13 @@ port 只拥有 integration-specific protocol state：
 port 不拥有 shared canonical history、Component checkpoint、semantic `#[diff]` baseline或 ToolOutput
 staging。它也不能在 `declare()` 中读取这些 private FrameSession 内容。
 
+`next_session_frame(feedback_pending)` 默认返回 `false`。会话 port 可根据 XML 工具反馈或等待输入
+就绪后返回 `true`，由 Application
+重新准备完整当前 Component 视图并提交下一 Frame。hook 本身不得开始模型生成、提交 Frame 或
+发布 ProviderFact；生成仍绑定实际成功 handoff 的 Frame。工具结果继续通过下一 Frame 的 staged
+inputs 交付。hook 被取消时，port 必须保留真实的输入交付状态与 continuity declaration。
+`finish_session()` 在 Reaction 收束后调用一次，会话 port 可用它释放该次 Reaction 持有的连接。
+
 port 可以拥有只计算 provider-private 候选的后台任务。正常 `Application::shutdown()` 在
 Component tasks 清理后调用 `ReactionPort::shutdown()`，port 必须取消并 join 自己的后台任务后返回；
 没有后台工作的 port 使用默认空实现。转发型 port 应转发此方法。普通 Drop 只保证 best-effort abort。
@@ -744,7 +765,8 @@ react；`current_projection()` 仍返回上一版完整 projection，并同时�
 preparation checkpoint bit。一个已经prepared的snapshot发生后续Signal写入时仍保持prepared，同时标记dirty；
 发布含preparation declaration的新projection在当前operation完成前为provisional。这个bit只描述已发布
 projection的checkpoint，不是hook readiness，不能使未来显式`prepare()`或`react()`跳过preparation。
-正常 reaction返回前执行一次 post-reconcile，使 handler和ToolCall lane产生的状态出现在下一 Frame。
+每个有限 fact stream 正常结算后执行 post-reconcile，使 handler 和 ToolCall lane 产生的状态
+出现在下一 Frame。会话 hook 返回 `true` 时，下一 Frame 在同一 active handle 内提交。
 
 完整projection中的全部`Instruction(System, pom)`不是普通append history。Frame compiler按node/item
 render顺序拼接每个POM的top-level children，形成零或一个normalized System snapshot；结果没有child时
@@ -1281,16 +1303,21 @@ send并返回Ready。boundary是owned transport/queue不可撤回地接受Frame�
 10. finalize direct XML callbacks at normal EOF; decide managed contracts and settle their effects
     -> unresolved effects retain workers and keep waiter Pending until explicit recovery or shutdown
 11. post-reconcile Component state
-12. publish checkpoint/temporary continuation; release execution slot; resolve ReactionOutcome or fault
+12. await port.next_session_frame(), arbitrated against interrupt, exit, and task panic
+     -> true repeats steps 2-11 with fresh preparation and bindings on the same owned lane
+     -> false finishes the active handle
+13. publish checkpoint/temporary continuation; release execution slot; resolve ReactionOutcome or fault
 ```
 
-一次 reaction 最多 handoff 一个 Frame，不自动开始下一次reaction。pre-handoff failure不推进任何
-candidate state；post-handoff HTTP、stream、handler或lane failure不回滚已经handoff的input、已经接纳的
-fact、Component写入或外部副作用。continuity retry只重复declaration、Frame prepare和submit，不重复第4步。
+默认 hook 使一次 reaction 在一个有限 Frame exchange 后结算。会话 port 可在同一 handle 内
+继续后续 Frame；每个 Frame 都完成上述交付与结算步骤。pre-handoff failure 不推进该 Frame 的
+candidate state；post-handoff HTTP、stream、handler 或 lane failure 保留已经 handoff 的 input、
+已经接纳的 fact、Component 写入和外部副作用。continuity retry 只重复该 Frame 的 declaration、
+Frame prepare 和 submit，不重复第4步；会话的下一 Frame 则重新执行第4步。
 
 ### Managed streaming contracts
 
-`XmlStreamingToolCall::new::<Channels>(identity)`为每个contract在每次reaction中创建独立parser、State、
+`XmlStreamingToolCall::new::<Channels>(identity)`为每个contract在每个Frame exchange中创建独立parser、State、
 诊断和effect ledger。同一contract内的所有element共享这些状态和有序sequence；不同contract可以声明
 相同标签。重复element只在同一contract内构成declaration fault。旧`StreamingXml`和
 `.contract(...).empty_element(...)`继续使用原有shared-route parser。
@@ -1339,7 +1366,7 @@ pub enum ProviderFact {
 }
 ```
 
-`ProviderOutputKey` 是reaction-local、provider-neutral identity。`ProviderFactStream`的yield顺序也是
+`ProviderOutputKey` 是Frame-local、provider-neutral identity。`ProviderFactStream`的yield顺序也是
 canonical publication顺序：一个key的first fact固定其output position；后续交错facts保持该position。
 如果Provider wire以不同顺序完成output，adapter必须在yield前buffer/reorder，不能把private arrival order
 泄漏成不确定的canonical history。一个fact最多投影出一个Component event：
@@ -1375,6 +1402,18 @@ Built-in target capability在v1仍可比公共fact grammar更窄。内部Chat Co
 非空`ToolCatalog`必须在handoff前typed reject，上游返回tool call也必须作为terminal upstream rejection；
 这不表示Responses或公共`ReactionPort`失去ToolCall能力。`FrameCapabilities`分别声明native tool calls、
 text delta output和decision能力；Chat当前不声明native或decision。能力在mount期间固定。
+
+Qwen Realtime port 声明 semantic delta、native tools 和 text delta 能力。普通 Delta 沿用
+上轮 WebSocket，先校验 replay 后缀与服务端已保留的输出事实，再交付 staged inputs 和当前
+Component 变化。文本模式通过 Full 建立新连接并发送完整观察。取消、断流和 ephemeral 请求
+释放对应文本连接，下一次从新 epoch 的 Full 恢复。
+
+`with_audio()` 启用长会话。宿主追加 16 kHz PCM16 并通过 `commit_input()` 划分话轮。
+port 在收到提交确认并交付本轮 Frame 后请求生成。原生工具结果与 XML 操作反馈驱动同一
+Reaction 提交新 Frame，由 port 请求后续生成。生成结束后仍接收用户转写，并在 `finish()`
+后等待未完成的转写。媒体消费端可读取类型化事件和有界的完整服务端 JSON 事件流。
+ephemeral 输入作为临时对话项随本轮发送，生成结束后按服务端 ID 删除并等待确认。
+语音会话的连续性依赖远端已提交的媒体，若后续 Frame 要求 Full，port 在 handoff 前拒绝。
 
 ### Frame 能力与结构化 Decision
 
@@ -2033,6 +2072,19 @@ accounting sink 是有界、非阻塞的诊断通知，明确采用 panic-contai
 panic 传播。正常取消通过 HTTP future/stream/worker 的 RAII guard 发 terminal；其他 panic 的 unwind
 不再次进入任何 callback，因此该异常路径不承诺 terminal 通知。
 
+`with_stream_observer` 是另行显式开启的原生 Responses 实时 transport 诊断接口，允许观察私有
+request/output 内容。每个事件携带与 accounting 相同的 call ID、不可变 Frame revision、调用 kind、
+墙钟时间和同一次尝试的单调 elapsed milliseconds。它在 transport 首次 poll 前交付精确请求 JSON，
+收到响应头时交付 HTTP status 和同一 request-ID allowlist，非空网络 chunk 到达时交付字节数，
+解码 SSE 后、protocol admission 前交付原始 event/id/data，并在终态或普通取消时交付 outcome。
+JSON 摘要与 HTTP 错误响应交付受既有字节上限约束的 response body。SSE 到达不代表对应 fact
+已经进入 canonical history；Completed 同样不代表 Application commit。此诊断不能承担业务 authority。
+
+该接口默认关闭，不在关闭时复制 request/output。它不暴露 URL、凭据或任意 headers；完整内容的
+存储权限、事件/字节保留上限、截断说明由显式开启它的 host 负责。sink 必须有界、非阻塞，建议
+排队做 I/O；采用与 accounting 相同的 panic-contained 契约，通知不改变请求、输出、连续性和清理。
+legacy ProviderPort 与其他 JSON adapter 不进入此原生 Responses 契约。
+
 `with_parallel_tool_calls(bool)` 控制 foreground Responses 的多调用请求选项，默认 false，
 不绕过 Application 的工具准入。`set_prompt_cache_comparison_response_id` 为后续 foreground
 请求设置可选 cache comparison hint，`None` 移除；hint 与多调用选项都进入同一最终 wire body
@@ -2063,7 +2115,8 @@ panic 传播。正常取消通过 HTTP future/stream/worker 的 RAII guard 发 t
 16. ToolCall commit后立即启动lane；fact stream和lanes并发推进，不同lanes可以并发但mutation保序。
 17. ToolOutput只在下一Frame successful handoff时作为ordered input commit，receipt只消费一次。
 18. 下一Frame必须闭合全部pending ToolCall，不能以Fresh、Full或context reset绕过。
-19. 一次 reaction 最多 handoff 一个 Frame，不自动开始下一 reaction；continuity retry 只能发生在 handoff 前。
+19. 每个 Frame exchange handoff 一个 Frame；`next_session_frame()` 可在同一 active reaction 内
+    继续新的 exchange。每次都重新 preparation 并完整结算；continuity retry 只能发生在该 Frame handoff 前。
 20. Signal dirty、读取latest、Provider EOF和task completion都不自动调用`react()`。
 21. `Application::run()`是默认固定循环；direct `react()`是手动单步接口。Component preparation决定何时
     允许提交，exit决定正常结束；兼容的Component demand只表达sticky demand，固定循环不依赖它。
@@ -2090,7 +2143,7 @@ panic 传播。正常取消通过 HTTP future/stream/worker 的 RAII guard 发 t
     首个被观察到的error会drop该wave其余future。最多16个execution waves，clean且无unfinished hook时early success；只有
     dirty的第16 wave之后才有一个不得dispatch新factory/future的final reconcile。success必须同时clean且无
     unfinished hook；若仍需另一wave，零handoff并以`PreparationGraphUnstable` terminal fail closed。
-30. 每次显式`prepare()`或`react()`都创建新operation，并使每个active `(mount generation, lexical slot)`
+30. 每次显式`prepare()`、`react()`及会话内下一Frame都创建新preparation operation，并使每个active `(mount generation, lexical slot)`
     运行一次；rerender跳过本operation已完成slot，新mount运行。ordinary failure或pre-handoff cancellation
     不自动重试，并保留同一个Application供下一次显式operation使用；下一次从全部active hooks重新开始。
     同一`react()`的continuity retry不得重新运行preparation。

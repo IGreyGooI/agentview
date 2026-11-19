@@ -700,7 +700,7 @@ pub(crate) enum FrameInvariantFault {
     DeltaBaseScopeMismatch,
 }
 
-/// Reaction-local identity of one provider-neutral output lifecycle.
+/// Frame-local identity of one provider-neutral output lifecycle.
 ///
 /// The first fact carrying a previously unseen key establishes that output's
 /// position in canonical reaction order. Later facts for the key retain that
@@ -944,6 +944,37 @@ pub trait ReactionPort: Send {
     /// `Accepted` continuity is forbidden.
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault>;
 
+    /// Decides whether the active reaction should submit another session Frame.
+    ///
+    /// Application calls this after the preceding Frame's finite fact stream,
+    /// handlers, tool lanes, and post-reconcile have settled normally. Returning
+    /// true runs fresh Component preparation and submits another Frame through
+    /// the same port and canonical session under the same Reaction handle.
+    /// Returning false completes that handle. Discrete ports use the default.
+    ///
+    /// `feedback_pending` reports settled XML action feedback. Native tool
+    /// results remain ordered inputs to the next Frame.
+    ///
+    /// A session port may wait for admitted input here. This hook must not
+    /// generate a response, submit a Frame, or publish model facts. Interruption,
+    /// Component exit, and shutdown can drop the future. Cancellation must leave
+    /// declaration and provider-owned input state truthful.
+    async fn next_session_frame(
+        &mut self,
+        _feedback_pending: bool,
+    ) -> Result<bool, ReactionPortFault> {
+        Ok(false)
+    }
+
+    /// Settles port-owned resources when the active Reaction handle ends.
+    ///
+    /// Application calls this once after all Frame exchanges and effects have
+    /// settled, including interruption, exit, or failure, before returning the
+    /// port to its retained lane. A session port may close its live connection
+    /// here and must leave subsequent declarations truthful. This hook does not
+    /// change canonical history or replace consuming Application shutdown.
+    async fn finish_session(&mut self) {}
+
     /// Stop and join port-owned background work. Called by Application shutdown
     /// after active reactions have ended. Ports without background work need
     /// no implementation; Drop alone only provides best-effort cancellation.
@@ -962,6 +993,17 @@ impl<P: ReactionPort + ?Sized> ReactionPort for Box<P> {
 
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
         (**self).submit(frame).await
+    }
+
+    async fn next_session_frame(
+        &mut self,
+        feedback_pending: bool,
+    ) -> Result<bool, ReactionPortFault> {
+        (**self).next_session_frame(feedback_pending).await
+    }
+
+    async fn finish_session(&mut self) {
+        (**self).finish_session().await;
     }
 
     async fn shutdown(&mut self) {

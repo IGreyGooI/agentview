@@ -34,7 +34,8 @@ use super::{
         ElementCompleteDispatch, ElementOpenDispatch, ErasedElement,
     },
     parser::{
-        CompletionForm, Contract, ElementForm, ElementSpec, Parser, ParserEvent, ParserFault,
+        CompletionForm, Contract, ElementForm, ElementSpec, InvalidKind, Parser, ParserEvent,
+        ParserFault,
     },
     NoStreamingValue, SelfClosing, StreamingToolAttemptId, StreamingToolChannels,
     StreamingToolDeclarationFault, StreamingToolDriverFault, StreamingToolEmission,
@@ -759,9 +760,14 @@ pub(crate) struct XmlCallbackRuntime {
     started: bool,
     sealed: bool,
     finished: bool,
+    feedback_pending: bool,
 }
 
 impl XmlCallbackRuntime {
+    pub(crate) fn feedback_pending(&self) -> bool {
+        self.feedback_pending
+    }
+
     pub(crate) fn feedback_signals(&self) -> Vec<Signal<XmlCallbackFeedback>> {
         self.declarations
             .iter()
@@ -818,6 +824,7 @@ impl XmlCallbackRuntime {
             started: false,
             sealed: false,
             finished: false,
+            feedback_pending: false,
         })
     }
 
@@ -1002,6 +1009,7 @@ impl XmlCallbackRuntime {
                         continue;
                     }
                     let index = self.owner(occurrence)?;
+                    self.feedback_pending = true;
                     let form = match form {
                         CompletionForm::SelfClosing => XmlElementForm::SelfClosing,
                         CompletionForm::ExplicitClose => XmlElementForm::ExplicitClose,
@@ -1023,6 +1031,7 @@ impl XmlCallbackRuntime {
                     kind,
                     span,
                 } => {
+                    self.feedback_pending |= kind != InvalidKind::TextOutsideEnvelope;
                     let owner = element
                         .as_deref()
                         .and_then(|name| self.indexes.get(name).copied())

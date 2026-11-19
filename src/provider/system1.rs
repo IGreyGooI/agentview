@@ -551,6 +551,7 @@ impl ReactionPort for System1Provider {
             .map(|_| OpenAiResponsesRequestSnapshot::new(&frame, &prepared.body));
         let mut accounting = CallAccounting::new(
             &self.http.call_observer,
+            &None,
             CallOrigin::from_frame(&frame),
             OpenAiResponsesCallKind::Foreground,
             self.options.model.id(),

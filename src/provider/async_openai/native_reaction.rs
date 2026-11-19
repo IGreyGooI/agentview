@@ -51,6 +51,7 @@ use super::{
         OpenAiResponsesTransportDiagnostic,
     },
     sse_event_size,
+    stream_observation::OpenAiResponsesStreamEventKind,
     usage::{observe_response_usage, validated_response_usage, ResponseUsageObserver},
     AsyncOpenAiResponsesProvider, NativeToolLedger, OpenAiWireEvent, ResponsesExecutionMode,
     ResponsesReactionTarget, SseWireLimiter,
@@ -324,6 +325,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
             .map(|_| OpenAiResponsesRequestSnapshot::new(&frame, &prepared.request_body));
         let mut accounting = CallAccounting::new(
             &self.call_observer,
+            &self.stream_observer,
             CallOrigin::from_frame(&frame),
             OpenAiResponsesCallKind::Foreground,
             self.encoder.model().id(),
@@ -351,7 +353,12 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 return Poll::Ready(Err(SubmitFault::Rejected(fault)));
             }
             frame.check_handoff_precondition(&declaration)?;
-            let Some(PreparedResponsesFrameRequest { state, .. }) = prepared.take() else {
+            let Some(PreparedResponsesFrameRequest {
+                state,
+                request_body,
+                ..
+            }) = prepared.take()
+            else {
                 return Poll::Ready(Err(rejected(
                     OpenAiFailureClass::Internal,
                     "native Frame candidate was consumed before handoff",
@@ -368,6 +375,7 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
                 }
             }
             accounting.start();
+            accounting.request(&request_body);
             let response = transport.as_mut().poll(cx);
             match &response {
                 Poll::Ready(Ok(response)) => {
@@ -518,9 +526,16 @@ impl ReactionPort for AsyncOpenAiResponsesProvider {
 
             let mut response_body_bytes = 0_usize;
             let mut sse_wire_limiter = SseWireLimiter::new(max_sse_event_bytes);
+            let stream_diagnostics = accounting.stream();
             let response_stream = response.bytes_stream().map(move |chunk| {
                 let chunk = chunk
                     .map_err(|error| NativeBodyStreamFault::Transport(format!("{error:?}")))?;
+                if !chunk.is_empty() {
+                    if let Some(diagnostics) = &stream_diagnostics {
+                        diagnostics
+                            .emit(OpenAiResponsesStreamEventKind::BodyChunk { bytes: chunk.len() });
+                    }
+                }
                 if capture_enabled {
                     let mut captured = stream_capture
                         .lock()
@@ -743,6 +758,7 @@ impl AsyncOpenAiResponsesProvider {
             response_usage_observer: self.response_usage_observer.clone(),
             request_observer: self.request_observer.clone(),
             call_observer: self.call_observer.clone(),
+            stream_observer: self.stream_observer.clone(),
             observer: self.observer.clone(),
             compaction_observer: self.compaction_observer.clone(),
             observation_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -842,6 +858,7 @@ impl AsyncOpenAiResponsesProvider {
             observer: self.compaction_observer.clone(),
             accounting: CallAccounting::new(
                 &self.call_observer,
+                &self.stream_observer,
                 CallOrigin::from_frame(frame),
                 kind,
                 self.encoder.model().id(),
@@ -1103,6 +1120,7 @@ where
                 ),
             );
         }
+        state.accounting.sse(&event);
         if event.data == "[DONE]" {
             if state.terminal_published {
                 return None;
@@ -1806,6 +1824,7 @@ fn upstream_rejected(diagnostic: impl Into<String>) -> ReactionPortFault {
 mod tests {
     mod call_accounting;
     mod main_ephemeral_cache;
+    mod stream_observation;
     mod stream_timeouts;
     use std::{
         collections::{BTreeMap, VecDeque},

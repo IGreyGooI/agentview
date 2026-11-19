@@ -85,6 +85,7 @@ mod parallel_compaction;
 pub(super) mod reaction_fault;
 pub(super) mod request_observation;
 mod responses_observation;
+mod stream_observation;
 mod transport;
 pub(super) mod usage;
 
@@ -119,6 +120,7 @@ pub use self::responses_observation::{
     OpenAiResponsesRequestPreparationReason, OpenAiResponsesTransportDiagnostic,
     OpenAiResponsesTransportPhase,
 };
+pub use self::stream_observation::{OpenAiResponsesStreamEvent, OpenAiResponsesStreamEventKind};
 pub use self::usage::OpenAiResponsesUsage;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -511,6 +513,7 @@ pub struct AsyncOpenAiResponsesProvider {
     response_usage_observer: Option<Arc<ResponseUsageObserver>>,
     request_observer: Option<Arc<RequestObserver>>,
     call_observer: Option<Arc<CallObserver>>,
+    stream_observer: Option<Arc<stream_observation::StreamObserver>>,
     observer: Option<Arc<dyn OpenAiResponsesObserver>>,
     compaction_observer: Option<Arc<dyn OpenAiResponsesObserver>>,
     observation_failed: Arc<AtomicBool>,
@@ -761,6 +764,7 @@ impl AsyncOpenAiResponsesProvider {
             response_usage_observer: None,
             request_observer: None,
             call_observer: None,
+            stream_observer: None,
             observer: None,
             compaction_observer: None,
             observation_failed: Arc::new(AtomicBool::new(false)),
@@ -804,6 +808,7 @@ impl AsyncOpenAiResponsesProvider {
             response_usage_observer: self.response_usage_observer.clone(),
             request_observer: self.request_observer.clone(),
             call_observer: self.call_observer.clone(),
+            stream_observer: self.stream_observer.clone(),
             observer: self.observer.clone(),
             compaction_observer: self.compaction_observer.clone(),
             observation_failed: Arc::new(AtomicBool::new(false)),
@@ -946,6 +951,25 @@ impl AsyncOpenAiResponsesProvider {
         observer: impl Fn(OpenAiResponsesCallEvent) + Send + Sync + 'static,
     ) -> Self {
         self.call_observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Opt-in live diagnostics for native Responses HTTP attempts.
+    ///
+    /// Emits the exact request JSON, header arrival, nonempty network chunk
+    /// sizes, decoded SSE fields and terminal status as transport is polled.
+    /// IDs agree with `with_call_observer`, including on cancellation. Request
+    /// and output contents are private; credentials, URLs and arbitrary headers
+    /// are never included. Disabled by default with no request/output capture.
+    ///
+    /// The callback must be bounded and nonblocking: enqueue for expensive work.
+    /// Panics are contained and cannot alter request, output or continuity.
+    /// This hook does not apply to legacy ProviderPort or JSON adapters.
+    pub fn with_stream_observer(
+        mut self,
+        observer: impl Fn(OpenAiResponsesStreamEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.stream_observer = Some(Arc::new(observer));
         self
     }
 

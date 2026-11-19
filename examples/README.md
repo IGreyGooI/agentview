@@ -1,5 +1,43 @@
 # Example Prompts
 
+## Qwen Realtime
+
+Set `QWEN_REALTIME_API_KEY` in your environment or `.env`. For a workspace
+endpoint, set `QWEN_REALTIME_URL` to its WebSocket URL. The voice example defaults
+to the public DashScope endpoint and uses `qwen-audio-3.1-realtime-plus`.
+
+```sh
+cargo run --locked --example qwen_realtime_live
+```
+
+The example runs two bundled TTS utterances with one Component, one inventory
+tool, and one `Application::react(false)`. It prints the conversation and saves
+both replies as WAV files under `target/qwen-realtime/`. To use your own
+utterances, pass two 16 kHz mono little-endian PCM16 files.
+
+```sh
+cargo run --locked --example qwen_realtime_live -- \
+  lookup-widget.pcm stock-plus-one.pcm
+```
+
+Use `QwenRealtimeProvider::with_audio()` to get the provider and its media
+handles. Stream microphone chunks with `append_pcm16` and mark each utterance
+with `commit_input`. AgentView delivers the rendered Component view and
+advances responses and tool feedback on the same WebSocket.
+`QwenRealtimeMediaEvents::next_event` yields typed media events, including
+24 kHz PCM16 output, and `next_server_event` yields the full server JSON,
+including provider extensions. Both subscriptions report lag to slow consumers.
+Keep receiving across `ResponseEnded` to collect late input transcription.
+Use `finish` to end input and drain outstanding work or interrupt the Reaction
+to stop it.
+
+The text example accepts one turn per line and prints tokens as they arrive.
+Set `QWEN_REALTIME_URL` and `AGENTVIEW_CONTEXT_WINDOW_TOKENS` for this variant.
+
+```sh
+cargo run --locked --example qwen_realtime
+```
+
 ## Callback Actions
 
 `native_tool` and `streaming_callbacks` declare actions inside `view!`, with callbacks

@@ -463,6 +463,12 @@ where
         std::mem::take(&mut self.streaming_contracts)
     }
 
+    pub(crate) fn has_xml_feedback(&self) -> bool {
+        self.xml_callbacks
+            .as_ref()
+            .is_some_and(XmlCallbackRuntime::feedback_pending)
+    }
+
     #[cfg(feature = "legacy-provider-port")]
     pub(crate) fn has_xml_callbacks(&self) -> bool {
         self.xml_callbacks.is_some()

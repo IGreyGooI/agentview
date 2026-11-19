@@ -266,6 +266,21 @@ impl<P: ReactionPort> ReactionPort for PortSlot<P> {
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
         self.0.as_mut().ok_or_else(port_busy)?.submit(frame).await
     }
+    async fn next_session_frame(
+        &mut self,
+        feedback_pending: bool,
+    ) -> Result<bool, ReactionPortFault> {
+        self.0
+            .as_mut()
+            .ok_or_else(port_busy)?
+            .next_session_frame(feedback_pending)
+            .await
+    }
+    async fn finish_session(&mut self) {
+        if let Some(port) = &mut self.0 {
+            port.finish_session().await;
+        }
+    }
     fn fork_temporary(&mut self) -> Result<Box<dyn ReactionPort>, ReactionPortFault> {
         self.0.as_mut().ok_or_else(port_busy)?.fork_temporary()
     }
@@ -319,6 +334,21 @@ impl<P: ReactionPort> ReactionPort for LanePort<P> {
             Self::Temporary(p) => p.submit(frame).await,
         }
     }
+    async fn next_session_frame(
+        &mut self,
+        feedback_pending: bool,
+    ) -> Result<bool, ReactionPortFault> {
+        match self {
+            Self::Main(port) => port.next_session_frame(feedback_pending).await,
+            Self::Temporary(port) => port.next_session_frame(feedback_pending).await,
+        }
+    }
+    async fn finish_session(&mut self) {
+        match self {
+            Self::Main(port) => port.finish_session().await,
+            Self::Temporary(port) => port.finish_session().await,
+        }
+    }
     async fn shutdown(&mut self) {
         match self {
             Self::Main(p) => p.shutdown().await,
@@ -331,6 +361,7 @@ struct Lane<P> {
     session: FrameSession,
     streaming: StreamingSupervisor,
     completion_bindings: Option<RenderBindings<ProviderEvent>>,
+    feedback_pending: bool,
 }
 struct Temporary {
     port: Box<dyn ReactionPort>,
@@ -1058,6 +1089,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
                 session: temporary.session,
                 streaming: temporary.streaming,
                 completion_bindings: None,
+                feedback_pending: false,
             }),
         };
         admission.tasks.push(runtime.spawn(Self::drive(owned)));
@@ -1077,26 +1109,85 @@ impl<P: ReactionPort + 'static> Shared<P> {
 
     async fn drive_owned(&self, state: &Arc<ReactionState>, lane: &mut Option<Lane<P>>) {
         let cancellation = ReactionCancellationControl::new(self.monitor.clone());
-        let operation = AssertUnwindSafe(self.drive_inner(state, lane, &cancellation))
-            .catch_unwind()
-            .await;
-        let mut completion = match operation {
-            Ok(result) => Completion::Result(result),
-            Err(payload) => {
-                self.fail(payload);
-                Completion::Panic(self.panic.clone())
-            }
-        };
-        // Keep all owned protocol state alive until its effects have settled,
-        // including when a callback or provider unwinds.
-        if let Some(lane) = lane.as_mut() {
-            let cleanup = AssertUnwindSafe(self.settle(state, lane, &mut completion))
+        let mut completion;
+        loop {
+            let operation = AssertUnwindSafe(self.drive_inner(state, lane, &cancellation))
                 .catch_unwind()
                 .await;
-            if let Err(payload) = cleanup {
+            completion = match operation {
+                Ok(result) => Completion::Result(result),
+                Err(payload) => {
+                    self.fail(payload);
+                    Completion::Panic(self.panic.clone())
+                }
+            };
+            // Keep all owned protocol state alive until its effects have
+            // settled, including when a callback or provider unwinds.
+            if let Some(lane) = lane.as_mut() {
+                let cleanup = AssertUnwindSafe(self.settle(state, lane, &mut completion))
+                    .catch_unwind()
+                    .await;
+                if let Err(payload) = cleanup {
+                    self.fail(payload);
+                    completion = Completion::Panic(self.panic.clone());
+                    self.drain_panicked_streaming(&mut lane.streaming).await;
+                }
+            }
+            if !matches!(
+                completion,
+                Completion::Result(Ok(ReactionOutcome::Completed))
+            ) {
+                break;
+            }
+
+            let continuation = AssertUnwindSafe(async {
+                let lane = lane.as_mut().expect("completed Frame owns a lane");
+                let feedback_pending = std::mem::take(&mut lane.feedback_pending);
+                tokio::select! {
+                    biased;
+                    _ = state.cancelled() => Ok(ControlFlow::Break(ReactionOutcome::Interrupted)),
+                    task = self.monitor.wait() => {
+                        let _ = task;
+                        cancellation.suppress();
+                        self.check()?;
+                        Err(owner_closed())
+                    }
+                    reason = self.exit.wait() => Ok(ControlFlow::Break(ReactionOutcome::Exited(reason))),
+                    next = lane.port.next_session_frame(feedback_pending) => next
+                        .map(|next| if next {
+                            ControlFlow::Continue(())
+                        } else {
+                            ControlFlow::Break(ReactionOutcome::Completed)
+                        })
+                        .map_err(|fault| ApplicationFault::from_port(ApplicationFaultStage::Reaction, fault)),
+                }
+            })
+            .catch_unwind()
+            .await;
+            match continuation {
+                Ok(Ok(ControlFlow::Continue(()))) => {}
+                Ok(Ok(ControlFlow::Break(outcome))) => {
+                    completion = Completion::Result(Ok(outcome));
+                    break;
+                }
+                Ok(Err(fault)) => {
+                    completion = Completion::Result(Err(fault));
+                    break;
+                }
+                Err(payload) => {
+                    self.fail(payload);
+                    completion = Completion::Panic(self.panic.clone());
+                    break;
+                }
+            }
+        }
+        if let Some(lane) = lane.as_mut() {
+            if let Err(payload) = AssertUnwindSafe(lane.port.finish_session())
+                .catch_unwind()
+                .await
+            {
                 self.fail(payload);
                 completion = Completion::Panic(self.panic.clone());
-                self.drain_panicked_streaming(&mut lane.streaming).await;
             }
         }
         state
@@ -1288,7 +1379,25 @@ impl<P: ReactionPort + 'static> Shared<P> {
             }
             core.check_task_panic(ApplicationFaultStage::Preparation)?;
             if state.kind == ReactionKind::Main {
-                core.refresh_declaration()?;
+                if let Some(lane) = lane.as_mut() {
+                    let declaration = lane.port.declare().map_err(|fault| {
+                        ApplicationFault::from_port(ApplicationFaultStage::Declaration, fault)
+                    })?;
+                    declaration
+                        .validate()
+                        .map_err(ApplicationFault::invalid_declaration)?;
+                    lane.session
+                        .observe_declaration(&declaration)
+                        .map_err(|fault| {
+                            ApplicationFault::from_session(
+                                ApplicationFaultStage::Declaration,
+                                fault,
+                            )
+                        })?;
+                    core.declaration = declaration;
+                } else {
+                    core.refresh_declaration()?;
+                }
             }
             core.components.set_reaction_history_scope(
                 (state.kind == ReactionKind::Temporary).then_some(state.lineage),
@@ -1300,7 +1409,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
                 ControlFlow::Continue(prepared) => prepared,
             };
             let projection_revision = core.current_projection().revision();
-            if state.kind == ReactionKind::Main {
+            if state.kind == ReactionKind::Main && lane.is_none() {
                 let session = FrameSession::new(&core.declaration).map_err(|fault| {
                     ApplicationFault::from_session(ApplicationFaultStage::Declaration, fault)
                 })?;
@@ -1311,6 +1420,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
                     session,
                     streaming: StreamingSupervisor::default(),
                     completion_bindings: None,
+                    feedback_pending: false,
                 });
             }
             let receipt = (state.kind == ReactionKind::Main)
@@ -1447,6 +1557,8 @@ impl<P: ReactionPort + 'static> Shared<P> {
             .await;
             lease.complete();
             result?;
+            lane.feedback_pending =
+                bindings.has_xml_feedback() || lane.streaming.reaction_requested();
             if lane.streaming.pending() && !lane.streaming.clear() {
                 return Err(ApplicationFault::streaming_recovery());
             }

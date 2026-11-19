@@ -694,6 +694,12 @@ async fn compact(
     }
     let started = Instant::now();
     transport.accounting.start();
+    transport.accounting.request(
+        request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .unwrap_or_default(),
+    );
     let response = match transport.client.execute(request).await {
         Ok(response) => response,
         Err(error) => {
@@ -774,6 +780,15 @@ async fn compact(
                     ParallelCompactionFault::Transport
                 }
             })?;
+            if !chunk.is_empty() {
+                if let Some(diagnostics) = transport.accounting.stream() {
+                    diagnostics.emit(
+                        super::stream_observation::OpenAiResponsesStreamEventKind::BodyChunk {
+                            bytes: chunk.len(),
+                        },
+                    );
+                }
+            }
             if chunk.len() > limit.saturating_sub(bytes.len()) {
                 return Err(ParallelCompactionFault::Limit);
             }

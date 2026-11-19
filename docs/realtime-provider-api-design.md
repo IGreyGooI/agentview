@@ -1,7 +1,8 @@
 # 基于现有 AgentView 的实时输入与 Provider API 草案
 
-状态：设计提案，尚未实现。本文中的新名称用于讨论 API；当前运行时契约仍以
-[engine.md](engine.md) 为准。实现前需要同步修改对应契约，不能把下述能力当成现有行为。
+本文记录通用媒体会话 API 的设计提案。当前 Qwen Realtime port 已支持同一次
+`Application::react(false)` 内的多轮语音、Component 工具和视图回执。实际入口见
+[Qwen Realtime 示例](../examples/README.md#qwen-realtime)，运行时契约见 [engine.md](engine.md)。
 
 ## 设计出发点
 
