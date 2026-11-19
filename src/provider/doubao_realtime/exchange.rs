@@ -44,6 +44,7 @@ struct Response {
     local_id: String,
     upstream_id: Option<String>,
     text: String,
+    cancelled: bool,
 }
 
 impl<'a> Exchange<'a> {
@@ -219,6 +220,7 @@ impl<'a> Exchange<'a> {
         let active = self
             .response
             .as_ref()
+            .filter(|response| !response.cancelled)
             .map(|response| response.local_id.as_str());
         let valid = active.is_some_and(|active| {
             request
@@ -314,12 +316,18 @@ impl<'a> Exchange<'a> {
                 // captured when we sent the one outstanding cancel.
                 let media = self.provider.media.as_mut().expect("mounted audio");
                 if let Some(cancel) = media.cancel.take() {
-                    if self
+                    if let Some(response) = self
                         .response
-                        .as_ref()
-                        .is_some_and(|response| response.local_id == cancel.response_id)
+                        .as_mut()
+                        .filter(|response| response.local_id == cancel.response_id)
                     {
-                        self.complete(Some(Status::Cancelled));
+                        // The service can send ID-less tail audio after this
+                        // ACK. Stop playback immediately and keep its Frame
+                        // open until the actual response.done drains that tail.
+                        response.cancelled = true;
+                        let response_id = response.local_id.clone();
+                        self.batches.clear();
+                        self.end_playback(response_id, Status::Cancelled);
                     }
                 }
             }
@@ -343,7 +351,7 @@ impl<'a> Exchange<'a> {
                 }
             }
             "response.function_call_arguments.done" => {
-                if !self.is_stale(&event) {
+                if self.accepts_output(&event) {
                     self.begin_response(&event);
                     self.tool_requests(&event)?;
                 }
@@ -353,7 +361,7 @@ impl<'a> Exchange<'a> {
             | "response.output_audio.started"
             | "response.output_audio.delta"
             | "response.output_audio.done" => {
-                if !self.is_stale(&event) {
+                if self.accepts_output(&event) {
                     self.begin_response(&event);
                     self.response_event(kind, &event)?;
                 }
@@ -422,6 +430,16 @@ impl<'a> Exchange<'a> {
         event_id(event).is_some_and(|id| self.last_response.as_deref() == Some(id))
     }
 
+    fn accepts_output(&self, event: &Value) -> bool {
+        // The provider can keep sending chunks belonging to the cancelled
+        // exchange. They must not restart playback or call another tool.
+        !self
+            .response
+            .as_ref()
+            .is_some_and(|response| response.cancelled)
+            && !self.is_stale(event)
+    }
+
     fn begin_response(&mut self, event: &Value) {
         self.deadline = Some(Instant::now() + RESPONSE_TIMEOUT);
         if let Some(response) = &mut self.response {
@@ -436,6 +454,7 @@ impl<'a> Exchange<'a> {
             local_id: local_id.clone(),
             upstream_id,
             text: String::new(),
+            cancelled: false,
         });
         self.provider
             .media
@@ -583,25 +602,31 @@ impl<'a> Exchange<'a> {
         Ok(())
     }
 
+    fn end_playback(&mut self, response_id: String, status: Status) {
+        self.provider
+            .media
+            .as_ref()
+            .expect("mounted audio")
+            .active_response
+            .send_replace(None);
+        self.publish(Audio::ResponseEnded {
+            response_id,
+            status,
+            error: None,
+        });
+        if let Some(request) = self.interrupt.take() {
+            let _ = request.result.send(Ok(status == Status::Cancelled));
+        }
+    }
+
     fn complete(&mut self, status: Option<Status>) {
         let mut primary_text = None;
         if let (Some(response), Some(status)) = (self.response.take(), status) {
             self.last_response = response.upstream_id;
-            self.provider
-                .media
-                .as_ref()
-                .expect("mounted audio")
-                .active_response
-                .send_replace(None);
-            self.publish(Audio::ResponseEnded {
-                response_id: response.local_id,
-                status,
-                error: None,
-            });
-            if let Some(request) = self.interrupt.take() {
-                let _ = request.result.send(Ok(status == Status::Cancelled));
+            if !response.cancelled {
+                self.end_playback(response.local_id, status);
             }
-            if status == Status::Completed && !response.text.is_empty() {
+            if !response.cancelled && status == Status::Completed && !response.text.is_empty() {
                 let output = ProviderOutputKey::new(self.tool_calls.len() as u64);
                 primary_text = Some(output);
                 self.replay.push(CanonicalInputItem::AssistantText {

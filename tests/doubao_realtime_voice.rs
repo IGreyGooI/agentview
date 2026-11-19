@@ -480,8 +480,26 @@ async fn active_interrupt_uses_the_same_response_and_stale_controls_do_not_cance
         assert_eq!(receive(&mut socket).await["type"], "response.cancel");
         // Seeduplex's documented cancel acknowledgement has no response ID.
         send(&mut socket, json!({"type": "response.canceled"})).await;
+        send(
+            &mut socket,
+            json!({
+                "type": "response.output_audio.delta",
+                "delta": STANDARD.encode([99, 0, 99, 0]),
+            }),
+        )
+        .await;
+        send(&mut socket, json!({"type": "response.done"})).await;
         // Unchanged configuration needs no session.update on the following
         // Frame; an ended-response interrupt must emit no second cancellation.
+        assert_eq!(receive_audio(&mut socket).await, [41, 0, 42, 0]);
+        send_reply(
+            &mut socket,
+            "next",
+            "next-response",
+            "New reply.",
+            &[7, 0, 8, 0],
+        )
+        .await;
         await_close(&mut socket).await;
     });
 
@@ -526,6 +544,15 @@ async fn active_interrupt_uses_the_same_response_and_stale_controls_do_not_cance
             }
         }
         assert!(!input.interrupt(id).await.unwrap());
+        input.append_pcm16(&[41, 0, 42, 0]).await.unwrap();
+        loop {
+            if let QwenRealtimeAudioEvent::AudioDelta { pcm16, .. } =
+                events.next_event().await.unwrap()
+            {
+                assert_eq!(pcm16, [7, 0, 8, 0]);
+                break;
+            }
+        }
         input.finish().await.unwrap();
     };
     let (outcome, ()) =
