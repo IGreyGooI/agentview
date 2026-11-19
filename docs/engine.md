@@ -1415,10 +1415,22 @@ Reaction 提交新 Frame，由 port 请求后续生成。生成结束后仍接�
 ephemeral 输入作为临时对话项随本轮发送，生成结束后按服务端 ID 删除并等待确认。
 语音会话的连续性依赖远端已提交的媒体，若后续 Frame 要求 Full，port 在 handoff 前拒绝。
 
+`QwenRealtimeVoiceApplication` 挂载专用于 Qwen Realtime 的语音 Component。该 Component
+声明 `FrameCapability::RealtimeAudio`，运行时在交付前检查 provider 能力。宿主把 16 kHz
+PCM16 音频块和静音交给 Component 的有界入口。PCM 不属于 POM 或 Frame 的 canonical replay。
+port 交付当前 Frame 并收到其配置和输入回执后，才向 Smart Turn v2 转发音频。Qwen 自动判句、
+提交和起答。该次回复的 canonical 输出沿用当前 exchange 的 FrameRevision，媒体事件携带 Qwen
+response ID。正常 `response.done` 之后重新准备并交付下一 Frame，函数输出通过该 Frame 回传，
+随后由 port 请求续答。流式音频独立投递，文本和工具在该次回复完成时才进入 canonical history。
+被插话取消的回复结束当前 exchange，并在同一个连接上交付下一 Frame。Component 可以通过
+语音 handle 请求取消指定回复，provider 拒绝只返回给请求者，后续音频和回复继续处理。
+会话开始后保留 `#[system_once]` 快照。需要随下一 Frame 更新的说明由普通 developer projection
+声明，并以会话项交付。修改 `#[system_once]` 会要求 Full Frame，而已有语音会话无法重放远端媒体。
+
 ### Frame 能力与结构化 Decision
 
 `FrameCapabilities`在既有semantic delta之外独立声明`native_tool_calls`、`text_delta_output`和
-`decision`。完整当前Component projection汇总`FrameRequirements`；`FrameSession::prepare`在handoff
+`decision`，语音 Component 还要求 `realtime_audio`。完整当前Component projection汇总`FrameRequirements`；`FrameSession::prepare`在handoff
 前验证requirements是capabilities的子集。缺失能力返回可恢复的明确准备拒绝，零submit、不推进
 revision/history/diff baseline或消费tool receipts。后续显式操作可以在组件声明改变后重试。
 semantic delta仍是传输优化，不支持时可以Full，并非业务能力缺失。

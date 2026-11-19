@@ -5,6 +5,7 @@ mod media;
 mod output;
 mod request;
 mod transport;
+mod voice_application;
 
 use std::{
     collections::VecDeque,
@@ -36,11 +37,26 @@ use media::Media;
 pub use media::{QwenRealtimeMediaEvents, QwenRealtimeMediaInput, QwenRealtimeServerEvents};
 use output::Decoder;
 use transport::Socket;
+pub use voice_application::{QwenRealtimeVoiceApplication, QwenRealtimeVoiceInput};
 
 use super::ModelSpec;
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Mode {
+    #[default]
+    Text,
+    ManualAudio,
+    SmartTurnV2,
+}
+
+impl Mode {
+    fn audio(self) -> bool {
+        self != Self::Text
+    }
+}
 
 /// Invalid local configuration, with no URL or credential in the diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -60,9 +76,9 @@ pub enum QwenRealtimeConfigError {
 
 /// A Frame-native port that retains its WebSocket across compatible reactions.
 ///
-/// Each Frame starts one explicit response. The runtime receives text deltas and
-/// structured native tool calls as they are admitted. The next Frame supplies
-/// their tool results and the latest Component view on the same session.
+/// The runtime receives deltas and structured native tool calls as they are
+/// admitted. The next Frame supplies tool results and the latest Component view
+/// on the same session.
 pub struct QwenRealtimeProvider {
     endpoint: Url,
     authorization: HeaderValue,
@@ -74,7 +90,7 @@ pub struct QwenRealtimeProvider {
     retained: Option<Retained>,
     terminal: Option<Fault>,
     media: Option<Media>,
-    voice: bool,
+    mode: Mode,
     follow_up: bool,
 }
 
@@ -126,7 +142,7 @@ impl QwenRealtimeProvider {
             retained: None,
             terminal: None,
             media: None,
-            voice: false,
+            mode: Mode::Text,
             follow_up: false,
         })
     }
@@ -134,9 +150,9 @@ impl QwenRealtimeProvider {
     /// Enables a single long-lived voice reaction. The media host supplies
     /// utterances while Application renders the view and dispatches tools.
     pub fn with_audio(mut self) -> (Self, QwenRealtimeMediaInput, QwenRealtimeMediaEvents) {
-        let (media, input, events) = Media::new();
+        let (media, input, events) = Media::new(Mode::ManualAudio);
         self.media = Some(media);
-        self.voice = true;
+        self.mode = Mode::ManualAudio;
         (self, input, events)
     }
 
@@ -216,13 +232,14 @@ impl ReactionPort for QwenRealtimeProvider {
     async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
         frame.check_handoff_precondition(&self.declare()?)?;
         let ephemeral = !frame.submission().ephemeral().is_empty();
-        if self.voice && matches!(frame.basis(), FrameBasis::Full) && self.retained.is_some() {
+        if self.mode.audio() && matches!(frame.basis(), FrameBasis::Full) && self.retained.is_some()
+        {
             // Full replay cannot reconstruct committed media held by the remote
             // session. Reject a replacement when that session is still needed.
             return Err(Fault::retryable(Code::Rejected, Reason::RequestPreparation).into());
         }
         if matches!(frame.basis(), FrameBasis::DeltaFrom(_))
-            && ((!self.voice && ephemeral)
+            && ((!self.mode.audio() && ephemeral)
                 || self
                     .retained
                     .as_ref()
@@ -230,17 +247,17 @@ impl ReactionPort for QwenRealtimeProvider {
         {
             // The existing session cannot safely represent this exact input.
             // Ask the runtime to prepare a Full Frame without consuming receipts.
-            if self.voice {
+            if self.mode.audio() {
                 return Err(transport::protocol_fault().into());
             }
             self.lose_continuity();
             return Err(SubmitFault::ContinuityChanged);
         }
 
-        if self.voice && self.retained.is_none() && self.media.is_none() {
+        if self.mode.audio() && self.retained.is_none() && self.media.is_none() {
             return Err(Fault::terminal(Code::Unavailable, Reason::Declaration).into());
         }
-        let commands = request::encode(&frame, MAX_REQUEST_BYTES, self.voice)?;
+        let commands = request::encode(&frame, MAX_REQUEST_BYTES, self.mode)?;
         let tool_feedback = self.follow_up || !frame.submission().staged_inputs().is_empty();
         let mut response_bytes = ResponseBytes::default();
         let fresh = if matches!(frame.basis(), FrameBasis::Full) {
@@ -281,6 +298,7 @@ impl ReactionPort for QwenRealtimeProvider {
                 response_bytes,
                 created,
                 tool_feedback,
+                self.mode,
             )
             .boxed();
             let first = started.as_mut().poll(cx);
@@ -295,17 +313,19 @@ impl ReactionPort for QwenRealtimeProvider {
             }
         }
         .boxed();
-        let decoder = if self.voice {
-            Decoder::with_audio()
+        let decoder = if self.mode.audio() {
+            Decoder::with_audio(self.mode == Mode::SmartTurnV2)
         } else {
             Decoder::default()
         };
-        let discard_session = !self.voice && ephemeral;
+        let discard_session = !self.mode.audio() && ephemeral;
+        let expect_immediate_response = self.mode != Mode::SmartTurnV2 || tool_feedback;
         let in_flight = InFlight {
             provider: self,
             pending: Some(pending),
             session: None,
             response_bytes,
+            expect_immediate_response,
             revision,
             discard_session,
             decoder,
@@ -322,7 +342,7 @@ impl ReactionPort for QwenRealtimeProvider {
     }
 
     async fn next_session_frame(&mut self, feedback_pending: bool) -> Result<bool, Fault> {
-        if !self.voice {
+        if !self.mode.audio() {
             return Ok(false);
         }
         let retained = self
@@ -339,6 +359,14 @@ impl ReactionPort for QwenRealtimeProvider {
             return Ok(true);
         }
         let session = &mut retained.session;
+        if self.mode == Mode::SmartTurnV2 {
+            // Install the next Frame before forwarding any queued microphone audio.
+            return Ok(!session
+                .media
+                .as_ref()
+                .expect("voice session has media")
+                .is_finished());
+        }
         let result = session
             .media
             .as_mut()
@@ -352,7 +380,7 @@ impl ReactionPort for QwenRealtimeProvider {
     }
 
     async fn finish_session(&mut self) {
-        if self.voice && self.media.is_none() {
+        if self.mode.audio() && self.media.is_none() {
             self.shutdown().await;
             self.terminal
                 .get_or_insert_with(|| Fault::terminal(Code::Unavailable, Reason::Declaration));
@@ -398,7 +426,9 @@ async fn start_response(
     mut bytes: ResponseBytes,
     created: Option<Value>,
     tool_feedback: bool,
+    mode: Mode,
 ) -> Result<StartedResponse, Fault> {
+    let first_frame = created.is_some();
     if let (Some(media), Some(created)) = (&mut session.media, created) {
         media.observe(&created)?;
     }
@@ -411,16 +441,23 @@ async fn start_response(
             && modes.iter().any(|mode| mode == "text")
             && (!audio || modes.iter().any(|mode| mode == "audio"))
     });
-    if updated["session"]["id"] != session.id
-        || !expected_modalities
-        || !updated["session"]["turn_detection"].is_null()
-    {
+    let turn_detection = &updated["session"]["turn_detection"];
+    let expected_detection = if mode == Mode::SmartTurnV2 {
+        turn_detection["type"] == "smart_turn_v2" || (!first_frame && turn_detection.is_null())
+    } else {
+        turn_detection.is_null()
+    };
+    // The provider owns the acknowledged configuration. With a mismatched
+    // session or mode, sending microphone data could expose the Frame's input
+    // to a different session or leave it waiting for a manual commit. Reject
+    // this provider exchange before forwarding its microphone input.
+    if updated["session"]["id"] != session.id || !expected_modalities || !expected_detection {
         return Err(transport::protocol_fault());
     }
     for item in commands.items {
         create_item(&mut session, &mut bytes, item).await?;
     }
-    if let Some(media) = &mut session.media {
+    if let Some(media) = session.media.as_mut().filter(|_| mode == Mode::ManualAudio) {
         if !tool_feedback {
             if !media.wait_for_turn(&mut session.socket).await? {
                 return Ok(StartedResponse {
@@ -440,11 +477,13 @@ async fn start_response(
             transient.push(id);
         }
     }
-    transport::send(
-        &mut session.socket,
-        r#"{"type":"response.create"}"#.to_owned(),
-    )
-    .await?;
+    if mode != Mode::SmartTurnV2 || tool_feedback {
+        transport::send(
+            &mut session.socket,
+            r#"{"type":"response.create"}"#.to_owned(),
+        )
+        .await?;
+    }
     Ok(StartedResponse {
         session,
         bytes,
@@ -481,9 +520,10 @@ async fn next_ack(
 ) -> Result<Value, Fault> {
     loop {
         let (event, count) = transport::receive(&mut session.socket).await?;
-        if let Some(media) = &mut session.media {
-            media.observe(&event)?;
-        }
+        let (event, count) = match &mut session.media {
+            Some(media) => media.admit(event, count)?,
+            None => (event, count),
+        };
         let event = bytes.admit(event, count)?;
         match event["type"].as_str() {
             Some("conversation.item.created")
@@ -518,6 +558,7 @@ struct InFlight<'a> {
     pending: Option<BoxFuture<'static, Result<StartedResponse, Fault>>>,
     session: Option<Session>,
     response_bytes: ResponseBytes,
+    expect_immediate_response: bool,
     revision: FrameRevision,
     discard_session: bool,
     decoder: Decoder,
@@ -601,11 +642,16 @@ impl InFlight<'_> {
             }
             let session = self.session.as_mut().expect("response started");
             let event = if let Some(media) = &mut session.media {
-                let (event, bytes) = media.receive(&mut session.socket, true).await?;
+                let responding = self.expect_immediate_response || self.decoder.has_started();
+                let (event, bytes) = media.receive(&mut session.socket, responding).await?;
                 self.response_bytes.admit(event, bytes)?
             } else {
                 self.response_bytes.receive(&mut session.socket).await?
             };
+            if event["type"] == "agentview.input_finished" {
+                self.ended_without_response = true;
+                return Ok(Some(ProviderFact::ReactionCompleted { primary_text: None }));
+            }
             if event["type"].as_str().is_some_and(media_event) {
                 continue;
             }

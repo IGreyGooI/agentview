@@ -1,7 +1,8 @@
-//! Typed Frame lowering for explicitly requested Qwen Realtime responses.
+//! Typed Frame lowering for Qwen Realtime.
 
 use serde_json::{json, Value};
 
+use super::Mode;
 use crate::{
     component::execution::{
         Frame, FrameBasis, ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultReason,
@@ -22,23 +23,29 @@ pub(super) struct Commands {
 pub(super) fn encode(
     frame: &Frame,
     max_request_bytes: usize,
-    audio: bool,
+    mode: Mode,
 ) -> Result<Commands, ReactionPortFault> {
     let submission = frame.submission();
     if submission.decision().is_some() {
         return Err(preparation_fault());
     }
 
-    let mut session = match frame.basis() {
-        FrameBasis::Full if audio => json!({
+    let mut session = match (frame.basis(), mode) {
+        (FrameBasis::Full, Mode::SmartTurnV2) => json!({
+            "modalities": ["text", "audio"],
+            "input_audio_format": "pcm",
+            "output_audio_format": "pcm",
+            "turn_detection": {"type": "smart_turn_v2"},
+        }),
+        (FrameBasis::Full, Mode::ManualAudio) => json!({
             "modalities": ["text", "audio"],
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
-            "turn_detection": null
+            "turn_detection": null,
         }),
-        FrameBasis::Full => json!({"modalities": ["text"], "turn_detection": null}),
+        (FrameBasis::Full, Mode::Text) => json!({"modalities": ["text"], "turn_detection": null}),
         // The service freezes turn detection once the session processes input.
-        FrameBasis::DeltaFrom(_) => json!({}),
+        (FrameBasis::DeltaFrom(_), _) => json!({}),
     };
     let mut tools = Vec::with_capacity(submission.tools().definitions().len());
     for tool in submission.tools().definitions() {

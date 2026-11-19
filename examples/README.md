@@ -10,8 +10,8 @@ to the public DashScope endpoint and uses `qwen-audio-3.1-realtime-plus`.
 cargo run --locked --example qwen_realtime_live
 ```
 
-The example runs two bundled TTS utterances with one Component, one inventory
-tool, and one `Application::react(false)`. It prints the conversation and saves
+The example runs two bundled TTS utterances with one voice Application, one
+inventory tool, and Smart Turn v2. It prints the conversation and saves
 both replies as WAV files under `target/qwen-realtime/`. To use your own
 utterances, pass two 16 kHz mono little-endian PCM16 files.
 
@@ -20,16 +20,21 @@ cargo run --locked --example qwen_realtime_live -- \
   lookup-widget.pcm stock-plus-one.pcm
 ```
 
-Use `QwenRealtimeProvider::with_audio()` to get the provider and its media
-handles. Stream microphone chunks with `append_pcm16` and mark each utterance
-with `commit_input`. AgentView delivers the rendered Component view and
-advances responses and tool feedback on the same WebSocket.
+Use `QwenRealtimeVoiceApplication::mount(root, provider)` to mount an independent
+voice Application and obtain its media handles. Stream 16 kHz PCM chunks,
+including silence, with `append_pcm16` while `app.run()` drives the session.
+Smart Turn v2 detects speech boundaries, commits audio, and starts replies.
+After `response.done`, AgentView renders the next Frame and submits any tool
+results on the same WebSocket. Microphone audio continues during playback.
+When Qwen interrupts a reply, discard queued PCM for the cancelled response ID
+on `ResponseEnded` and continue playing audio from the next response.
 `QwenRealtimeMediaEvents::next_event` yields typed media events, including
 24 kHz PCM16 output, and `next_server_event` yields the full server JSON,
 including provider extensions. Both subscriptions report lag to slow consumers.
 Keep receiving across `ResponseEnded` to collect late input transcription.
-Use `finish` to end input and drain outstanding work or interrupt the Reaction
-to stop it.
+Use `finish` to end voice input at the end of the conversation, then
+`app.shutdown()` to release the Application. The explicit input API for manual
+voice sessions is `QwenRealtimeProvider::with_audio()`.
 
 The text example accepts one turn per line and prints tokens as they arrive.
 Set `QWEN_REALTIME_URL` and `AGENTVIEW_CONTEXT_WINDOW_TOKENS` for this variant.

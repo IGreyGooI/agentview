@@ -3,15 +3,12 @@
 use std::{collections::HashMap, io::Write, path::Path, time::Duration};
 
 use agentview::{
-    component::{
-        execution::{Application, ReactionOutcome},
-        prelude::*,
-    },
+    component::{execution::ReactionOutcome, prelude::*},
     provider::{
         qwen_realtime::{
-            QwenRealtimeAudioEvent, QwenRealtimeMediaEvents, QwenRealtimeMediaInput,
-            QwenRealtimeProvider, QwenRealtimeResponseStatus, QwenRealtimeServerEvents,
-            QWEN_REALTIME_OUTPUT_SAMPLE_RATE_HZ,
+            QwenRealtimeAudioEvent, QwenRealtimeMediaEvents, QwenRealtimeProvider,
+            QwenRealtimeResponseStatus, QwenRealtimeServerEvents, QwenRealtimeVoiceApplication,
+            QwenRealtimeVoiceInput, QWEN_REALTIME_OUTPUT_SAMPLE_RATE_HZ,
         },
         ModelSpec,
     },
@@ -51,15 +48,22 @@ fn stock_assistant() -> Component {
     }
 }
 
-async fn send_utterance(input: &QwenRealtimeMediaInput, pcm: &[u8]) -> anyhow::Result<()> {
+async fn send_utterance(input: &QwenRealtimeVoiceInput, pcm: &[u8]) -> anyhow::Result<()> {
     anyhow::ensure!(
         !pcm.is_empty() && pcm.len() % 2 == 0,
         "input must be 16 kHz mono PCM16"
     );
-    for chunk in pcm.chunks(3_200) {
+    let mut pacing = tokio::time::interval(Duration::from_millis(100));
+    pacing.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let silence = [0; 3_200];
+    // A real microphone continues streaming during the silence after speech.
+    for chunk in pcm
+        .chunks(3_200)
+        .chain(std::iter::repeat_n(&silence[..], 40))
+    {
+        pacing.tick().await;
         input.append_pcm16(chunk).await?;
     }
-    input.commit_input().await?;
     Ok(())
 }
 
@@ -154,8 +158,9 @@ async fn main() -> anyhow::Result<()> {
         .map_or(Ok(262_144), |value| value.parse())
         .context("AGENTVIEW_CONTEXT_WINDOW_TOKENS must be a positive integer")?;
     let model = ModelSpec::new("qwen-audio-3.1-realtime-plus", tokens)?;
-    let (provider, input, mut events) =
-        QwenRealtimeProvider::new(&endpoint, &key, model)?.with_audio();
+    let provider = QwenRealtimeProvider::new(&endpoint, &key, model)?;
+    let (mut app, input, mut events) =
+        QwenRealtimeVoiceApplication::mount(stock_assistant, provider)?;
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let utterances = match args.as_slice() {
         [] => [LOOKUP.to_vec(), FOLLOW_UP.to_vec()],
@@ -168,21 +173,12 @@ async fn main() -> anyhow::Result<()> {
 
     std::fs::create_dir_all(OUTPUT)?;
     let mut server = events.subscribe_server_events();
-    let mut app = Application::mount(stock_assistant, provider)?;
-    let reaction = app.react(false)?;
-    let operation = tokio::time::timeout(Duration::from_secs(90), async {
+    let conversation = async {
         for (index, pcm) in utterances.iter().enumerate() {
-            let round = async {
-                let (_, reply) = tokio::try_join!(
-                    send_utterance(&input, pcm),
-                    receive_reply(&mut events, &mut server)
-                )?;
-                Ok::<_, anyhow::Error>(reply)
-            };
-            let reply = tokio::select! {
-                outcome = reaction.clone() => anyhow::bail!("Realtime session ended early: {:?}", outcome?),
-                reply = round => reply?,
-            };
+            let (_, reply) = tokio::try_join!(
+                send_utterance(&input, pcm),
+                receive_reply(&mut events, &mut server)
+            )?;
 
             let path = Path::new(OUTPUT).join(format!("reply-{}.wav", index + 1));
             write_wav(&path, &reply.pcm)?;
@@ -190,11 +186,17 @@ async fn main() -> anyhow::Result<()> {
             println!("Audio saved to {}", path.display());
         }
         input.finish().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let drive = async {
         anyhow::ensure!(
-            reaction.await? == ReactionOutcome::Completed,
+            app.run().await? == ReactionOutcome::Completed,
             "Realtime session ended before input drained"
         );
         Ok::<_, anyhow::Error>(())
+    };
+    let operation = tokio::time::timeout(Duration::from_secs(90), async {
+        tokio::try_join!(drive, conversation)
     })
     .await;
     let shutdown = app.shutdown().await;

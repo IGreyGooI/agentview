@@ -16,6 +16,7 @@ pub(super) struct Decoder {
     next_output: u64,
     primary_text: Option<ProviderOutputKey>,
     audio: bool,
+    interruptible: bool,
     complete: bool,
 }
 
@@ -108,15 +109,20 @@ impl WireItem {
 }
 
 impl Decoder {
-    pub(super) fn with_audio() -> Self {
+    pub(super) fn with_audio(interruptible: bool) -> Self {
         Self {
             audio: true,
+            interruptible,
             ..Self::default()
         }
     }
 
     pub(super) fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    pub(super) fn has_started(&self) -> bool {
+        self.response_id.is_some()
     }
 
     pub(super) fn on_event(
@@ -146,7 +152,9 @@ impl Decoder {
             }
             "response.content_part.added" => self.content_part(&event, false)?,
             "response.content_part.done" => self.content_part(&event, true)?,
-            "response.output_item.done" => self.output_done(&event)?,
+            // For interruptible replies, the final envelope determines whether
+            // partial output should be admitted at all, especially function calls.
+            "response.output_item.done" if !self.interruptible => self.output_done(&event)?,
             "response.done" => return self.response_done(&event),
             "session.created"
             | "session.updated"
@@ -280,13 +288,14 @@ impl Decoder {
         content_kind: Option<ContentKind>,
     ) -> Result<(), ReactionPortFault> {
         let delta = string(event, "delta")?;
+        let stream_text = !self.interruptible;
         let (index, output) = self.output_mut(event, content_kind)?;
         if output.value_done_seen || output.part_done.is_some() {
             return Err(protocol());
         }
         output.delta.push_str(delta);
         output.saw_delta = true;
-        if content_kind.is_some() && !delta.is_empty() {
+        if stream_text && content_kind.is_some() && !delta.is_empty() {
             output.pending.push_back(ProviderFact::TextDelta {
                 output: ProviderOutputKey::new(index),
                 phase: None,
@@ -454,7 +463,12 @@ impl Decoder {
         if self.response_id.as_deref() != Some(response_id) {
             return Err(protocol());
         }
-        if string(response, "status")? != "completed" {
+        let status = string(response, "status")?;
+        if self.interruptible && status == "cancelled" {
+            self.complete = true;
+            return Ok(vec![ProviderFact::ReactionCompleted { primary_text: None }]);
+        }
+        if status != "completed" {
             return Err(server_error(&response["status_details"]["error"]));
         }
         let items: Vec<WireItem> = decode(&response["output"])?;
@@ -469,6 +483,8 @@ impl Decoder {
             let index = index as u64;
             if !self.outputs.contains_key(&index) {
                 self.register_output(index, item.clone(), false)?;
+            }
+            if !self.outputs[&index].sealed {
                 self.seal_output(index, item.clone())?;
             }
             let output = self.outputs.get(&index).ok_or_else(protocol)?;
@@ -783,7 +799,7 @@ mod tests {
     }
 
     fn open_audio_output() -> Decoder {
-        let mut decoder = Decoder::with_audio();
+        let mut decoder = Decoder::with_audio(false);
         decoder
             .on_event(json!({
                 "type": "response.created",
@@ -878,7 +894,7 @@ mod tests {
             json!({"type": "audio", "transcript": null}),
             json!({"type": "audio", "text": null}),
         ] {
-            let mut decoder = Decoder::with_audio();
+            let mut decoder = Decoder::with_audio(false);
             assert_eq!(
                 decoder
                     .on_event(completed(vec![audio_item(content)]))
@@ -942,13 +958,13 @@ mod tests {
                 json!({"type": "audio", "text": "Ready."})
             )]))
             .is_err());
-        let mut audio = Decoder::with_audio();
+        let mut audio = Decoder::with_audio(false);
         assert!(audio
             .on_event(completed(vec![audio_item(
                 json!({"type": "text", "transcript": "Ready."})
             )]))
             .is_err());
-        let mut conflicting = Decoder::with_audio();
+        let mut conflicting = Decoder::with_audio(false);
         assert!(conflicting
             .on_event(completed(vec![audio_item(json!({
                 "type": "audio", "transcript": "Ready.", "text": "Different."

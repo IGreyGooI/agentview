@@ -149,6 +149,7 @@ pub struct FrameCapabilities {
     native_tool_calls: bool,
     text_delta_output: bool,
     decision: bool,
+    realtime_audio: bool,
 }
 
 impl FrameCapabilities {
@@ -160,6 +161,7 @@ impl FrameCapabilities {
             native_tool_calls: false,
             text_delta_output: false,
             decision: false,
+            realtime_audio: false,
         }
     }
 
@@ -182,6 +184,11 @@ impl FrameCapabilities {
         self
     }
 
+    pub const fn with_realtime_audio(mut self, enabled: bool) -> Self {
+        self.realtime_audio = enabled;
+        self
+    }
+
     pub const fn supports_native_tool_calls(self) -> bool {
         self.native_tool_calls
     }
@@ -198,6 +205,7 @@ pub enum FrameCapability {
     NativeToolCalls,
     TextDeltaOutput,
     Decision,
+    RealtimeAudio,
 }
 
 /// Requirements collected from a complete current Component declaration.
@@ -206,6 +214,7 @@ pub struct FrameRequirements {
     native_tool_calls: bool,
     text_delta_output: bool,
     decision: bool,
+    realtime_audio: bool,
 }
 
 impl FrameRequirements {
@@ -215,6 +224,7 @@ impl FrameRequirements {
             native_tool_calls,
             text_delta_output,
             decision,
+            realtime_audio: false,
         }
     }
     pub const fn with_native_tool_calls(mut self, enabled: bool) -> Self {
@@ -229,6 +239,11 @@ impl FrameRequirements {
         self.decision = enabled;
         self
     }
+
+    pub const fn with_realtime_audio(mut self, enabled: bool) -> Self {
+        self.realtime_audio = enabled;
+        self
+    }
     pub const fn requires_native_tool_calls(self) -> bool {
         self.native_tool_calls
     }
@@ -239,13 +254,14 @@ impl FrameRequirements {
         self.decision
     }
     pub const fn is_empty(self) -> bool {
-        !self.native_tool_calls && !self.text_delta_output && !self.decision
+        !self.native_tool_calls && !self.text_delta_output && !self.decision && !self.realtime_audio
     }
     pub const fn contains(self, capability: FrameCapability) -> bool {
         match capability {
             FrameCapability::NativeToolCalls => self.native_tool_calls,
             FrameCapability::TextDeltaOutput => self.text_delta_output,
             FrameCapability::Decision => self.decision,
+            FrameCapability::RealtimeAudio => self.realtime_audio,
         }
     }
     pub const fn union(self, other: Self) -> Self {
@@ -254,6 +270,7 @@ impl FrameRequirements {
             self.text_delta_output || other.text_delta_output,
             self.decision || other.decision,
         )
+        .with_realtime_audio(self.realtime_audio || other.realtime_audio)
     }
     pub const fn missing_from(self, available: FrameCapabilities) -> Self {
         Self::new(
@@ -261,6 +278,7 @@ impl FrameRequirements {
             self.text_delta_output && !available.text_delta_output,
             self.decision && !available.decision,
         )
+        .with_realtime_audio(self.realtime_audio && !available.realtime_audio)
     }
 }
 

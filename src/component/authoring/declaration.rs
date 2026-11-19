@@ -89,11 +89,16 @@ impl Component {
     pub(crate) fn from_node(node: ComponentNode) -> Self {
         Self { node }
     }
+
+    pub(crate) fn realtime_audio() -> Self {
+        Self::from_node(ComponentNode::RealtimeAudio)
+    }
 }
 
 pub(crate) enum ComponentNode {
     Fragment(Vec<Component>),
     Pom(PomFragment),
+    RealtimeAudio,
     Scope {
         function: &'static str,
         render: ScopeRender,

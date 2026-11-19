@@ -100,6 +100,14 @@ pub enum QwenRealtimeAudioEvent {
 }
 
 impl AudioDecoder {
+    pub(super) fn is_responding(&self) -> bool {
+        self.active_response.is_some()
+    }
+
+    pub(super) fn active_response(&self) -> Option<&str> {
+        self.active_response.as_deref()
+    }
+
     pub(super) fn decode(
         &mut self,
         event: &Value,

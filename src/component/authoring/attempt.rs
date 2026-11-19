@@ -295,7 +295,8 @@ where
             || !capture.streaming_contracts.is_empty()
             || listeners.iter().any(MountedListener::is_xml_action);
         let requirements = FrameRequirements::NONE
-            .with_text_delta_output(listeners.iter().any(MountedListener::requires_text_deltas));
+            .with_text_delta_output(listeners.iter().any(MountedListener::requires_text_deltas))
+            .with_realtime_audio(capture.realtime_audio);
         let streaming_contracts = std::mem::take(&mut capture.streaming_contracts);
         let xml_callbacks = match std::mem::take(&mut capture.xml_callbacks) {
             declarations if declarations.is_empty() => None,
@@ -833,6 +834,7 @@ fn visit_render(
                 capture.push(owner, placement, document.into_children(), None)?;
             }
         }
+        ComponentNode::RealtimeAudio => capture.realtime_audio = true,
         node @ (ComponentNode::Scope { .. } | ComponentNode::DynamicScope { .. }) => {
             let is_system_scope = forced == Some(Placement::SystemOnce);
             let (component_id, render) = match node {
@@ -1343,6 +1345,7 @@ fn ensure_depth(depth: usize) -> Result<(), ComponentAttemptFault> {
 }
 
 struct RenderCapture {
+    realtime_audio: bool,
     questions: BTreeMap<String, DecisionQuestion>,
     decision_error: Option<DecisionDeclarationError>,
     command_prefix: String,
@@ -1365,6 +1368,7 @@ impl RenderCapture {
         let mut node_indexes = HashMap::new();
         node_indexes.insert(root.clone(), 0);
         Self {
+            realtime_audio: false,
             questions: BTreeMap::new(),
             decision_error: None,
             command_prefix: command_prefix.to_owned(),
