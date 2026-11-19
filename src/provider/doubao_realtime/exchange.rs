@@ -273,6 +273,13 @@ impl<'a> Exchange<'a> {
         let kind = event["type"].as_str().unwrap_or_default();
         match kind {
             "error" => {
+                let detail = event.get("error").unwrap_or(&event);
+                let code = detail.get("code").or_else(|| detail.get("status_code"));
+                let provider_code = code.and_then(|code| {
+                    code.as_i64()
+                        .or_else(|| code.as_str().and_then(|code| code.parse().ok()))
+                });
+                tracing::warn!(event = "seeduplex_upstream_error", provider_code);
                 // A cancel may lose a race with the old response ending. Only
                 // a rejection correlated to this control should be handled
                 // here. Other provider errors keep their regular fault path.

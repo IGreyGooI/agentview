@@ -47,7 +47,7 @@ fn session_event(
                 "type": "function",
                 "name": tool.name(),
                 "description": tool.description(),
-                "parameters": tool.input_schema(),
+                "parameters": tool_schema(tool.input_schema()),
             })
         })
         .collect();
@@ -69,6 +69,73 @@ fn session_event(
             "tools": tools,
         },
     })
+}
+
+fn tool_schema(schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    lower_schema_types(&mut schema);
+    schema
+}
+
+fn lower_schema_types(schema: &mut Value) {
+    let Some(schema) = schema.as_object_mut() else {
+        return;
+    };
+    // The service decodes each JSON Schema type as a string. Schemars
+    // represents nullable properties with type arrays, which the service
+    // rejects before opening the session. Publish the concrete argument type
+    // for those fields and keep the original validation in the Component.
+    if let Some(types) = schema.get("type").and_then(Value::as_array) {
+        let concrete: Vec<_> = types
+            .iter()
+            .filter(|kind| **kind != "null")
+            .cloned()
+            .collect();
+        if concrete.len() == 1 {
+            schema.insert("type".to_owned(), concrete[0].clone());
+        } else if concrete.is_empty() {
+            schema.insert("type".to_owned(), json!("null"));
+        } else {
+            let alternatives: Vec<_> = types.iter().map(|kind| json!({"type": kind})).collect();
+            schema.remove("type");
+            let clauses = schema.entry("allOf").or_insert_with(|| json!([]));
+            if let Some(clauses) = clauses.as_array_mut() {
+                clauses.push(json!({"anyOf": alternatives}));
+            }
+        }
+    }
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ] {
+        if let Some(children) = schema.get_mut(keyword).and_then(Value::as_object_mut) {
+            children.values_mut().for_each(lower_schema_types);
+        }
+    }
+    for keyword in [
+        "items",
+        "additionalProperties",
+        "propertyNames",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+    ] {
+        if let Some(child) = schema.get_mut(keyword) {
+            lower_schema_types(child);
+        }
+    }
+    for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = schema.get_mut(keyword).and_then(Value::as_array_mut) {
+            children.iter_mut().for_each(lower_schema_types);
+        }
+    }
 }
 
 pub(super) fn append_audio(audio: &str) -> Value {
@@ -173,6 +240,36 @@ mod tests {
         assert_eq!(updated["session"]["instructions"], "");
         assert_eq!(updated["session"]["tools"], json!([]));
         assert_ne!(created["event_id"], updated["event_id"]);
+    }
+
+    #[test]
+    fn session_negotiates_schemars_nullable_fields_without_type_arrays() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "mode_id": {"type": ["string", "null"], "default": null},
+                "options": {"type": ["array", "null"], "items": {"type": ["string", "null"]}},
+                "value": {"type": ["string", "integer"]},
+            },
+            "required": ["value"],
+        });
+        let tool = ToolDefinition::new("start_task", "Create task", schema.clone()).unwrap();
+        let event = session_create("1.2.6.1", "test-voice", "", &[tool.clone()]);
+        let params = &event["session"]["tools"][0]["parameters"];
+        assert_eq!(
+            params["properties"]["mode_id"],
+            json!({"type":"string","default":null})
+        );
+        assert_eq!(
+            params["properties"]["options"],
+            json!({"type":"array","items":{"type":"string"}})
+        );
+        assert_eq!(
+            params["properties"]["value"],
+            json!({"allOf":[{"anyOf":[{"type":"string"},{"type":"integer"}]}]})
+        );
+        assert_eq!(params["required"], json!(["value"]));
+        assert_eq!(tool.input_schema(), &schema);
     }
 
     #[test]
