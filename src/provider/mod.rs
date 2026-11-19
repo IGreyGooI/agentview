@@ -9,6 +9,7 @@ use crate::transcript::CanonicalTranscript;
 
 pub mod async_openai;
 pub mod codex_http_v1;
+pub mod doubao_realtime;
 mod model;
 pub mod qwen_realtime;
 pub mod system1;

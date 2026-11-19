@@ -4351,6 +4351,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_output_feedback_continues_open_stream_without_an_extra_frame() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let ready = Arc::new(Notify::new());
+        let (port, probe) = scripted_port(
+            vec![
+                FactScript::Gated {
+                    before: vec![Ok(ProviderFact::ToolCall {
+                        output: ProviderOutputKey::new(3),
+                        ordinal: 1,
+                        call: ProviderToolCall::new("call-feedback", "lookup", "{}")
+                            .unwrap()
+                            .with_output_sender(sender),
+                    })],
+                    ready: Arc::clone(&ready),
+                    after: vec![
+                        Ok(ProviderFact::TextSealed {
+                            output: ProviderOutputKey::new(4),
+                            phase: None,
+                            text: "The actual result is ready.".into(),
+                        }),
+                        Ok(ProviderFact::ReactionCompleted {
+                            primary_text: Some(ProviderOutputKey::new(4)),
+                        }),
+                    ],
+                },
+                completed_reaction(),
+            ],
+            0,
+        );
+        let mut application = Application::mount(
+            || {
+                NativeToolCall::named("lookup").on_call(|_ctx, call| async move {
+                    Ok::<_, String>(call.output("actual-result"))
+                })
+            },
+            port,
+        )
+        .unwrap();
+
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(application.react(), async {
+                // This simulates a session provider that cannot finish its
+                // real response until the runtime returns the tool result.
+                let output = receiver.recv().await.expect("admitted tool result");
+                assert_eq!(output.call_id(), "call-feedback");
+                assert_eq!(output.content(), "actual-result");
+                assert_eq!(probe.handoffs.load(Ordering::Relaxed), 1);
+                ready.notify_one();
+            })
+        })
+        .await
+        .expect("native tool feedback must unblock the current stream");
+        assert!(outcome.unwrap().is_continue());
+        assert_eq!(probe.handoffs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            application
+                .session
+                .target_delivery
+                .tool_outputs
+                .ordered_outputs()
+                .count(),
+            1
+        );
+
+        assert!(application.react().await.unwrap().is_continue());
+        assert_eq!(*probe.staged_input_counts.lock().unwrap(), vec![0, 1]);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn tool_lane_progresses_while_fact_stream_is_pending() {
         let completed = Arc::new(Notify::new());
         let observed_completion = Arc::clone(&completed);

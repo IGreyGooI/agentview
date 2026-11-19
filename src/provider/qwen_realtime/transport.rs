@@ -22,12 +22,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_EVENT_BYTES: usize = 2 * 1024 * 1024;
 
-pub(super) type Socket = WebSocketStream<Upgraded>;
+pub(crate) type Socket = WebSocketStream<Upgraded>;
 
 pub(super) async fn connect(
     client: &Client,
     endpoint: &Url,
     authorization: header::HeaderValue,
+) -> Result<Socket, Fault> {
+    connect_with_header(client, endpoint, header::AUTHORIZATION, authorization).await
+}
+
+pub(crate) async fn connect_with_header(
+    client: &Client,
+    endpoint: &Url,
+    credential_header: header::HeaderName,
+    credential: header::HeaderValue,
 ) -> Result<Socket, Fault> {
     timeout(CONNECT_TIMEOUT, async {
         // Use the HTTP client for the upgrade so TLS/proxies and sensitive header
@@ -35,7 +44,7 @@ pub(super) async fn connect(
         let key = generate_key();
         let response = client
             .get(endpoint.clone())
-            .header(header::AUTHORIZATION, authorization)
+            .header(credential_header, credential)
             .header(header::CONNECTION, "Upgrade")
             .header(header::UPGRADE, "websocket")
             .header(header::SEC_WEBSOCKET_VERSION, "13")
@@ -98,7 +107,7 @@ fn header_has_token(headers: &header::HeaderMap, name: header::HeaderName, token
     })
 }
 
-pub(super) async fn send(
+pub(crate) async fn send(
     socket: &mut (impl Sink<Message, Error = WsError> + Unpin),
     raw: String,
 ) -> Result<(), Fault> {
@@ -116,7 +125,7 @@ pub(super) async fn receive(
         .map_err(|_| timeout_fault())?
 }
 
-pub(super) async fn receive_unbounded(
+pub(crate) async fn receive_unbounded(
     socket: &mut (impl Stream<Item = Result<Message, WsError>> + Unpin),
 ) -> Result<(Value, usize), Fault> {
     loop {
@@ -135,7 +144,7 @@ pub(super) async fn receive_unbounded(
     }
 }
 
-pub(super) fn protocol_fault() -> Fault {
+pub(crate) fn protocol_fault() -> Fault {
     Fault::retryable(Code::Protocol, Reason::ResponseProtocol)
 }
 

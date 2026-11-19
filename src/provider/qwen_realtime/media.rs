@@ -18,17 +18,18 @@ const EVENT_CAPACITY: usize = 256;
 const MAX_PENDING_TRANSCRIPTIONS: usize = 128;
 const TRANSCRIPTION_DRAIN: Duration = Duration::from_secs(15);
 
-pub(super) enum Input {
+pub(crate) enum Input {
     Append(String),
+    SetMuted(bool),
     Commit,
     Clear,
     Interrupt(Interrupt),
     Finish,
 }
 
-pub(super) struct Interrupt {
-    pub(super) response_id: String,
-    pub(super) result: oneshot::Sender<Result<bool, Fault>>,
+pub(crate) struct Interrupt {
+    pub(crate) response_id: String,
+    pub(crate) result: oneshot::Sender<Result<bool, Fault>>,
 }
 
 /// Cloneable, bounded input to a mounted Qwen Realtime voice session.
@@ -36,6 +37,11 @@ pub(super) struct Interrupt {
 pub struct QwenRealtimeMediaInput(mpsc::Sender<Input>);
 
 impl QwenRealtimeMediaInput {
+    pub(crate) fn channel() -> (Self, mpsc::Receiver<Input>) {
+        let (sender, receiver) = mpsc::channel(INPUT_CAPACITY);
+        (Self(sender), receiver)
+    }
+
     /// Enqueues 16 kHz mono signed little-endian PCM16.
     pub async fn append_pcm16(&self, pcm16: &[u8]) -> Result<(), Fault> {
         self.send(Input::Append(super::audio::encode_pcm16(pcm16)?))
@@ -57,7 +63,7 @@ impl QwenRealtimeMediaInput {
         self.send(Input::Finish).await
     }
 
-    pub(super) async fn send(&self, input: Input) -> Result<(), Fault> {
+    pub(crate) async fn send(&self, input: Input) -> Result<(), Fault> {
         self.0.send(input).await.map_err(|_| closed())
     }
 }
@@ -66,6 +72,34 @@ impl QwenRealtimeMediaInput {
 pub struct QwenRealtimeMediaEvents {
     typed: broadcast::Receiver<QwenRealtimeAudioEvent>,
     raw: broadcast::Receiver<Arc<Value>>,
+}
+
+/// Provider-owned publishers for the shared voice transport contract.
+pub(crate) struct MediaEventsSender {
+    typed: broadcast::Sender<QwenRealtimeAudioEvent>,
+    raw: broadcast::Sender<Arc<Value>>,
+}
+
+impl MediaEventsSender {
+    pub(crate) fn new() -> (Self, QwenRealtimeMediaEvents) {
+        let (typed, events) = broadcast::channel(EVENT_CAPACITY);
+        let (raw, server_events) = broadcast::channel(EVENT_CAPACITY);
+        (
+            Self { typed, raw },
+            QwenRealtimeMediaEvents {
+                typed: events,
+                raw: server_events,
+            },
+        )
+    }
+
+    pub(crate) fn publish(&self, event: QwenRealtimeAudioEvent) {
+        let _ = self.typed.send(event);
+    }
+
+    pub(crate) fn publish_server_event(&self, event: Arc<Value>) {
+        let _ = self.raw.send(event);
+    }
 }
 
 /// An independent subscription to complete Qwen server events.
@@ -107,15 +141,14 @@ fn event_fault(error: broadcast::error::RecvError) -> Fault {
     }
 }
 
-pub(super) fn closed() -> Fault {
+pub(crate) fn closed() -> Fault {
     Fault::retryable(Code::Unavailable, Reason::StreamTransport)
 }
 
 pub(super) struct Media {
     mode: Mode,
     input: mpsc::Receiver<Input>,
-    events: broadcast::Sender<QwenRealtimeAudioEvent>,
-    raw: broadcast::Sender<Arc<Value>>,
+    events: MediaEventsSender,
     decoder: AudioDecoder,
     pending_asr: HashSet<String>,
     buffered_bytes: usize,
@@ -130,16 +163,14 @@ pub(super) struct Media {
 
 impl Media {
     pub(super) fn new(mode: Mode) -> (Self, QwenRealtimeMediaInput, QwenRealtimeMediaEvents) {
-        let (sender, input) = mpsc::channel(INPUT_CAPACITY);
-        let (events, typed) = broadcast::channel(EVENT_CAPACITY);
-        let (raw, server_events) = broadcast::channel(EVENT_CAPACITY);
+        let (sender, input) = QwenRealtimeMediaInput::channel();
+        let (events, media_events) = MediaEventsSender::new();
         let (active_response, _) = watch::channel(None);
         (
             Self {
                 mode,
                 input,
                 events,
-                raw,
                 decoder: AudioDecoder::default(),
                 pending_asr: HashSet::new(),
                 buffered_bytes: 0,
@@ -151,11 +182,8 @@ impl Media {
                 active_response,
                 finished: false,
             },
-            QwenRealtimeMediaInput(sender),
-            QwenRealtimeMediaEvents {
-                typed,
-                raw: server_events,
-            },
+            sender,
+            media_events,
         )
     }
 
@@ -164,8 +192,8 @@ impl Media {
     }
 
     pub(super) fn observe(&mut self, event: &Value) -> Result<(), Fault> {
-        if self.raw.receiver_count() > 0 {
-            let _ = self.raw.send(Arc::new(event.clone()));
+        if self.events.raw.receiver_count() > 0 {
+            self.events.publish_server_event(Arc::new(event.clone()));
         }
         if self.is_cancel_rejection(event) {
             // Qwen may reject cancel while the old response is completing or
@@ -202,7 +230,7 @@ impl Media {
                             self.pending_asr.insert(item_id.clone());
                         }
                         self.awaiting_commit = true;
-                        let _ = self.events.send(event);
+                        self.events.publish(event);
                         return Ok(());
                     }
                     if self.pending_asr.len() >= MAX_PENDING_TRANSCRIPTIONS {
@@ -244,7 +272,7 @@ impl Media {
                 }
                 _ => {}
             }
-            let _ = self.events.send(event);
+            self.events.publish(event);
         }
         Ok(())
     }
@@ -326,6 +354,7 @@ impl Media {
                             "type": "input_audio_buffer.append", "audio": audio,
                         }).to_string()).await?;
                     }
+                    Some(Input::SetMuted(_)) => {},
                     Some(Input::Commit) if responding => self.commit_pending = true,
                     Some(Input::Commit) => self.commit(socket).await?,
                     Some(Input::Clear) => {

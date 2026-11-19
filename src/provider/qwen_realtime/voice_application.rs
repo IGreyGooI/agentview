@@ -6,7 +6,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::component::{
-    execution::{Application, ApplicationFault, ReactionOutcome, ReactionPortFault},
+    execution::{Application, ApplicationFault, ReactionOutcome, ReactionPort, ReactionPortFault},
     prelude::{component, Component},
 };
 
@@ -51,39 +51,55 @@ impl QwenRealtimeVoiceApplication {
             .capabilities
             .with_realtime_audio(true)
             .with_text_delta_output(false);
-        let (sender, receiver) = mpsc::channel(8);
-        let receiver = Arc::new(Mutex::new(Some(receiver)));
-        let input = QwenRealtimeVoiceInput {
-            sender,
-            active_response,
-        };
-        let component_input = input.clone();
-        let app = Application::mount(
-            move || {
-                Component::fragment([
-                    voice_input(receiver.clone(), provider_input.clone()),
-                    root(component_input.clone()),
-                ])
-            },
-            provider,
-        )?;
+        let (app, input) = mount_voice(root, provider, provider_input, active_response)?;
         Ok((Self(app), input, events))
     }
 
     /// Drive one voice session until its input finishes or its Component exits.
     pub async fn run(&mut self) -> Result<ReactionOutcome, ApplicationFault> {
-        let reaction = self.0.react(false)?.into_future();
-        tokio::pin!(reaction);
-        tokio::select! {
-            biased;
-            result = &mut reaction => result,
-            () = self.0.refresh_projection_on_signal_writes() => reaction.await,
-        }
+        drive_voice(&mut self.0).await
     }
 
     /// Close the Application and release its resources.
     pub async fn shutdown(self) -> Result<(), ApplicationFault> {
         self.0.shutdown().await
+    }
+}
+
+pub(crate) fn mount_voice<P: ReactionPort + 'static>(
+    root: impl Fn(QwenRealtimeVoiceInput) -> Component + Send + Sync + 'static,
+    provider: P,
+    provider_input: QwenRealtimeMediaInput,
+    active_response: watch::Receiver<Option<String>>,
+) -> Result<(Application<P>, QwenRealtimeVoiceInput), ApplicationFault> {
+    let (sender, receiver) = mpsc::channel(8);
+    let receiver = Arc::new(Mutex::new(Some(receiver)));
+    let input = QwenRealtimeVoiceInput {
+        sender,
+        active_response,
+    };
+    let component_input = input.clone();
+    let app = Application::mount(
+        move || {
+            Component::fragment([
+                voice_input(receiver.clone(), provider_input.clone()),
+                root(component_input.clone()),
+            ])
+        },
+        provider,
+    )?;
+    Ok((app, input))
+}
+
+pub(crate) async fn drive_voice<P: ReactionPort + 'static>(
+    application: &mut Application<P>,
+) -> Result<ReactionOutcome, ApplicationFault> {
+    let reaction = application.react(false)?.into_future();
+    tokio::pin!(reaction);
+    tokio::select! {
+        biased;
+        result = &mut reaction => result,
+        () = application.refresh_projection_on_signal_writes() => reaction.await,
     }
 }
 
@@ -112,6 +128,11 @@ impl QwenRealtimeVoiceInput {
     /// Stream 16 kHz mono signed little-endian PCM16, including silence.
     pub async fn append_pcm16(&self, pcm16: &[u8]) -> Result<(), ReactionPortFault> {
         self.send(Input::Append(encode_pcm16(pcm16)?)).await
+    }
+
+    /// Tell a provider with microphone pause support that PCM delivery is paused or resumed.
+    pub async fn set_input_muted(&self, muted: bool) -> Result<(), ReactionPortFault> {
+        self.send(Input::SetMuted(muted)).await
     }
 
     /// Close the microphone input when the conversation has finished.

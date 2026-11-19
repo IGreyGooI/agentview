@@ -435,6 +435,23 @@ impl FrameSession {
                 projection_items.insert(0, system_snapshot_item(snapshot));
             }
         }
+        // Session providers that replace instructions need the authored full
+        // state, not the semantic Delta. Reuse the already normalized envelope
+        // so this private snapshot cannot retain old Developer instructions or
+        // accidentally include history, messages, tools or request-only prompts.
+        let complete_instructions = complete_component_items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    CanonicalInputItem::Instruction {
+                        authority: InstructionAuthority::System | InstructionAuthority::Developer,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .collect();
         let constraints = &self.target_delivery.profile.constraints;
 
         // The authoring envelope is always measured from the complete
@@ -478,7 +495,8 @@ impl FrameSession {
             basis,
             submission,
         )?
-        .with_requested_context_bytes(requested_context_bytes);
+        .with_requested_context_bytes(requested_context_bytes)
+        .with_complete_instructions(complete_instructions);
 
         let replay_basis = committed_transcript.items().to_vec();
         let checkpoint = FrameCheckpoint {
@@ -2334,6 +2352,80 @@ mod tests {
             .items()
             .iter()
             .all(|item| !super::is_system_instruction(item)));
+    }
+
+    #[test]
+    fn complete_instructions_follow_current_full_state_even_when_delta_omits_it() {
+        let developer = CanonicalInputItem::instruction(
+            InstructionAuthority::Developer,
+            resolve_system_document(Document::from_raw_text("current context")),
+        );
+        let temporary = CanonicalInputItem::instruction(
+            InstructionAuthority::Developer,
+            resolve_system_document(Document::from_raw_text("request only")),
+        );
+        let projection = |include_developer: bool| {
+            RenderedProjection::from_nodes(vec![
+                RenderedProjectionNode::new("first", vec![system_fragment("first", "one")]),
+                RenderedProjectionNode::new(
+                    "context",
+                    if include_developer {
+                        vec![developer.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                ),
+                RenderedProjectionNode::new("second", vec![system_fragment("second", "two")]),
+                RenderedProjectionNode::new("temporary", vec![temporary.clone()])
+                    .with_ephemeral_items(vec![0]),
+                RenderedProjectionNode::new(
+                    "ordinary",
+                    vec![CanonicalInputItem::assistant_text("authored reply", None)],
+                ),
+            ])
+            .unwrap()
+        };
+        let normalized_system = CanonicalInputItem::instruction(
+            InstructionAuthority::System,
+            document([text_element("first", "one"), text_element("second", "two")]),
+        );
+        let profile = profile(true);
+        let declaration = full(profile.clone(), 1);
+        let mut session = FrameSession::new(&declaration).unwrap();
+        let prepared = session.prepare(&declaration, &projection(true)).unwrap();
+        let (frame, commit) = prepared.into_parts();
+        assert_eq!(
+            frame.complete_instructions(),
+            &[normalized_system.clone(), developer.clone()]
+        );
+        assert_eq!(frame.submission().ephemeral(), &[temporary.clone()]);
+        let head = frame.revision();
+        session.commit(commit);
+        let declaration = TargetDeclaration::resume(head, profile);
+
+        let unchanged = session.prepare(&declaration, &projection(true)).unwrap();
+        assert_eq!(unchanged.frame.basis(), FrameBasis::DeltaFrom(head));
+        assert!(unchanged.frame.submission().projection().items().is_empty());
+        assert_eq!(
+            unchanged.frame.complete_instructions(),
+            &[normalized_system.clone(), developer.clone()]
+        );
+        let submission = unchanged.frame.submission();
+        // The provider-private snapshot adds no field to the exact payload.
+        let canonical = super::canonical_frame_bytes(
+            submission.replay(),
+            submission.staged_inputs(),
+            submission.projection(),
+            submission.ephemeral(),
+            submission.tools(),
+        )
+        .unwrap();
+        assert_eq!(submission.canonical_bytes(), canonical);
+
+        let removed = session.prepare(&declaration, &projection(false)).unwrap();
+        assert_eq!(removed.frame.basis(), FrameBasis::DeltaFrom(head));
+        assert_eq!(removed.frame.complete_instructions(), &[normalized_system]);
+        assert_eq!(removed.frame.submission().ephemeral(), &[temporary]);
     }
 
     #[test]

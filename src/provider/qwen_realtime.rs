@@ -1,11 +1,11 @@
 //! Alibaba Cloud Qwen Realtime WebSocket text, tools and audio.
 
 mod audio;
-mod media;
+pub(crate) mod media;
 mod output;
 mod request;
-mod transport;
-mod voice_application;
+pub(crate) mod transport;
+pub(crate) mod voice_application;
 
 use std::{
     collections::VecDeque,

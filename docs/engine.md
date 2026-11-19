@@ -660,8 +660,11 @@ staging。它也不能在 `declare()` 中读取这些 private FrameSession 内�
 `next_session_frame(feedback_pending)` 默认返回 `false`。会话 port 可根据 XML 工具反馈或等待输入
 就绪后返回 `true`，由 Application
 重新准备完整当前 Component 视图并提交下一 Frame。hook 本身不得开始模型生成、提交 Frame 或
-发布 ProviderFact；生成仍绑定实际成功 handoff 的 Frame。工具结果继续通过下一 Frame 的 staged
-inputs 交付。hook 被取消时，port 必须保留真实的输入交付状态与 continuity declaration。
+发布 ProviderFact；生成仍绑定实际成功 handoff 的 Frame。工具结果仍在下一 Frame 的 staged
+inputs 中结算交付。对于要求在同一响应中收到工具结果的协议，port 可以通过
+`ProviderToolCall::with_output_sender` 接收已通过 admission 和预算校验的实际结果。通知不提交
+Frame。port 在原 exchange 内回传结果，并在下一 Frame 消费对应 staged input 时避免重复发送。
+hook 被取消时，port 必须保留真实的输入交付状态与 continuity declaration。
 `finish_session()` 在 Reaction 收束后调用一次，会话 port 可用它释放该次 Reaction 持有的连接。
 
 port 可以拥有只计算 provider-private 候选的后台任务。正常 `Application::shutdown()` 在
@@ -1429,6 +1432,13 @@ response ID。正常 `response.done` 之后重新准备并交付下一 Frame，�
 语音 Application 监听 Signal dirty 通知，在会话运行期间刷新本地 projection。若渲染会变更 Component
 挂载，刷新留到正常的回复结算边界，使当前 Frame 的回调保持可用。下一帧照常执行 preparation、
 编译和交付，声明了 `repeat` 的内容按每帧的交付规则发送。
+
+`DoubaoRealtimeVoiceApplication` 使用火山引擎 Seeduplex 全双工 WebSocket。它沿用同一语音
+Component 输入、播放和转写接口。创建会话后复用连接，下一 Frame 的完整系统和 developer
+说明或工具目录变化时发送 `session.update`，收到确认后继续发送麦克风 PCM。收到
+`response.function_call_arguments.done` 后，port 将调用交给当前 Frame 的工具绑定，将该批
+已提交的结果按 `call_id` 回传给同一响应。正常回复由 `response.done` 结算，客户端
+`response.cancel` 的确认 `response.canceled` 结算被打断的回复。
 
 ### Frame 能力与结构化 Decision
 

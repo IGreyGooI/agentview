@@ -14,7 +14,7 @@ use futures::Stream;
 
 use crate::transcript::{AssistantPhase, CanonicalInputItem, CanonicalTranscriptError};
 
-use super::{DecisionDeclaration, ProviderDecision, ToolDefinition};
+use super::{DecisionDeclaration, ProviderDecision, ToolDefinition, ToolOutput};
 
 /// Mount-stable identity of the logical target owned by one reaction port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -571,6 +571,7 @@ pub struct Frame {
     basis: FrameBasis,
     submission: FrameSubmission,
     requested_context_bytes: Option<usize>,
+    complete_instructions: Vec<CanonicalInputItem>,
 }
 
 impl Frame {
@@ -634,6 +635,7 @@ impl Frame {
             basis,
             submission,
             requested_context_bytes: None,
+            complete_instructions: Vec::new(),
         })
     }
 
@@ -646,6 +648,24 @@ impl Frame {
 
     pub(crate) fn with_requested_context_bytes(mut self, bytes: usize) -> Self {
         self.requested_context_bytes = Some(bytes);
+        self
+    }
+
+    /// Current normalized System and retained Developer Component instructions.
+    ///
+    /// A session provider that replaces one instructions field needs this full
+    /// snapshot even when ordinary Frame omission produces an empty Delta.
+    /// This private view excludes history, messages, tool results and ephemeral
+    /// prompts; it is not part of the canonical submission or its byte meter.
+    pub(crate) fn complete_instructions(&self) -> &[CanonicalInputItem] {
+        &self.complete_instructions
+    }
+
+    pub(crate) fn with_complete_instructions(
+        mut self,
+        instructions: Vec<CanonicalInputItem>,
+    ) -> Self {
+        self.complete_instructions = instructions;
         self
     }
 
@@ -737,11 +757,12 @@ impl ProviderOutputKey {
 }
 
 /// One complete, provider-neutral function call emitted by a reaction target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ProviderToolCall {
     call_id: String,
     name: String,
     raw_arguments: String,
+    output_sender: Option<tokio::sync::mpsc::UnboundedSender<ToolOutput>>,
 }
 
 impl ProviderToolCall {
@@ -763,6 +784,7 @@ impl ProviderToolCall {
             call_id,
             name,
             raw_arguments,
+            output_sender: None,
         })
     }
 
@@ -777,7 +799,42 @@ impl ProviderToolCall {
     pub fn raw_arguments(&self) -> &str {
         &self.raw_arguments
     }
+
+    /// Receive this call's actual output after runtime admission has
+    /// authoritatively staged it, while the provider fact stream stays open.
+    ///
+    /// Session providers can forward these notifications when their protocol
+    /// waits for a tool result before completing the current response. This
+    /// does not submit a Frame or complete the reaction. The result remains a
+    /// mandatory staged input to the next ordinary Frame; a provider that has
+    /// already forwarded it must avoid sending that same result twice.
+    ///
+    /// The channel carries at most one output per successfully completed,
+    /// admitted call. Scope and drain its receiver with the provider session.
+    /// A closed receiver leaves normal staged delivery intact. The sender is
+    /// not part of the call's canonical identity or Component-facing value.
+    pub fn with_output_sender(
+        mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<ToolOutput>,
+    ) -> Self {
+        self.output_sender = Some(sender);
+        self
+    }
+
+    pub(super) fn output_sender(&self) -> Option<&tokio::sync::mpsc::UnboundedSender<ToolOutput>> {
+        self.output_sender.as_ref()
+    }
 }
+
+impl PartialEq for ProviderToolCall {
+    fn eq(&self, other: &Self) -> bool {
+        self.call_id == other.call_id
+            && self.name == other.name
+            && self.raw_arguments == other.raw_arguments
+    }
+}
+
+impl Eq for ProviderToolCall {}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]

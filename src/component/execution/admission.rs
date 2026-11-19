@@ -147,6 +147,7 @@ pub(super) struct ToolLaneTicket {
     registration: u64,
     ordinal: u64,
     call_id: String,
+    output_sender: Option<tokio::sync::mpsc::UnboundedSender<ToolOutput>>,
 }
 
 impl PartialEq for ToolLaneTicket {
@@ -209,6 +210,7 @@ impl ToolOutputStaging {
             registration,
             ordinal,
             call_id: call_id.to_owned(),
+            output_sender: None,
         })
     }
 
@@ -610,12 +612,13 @@ impl<'a> ReactionAdmissionGuard<'a> {
                     }
                     None => (None, None),
                 };
-                let ticket = self.staging.register(
+                let mut ticket = self.staging.register(
                     ordinal,
                     call.call_id(),
                     cancellation_fallback,
                     reserved_item_bytes,
                 )?;
+                ticket.output_sender = call.output_sender().cloned();
                 let budget_item_bytes = budget_candidate.map(FullReserveCandidate::item_bytes);
                 self.commit_budget(budget_candidate);
                 Self::commit_tool_call(&mut self.state, output, ordinal, call, budget_item_bytes);
@@ -674,7 +677,7 @@ impl<'a> ReactionAdmissionGuard<'a> {
 
     pub(super) fn stage_tool_output(
         &mut self,
-        ticket: ToolLaneTicket,
+        mut ticket: ToolLaneTicket,
         output: ToolOutput,
     ) -> Result<(), ToolOutputStagingFault> {
         let (item, reserved_item_bytes) = self.staging.prepare_stage(&ticket, &output)?;
@@ -697,12 +700,19 @@ impl<'a> ReactionAdmissionGuard<'a> {
             }
             None => None,
         };
+        let output_sender = ticket.output_sender.take();
         self.staging.commit_stage(
             ticket,
             item,
             budget_candidate.map(FullReserveCandidate::item_bytes),
         );
         self.commit_budget(budget_candidate);
+        // The provider stream may have been dropped after admitting this call.
+        // Notify only after the authoritative result and budget are committed;
+        // a closed receiver leaves that result staged for ordinary delivery.
+        if let Some(sender) = output_sender {
+            let _ = sender.send(output);
+        }
         Ok(())
     }
 
@@ -2258,6 +2268,7 @@ mod tests {
                     registration: 41,
                     ordinal: 9,
                     call_id: "unknown".to_owned(),
+                    output_sender: None,
                 },
                 unknown_call.output("result"),
             ),
@@ -2284,6 +2295,7 @@ mod tests {
             registration,
             ordinal: 3,
             call_id: "expected".to_owned(),
+            output_sender: None,
         };
         let expected_call = ToolCall::new("expected", "lookup", "{}").unwrap();
         staging
@@ -2296,6 +2308,7 @@ mod tests {
                     registration,
                     ordinal: 3,
                     call_id: "expected".to_owned(),
+                    output_sender: None,
                 },
                 expected_call.output("second"),
             ),
@@ -2445,6 +2458,7 @@ mod tests {
                     registration,
                     ordinal: 9,
                     call_id: duplicate_call.call_id().to_owned(),
+                    output_sender: None,
                 },
                 duplicate_call.output(SEALED),
             )
@@ -2586,6 +2600,7 @@ mod tests {
 
     #[test]
     fn oversized_tool_output_leaves_the_original_slot_retryable() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut transcript = CanonicalTranscript::new();
         let mut staging = ToolOutputStaging::default();
         let mut guard = ReactionAdmissionGuard::with_budget(
@@ -2594,7 +2609,17 @@ mod tests {
             full_reserve(128, 1_024),
         )
         .unwrap();
-        let (event, ticket) = guard.admit(tool(1, 1, "retryable")).unwrap().into_parts();
+        let provider_call = ProviderToolCall::new("retryable", "lookup", "{}").unwrap();
+        let notifying_call = provider_call.clone().with_output_sender(sender);
+        assert_eq!(provider_call, notifying_call);
+        let (event, ticket) = guard
+            .admit(ProviderFact::ToolCall {
+                output: key(1),
+                ordinal: 1,
+                call: notifying_call,
+            })
+            .unwrap()
+            .into_parts();
         let ProviderEvent::ToolCall(call) = event.unwrap() else {
             panic!("expected ToolCall event")
         };
@@ -2604,12 +2629,14 @@ mod tests {
             registration: ticket.registration,
             ordinal: ticket.ordinal,
             call_id: ticket.call_id.clone(),
+            output_sender: ticket.output_sender.clone(),
         };
 
         let fault = guard
             .stage_tool_output(ticket, call.output("too-large".repeat(512)))
             .unwrap_err();
         assert_eq!(fault.reason(), ToolOutputStagingReason::Budget);
+        assert!(receiver.try_recv().is_err());
         assert!(guard
             .staging
             .slots
@@ -2628,6 +2655,10 @@ mod tests {
         guard
             .stage_tool_output(retry, call.output("small"))
             .unwrap();
+        let notification = receiver.try_recv().unwrap();
+        assert_eq!(notification.call_id(), "retryable");
+        assert_eq!(notification.content(), "small");
+        assert!(receiver.try_recv().is_err());
         assert!(guard
             .staging
             .slots
@@ -2644,6 +2675,41 @@ mod tests {
             .unwrap()
             .cancellation_fallback
             .is_none());
+    }
+
+    #[test]
+    fn closed_native_output_receiver_preserves_normal_staging() {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(receiver);
+        let mut transcript = CanonicalTranscript::new();
+        let mut staging = ToolOutputStaging::default();
+        {
+            let mut guard = ReactionAdmissionGuard::new(&mut transcript, &mut staging);
+            let (event, ticket) = guard
+                .admit(ProviderFact::ToolCall {
+                    output: key(1),
+                    ordinal: 1,
+                    call: ProviderToolCall::new("closed-receiver", "lookup", "{}")
+                        .unwrap()
+                        .with_output_sender(sender),
+                })
+                .unwrap()
+                .into_parts();
+            let ProviderEvent::ToolCall(call) = event.unwrap() else {
+                panic!("expected ToolCall event")
+            };
+            guard
+                .stage_tool_output(ticket.unwrap(), call.output("actual-result"))
+                .unwrap();
+            guard.admit(completed(None)).unwrap();
+            guard.finish_normal().unwrap();
+        }
+        let receipt = staging.prepare_receipt().unwrap();
+        assert!(matches!(
+            receipt.outputs(),
+            [CanonicalInputItem::ToolResult { call_id, content }]
+                if call_id == "closed-receiver" && content == "actual-result"
+        ));
     }
 
     #[test]
