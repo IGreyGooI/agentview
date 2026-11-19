@@ -617,6 +617,34 @@ impl<P: ReactionPort + 'static> Application<P> {
         }
     }
 
+    /// Refresh the local view of the current mount tree in a live session.
+    pub(crate) async fn refresh_projection_on_signal_writes(&self) {
+        let wake = {
+            let guard = self.shared.core.lock().await;
+            let Some(core) = guard.as_ref() else { return };
+            core.components.signal_wake()
+        };
+        loop {
+            let observed = wake.revision();
+            {
+                let mut guard = self.shared.core.lock().await;
+                let Some(core) = guard.as_mut() else { return };
+                // The normal driver owns an unfinished mount transition.
+                // Defer this refresh so the transition can finish publishing
+                // its bindings and tasks before another render starts.
+                if core.pending_render.is_none() && core.components.is_dirty() {
+                    match core.components.refresh_mounted_projection() {
+                        Ok(()) => self.shared.publish(core),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "local voice projection refresh deferred")
+                        }
+                    }
+                }
+            }
+            wake.wait_after(observed).await;
+        }
+    }
+
     /// Admit and start one operation without borrowing the application until EOF.
     /// With `ephemeral`, always use an independent Temporary from the last legal
     /// checkpoint, including while Main is idle. Otherwise, use Main when idle

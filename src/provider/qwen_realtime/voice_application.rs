@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    future::IntoFuture,
+    sync::{Arc, Mutex},
+};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -69,7 +72,13 @@ impl QwenRealtimeVoiceApplication {
 
     /// Drive one voice session until its input finishes or its Component exits.
     pub async fn run(&mut self) -> Result<ReactionOutcome, ApplicationFault> {
-        self.0.react(false)?.await
+        let reaction = self.0.react(false)?.into_future();
+        tokio::pin!(reaction);
+        tokio::select! {
+            biased;
+            result = &mut reaction => result,
+            () = self.0.refresh_projection_on_signal_writes() => reaction.await,
+        }
     }
 
     /// Close the Application and release its resources.

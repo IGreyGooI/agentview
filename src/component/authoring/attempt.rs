@@ -108,6 +108,10 @@ where
         !self.stage.task_starts.is_empty()
     }
 
+    pub(crate) fn preserves_mounts(&self) -> bool {
+        self.signal_render.preserves_mounts()
+    }
+
     pub(crate) fn commit(self) -> (ComponentRenderStage<Root>, Option<ResolvedDocument>) {
         let Self {
             stage,

@@ -9,7 +9,7 @@ use super::{
         RenderBindings, RetainedModelHistory,
     },
     execution::{DriverDemandHandle, ProjectionExecutionScope, ProviderEvent, RenderedProjection},
-    signal::{MountIdentity, SignalMountTransition, SignalRenderError, SignalRuntime},
+    signal::{MountIdentity, SignalMountTransition, SignalRenderError, SignalRuntime, SignalWake},
     task::{MountTaskHandle, MountTaskSupervisorError},
     ApplicationId, ReactionId,
 };
@@ -230,6 +230,10 @@ impl<Props> ComponentHost<Props> {
         self.signals.wait_for_wake_after(observed).await
     }
 
+    pub(crate) fn signal_wake(&self) -> SignalWake {
+        self.signals.wake_handle()
+    }
+
     /// Return the latest successfully committed complete projection.
     ///
     /// A dirty host retains this snapshot until a later render succeeds. Call
@@ -289,6 +293,23 @@ where
         replacement: Option<Component>,
         validate: impl FnOnce(&RenderedProjection) -> Result<(), ComponentHostFault>,
     ) -> Result<CommittedRenderTransition, ComponentHostFault> {
+        self.begin_render(replacement, validate, false)
+            .map(|render| render.expect("ordinary renders allow mount changes"))
+    }
+
+    pub(crate) fn refresh_mounted_projection(&mut self) -> Result<(), ComponentHostFault> {
+        if let Some(render) = self.begin_render(None, |_| Ok(()), true)? {
+            self.publish_managed_render(render);
+        }
+        Ok(())
+    }
+
+    fn begin_render(
+        &mut self,
+        replacement: Option<Component>,
+        validate: impl FnOnce(&RenderedProjection) -> Result<(), ComponentHostFault>,
+        preserve_mounts: bool,
+    ) -> Result<Option<CommittedRenderTransition>, ComponentHostFault> {
         self.signals
             .preflight_render()
             .map_err(ComponentHostFault::signal)?;
@@ -320,6 +341,13 @@ where
                 &self.command_prefix,
                 self.native_history_scope,
             )?;
+        // An in-flight Frame still owns callbacks from the current mounts.
+        // Publishing a different topology could retire those callbacks before
+        // the provider delivers their events. Defer that render to the normal
+        // Frame boundary and leave the dirty marker pending.
+        if preserve_mounts && (!candidate.preserves_mounts() || candidate.has_task_starts()) {
+            return Ok(None);
+        }
         if candidate.has_task_starts() {
             self.tasks
                 .as_ref()
@@ -344,7 +372,7 @@ where
         let (preparations, bindings, task_starts) = stage.into_execution_parts();
         self.next_projection_revision = projection_revision.checked_next();
 
-        Ok(CommittedRenderTransition {
+        Ok(Some(CommittedRenderTransition {
             host_id: self.id,
             generation,
             projection_revision,
@@ -353,7 +381,7 @@ where
             bindings,
             task_starts,
             mounts,
-        })
+        }))
     }
 
     /// Install the factory whose output was already validated and committed.

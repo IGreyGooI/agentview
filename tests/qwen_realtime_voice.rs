@@ -23,7 +23,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::oneshot,
+    sync::{oneshot, Notify},
 };
 use tokio_tungstenite::{
     accept_hdr_async,
@@ -44,10 +44,21 @@ struct VoiceProbe {
     text_frames: Arc<Mutex<Vec<(String, FrameRevision)>>>,
     tool_frames: Arc<Mutex<Vec<FrameRevision>>>,
     completed_frames: Arc<Mutex<Vec<FrameRevision>>>,
+    external_state: Arc<Mutex<Option<Signal<u32>>>>,
+    rendered_values: Arc<Mutex<Vec<u32>>>,
+    rendered: Arc<Notify>,
 }
 
 #[component]
 fn voice_assistant(probe: VoiceProbe) -> Component {
+    let external_state = use_signal(|| 0u32);
+    *probe.external_state.lock().unwrap() = Some(external_state.clone());
+    probe
+        .rendered_values
+        .lock()
+        .unwrap()
+        .push(external_state.with(|value| *value).unwrap());
+    probe.rendered.notify_one();
     let completed_frames = probe.completed_frames.clone();
     use_reaction_completion(move |context: EventContext| async move {
         completed_frames
@@ -94,6 +105,10 @@ fn voice_assistant(probe: VoiceProbe) -> Component {
     view! {
         #[system_once]
         "Answer briefly in Chinese."
+
+        #[developer(repeat)]
+        "Use the current application state and confirmed tool results when answering."
+
         { tools }
     }
 }
@@ -182,6 +197,18 @@ async fn receive_audio(socket: &mut WebSocketStream<TcpStream>) -> Vec<u8> {
             other => panic!("speech must be streamed without client turn commands, got {other}"),
         }
     }
+}
+
+async fn receive_repeated_instruction(socket: &mut WebSocketStream<TcpStream>) -> Value {
+    let event = receive(socket).await;
+    assert_eq!(event["type"], "conversation.item.create");
+    let item = &event["item"];
+    assert_eq!(item["type"], "message");
+    assert_eq!(item["role"], "system");
+    assert_eq!(item["content"].as_array().unwrap().len(), 1);
+    assert_eq!(item["content"][0]["type"], "input_text");
+    acknowledge_item(socket, &event).await;
+    event["item"].clone()
 }
 
 async fn send_input(socket: &mut WebSocketStream<TcpStream>, input_id: &str) {
@@ -280,6 +307,7 @@ async fn send_audio_reply(
     item_id: &str,
     transcript: &str,
     pcm16: &[u8],
+    mut local_render: Option<oneshot::Receiver<()>>,
 ) {
     let item = json!({
         "id": item_id, "object": "realtime.item", "type": "message",
@@ -337,7 +365,30 @@ async fn send_audio_reply(
             },
         }),
     ] {
+        if event["type"] == "response.done" {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), socket.next())
+                    .await
+                    .is_err(),
+                "rendering changed Components must wait for response.done before handing off a Frame"
+            );
+        }
+        let started = event["type"] == "response.created";
         send(socket, event).await;
+        if started {
+            if let Some(rendered) = local_render.take() {
+                tokio::time::timeout(DEADLINE, rendered)
+                    .await
+                    .expect("Signal writes should render while the response is active")
+                    .unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), socket.next())
+                        .await
+                        .is_err(),
+                    "a local render must preserve the response.done Frame boundary"
+                );
+            }
+        }
     }
 }
 
@@ -384,6 +435,7 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
     let (audio_queued_tx, audio_queued_rx) = oneshot::channel();
+    let (local_render_tx, local_render_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         let mut socket = accept_session(&listener).await;
 
@@ -399,6 +451,7 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
         );
         assert_eq!(initial["session"]["tools"], json!([]));
         acknowledge_update(&mut socket, &initial).await;
+        let first_instruction = receive_repeated_instruction(&mut socket).await;
         assert_eq!(receive_audio(&mut socket).await, [11, 0, 12, 0]);
         send_input(&mut socket, "input_1").await;
         send_audio_reply(
@@ -407,6 +460,7 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
             "answer_1",
             "第一句。",
             &[1, 0, 2, 0],
+            Some(local_render_rx),
         )
         .await;
 
@@ -423,6 +477,7 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
                 .is_err()
         );
         acknowledge_update(&mut socket, &next).await;
+        let second_instruction = receive_repeated_instruction(&mut socket).await;
         assert_eq!(receive_audio(&mut socket).await, [21, 0, 22, 0]);
         send_input(&mut socket, "input_2").await;
         send_tool_reply(&mut socket).await;
@@ -438,6 +493,9 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
             serde_json::from_str(result["item"]["output"].as_str().unwrap()).unwrap();
         assert_eq!(status, json!({"status": "ready"}));
         acknowledge_item(&mut socket, &result).await;
+        let third_instruction = receive_repeated_instruction(&mut socket).await;
+        assert_eq!(first_instruction, second_instruction);
+        assert_eq!(second_instruction, third_instruction);
         let continuation = receive(&mut socket).await;
         assert_eq!(continuation["type"], "response.create");
         send_audio_reply(
@@ -446,6 +504,7 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
             "answer_2",
             "第二句。",
             &[3, 0, 4, 0],
+            None,
         )
         .await;
 
@@ -465,6 +524,7 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
             .unwrap();
     let operation = async {
         let mut audio_queued_tx = Some(audio_queued_tx);
+        let mut local_render_tx = Some(local_render_tx);
         input.append_pcm16(&[11, 0, 12, 0]).await.unwrap();
         let mut received = Vec::new();
         for response_id in ["response_1", "response_2"] {
@@ -476,6 +536,26 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
                 let done = matches!(&event, QwenRealtimeAudioEvent::ResponseEnded {
                     response_id: id, status: QwenRealtimeResponseStatus::Completed, ..
                 } if id == response_id);
+                if matches!(&event, QwenRealtimeAudioEvent::ResponseStarted { response_id }
+                    if response_id == "response_1")
+                {
+                    let state = probe.external_state.lock().unwrap().clone().unwrap();
+                    state.set(1).unwrap();
+                    tokio::time::timeout(DEADLINE, async {
+                        loop {
+                            let rendered = probe.rendered.notified();
+                            tokio::pin!(rendered);
+                            rendered.as_mut().enable();
+                            if probe.rendered_values.lock().unwrap().contains(&1) {
+                                break;
+                            }
+                            rendered.await;
+                        }
+                    })
+                    .await
+                    .expect("external Signal change should trigger a local render");
+                    local_render_tx.take().unwrap().send(()).unwrap();
+                }
                 received.push(event);
                 if done {
                     break;
@@ -522,6 +602,7 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
     assert_eq!(texts[0].1, completed[0]);
     assert_eq!(tools[0], completed[1]);
     assert_eq!(texts[1].1, completed[2]);
+    assert!(probe.rendered_values.lock().unwrap().contains(&1));
 }
 
 #[tokio::test]
@@ -624,6 +705,7 @@ async fn spoken_interruption_keeps_streaming_audio_and_continues_on_the_same_ses
             "answer_after_interrupt",
             "收到，请继续。",
             &[7, 0, 8, 0],
+            None,
         )
         .await;
         await_session_close(&mut socket).await;

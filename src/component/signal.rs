@@ -732,6 +732,27 @@ pub(crate) struct SignalRuntime {
     core: Arc<SignalRuntimeCore>,
 }
 
+pub(crate) struct SignalWake(Arc<SignalRuntimeCore>);
+
+impl SignalWake {
+    pub(crate) fn revision(&self) -> u64 {
+        self.0.wake_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_after(&self, observed: u64) -> u64 {
+        loop {
+            let notified = self.0.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let current = self.revision();
+            if current != observed {
+                return current;
+            }
+            notified.await;
+        }
+    }
+}
+
 impl SignalRuntime {
     pub(crate) fn new() -> Self {
         Self {
@@ -881,16 +902,11 @@ impl SignalRuntime {
 
     /// Wait until a write advances the supplied scheduler revision.
     pub(crate) async fn wait_for_wake_after(&self, observed: u64) -> u64 {
-        loop {
-            let notified = self.core.wake.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let current = self.wake_revision();
-            if current != observed {
-                return current;
-            }
-            notified.await;
-        }
+        self.wake_handle().wait_after(observed).await
+    }
+
+    pub(crate) fn wake_handle(&self) -> SignalWake {
+        SignalWake(self.core.clone())
     }
 
     #[cfg(test)]
@@ -951,6 +967,16 @@ pub(crate) struct SignalRenderTransaction<'runtime> {
 }
 
 impl SignalRenderTransaction<'_> {
+    pub(crate) fn preserves_mounts(&self) -> bool {
+        let mounted = self
+            .runtime
+            .core
+            .components
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        mounted.len() == self.staged.len() && mounted.keys().all(|id| self.staged.contains_key(id))
+    }
+
     /// Render one Component identity. The closure may call `scope.use_signal`.
     pub(crate) fn render_component<R>(
         &mut self,

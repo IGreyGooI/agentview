@@ -1426,6 +1426,9 @@ response ID。正常 `response.done` 之后重新准备并交付下一 Frame，�
 语音 handle 请求取消指定回复，provider 拒绝只返回给请求者，后续音频和回复继续处理。
 会话开始后保留 `#[system_once]` 快照。需要随下一 Frame 更新的说明由普通 developer projection
 声明，并以会话项交付。修改 `#[system_once]` 会要求 Full Frame，而已有语音会话无法重放远端媒体。
+语音 Application 监听 Signal dirty 通知，在会话运行期间刷新本地 projection。若渲染会变更 Component
+挂载，刷新留到正常的回复结算边界，使当前 Frame 的回调保持可用。下一帧照常执行 preparation、
+编译和交付，声明了 `repeat` 的内容按每帧的交付规则发送。
 
 ### Frame 能力与结构化 Decision
 
