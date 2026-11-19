@@ -1437,8 +1437,8 @@ response ID。正常 `response.done` 之后重新准备并交付下一 Frame，�
 Component 输入、播放和转写接口。创建会话后复用连接，下一 Frame 的完整系统和 developer
 说明或工具目录变化时发送 `session.update`，收到确认后继续发送麦克风 PCM。收到
 `response.function_call_arguments.done` 后，port 将调用交给当前 Frame 的工具绑定，将该批
-已提交的结果按 `call_id` 回传给同一响应。客户端收到 `response.canceled` 时立即停播，
-port 丢弃该回复的尾部输出，等待 `response.done` 后结算 Frame。
+已提交的结果按 `call_id` 回传给同一响应。服务端识别到插话或确认 `response.canceled`
+时立即停播，port 丢弃旧回复的尾部输出，等待 `response.done` 后结算 Frame。
 
 ### Frame 能力与结构化 Decision
 

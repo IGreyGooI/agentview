@@ -446,6 +446,15 @@ async fn batched_native_results_continue_the_current_response_before_the_next_fr
 
 #[tokio::test]
 async fn active_interrupt_uses_the_same_response_and_stale_controls_do_not_cancel_again() {
+    exercise_interruption(true).await;
+}
+
+#[tokio::test]
+async fn provider_detected_barge_in_stops_playback_and_drains_until_done() {
+    exercise_interruption(false).await;
+}
+
+async fn exercise_interruption(explicit: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!(
         "ws://{}/api/v3/realtime/dialogue",
@@ -477,9 +486,19 @@ async fn active_interrupt_uses_the_same_response_and_stale_controls_do_not_cance
             }),
         )
         .await;
-        assert_eq!(receive(&mut socket).await["type"], "response.cancel");
-        // Seeduplex's documented cancel acknowledgement has no response ID.
-        send(&mut socket, json!({"type": "response.canceled"})).await;
+        if explicit {
+            assert_eq!(receive(&mut socket).await["type"], "response.cancel");
+            send(&mut socket, json!({"type": "response.canceled"})).await;
+        } else {
+            send(
+                &mut socket,
+                json!({
+                    "type": "conversation.item.input_audio_transcription.started",
+                    "item_id": "next-question",
+                }),
+            )
+            .await;
+        }
         send(
             &mut socket,
             json!({
@@ -530,7 +549,9 @@ async fn active_interrupt_uses_the_same_response_and_stale_controls_do_not_cance
             }
         };
         assert!(!id.is_empty());
-        assert!(input.interrupt(id.clone()).await.unwrap());
+        if explicit {
+            assert!(input.interrupt(id.clone()).await.unwrap());
+        }
         loop {
             if let QwenRealtimeAudioEvent::ResponseEnded {
                 response_id,

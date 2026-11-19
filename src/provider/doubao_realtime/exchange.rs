@@ -43,7 +43,9 @@ pub(super) struct Exchange<'a> {
 struct Response {
     local_id: String,
     upstream_id: Option<String>,
+    question_id: Option<String>,
     text: String,
+    audio_open: bool,
     cancelled: bool,
 }
 
@@ -185,7 +187,7 @@ impl<'a> Exchange<'a> {
                 self.send(json!({"type": kind, "event_id": wire::id("event")}))
                     .await?;
             }
-            Some(Input::Interrupt(request)) => self.cancel(Some(request)).await?,
+            Some(Input::Interrupt(request)) => self.cancel(request).await?,
             Some(Input::Finish) | None => {
                 self.provider
                     .media
@@ -212,7 +214,7 @@ impl<'a> Exchange<'a> {
         .await
     }
 
-    async fn cancel(&mut self, request: Option<Interrupt>) -> Result<(), Fault> {
+    async fn cancel(&mut self, request: Interrupt) -> Result<(), Fault> {
         // The input component may have captured its response ID before the
         // server ended that reply. Seeduplex cancels the current reply without
         // any wire ID, so ignore stale requests instead of cancelling its successor.
@@ -223,21 +225,17 @@ impl<'a> Exchange<'a> {
             .filter(|response| !response.cancelled)
             .map(|response| response.local_id.as_str());
         let valid = active.is_some_and(|active| {
-            request
-                .as_ref()
-                .is_none_or(|request| request.response_id == active)
+            request.response_id == active
                 && media
                     .cancel
                     .as_ref()
                     .is_none_or(|cancel| cancel.response_id == active)
         });
         if !valid || self.interrupt.is_some() {
-            if let Some(request) = request {
-                let _ = request.result.send(Ok(false));
-            }
+            let _ = request.result.send(Ok(false));
             return Ok(());
         }
-        self.interrupt = request;
+        self.interrupt = Some(request);
         if media.cancel.is_none() {
             let response_id = active.expect("validated response").to_owned();
             let event_id = wire::id("event");
@@ -303,7 +301,16 @@ impl<'a> Exchange<'a> {
             }
             "conversation.item.input_audio_transcription.started" => {
                 self.input_started(&event);
-                self.cancel(None).await?;
+                // Seeduplex's automatic interruption starts a new ASR item
+                // before it sends the old reply's bare response.done. Sending
+                // an extra response.cancel here races that provider boundary.
+                // Stop local playback immediately and drain the old reply.
+                let item = string(&event, "item_id");
+                if self.response.as_ref().is_some_and(|response| {
+                    item.is_none() || response.question_id.as_deref() != item
+                }) {
+                    self.mark_cancelled();
+                }
             }
             "conversation.item.input_audio_transcription.delta"
             | "conversation.item.input_audio_transcription.completed"
@@ -316,18 +323,15 @@ impl<'a> Exchange<'a> {
                 // captured when we sent the one outstanding cancel.
                 let media = self.provider.media.as_mut().expect("mounted audio");
                 if let Some(cancel) = media.cancel.take() {
-                    if let Some(response) = self
+                    if self
                         .response
-                        .as_mut()
-                        .filter(|response| response.local_id == cancel.response_id)
+                        .as_ref()
+                        .is_some_and(|response| response.local_id == cancel.response_id)
                     {
                         // The service can send ID-less tail audio after this
                         // ACK. Stop playback immediately and keep its Frame
                         // open until the actual response.done drains that tail.
-                        response.cancelled = true;
-                        let response_id = response.local_id.clone();
-                        self.batches.clear();
-                        self.end_playback(response_id, Status::Cancelled);
+                        self.mark_cancelled();
                     }
                 }
             }
@@ -340,6 +344,16 @@ impl<'a> Exchange<'a> {
                         Some("canceled" | "cancelled") => Status::Cancelled,
                         Some("incomplete") => Status::Incomplete,
                         Some("failed") => Status::Failed,
+                        // A natural interruption can deliver done before the
+                        // next ASR starts. If the provider never finished its
+                        // audio, discard queued playback for the cut-off reply.
+                        None if self
+                            .response
+                            .as_ref()
+                            .is_some_and(|response| response.audio_open) =>
+                        {
+                            Status::Cancelled
+                        }
                         _ => Status::Completed,
                     };
                     if self.response.is_some() {
@@ -446,6 +460,9 @@ impl<'a> Exchange<'a> {
             if response.upstream_id.is_none() {
                 response.upstream_id = event_id(event).map(str::to_owned);
             }
+            if response.question_id.is_none() {
+                response.question_id = string(event, "question_id").map(str::to_owned);
+            }
             return;
         }
         let upstream_id = event_id(event).map(str::to_owned);
@@ -453,7 +470,9 @@ impl<'a> Exchange<'a> {
         self.response = Some(Response {
             local_id: local_id.clone(),
             upstream_id,
+            question_id: string(event, "question_id").map(str::to_owned),
             text: String::new(),
+            audio_open: false,
             cancelled: false,
         });
         self.provider
@@ -475,6 +494,10 @@ impl<'a> Exchange<'a> {
             .unwrap_or_else(|| response_id.clone());
         let content_index = event["content_index"].as_u64().unwrap_or_default();
         let audio = match kind {
+            "response.output_audio.started" => {
+                response.audio_open = true;
+                return Ok(());
+            }
             "response.output_text.delta" => {
                 let delta = event["delta"]
                     .as_str()
@@ -503,6 +526,7 @@ impl<'a> Exchange<'a> {
                 }
             }
             "response.output_audio.delta" => {
+                response.audio_open = true;
                 let pcm16 = event["delta"]
                     .as_str()
                     .or(event["audio"].as_str())
@@ -522,11 +546,14 @@ impl<'a> Exchange<'a> {
                     pcm16,
                 }
             }
-            "response.output_audio.done" => Audio::AudioDone {
-                response_id,
-                item_id,
-                content_index,
-            },
+            "response.output_audio.done" => {
+                response.audio_open = false;
+                Audio::AudioDone {
+                    response_id,
+                    item_id,
+                    content_index,
+                }
+            }
             _ => return Ok(()),
         };
         self.publish(audio);
@@ -600,6 +627,22 @@ impl<'a> Exchange<'a> {
             self.deadline = Some(Instant::now() + RESPONSE_TIMEOUT);
         }
         Ok(())
+    }
+
+    fn mark_cancelled(&mut self) {
+        // The automatic VAD signal and a response.cancel acknowledgement can
+        // both refer to the same reply. Publish one terminal playback event
+        // and leave protocol completion to response.done.
+        if let Some(response) = self
+            .response
+            .as_mut()
+            .filter(|response| !response.cancelled)
+        {
+            response.cancelled = true;
+            let response_id = response.local_id.clone();
+            self.batches.clear();
+            self.end_playback(response_id, Status::Cancelled);
+        }
     }
 
     fn end_playback(&mut self, response_id: String, status: Status) {
