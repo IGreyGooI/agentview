@@ -795,8 +795,21 @@ async fn proactive_notifications_wait_for_the_next_frame_and_keep_streaming_micr
         acknowledge_update(&mut socket, &update).await;
         let first_notice = receive(&mut socket).await;
         assert_eq!(first_notice["type"], "conversation.item.create");
-        assert_eq!(first_notice["item"]["role"], "system");
+        assert_eq!(first_notice["item"]["role"], "user");
         let first_item = first_notice["item"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(receive_audio(&mut socket).await, [21, 0, 22, 0]);
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.created",
+            "item":{"id":"unrelated-item", "type":"message", "role":"user", "content":[]}}),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "the microphone remains active, but generation waits for this notice's matching ACK"
+        );
         send(
             &mut socket,
             json!({"type":"conversation.item.created", "item":first_notice["item"]}),
@@ -872,7 +885,7 @@ async fn proactive_notifications_wait_for_the_next_frame_and_keep_streaming_micr
         acknowledge_update(&mut socket, &update).await;
         let notice = receive(&mut socket).await;
         assert_eq!(notice["type"], "conversation.item.create");
-        assert_eq!(notice["item"]["role"], "system");
+        assert_eq!(notice["item"]["role"], "user");
         let item_id = notice["item"]["id"].as_str().unwrap().to_owned();
         send(
             &mut socket,
@@ -916,6 +929,7 @@ async fn proactive_notifications_wait_for_the_next_frame_and_keep_streaming_micr
     )
     .unwrap();
     input.speak_text("你好，我已经准备好了。").await.unwrap();
+    input.append_pcm16(&[21, 0, 22, 0]).await.unwrap();
     let operation = async {
         let mut ended = 0;
         while ended < 2 {
@@ -931,6 +945,149 @@ async fn proactive_notifications_wait_for_the_next_frame_and_keep_streaming_micr
                     ended += 1;
                 }
                 _ => {}
+            }
+        }
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    tokio::time::timeout(DEADLINE, server)
+        .await
+        .unwrap()
+        .unwrap();
+    let texts = probe.text_frames.lock().unwrap();
+    assert_eq!(texts.len(), 2);
+    assert_ne!(texts[0].1, texts[1].1);
+}
+
+#[tokio::test]
+async fn expired_notice_acks_do_not_replace_frame_item_acks_or_interrupt_user_replies() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let update = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &update).await;
+        receive_repeated_instruction(&mut socket).await;
+        let notice = receive(&mut socket).await;
+        assert_eq!(notice["type"], "conversation.item.create");
+        assert_eq!(notice["item"]["role"], "user");
+        let notice_id = notice["item"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(receive_audio(&mut socket).await, [21, 0, 22, 0]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5_100), socket.next())
+                .await
+                .is_err(),
+            "an unacknowledged optional notice expires without generating or retrying"
+        );
+        send_input(&mut socket, "user_after_notice_timeout").await;
+        send_audio_reply(
+            &mut socket,
+            "user_reply_1",
+            "user_answer_1",
+            "先回答用户。",
+            &[1, 0, 2, 0],
+            None,
+        )
+        .await;
+        let first_delete = receive(&mut socket).await;
+        assert_eq!(first_delete["type"], "conversation.item.delete");
+        assert_eq!(first_delete["item_id"], "item_application_context");
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.deleted", "item_id":first_delete["item_id"]}),
+        )
+        .await;
+        let update = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &update).await;
+        let context = receive(&mut socket).await;
+        assert_eq!(context["type"], "conversation.item.create");
+        assert_eq!(context["item"]["role"], "system");
+        // This expired notice ACK arrives inside the next Frame's context ACK
+        // wait. It must trigger only notice cleanup, never stand in for context.
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.created", "item":notice["item"]}),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err()
+        );
+        let mut context_item = context["item"].clone();
+        context_item["id"] = json!("frame_context_2");
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.created", "item":context_item}),
+        )
+        .await;
+        let optional_delete = receive(&mut socket).await;
+        assert_eq!(optional_delete["type"], "conversation.item.delete");
+        assert_eq!(optional_delete["item_id"], notice_id);
+        assert_eq!(receive_audio(&mut socket).await, [31, 0, 32, 0]);
+        send_input(&mut socket, "second_user_input").await;
+        send_audio_reply(
+            &mut socket,
+            "user_reply_2",
+            "user_answer_2",
+            "继续回答用户。",
+            &[3, 0, 4, 0],
+            None,
+        )
+        .await;
+        let context_delete = receive(&mut socket).await;
+        assert_eq!(context_delete["type"], "conversation.item.delete");
+        assert_eq!(context_delete["item_id"], "frame_context_2");
+        // The optional delete ACK is also independent of this Frame's cleanup.
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.deleted", "item_id":notice_id}),
+        )
+        .await;
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.deleted", "item_id":"frame_context_2"}),
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let provider = QwenRealtimeProvider::new(
+        &endpoint,
+        CREDENTIAL,
+        ModelSpec::new(MODEL, 262_144).unwrap(),
+    )
+    .unwrap();
+    let probe = VoiceProbe::default();
+    let root_probe = probe.clone();
+    let (mut app, input, mut events) = QwenRealtimeVoiceApplication::mount(
+        move || {
+            view! {
+                #[developer(ephemeral, repeat)]
+                "Use the current application state when answering."
+                { interruptible_voice_assistant(root_probe.clone()) }
+            }
+        },
+        provider,
+    )
+    .unwrap();
+    input.speak_text("这条可选通知会超时。").await.unwrap();
+    input.append_pcm16(&[21, 0, 22, 0]).await.unwrap();
+    let operation = async {
+        let mut ended = 0;
+        while ended < 2 {
+            if let QwenRealtimeAudioEvent::ResponseEnded { status, .. } =
+                events.next_event().await.unwrap()
+            {
+                assert_eq!(status, QwenRealtimeResponseStatus::Completed);
+                ended += 1;
+                if ended == 1 {
+                    input.append_pcm16(&[31, 0, 32, 0]).await.unwrap();
+                }
             }
         }
         input.finish().await.unwrap();

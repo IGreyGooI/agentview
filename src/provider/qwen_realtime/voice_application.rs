@@ -151,6 +151,9 @@ impl QwenRealtimeVoiceInput {
     ///
     /// Seeduplex synthesizes this text directly. Qwen receives an instruction
     /// to read it and generates a response, so verbatim wording is not guaranteed.
+    /// Qwen waits for the matching text-item acknowledgement before generation;
+    /// a rejected or unacknowledged optional notice is skipped without closing
+    /// the voice session. User speech that wins this insertion race takes priority.
     /// This method is for trusted application text, not external user commands.
     /// Empty text, text over 64 KiB, or eight already queued notifications return
     /// a local fault without affecting the running session.

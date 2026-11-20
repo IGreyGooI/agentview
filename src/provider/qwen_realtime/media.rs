@@ -9,6 +9,7 @@ use std::{
 
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, OwnedSemaphorePermit};
+use tokio::time::Instant;
 
 use crate::component::execution::{
     ReactionPortFault as Fault, ReactionPortFaultCode as Code, ReactionPortFaultReason as Reason,
@@ -24,6 +25,17 @@ const INPUT_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 256;
 const MAX_PENDING_TRANSCRIPTIONS: usize = 128;
 const TRANSCRIPTION_DRAIN: Duration = Duration::from_secs(15);
+const NOTICE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const ABANDONED_NOTICES: usize = 16;
+
+struct Notice {
+    item_id: String,
+    create_event_id: String,
+    response_event_id: String,
+    deadline: Instant,
+    created: bool,
+    requested: bool,
+}
 
 pub(crate) enum Input {
     Append(String),
@@ -183,6 +195,10 @@ pub(super) struct Media {
     spoken: VecDeque<SpokenText>,
     spoken_items: Vec<String>,
     spoken_pending: bool,
+    notice: Option<Notice>,
+    abandoned_notices: VecDeque<Notice>,
+    notice_cleanup: VecDeque<String>,
+    notice_delete_events: VecDeque<(String, String)>,
     input_speech: bool,
     awaiting_speech_response: bool,
     finished: bool,
@@ -210,6 +226,10 @@ impl Media {
                 spoken: VecDeque::new(),
                 spoken_items: Vec::new(),
                 spoken_pending: false,
+                notice: None,
+                abandoned_notices: VecDeque::new(),
+                notice_cleanup: VecDeque::new(),
+                notice_delete_events: VecDeque::new(),
                 input_speech: false,
                 awaiting_speech_response: false,
                 finished: false,
@@ -242,9 +262,60 @@ impl Media {
             Some("input_audio_buffer.speech_started") => {
                 self.input_speech = true;
                 self.awaiting_speech_response = true;
+                // User speech can win the race with optional text insertion.
+                // Do not request a second response inside that user's turn.
+                if self.notice.as_ref().is_some_and(|notice| !notice.requested) {
+                    self.abandon_notice("user_speech", true);
+                }
             }
-            Some("input_audio_buffer.speech_stopped") => self.input_speech = false,
-            Some("response.done") => self.spoken_pending = false,
+            Some("input_audio_buffer.speech_stopped") => {
+                self.input_speech = false;
+                if event["reason"] == "turn_invalid" {
+                    self.awaiting_speech_response = false;
+                }
+            }
+            Some("conversation.item.created") => {
+                let item_id = event["item"]["id"].as_str();
+                if let Some(notice) = self
+                    .notice
+                    .as_mut()
+                    .filter(|notice| Some(notice.item_id.as_str()) == item_id && !notice.created)
+                {
+                    notice.created = true;
+                    self.spoken_items.push(notice.item_id.clone());
+                    tracing::info!(event = "qwen_spoken_notice_ack", item_id = notice.item_id);
+                } else if let Some(index) = self
+                    .abandoned_notices
+                    .iter()
+                    .position(|notice| Some(notice.item_id.as_str()) == item_id)
+                {
+                    // A late ACK proves the abandoned optional item exists.
+                    // Retire it through optional cleanup, without generating
+                    // or retrying the discarded notification.
+                    let notice = self
+                        .abandoned_notices
+                        .remove(index)
+                        .expect("matched notice");
+                    self.queue_notice_cleanup(notice.item_id);
+                }
+            }
+            Some("conversation.item.deleted") => {
+                self.notice_delete_events
+                    .retain(|(_, item_id)| Some(item_id.as_str()) != event["item_id"].as_str());
+            }
+            Some("response.created") => {
+                if let Some(notice) = self.notice.as_ref().filter(|notice| notice.requested) {
+                    tracing::info!(
+                        event = "qwen_spoken_notice_response",
+                        item_id = notice.item_id,
+                        response_id = event["response"]["id"].as_str()
+                    );
+                }
+            }
+            Some("response.done") => {
+                self.spoken_pending = false;
+                self.notice = None;
+            }
             _ => {}
         }
         if self.mode == Mode::SmartTurnV2 {
@@ -375,23 +446,50 @@ impl Media {
         responding: bool,
     ) -> Result<(Value, usize), Fault> {
         loop {
+            if let Some(item_id) = self.notice_cleanup.pop_front() {
+                // An acknowledged optional item lost the race to user speech.
+                // Remove it before forwarding more input where possible; its
+                // own ACK/error is observed independently and never retried.
+                let event_id = format!("discard_{item_id}");
+                transport::send(
+                    socket,
+                    json!({"type":"conversation.item.delete",
+                    "event_id":event_id, "item_id":item_id})
+                    .to_string(),
+                )
+                .await?;
+                if self.notice_delete_events.len() == ABANDONED_NOTICES {
+                    self.notice_delete_events.pop_front();
+                }
+                self.notice_delete_events.push_back((event_id, item_id));
+                continue;
+            }
             // The socket reader owns the response and VAD state. A notification
             // received during a reply stays queued until the following normal
             // Frame; a user utterance already in progress takes precedence.
-            let can_speak = !responding
+            let idle = !responding
                 && !self.decoder.is_responding()
-                && !self.spoken_pending
                 && !self.input_speech
                 && !self.awaiting_speech_response
                 && !self.awaiting_commit;
+            let can_speak = idle && !self.spoken_pending;
+            let notice_ready = idle
+                && self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.created && !notice.requested);
+            let notice_deadline = self
+                .notice
+                .as_ref()
+                .filter(|notice| !notice.created)
+                .map_or_else(
+                    || Instant::now() + NOTICE_ACK_TIMEOUT,
+                    |notice| notice.deadline,
+                );
             if self.finished && !responding && !self.spoken_pending && self.spoken.is_empty() {
                 return Ok((json!({"type":"agentview.input_finished"}), 0));
             }
-            if self.finished && (!can_speak || self.spoken.is_empty())
-                || self.commit_pending
-                || self.awaiting_commit
-                || self.waiting_for_interruption
-            {
+            if self.commit_pending || self.awaiting_commit || self.waiting_for_interruption {
                 return self
                     .read(
                         socket,
@@ -405,21 +503,37 @@ impl Media {
                     let (event, bytes) = result?;
                     return self.admit(event, bytes);
                 }
+                () = tokio::time::sleep_until(notice_deadline), if self.notice.as_ref().is_some_and(|notice| !notice.created) => {
+                    // The provider did not accept this optional text in time.
+                    // Drop only the notification and keep microphone/reply
+                    // processing alive; a later matching ACK is cleanup evidence.
+                    self.abandon_notice("create_timeout", true);
+                }
+                () = std::future::ready(()), if notice_ready => {
+                    let notice = self.notice.as_mut().expect("acknowledged notification");
+                    notice.requested = true;
+                    let event_id = notice.response_event_id.clone();
+                    transport::send(socket, json!({
+                        "type": "response.create", "event_id":event_id,
+                    }).to_string()).await?;
+                }
                 () = std::future::ready(()), if can_speak && !self.spoken.is_empty() => {
                     let spoken = self.spoken.pop_front().expect("queued notification");
                     static NEXT_SPOKEN_ITEM: AtomicU64 = AtomicU64::new(1);
                     let item_id = format!("msg_agentview_notice_{}", NEXT_SPOKEN_ITEM.fetch_add(1, Ordering::Relaxed));
+                    let create_event_id = format!("create_{item_id}");
+                    let response_event_id = format!("respond_{item_id}");
                     transport::send(socket, json!({
-                        "type": "conversation.item.create", "item": {
-                            "id": item_id, "type": "message", "role": "system",
+                        "type": "conversation.item.create", "event_id":create_event_id, "item": {
+                            "id": item_id, "type": "message", "role": "user",
                             "content": [{"type":"input_text", "text": format!(
-                                "请朗读以下服务端通知，不添加前后说明：\n\n{}", spoken.text,
+                                "这是服务端已生成的通知。现在只逐字朗读下面的通知正文，不回答先前的问题，不调用工具，也不要添加前后说明：\n\n{}", spoken.text,
                             )}],
                         },
                     }).to_string()).await?;
-                    self.spoken_items.push(item_id);
+                    self.notice = Some(Notice { item_id, create_event_id, response_event_id,
+                        deadline:Instant::now() + NOTICE_ACK_TIMEOUT, created:false, requested:false });
                     self.spoken_pending = true;
-                    transport::send(socket, json!({"type": "response.create"}).to_string()).await?;
                 }
                 input = self.input.recv(), if !self.finished => match input {
                     Some(Input::Append(audio)) => {
@@ -478,11 +592,118 @@ impl Media {
     }
 
     pub(super) fn admit(&mut self, event: Value, bytes: usize) -> Result<(Value, usize), Fault> {
+        // Optional notification requests are the only client item/create-response
+        // commands outstanding in this media phase. Match an explicit request
+        // reference, or its create parameter while waiting for this exact ACK;
+        // unrelated provider errors retain their existing failure semantics.
+        if let Some(item_id) = self.rejected_notice(&event) {
+            self.events.publish_server_event(Arc::new(event));
+            if self
+                .notice
+                .as_ref()
+                .is_some_and(|notice| notice.item_id == item_id)
+            {
+                self.abandon_notice("provider_rejected", false);
+            } else {
+                tracing::warn!(event = "qwen_spoken_notice_late_rejection", item_id);
+            }
+            return Ok((json!({"type":"agentview.notice_rejected"}), 0));
+        }
+        // Optional notice ACKs can arrive while the ordinary Frame writer waits
+        // for a Persona/context create or delete ACK. Classify our owned IDs
+        // before observation removes their records, then consume only those
+        // ACKs so they cannot satisfy a different Frame command's waiter.
+        let notice_ack = match event["type"].as_str() {
+            Some("conversation.item.created") => event["item"]["id"].as_str().is_some_and(|id| {
+                self.notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.item_id == id)
+                    || self
+                        .abandoned_notices
+                        .iter()
+                        .any(|notice| notice.item_id == id)
+                    || self.notice_cleanup.iter().any(|item_id| item_id == id)
+                    || self
+                        .notice_delete_events
+                        .iter()
+                        .any(|(_, item_id)| item_id == id)
+            }),
+            Some("conversation.item.deleted") => self
+                .notice_delete_events
+                .iter()
+                .any(|(_, item_id)| Some(item_id.as_str()) == event["item_id"].as_str()),
+            _ => false,
+        };
         self.observe(&event)?;
-        if self.is_cancel_rejection(&event) {
+        if notice_ack {
+            Ok((json!({"type":"agentview.notice_ack"}), 0))
+        } else if self.is_cancel_rejection(&event) {
             Ok((json!({"type": "agentview.cancel_rejected"}), 0))
         } else {
             Ok((event, bytes))
+        }
+    }
+
+    fn rejected_notice(&self, event: &Value) -> Option<String> {
+        if event["type"] != "error" {
+            return None;
+        }
+        let reference = event["error"]["event_id"]
+            .as_str()
+            .or_else(|| event["error"]["request_event_id"].as_str());
+        let matched = |notice: &Notice| {
+            reference
+                .is_some_and(|id| id == notice.create_event_id || id == notice.response_event_id)
+        };
+        let current = self.notice.as_ref().filter(|notice| {
+            matched(notice)
+                || (reference.is_none()
+                    && !notice.created
+                    && event["error"]["param"] == "conversation.item.create")
+                || (reference.is_none()
+                    && notice.requested
+                    && !self.decoder.is_responding()
+                    && event["error"]["param"] == "response.create")
+        });
+        current
+            .or_else(|| self.abandoned_notices.iter().find(|notice| matched(notice)))
+            .map(|notice| notice.item_id.clone())
+            .or_else(|| {
+                self.notice_delete_events
+                    .iter()
+                    .find(|(id, _)| Some(id.as_str()) == reference)
+                    .map(|(_, item_id)| item_id.clone())
+            })
+    }
+
+    fn abandon_notice(&mut self, reason: &'static str, retain_late_ack: bool) {
+        if let Some(notice) = self.notice.take() {
+            tracing::warn!(
+                event = "qwen_spoken_notice_skipped",
+                item_id = notice.item_id,
+                reason
+            );
+            if notice.created {
+                self.spoken_items
+                    .retain(|item_id| *item_id != notice.item_id);
+                self.queue_notice_cleanup(notice.item_id);
+            } else if retain_late_ack && !notice.created {
+                if self.abandoned_notices.len() == ABANDONED_NOTICES {
+                    self.abandoned_notices.pop_front();
+                }
+                self.abandoned_notices.push_back(notice);
+            }
+        }
+        self.spoken_pending = false;
+    }
+
+    fn queue_notice_cleanup(&mut self, item_id: String) {
+        if self.notice_cleanup.len() < ABANDONED_NOTICES {
+            self.notice_cleanup.push_back(item_id);
+        } else {
+            // Keep confirmed cleanup evidence on the existing response-boundary
+            // cleanup path if several late ACKs arrive together.
+            self.spoken_items.push(item_id);
         }
     }
 
@@ -510,5 +731,135 @@ async fn receive(socket: &mut Socket, bounded: bool) -> Result<(Value, usize), F
         transport::receive(socket).await
     } else {
         transport::receive_unbounded(socket).await
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    fn notice(id: &str) -> Notice {
+        Notice {
+            item_id: id.to_owned(),
+            create_event_id: format!("create_{id}"),
+            response_event_id: format!("respond_{id}"),
+            deadline: Instant::now() + NOTICE_ACK_TIMEOUT,
+            created: false,
+            requested: false,
+        }
+    }
+
+    fn rejected(event_id: &str) -> Value {
+        json!({"type":"error", "error": {
+            "type":"invalid_request_error", "code":"invalid_parameter",
+            "param":"conversation.item.create", "event_id":event_id,
+            "message":"Optional text rejected",
+        }})
+    }
+
+    #[test]
+    fn late_rejection_does_not_discard_a_newer_notice() {
+        let (mut media, _input, _events) = Media::new(Mode::SmartTurnV2);
+        media.notice = Some(notice("old"));
+        media.abandon_notice("create_timeout", true);
+        media.notice = Some(notice("current"));
+        media.spoken_pending = true;
+
+        let (event, _) = media.admit(rejected("create_old"), 10).unwrap();
+        assert_eq!(event["type"], "agentview.notice_rejected");
+        assert_eq!(media.notice.as_ref().unwrap().item_id, "current");
+        assert!(media.spoken_pending);
+    }
+
+    #[test]
+    fn explicit_other_request_never_matches_optional_parameter_fallback() {
+        let (mut media, _input, _events) = Media::new(Mode::SmartTurnV2);
+        media.notice = Some(notice("current"));
+        media.spoken_pending = true;
+
+        assert!(media.admit(rejected("frame_context_create"), 10).is_err());
+        assert_eq!(media.notice.as_ref().unwrap().item_id, "current");
+        assert!(media.spoken_pending);
+    }
+
+    #[test]
+    fn rejected_optional_create_keeps_user_input_usable() {
+        let (mut media, _input, _events) = Media::new(Mode::SmartTurnV2);
+        media.notice = Some(notice("optional"));
+        media.spoken_pending = true;
+        media.admit(rejected("create_optional"), 10).unwrap();
+        assert!(media.notice.is_none());
+        assert!(!media.spoken_pending);
+        media
+            .admit(json!({"type":"input_audio_buffer.speech_started"}), 10)
+            .unwrap();
+        assert!(media.input_speech);
+        assert!(media.awaiting_speech_response);
+        media
+            .admit(
+                json!({"type":"input_audio_buffer.speech_stopped", "reason":"turn_invalid"}),
+                10,
+            )
+            .unwrap();
+        assert!(!media.input_speech);
+        assert!(!media.awaiting_speech_response);
+    }
+
+    #[test]
+    fn speech_after_ack_cleans_the_item_before_optional_generation() {
+        let (mut media, _input, _events) = Media::new(Mode::SmartTurnV2);
+        media.notice = Some(notice("optional"));
+        media.spoken_pending = true;
+        media
+            .admit(
+                json!({"type":"conversation.item.created", "item":{"id":"optional"}}),
+                10,
+            )
+            .unwrap();
+        assert!(media.notice.as_ref().unwrap().created);
+        media
+            .admit(json!({"type":"input_audio_buffer.speech_started"}), 10)
+            .unwrap();
+        assert!(media.notice.is_none());
+        assert!(!media.spoken_pending);
+        assert!(media.spoken_items.is_empty());
+        assert_eq!(media.notice_cleanup.front().unwrap(), "optional");
+    }
+
+    #[test]
+    fn late_optional_acks_cannot_satisfy_ordinary_frame_waiters() {
+        let (mut media, _input, _events) = Media::new(Mode::SmartTurnV2);
+        media.notice = Some(notice("abandoned"));
+        media.abandon_notice("create_timeout", true);
+        media.notice = Some(notice("current"));
+        media.spoken_pending = true;
+        let (late_create, _) = media
+            .admit(
+                json!({"type":"conversation.item.created", "item":{"id":"abandoned"}}),
+                10,
+            )
+            .unwrap();
+        assert_eq!(late_create["type"], "agentview.notice_ack");
+        assert_eq!(media.notice_cleanup.pop_front().unwrap(), "abandoned");
+        media
+            .notice_delete_events
+            .push_back(("discard_abandoned".into(), "abandoned".into()));
+        let (late_delete, _) = media
+            .admit(
+                json!({"type":"conversation.item.deleted", "item_id":"abandoned"}),
+                10,
+            )
+            .unwrap();
+        assert_eq!(late_delete["type"], "agentview.notice_ack");
+        assert!(media.notice_delete_events.is_empty());
+        assert_eq!(media.notice.as_ref().unwrap().item_id, "current");
+        assert!(media.spoken_pending);
+
+        for event in [
+            json!({"type":"conversation.item.created", "item":{"id":"frame_context"}}),
+            json!({"type":"conversation.item.deleted", "item_id":"ordinary_transient"}),
+        ] {
+            assert_eq!(media.admit(event.clone(), 10).unwrap().0, event);
+        }
     }
 }
