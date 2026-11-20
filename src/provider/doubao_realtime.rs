@@ -6,6 +6,7 @@ mod voice_application;
 mod wire;
 
 use std::{
+    collections::VecDeque,
     num::{NonZeroU128, NonZeroU64},
     time::Duration,
 };
@@ -32,7 +33,7 @@ use crate::{
 
 use super::{
     qwen_realtime::{
-        media::{Input, MediaEventsSender},
+        media::{Input, MediaEventsSender, SpokenText},
         transport::{self, Socket},
         QwenRealtimeMediaEvents, QwenRealtimeMediaInput,
     },
@@ -78,6 +79,8 @@ struct Media {
     events: MediaEventsSender,
     active_response: watch::Sender<Option<String>>,
     input_item: Option<String>,
+    awaiting_response: bool,
+    spoken: VecDeque<SpokenText>,
     cancel: Option<PendingCancel>,
     finished: bool,
 }
@@ -183,6 +186,8 @@ impl DoubaoRealtimeProvider {
             events,
             active_response,
             input_item: None,
+            awaiting_response: false,
+            spoken: VecDeque::new(),
             cancel: None,
             finished: false,
         });
@@ -241,7 +246,10 @@ impl ReactionPort for DoubaoRealtimeProvider {
     }
 
     async fn next_session_frame(&mut self, _feedback_pending: bool) -> Result<bool, Fault> {
-        Ok(self.media.as_ref().is_some_and(|media| !media.finished))
+        Ok(self
+            .media
+            .as_ref()
+            .is_some_and(|media| !media.finished || !media.spoken.is_empty()))
     }
 
     async fn finish_session(&mut self) {

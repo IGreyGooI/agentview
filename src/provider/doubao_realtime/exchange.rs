@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
+use futures::FutureExt;
 use serde_json::{json, Value};
 use tokio::{sync::mpsc, time::Instant};
 
@@ -38,6 +39,7 @@ pub(super) struct Exchange<'a> {
     deadline: Option<Instant>,
     done: bool,
     settled: bool,
+    spoken_pending: bool,
 }
 
 struct Response {
@@ -76,6 +78,7 @@ impl<'a> Exchange<'a> {
             deadline: None,
             done: false,
             settled: false,
+            spoken_pending: false,
         }
     }
 
@@ -134,11 +137,50 @@ impl<'a> Exchange<'a> {
             if self.done {
                 return Ok(None);
             }
+            // A server notification is independent of the user's current
+            // utterance. Forward it only on an idle, already configured Frame;
+            // retaining it in Media carries it across an active reply's end.
+            let media = self.provider.media.as_mut().expect("mounted audio");
+            let can_speak = self.response.is_none()
+                && !self.spoken_pending
+                && media.input_item.is_none()
+                && !media.awaiting_response;
+            if can_speak && media.finished && media.spoken.is_empty() {
+                self.complete(None);
+                continue;
+            }
+            let pending_spoken = can_speak && !media.spoken.is_empty();
             let socket = self
                 .provider
                 .connection
                 .as_mut()
                 .expect("connected at handoff");
+            if pending_spoken {
+                // Consume already available provider state before deciding to
+                // speak. Keep normal input/output polling fair so continuous
+                // synthesized audio cannot starve microphone forwarding.
+                if let Some(event) = transport::receive_unbounded(socket).now_or_never() {
+                    let (event, _) = event?;
+                    self.server_event(event).await?;
+                    continue;
+                }
+                let spoken = self
+                    .provider
+                    .media
+                    .as_mut()
+                    .expect("mounted audio")
+                    .spoken
+                    .pop_front()
+                    .expect("queued notification");
+                self.spoken_pending = true;
+                self.send(json!({
+                    "type":"speech_text_buffer.commit", "event_id":wire::id("event"),
+                    "text":spoken.text,
+                }))
+                .await?;
+                self.deadline = Some(Instant::now() + RESPONSE_TIMEOUT);
+                continue;
+            }
             let media = self.provider.media.as_mut().expect("mounted audio");
             tokio::select! {
                 event = transport::receive_unbounded(socket) => {
@@ -178,6 +220,14 @@ impl<'a> Exchange<'a> {
     async fn input(&mut self, command: Option<Input>) -> Result<(), Fault> {
         match command {
             Some(Input::Append(audio)) => self.send(wire::append_audio(&audio)).await?,
+            Some(Input::Speak(spoken)) => {
+                self.provider
+                    .media
+                    .as_mut()
+                    .expect("mounted audio")
+                    .spoken
+                    .push_back(spoken);
+            }
             Some(Input::SetMuted(muted)) => {
                 let kind = if muted {
                     "input_audio_mute.commit"
@@ -194,7 +244,16 @@ impl<'a> Exchange<'a> {
                     .as_mut()
                     .expect("mounted audio")
                     .finished = true;
-                if self.response.is_none() {
+                if self.response.is_none()
+                    && !self.spoken_pending
+                    && self
+                        .provider
+                        .media
+                        .as_ref()
+                        .expect("mounted audio")
+                        .spoken
+                        .is_empty()
+                {
                     self.complete(None);
                 }
             }
@@ -391,6 +450,7 @@ impl<'a> Exchange<'a> {
             .map(str::to_owned)
             .unwrap_or_else(|| wire::id("input"));
         media.input_item = Some(item.clone());
+        media.awaiting_response = true;
         self.publish_raw(json!({"type": "input_audio_buffer.speech_started", "item_id": item}));
     }
 
@@ -430,6 +490,7 @@ impl<'a> Exchange<'a> {
             }
             _ => {
                 media.input_item = None;
+                media.awaiting_response = false;
                 self.publish(Audio::InputTranscriptFailed {
                     item_id,
                     error: upstream_fault(),
@@ -466,6 +527,11 @@ impl<'a> Exchange<'a> {
             return;
         }
         let upstream_id = event_id(event).map(str::to_owned);
+        self.provider
+            .media
+            .as_mut()
+            .expect("mounted audio")
+            .awaiting_response = false;
         let local_id = upstream_id.clone().unwrap_or_else(|| wire::id("response"));
         self.response = Some(Response {
             local_id: local_id.clone(),

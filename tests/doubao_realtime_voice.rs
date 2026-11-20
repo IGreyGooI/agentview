@@ -53,6 +53,34 @@ struct StockInput {
 }
 
 #[component]
+fn notification_assistant(probe: Probe) -> Component {
+    let count = use_signal(|| 0u32);
+    let text_frames = probe.text_frames.clone();
+    let completion_count = count.clone();
+    use_provider_event_handler(ProviderEvent::TEXT, move |context, event| {
+        let text_frames = text_frames.clone();
+        let completion_count = completion_count.clone();
+        async move {
+            if let TextTurnEvent::TextComplete(text) = event {
+                text_frames
+                    .lock()
+                    .unwrap()
+                    .push((text, context.frame_revision().unwrap()));
+                completion_count.update(|count| *count += 1).unwrap();
+            }
+            Ok::<_, Infallible>(())
+        }
+    });
+    let count = count.with(|count| *count).unwrap();
+    view! {
+        #[system_once]
+        "Listen continuously. Read notifications when idle."
+        #[developer]
+        status { "{count}" }
+    }
+}
+
+#[component]
 fn voice_assistant(probe: Probe) -> Component {
     let calls_completed = use_signal(|| 0u8);
     let text_frames = probe.text_frames.clone();
@@ -442,6 +470,148 @@ async fn batched_native_results_continue_the_current_response_before_the_next_fr
     assert_eq!(tools[0].1, texts[0].1);
     assert_ne!(texts[0].1, texts[1].1);
     assert_eq!(&completed[..2], &[texts[0].1, texts[1].1]);
+}
+
+#[tokio::test]
+async fn proactive_speech_waits_for_the_reply_and_keeps_the_microphone_and_frame_boundary() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "ws://{}/api/v3/realtime/dialogue",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let create = receive(&mut socket).await;
+        assert_eq!(create["type"], "session.create");
+        send(
+            &mut socket,
+            json!({"type":"session.created", "session":{"id":"notification-session"}}),
+        )
+        .await;
+        let greeting = receive(&mut socket).await;
+        assert_eq!(greeting["type"], "speech_text_buffer.commit");
+        assert_eq!(greeting["text"], "你好，我已经准备好了。");
+        send(
+            &mut socket,
+            json!({
+                "type":"response.output_audio.started", "response_id":"greeting-response",
+            }),
+        )
+        .await;
+        send(
+            &mut socket,
+            json!({
+                "type":"response.output_audio.delta", "response_id":"greeting-response",
+                "delta":STANDARD.encode([1, 0, 2, 0]),
+            }),
+        )
+        .await;
+        assert_eq!(receive_audio(&mut socket).await, [31, 0, 32, 0]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "queued notifications must not cancel or overlap an active reply"
+        );
+        send_reply(
+            &mut socket,
+            "",
+            "greeting-response",
+            "你好，我已经准备好了。",
+            &[3, 0, 4, 0],
+        )
+        .await;
+
+        let update = receive(&mut socket).await;
+        assert_eq!(update["type"], "session.update");
+        assert_ne!(
+            update["session"]["instructions"],
+            create["session"]["instructions"]
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "the notification must wait for the following Frame's configuration ACK"
+        );
+        send(
+            &mut socket,
+            json!({"type":"session.updated", "session":{"id":"notification-session"}}),
+        )
+        .await;
+        let notification = receive(&mut socket).await;
+        assert_eq!(notification["type"], "speech_text_buffer.commit");
+        assert_eq!(notification["text"], "你的任务已经完成。");
+        send_reply(
+            &mut socket,
+            "",
+            "notification-response",
+            "你的任务已经完成。",
+            &[5, 0, 6, 0],
+        )
+        .await;
+        // The updated status is delivered through the ordinary third Frame.
+        let update = receive(&mut socket).await;
+        assert_eq!(update["type"], "session.update");
+        send(
+            &mut socket,
+            json!({"type":"session.updated", "session":{"id":"notification-session"}}),
+        )
+        .await;
+        await_close(&mut socket).await;
+    });
+    let provider = DoubaoRealtimeProvider::new(
+        &endpoint,
+        CREDENTIAL,
+        ModelSpec::new(MODEL, 32_768).unwrap(),
+        VOICE,
+    )
+    .unwrap();
+    let probe = Probe::default();
+    let root_probe = probe.clone();
+    let (mut app, input, mut events) = DoubaoRealtimeVoiceApplication::mount(
+        move || notification_assistant(root_probe.clone()),
+        provider,
+    )
+    .unwrap();
+    assert!(input.speak_text(" ").await.is_err());
+    assert!(input.speak_text("x".repeat(65_537)).await.is_err());
+    input.speak_text("你好，我已经准备好了。").await.unwrap();
+    let operation = async {
+        let mut queued = false;
+        let mut ended = 0;
+        while ended < 2 {
+            match events.next_event().await.unwrap() {
+                QwenRealtimeAudioEvent::ResponseStarted { response_id }
+                    if response_id == "greeting-response" =>
+                {
+                    input.speak_text("你的任务已经完成。").await.unwrap();
+                    input.append_pcm16(&[31, 0, 32, 0]).await.unwrap();
+                    queued = true;
+                }
+                QwenRealtimeAudioEvent::ResponseEnded { status, .. } => {
+                    assert_eq!(status, QwenRealtimeResponseStatus::Completed);
+                    ended += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(queued);
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    tokio::time::timeout(DEADLINE, server)
+        .await
+        .unwrap()
+        .unwrap();
+    let frames = probe.text_frames.lock().unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_ne!(frames[0].1, frames[1].1);
 }
 
 #[tokio::test]

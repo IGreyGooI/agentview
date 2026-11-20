@@ -3,20 +3,25 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
 use crate::component::{
-    execution::{Application, ApplicationFault, ReactionOutcome, ReactionPort, ReactionPortFault},
+    execution::{
+        Application, ApplicationFault, ReactionOutcome, ReactionPort, ReactionPortFault,
+        ReactionPortFaultCode, ReactionPortFaultReason,
+    },
     prelude::{component, Component},
 };
 
 use super::{
     audio::encode_pcm16,
-    media::{closed, Input, Interrupt, Media},
+    media::{closed, Input, Interrupt, Media, SpokenText},
     Mode, QwenRealtimeMediaEvents, QwenRealtimeMediaInput, QwenRealtimeProvider,
 };
 
 type VoiceReceiver = Arc<Mutex<Option<mpsc::Receiver<Input>>>>;
+const PENDING_SPEECH_CAPACITY: usize = 8;
+const MAX_SPOKEN_TEXT_BYTES: usize = 64 * 1024;
 
 /// A dedicated voice Application for Qwen Realtime with Smart Turn v2.
 ///
@@ -77,6 +82,7 @@ pub(crate) fn mount_voice<P: ReactionPort + 'static>(
     let input = QwenRealtimeVoiceInput {
         sender,
         active_response,
+        pending_speech: Arc::new(Semaphore::new(PENDING_SPEECH_CAPACITY)),
     };
     let component_input = input.clone();
     let app = Application::mount(
@@ -122,6 +128,7 @@ fn voice_input(receiver: VoiceReceiver, provider: QwenRealtimeMediaInput) -> Com
 pub struct QwenRealtimeVoiceInput {
     sender: mpsc::Sender<Input>,
     active_response: watch::Receiver<Option<String>>,
+    pending_speech: Arc<Semaphore>,
 }
 
 impl QwenRealtimeVoiceInput {
@@ -133,6 +140,44 @@ impl QwenRealtimeVoiceInput {
     /// Tell a provider with microphone pause support that PCM delivery is paused or resumed.
     pub async fn set_input_muted(&self, muted: bool) -> Result<(), ReactionPortFault> {
         self.send(Input::SetMuted(muted)).await
+    }
+
+    /// Queue a trusted server-authored greeting or notification for spoken output.
+    ///
+    /// The provider waits for the current reply and any user utterance to
+    /// finish. A queued notification is forwarded only after its exchange's
+    /// normal Frame setup, without cancelling speech or stopping the microphone.
+    /// The returned success means queued, not spoken or acknowledged upstream.
+    ///
+    /// Seeduplex synthesizes this text directly. Qwen receives an instruction
+    /// to read it and generates a response, so verbatim wording is not guaranteed.
+    /// This method is for trusted application text, not external user commands.
+    /// Empty text, text over 64 KiB, or eight already queued notifications return
+    /// a local fault without affecting the running session.
+    pub async fn speak_text(&self, text: impl Into<String>) -> Result<(), ReactionPortFault> {
+        let text = text.into();
+        // The application owns the notification. Reject only an unusable or
+        // oversized new request before it could stall the microphone queue.
+        if text.trim().is_empty() || text.len() > MAX_SPOKEN_TEXT_BYTES {
+            return Err(ReactionPortFault::retryable(
+                ReactionPortFaultCode::Rejected,
+                ReactionPortFaultReason::RequestPreparation,
+            ));
+        }
+        // Each accepted request retains one permit while queued across provider
+        // responses. Refuse only this excess notification, leaving PCM and the
+        // already accepted notifications free to advance.
+        let permit = self
+            .pending_speech
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                ReactionPortFault::retryable(
+                    ReactionPortFaultCode::Limit,
+                    ReactionPortFaultReason::RequestPreparation,
+                )
+            })?;
+        self.send(Input::Speak(SpokenText::new(text, permit))).await
     }
 
     /// Close the microphone input when the conversation has finished.

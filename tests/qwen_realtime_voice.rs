@@ -783,3 +783,169 @@ async fn spoken_interruption_keeps_streaming_audio_and_continues_on_the_same_ses
     assert_ne!(completed[0], completed[1]);
     assert_eq!(texts[0].1, completed[1]);
 }
+
+#[tokio::test]
+async fn proactive_notifications_wait_for_the_next_frame_and_keep_streaming_microphone_audio() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let update = receive(&mut socket).await;
+        assert_eq!(update["type"], "session.update");
+        acknowledge_update(&mut socket, &update).await;
+        let first_notice = receive(&mut socket).await;
+        assert_eq!(first_notice["type"], "conversation.item.create");
+        assert_eq!(first_notice["item"]["role"], "system");
+        let first_item = first_notice["item"]["id"].as_str().unwrap().to_owned();
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.created", "item":first_notice["item"]}),
+        )
+        .await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        let answer = json!({
+            "id":"greeting-item", "object":"realtime.item", "type":"message",
+            "status":"completed", "role":"assistant",
+            "content":[{"type":"audio", "transcript":"你好，我已经准备好了。"}],
+        });
+        for event in [
+            json!({"type":"response.created", "response":{"id":"greeting-response", "status":"in_progress", "output":[]}}),
+            json!({
+                "type":"response.output_item.added", "response_id":"greeting-response", "output_index":0,
+                "item":{"id":"greeting-item", "object":"realtime.item", "type":"message", "status":"in_progress", "role":"assistant", "content":[]},
+            }),
+            json!({
+                "type":"response.content_part.added", "response_id":"greeting-response", "item_id":"greeting-item",
+                "output_index":0, "content_index":0, "part":{"type":"audio", "text":""},
+            }),
+            json!({
+                "type":"response.audio.delta", "response_id":"greeting-response", "item_id":"greeting-item",
+                "output_index":0, "content_index":0, "delta":STANDARD.encode([1, 0, 2, 0]),
+            }),
+        ] {
+            send(&mut socket, event).await;
+        }
+        assert_eq!(receive_audio(&mut socket).await, [31, 0, 32, 0]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "a queued notification must not cancel or overlap the current reply"
+        );
+        for event in [
+            json!({
+                "type":"response.audio_transcript.done", "response_id":"greeting-response", "item_id":"greeting-item",
+                "output_index":0, "content_index":0, "transcript":"你好，我已经准备好了。",
+            }),
+            json!({
+                "type":"response.audio.done", "response_id":"greeting-response", "item_id":"greeting-item",
+                "output_index":0, "content_index":0,
+            }),
+            json!({
+                "type":"response.content_part.done", "response_id":"greeting-response", "item_id":"greeting-item",
+                "output_index":0, "content_index":0, "part":{"type":"audio", "text":"你好，我已经准备好了。"},
+            }),
+            json!({"type":"response.output_item.done", "response_id":"greeting-response", "output_index":0, "item":answer}),
+            json!({
+                "type":"response.done", "response":{"id":"greeting-response", "object":"realtime.response", "status":"completed",
+                    "modalities":["text","audio"], "output":[answer]},
+            }),
+        ] {
+            send(&mut socket, event).await;
+        }
+        let delete = receive(&mut socket).await;
+        assert_eq!(delete["type"], "conversation.item.delete");
+        assert_eq!(delete["item_id"], first_item);
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.deleted", "item_id":first_item}),
+        )
+        .await;
+        let update = receive(&mut socket).await;
+        assert_eq!(update["type"], "session.update");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "the next notification must wait until the new Frame is configured"
+        );
+        acknowledge_update(&mut socket, &update).await;
+        let notice = receive(&mut socket).await;
+        assert_eq!(notice["type"], "conversation.item.create");
+        assert_eq!(notice["item"]["role"], "system");
+        let item_id = notice["item"]["id"].as_str().unwrap().to_owned();
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.created", "item":notice["item"]}),
+        )
+        .await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        send_audio_reply(
+            &mut socket,
+            "notification-response",
+            "notification-item",
+            "你的任务已经完成。",
+            &[3, 0, 4, 0],
+            None,
+        )
+        .await;
+        let delete = receive(&mut socket).await;
+        assert_eq!(delete["type"], "conversation.item.delete");
+        assert_eq!(delete["item_id"], item_id);
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.deleted", "item_id":item_id}),
+        )
+        .await;
+        let update = receive(&mut socket).await;
+        assert_eq!(update["type"], "session.update");
+        acknowledge_update(&mut socket, &update).await;
+        await_session_close(&mut socket).await;
+    });
+    let provider = QwenRealtimeProvider::new(
+        &endpoint,
+        CREDENTIAL,
+        ModelSpec::new(MODEL, 262_144).unwrap(),
+    )
+    .unwrap();
+    let probe = VoiceProbe::default();
+    let root_probe = probe.clone();
+    let (mut app, input, mut events) = QwenRealtimeVoiceApplication::mount(
+        move || interruptible_voice_assistant(root_probe.clone()),
+        provider,
+    )
+    .unwrap();
+    input.speak_text("你好，我已经准备好了。").await.unwrap();
+    let operation = async {
+        let mut ended = 0;
+        while ended < 2 {
+            match events.next_event().await.unwrap() {
+                QwenRealtimeAudioEvent::ResponseStarted { response_id }
+                    if response_id == "greeting-response" =>
+                {
+                    input.speak_text("你的任务已经完成。").await.unwrap();
+                    input.append_pcm16(&[31, 0, 32, 0]).await.unwrap();
+                }
+                QwenRealtimeAudioEvent::ResponseEnded { status, .. } => {
+                    assert_eq!(status, QwenRealtimeResponseStatus::Completed);
+                    ended += 1;
+                }
+                _ => {}
+            }
+        }
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    tokio::time::timeout(DEADLINE, server)
+        .await
+        .unwrap()
+        .unwrap();
+    let texts = probe.text_frames.lock().unwrap();
+    assert_eq!(texts.len(), 2);
+    assert_ne!(texts[0].1, texts[1].1);
+}

@@ -657,6 +657,9 @@ impl InFlight<'_> {
             }
             self.facts.extend(self.decoder.on_event(event)?);
             if self.decoder.is_complete() {
+                if let Some(media) = &mut session.media {
+                    self.transient.extend(media.take_spoken_items());
+                }
                 for id in std::mem::take(&mut self.transient) {
                     transport::send(
                         &mut session.socket,

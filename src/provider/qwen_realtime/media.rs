@@ -1,7 +1,14 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, OwnedSemaphorePermit};
 
 use crate::component::execution::{
     ReactionPortFault as Fault, ReactionPortFaultCode as Code, ReactionPortFaultReason as Reason,
@@ -21,10 +28,25 @@ const TRANSCRIPTION_DRAIN: Duration = Duration::from_secs(15);
 pub(crate) enum Input {
     Append(String),
     SetMuted(bool),
+    Speak(SpokenText),
     Commit,
     Clear,
     Interrupt(Interrupt),
     Finish,
+}
+
+pub(crate) struct SpokenText {
+    pub(crate) text: String,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl SpokenText {
+    pub(crate) fn new(text: String, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            text,
+            _permit: permit,
+        }
+    }
 }
 
 pub(crate) struct Interrupt {
@@ -158,6 +180,11 @@ pub(super) struct Media {
     waiting_for_interruption: bool,
     interrupt: Option<Interrupt>,
     active_response: watch::Sender<Option<String>>,
+    spoken: VecDeque<SpokenText>,
+    spoken_items: Vec<String>,
+    spoken_pending: bool,
+    input_speech: bool,
+    awaiting_speech_response: bool,
     finished: bool,
 }
 
@@ -180,6 +207,11 @@ impl Media {
                 waiting_for_interruption: false,
                 interrupt: None,
                 active_response,
+                spoken: VecDeque::new(),
+                spoken_items: Vec::new(),
+                spoken_pending: false,
+                input_speech: false,
+                awaiting_speech_response: false,
                 finished: false,
             },
             sender,
@@ -205,6 +237,15 @@ impl Media {
                     .send(Err(super::output::server_error(&event["error"])));
             }
             return Ok(());
+        }
+        match event["type"].as_str() {
+            Some("input_audio_buffer.speech_started") => {
+                self.input_speech = true;
+                self.awaiting_speech_response = true;
+            }
+            Some("input_audio_buffer.speech_stopped") => self.input_speech = false,
+            Some("response.done") => self.spoken_pending = false,
+            _ => {}
         }
         if self.mode == Mode::SmartTurnV2 {
             match event["type"].as_str() {
@@ -240,12 +281,14 @@ impl Media {
                         return Err(transport::protocol_fault());
                     }
                     self.awaiting_commit = false;
+                    self.awaiting_speech_response = false;
                     self.committed_turn = true;
                 }
                 QwenRealtimeAudioEvent::ResponseStarted { response_id }
                     if self.mode == Mode::SmartTurnV2 =>
                 {
                     self.awaiting_commit = false;
+                    self.awaiting_speech_response = false;
                     self.active_response.send_replace(Some(response_id.clone()));
                 }
                 QwenRealtimeAudioEvent::ResponseEnded {
@@ -305,7 +348,11 @@ impl Media {
     }
 
     pub(super) fn is_finished(&self) -> bool {
-        self.finished
+        self.finished && self.spoken.is_empty()
+    }
+
+    pub(super) fn take_spoken_items(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.spoken_items)
     }
 
     async fn drain_transcripts(&mut self, socket: &mut Socket) -> Result<(), Fault> {
@@ -328,20 +375,53 @@ impl Media {
         responding: bool,
     ) -> Result<(Value, usize), Fault> {
         loop {
-            if self.finished
+            // The socket reader owns the response and VAD state. A notification
+            // received during a reply stays queued until the following normal
+            // Frame; a user utterance already in progress takes precedence.
+            let can_speak = !responding
+                && !self.decoder.is_responding()
+                && !self.spoken_pending
+                && !self.input_speech
+                && !self.awaiting_speech_response
+                && !self.awaiting_commit;
+            if self.finished && !responding && !self.spoken_pending && self.spoken.is_empty() {
+                return Ok((json!({"type":"agentview.input_finished"}), 0));
+            }
+            if self.finished && (!can_speak || self.spoken.is_empty())
                 || self.commit_pending
                 || self.awaiting_commit
                 || self.waiting_for_interruption
             {
-                return self.read(socket, responding || self.awaiting_commit).await;
+                return self
+                    .read(
+                        socket,
+                        responding || self.awaiting_commit || self.spoken_pending,
+                    )
+                    .await;
             }
             tokio::select! {
                 biased;
-                result = receive(socket, responding) => {
+                result = receive(socket, responding || self.spoken_pending) => {
                     let (event, bytes) = result?;
                     return self.admit(event, bytes);
                 }
-                input = self.input.recv() => match input {
+                () = std::future::ready(()), if can_speak && !self.spoken.is_empty() => {
+                    let spoken = self.spoken.pop_front().expect("queued notification");
+                    static NEXT_SPOKEN_ITEM: AtomicU64 = AtomicU64::new(1);
+                    let item_id = format!("msg_agentview_notice_{}", NEXT_SPOKEN_ITEM.fetch_add(1, Ordering::Relaxed));
+                    transport::send(socket, json!({
+                        "type": "conversation.item.create", "item": {
+                            "id": item_id, "type": "message", "role": "system",
+                            "content": [{"type":"input_text", "text": format!(
+                                "请朗读以下服务端通知，不添加前后说明：\n\n{}", spoken.text,
+                            )}],
+                        },
+                    }).to_string()).await?;
+                    self.spoken_items.push(item_id);
+                    self.spoken_pending = true;
+                    transport::send(socket, json!({"type": "response.create"}).to_string()).await?;
+                }
+                input = self.input.recv(), if !self.finished => match input {
                     Some(Input::Append(audio)) => {
                         // Bound the open utterance independently of the ingress queue.
                         if self.mode == Mode::ManualAudio {
@@ -355,6 +435,7 @@ impl Media {
                         }).to_string()).await?;
                     }
                     Some(Input::SetMuted(_)) => {},
+                    Some(Input::Speak(spoken)) => self.spoken.push_back(spoken),
                     Some(Input::Commit) if responding => self.commit_pending = true,
                     Some(Input::Commit) => self.commit(socket).await?,
                     Some(Input::Clear) => {
@@ -377,7 +458,7 @@ impl Media {
                     Some(Input::Finish) | None => {
                         self.finished = true;
                         self.input.close();
-                        if !responding {
+                        if !responding && self.spoken.is_empty() && !self.spoken_pending {
                             // Allow the idle driver to settle pending ASR with its own deadline.
                             if self.mode == Mode::SmartTurnV2 {
                                 // Late transcripts are observations and do not prevent shutdown.

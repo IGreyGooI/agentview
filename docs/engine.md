@@ -1440,6 +1440,16 @@ Component 输入、播放和转写接口。创建会话后复用连接，下一 
 已提交的结果按 `call_id` 回传给同一响应。服务端识别到插话或确认 `response.canceled`
 时立即停播，port 丢弃旧回复的尾部输出，等待 `response.done` 后结算 Frame。
 
+两个语音 Application 返回的 handle 均支持 `speak_text(text).await`，供应用提交可信的服务端
+问候或通知。成功表示进入有界队列，不表示已经播出或得到上游确认。请求不会取消当前回复，
+麦克风仍可持续送入 PCM；当前回复或已开始的用户输入优先，排队通知在正常结算和下一 Frame
+配置完成后发送。空文本、超过 64 KiB 的文本或已有八条排队通知只拒绝这条新请求。
+Seeduplex 使用 `speech_text_buffer.commit` 直接合成给定文本；Qwen 通过临时 system 对话项请求
+朗读并调用 `response.create`，仍属于模型生成，不能保证逐字一致，回复结束后删除临时指令。
+通知是 provider 的实时输入，不额外提交 Frame，也不改变 `next_session_frame()` 和真实
+`response.done` 的边界；模型回调仍归属于实际已交付的 Frame。需要在后续模型上下文保留的
+通知业务事实应由 Component 继续声明。
+
 ### Frame 能力与结构化 Decision
 
 `FrameCapabilities`在既有semantic delta之外独立声明`native_tool_calls`、`text_delta_output`和
