@@ -13,7 +13,7 @@ use agentview::{
     provider::{
         qwen_realtime::{
             QwenRealtimeAudioEvent, QwenRealtimeProvider, QwenRealtimeResponseStatus,
-            QwenRealtimeVoiceApplication,
+            QwenRealtimeServerEvents, QwenRealtimeVoiceApplication,
         },
         ModelSpec,
     },
@@ -261,6 +261,267 @@ async fn receive_context_update(socket: &mut WebSocketStream<TcpStream>) -> Valu
             other => panic!("context refresh must not generate a reply, got {other}"),
         }
     }
+}
+
+async fn next_context_refresh_outcome(events: &mut QwenRealtimeServerEvents) -> Arc<Value> {
+    loop {
+        let event = events.next_event().await.unwrap();
+        if event["type"]
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("agentview.context_refresh_"))
+        {
+            return event;
+        }
+    }
+}
+
+async fn next_context_response_outcome(events: &mut QwenRealtimeServerEvents) -> Arc<Value> {
+    loop {
+        let event = events.next_event().await.unwrap();
+        if matches!(
+            event["type"].as_str(),
+            Some("agentview.context_response_requested" | "agentview.context_response_skipped")
+        ) {
+            return event;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ContextReplyCase {
+    Complete,
+    UserWins,
+    ProviderRejects,
+}
+
+#[tokio::test]
+async fn explicit_context_reply_waits_for_its_scoped_cue_ack_and_preserves_future_turns() {
+    exercise_context_reply(ContextReplyCase::Complete).await;
+}
+
+#[tokio::test]
+async fn user_speech_and_provider_refusal_skip_only_the_optional_context_reply() {
+    exercise_context_reply(ContextReplyCase::UserWins).await;
+    exercise_context_reply(ContextReplyCase::ProviderRejects).await;
+}
+
+async fn exercise_context_reply(case: ContextReplyCase) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (initialized_tx, initialized_rx) = oneshot::channel();
+    let (cue_seen_tx, cue_seen_rx) = oneshot::channel();
+    let (release_cue_tx, release_cue_rx) = oneshot::channel();
+    let (user_ready_tx, user_ready_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        receive_repeated_instruction(&mut socket).await;
+        initialized_tx.send(()).unwrap();
+        let refresh = receive_context_update(&mut socket).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), socket.next())
+                .await
+                .is_err()
+        );
+        acknowledge_update(&mut socket, &refresh).await;
+        receive_repeated_instruction(&mut socket).await;
+        let cue = receive(&mut socket).await;
+        assert_eq!(cue["type"], "conversation.item.create");
+        assert_eq!(cue["item"]["role"], "system");
+        assert_eq!(cue["item"]["content"][0]["type"], "input_text");
+        cue_seen_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "generation must wait for the cue's own ACK"
+        );
+        if matches!(case, ContextReplyCase::UserWins) {
+            send_input(&mut socket, "new-user-race").await;
+            send_audio_reply(
+                &mut socket,
+                "user-won",
+                "user-won-item",
+                "先回应用户。",
+                &[2, 0],
+                None,
+            )
+            .await;
+        }
+        release_cue_rx.await.unwrap();
+        let mut acknowledged_cue = cue["item"].clone();
+        acknowledged_cue["id"] = json!("context-cue-once");
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.created", "item":acknowledged_cue}),
+        )
+        .await;
+
+        let mut removed = Vec::new();
+        match case {
+            ContextReplyCase::UserWins => {}
+            ContextReplyCase::Complete | ContextReplyCase::ProviderRejects => {
+                let generate = receive(&mut socket).await;
+                assert_eq!(generate["type"], "response.create");
+                assert!(generate["event_id"].is_string());
+                if matches!(case, ContextReplyCase::Complete) {
+                    send_audio_reply(
+                        &mut socket,
+                        "proactive-result",
+                        "proactive-result-item",
+                        "任务结果已返回。",
+                        &[1, 0],
+                        None,
+                    )
+                    .await;
+                } else {
+                    send(&mut socket, json!({"type":"error", "error":{
+                        "type":"invalid_request_error", "code":"invalid_state", "param":"response.create",
+                        "event_id":generate["event_id"], "message":"Optional generation refused"
+                    }})).await;
+                    let delete = receive(&mut socket).await;
+                    assert_eq!(delete["type"], "conversation.item.delete");
+                    assert_eq!(delete["item_id"], "context-cue-once");
+                    removed.push("context-cue-once".to_owned());
+                    send(
+                        &mut socket,
+                        json!({"type":"conversation.item.deleted", "item_id":delete["item_id"]}),
+                    )
+                    .await;
+                }
+            }
+        }
+        if !matches!(case, ContextReplyCase::ProviderRejects) {
+            let next = loop {
+                let event = receive(&mut socket).await;
+                match event["type"].as_str().unwrap() {
+                    "conversation.item.delete" => {
+                        removed.push(event["item_id"].as_str().unwrap().to_owned());
+                        send(
+                            &mut socket,
+                            json!({"type":"conversation.item.deleted", "item_id":event["item_id"]}),
+                        )
+                        .await;
+                    }
+                    "session.update" => break event,
+                    other => panic!(
+                        "one explicit context intent must not request a second reply: {other}"
+                    ),
+                }
+            };
+            acknowledge_update(&mut socket, &next).await;
+            receive_repeated_instruction(&mut socket).await;
+        }
+        assert_eq!(
+            removed
+                .iter()
+                .filter(|id| id.as_str() == "context-cue-once")
+                .count(),
+            1
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "the one-reply instruction must not be repeated on the following user Frame"
+        );
+        user_ready_tx.send(()).unwrap();
+        assert_eq!(receive_audio(&mut socket).await, [41, 0, 42, 0]);
+        send_input(&mut socket, "following-user").await;
+        send_audio_reply(
+            &mut socket,
+            "following-user-answer",
+            "following-user-item",
+            "继续回答用户。",
+            &[3, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let provider = QwenRealtimeProvider::new(
+        &endpoint,
+        CREDENTIAL,
+        ModelSpec::new(MODEL, 262_144).unwrap(),
+    )
+    .unwrap();
+    let probe = RefreshProbe::default();
+    let root_probe = probe.clone();
+    let (mut app, input, mut events) = QwenRealtimeVoiceApplication::mount(
+        move || refreshable_assistant(root_probe.clone()),
+        provider,
+    )
+    .unwrap();
+    let mut raw = events.subscribe_server_events();
+    let operation = async {
+        initialized_rx.await.unwrap();
+        probe
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .set(1)
+            .unwrap();
+        input
+            .refresh_context_and_respond_with_instruction(
+                "本次服务端主动回复只简短播报当前完整结果；若有新用户请求则优先处理用户。",
+            )
+            .await
+            .unwrap();
+        cue_seen_rx.await.unwrap();
+        assert_eq!(
+            next_context_refresh_outcome(&mut raw).await["type"],
+            "agentview.context_refresh_applied"
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            next_context_response_outcome(&mut raw)
+        )
+        .await
+        .is_err());
+        release_cue_tx.send(()).unwrap();
+        let outcome = next_context_response_outcome(&mut raw).await;
+        assert_eq!(outcome["provider_session_id"], SESSION);
+        assert_eq!(outcome.as_object().unwrap().len(), 4);
+        if matches!(case, ContextReplyCase::UserWins) {
+            assert_eq!(outcome["type"], "agentview.context_response_skipped");
+            assert_eq!(outcome["reason"], "user_turn");
+        } else {
+            assert_eq!(outcome["type"], "agentview.context_response_requested");
+            assert_eq!(outcome["source"], "explicit_context");
+            if matches!(case, ContextReplyCase::ProviderRejects) {
+                let skipped = next_context_response_outcome(&mut raw).await;
+                assert_eq!(skipped["type"], "agentview.context_response_skipped");
+                assert_eq!(skipped["reason"], "provider_rejected");
+            }
+        }
+        user_ready_rx.await.unwrap();
+        assert_eq!(
+            probe.completions.lock().unwrap().len(),
+            if matches!(case, ContextReplyCase::ProviderRejects) {
+                0
+            } else {
+                1
+            }
+        );
+        input.append_pcm16(&[41, 0, 42, 0]).await.unwrap();
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseEnded { response_id, .. } if response_id == "following-user-answer")
+            {
+                break;
+            }
+        }
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    server.await.unwrap();
 }
 
 async fn send_input(socket: &mut WebSocketStream<TcpStream>, input_id: &str) {
@@ -561,6 +822,7 @@ async fn explicit_context_refresh_is_silent_and_keeps_a_newer_signal_write_durin
         provider,
     )
     .unwrap();
+    let mut raw = events.subscribe_server_events();
     let operation = async {
         initialized_rx.await.unwrap();
         let state = probe.state.lock().unwrap().clone().unwrap();
@@ -570,8 +832,34 @@ async fn explicit_context_refresh_is_silent_and_keeps_a_newer_signal_write_durin
         refresh_started_rx.await.unwrap();
         state.set(2).unwrap();
         input.refresh_context().await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                next_context_refresh_outcome(&mut raw)
+            )
+            .await
+            .is_err(),
+            "a queued update must not claim remote application before its ACKs"
+        );
         newer_queued_tx.send(()).unwrap();
         context_ready_rx.await.unwrap();
+        for _ in 0..2 {
+            let applied = next_context_refresh_outcome(&mut raw).await;
+            assert_eq!(applied["type"], "agentview.context_refresh_applied");
+            assert_eq!(applied["provider_session_id"], SESSION);
+            assert!(applied["frame_revision"]
+                .as_str()
+                .is_some_and(|revision| !revision.is_empty()));
+            let fields = applied.as_object().unwrap();
+            assert_eq!(fields.len(), 3);
+            assert!(
+                fields.keys().all(|field| matches!(
+                    field.as_str(),
+                    "type" | "provider_session_id" | "frame_revision"
+                )),
+                "delivery observations must not expose authored context or task results"
+            );
+        }
         assert!(
             probe.completions.lock().unwrap().is_empty(),
             "silent refresh is not a reaction completion"
@@ -787,6 +1075,7 @@ async fn exercise_refused_context(reject_update: bool) {
         provider,
     )
     .unwrap();
+    let mut raw = events.subscribe_server_events();
     let operation = async {
         initialized_rx.await.unwrap();
         probe
@@ -799,6 +1088,25 @@ async fn exercise_refused_context(reject_update: bool) {
             .unwrap();
         input.refresh_context().await.unwrap();
         refused_rx.await.unwrap();
+        let rejected = next_context_refresh_outcome(&mut raw).await;
+        assert_eq!(rejected["type"], "agentview.context_refresh_rejected");
+        assert_eq!(rejected["provider_session_id"], SESSION);
+        assert_eq!(rejected["reason"], "invalid_request");
+        assert_eq!(
+            rejected["ack"],
+            if reject_update {
+                "session.updated"
+            } else {
+                "conversation.item.created"
+            }
+        );
+        assert_eq!(rejected.as_object().unwrap().len(), 4);
+        if !reject_update {
+            let incomplete = next_context_refresh_outcome(&mut raw).await;
+            assert_eq!(incomplete["type"], "agentview.context_refresh_incomplete");
+            assert_eq!(incomplete["rejected_items"], 1);
+            assert_eq!(incomplete.as_object().unwrap().len(), 4);
+        }
         assert!(probe.completions.lock().unwrap().is_empty());
         input.append_pcm16(&[31, 0, 32, 0]).await.unwrap();
         loop {
@@ -911,6 +1219,7 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
     let (mut app, input, mut events) =
         QwenRealtimeVoiceApplication::mount(move || voice_assistant(root_probe.clone()), provider)
             .unwrap();
+    let mut raw = events.subscribe_server_events();
     let operation = async {
         let mut audio_queued_tx = Some(audio_queued_tx);
         let mut local_render_tx = Some(local_render_tx);
@@ -930,6 +1239,7 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
                 {
                     let state = probe.external_state.lock().unwrap().clone().unwrap();
                     state.set(1).unwrap();
+                    input.refresh_context().await.unwrap();
                     tokio::time::timeout(DEADLINE, async {
                         loop {
                             let rendered = probe.rendered.notified();
@@ -953,6 +1263,11 @@ async fn smart_turn_voice_streams_two_rounds_and_refreshes_the_frame_after_respo
             if response_id == "response_1" {
                 input.append_pcm16(&[21, 0, 22, 0]).await.unwrap();
                 audio_queued_tx.take().unwrap().send(()).unwrap();
+                let applied = next_context_refresh_outcome(&mut raw).await;
+                assert_eq!(applied["type"], "agentview.context_refresh_applied");
+                assert_eq!(applied["provider_session_id"], SESSION);
+                assert_eq!(applied.as_object().unwrap().len(), 3,
+                    "an explicit refresh covered by the normal post-response Frame is observed without another generation request");
             }
         }
         input.finish().await.unwrap();

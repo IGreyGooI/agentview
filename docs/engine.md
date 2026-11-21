@@ -299,6 +299,16 @@ Frame；整份上下文的 items 确认之前不发布新 Frame 的输出归属�
 ephemeral developer projection，在后续授权的 Frame 中重新声明当前状态。其他 voice provider
 对该可选控制返回本地不支持错误，不生成语音。
 
+需要主动回复时显式调用 `refresh_context_and_respond()`，或用
+`refresh_context_and_respond_with_instruction(trusted_text)` 提供本次回复的可信简短指令。
+这保留既有 Frame 事实：全部上下文 ACK 后，再以 system/input_text 写入一次临时控制指令，等待其
+自身 ACK 后发送一次 `response.create`；与已需执行的 native tool 续轮合并，不额外重复生成。
+临时指令在该回复结束后删除；用户在插入阶段抢先开始一轮时，删除本次指令并跳过可选生成。
+相关客户端拒绝只丢弃这次可选控制，不关闭既有语音。后续普通 Frame 不携带该一次性指令。
+raw media 订阅中的 `agentview.context_refresh_applied/incomplete/rejected` 与
+`agentview.context_response_requested/skipped` 是本地交付观测，独立于 tracing filter，
+只含 provider session、opaque Frame revision、固定原因和计数，不携带上下文、任务结果或指令正文。
+
 `app.react(ephemeral: bool)` 在准入时选择历史分支。`ephemeral=true` 始终创建 Temporary，
 即使没有活动 Main，也不领取或推进主 port/session；每次都从最近的合法主 checkpoint 创建新 sibling。
 `ephemeral=false` 保留自动分类：没有占用主线执行位时为 Main，否则为 Temporary。

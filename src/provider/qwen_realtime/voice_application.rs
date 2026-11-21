@@ -147,6 +147,39 @@ impl QwenRealtimeVoiceInput {
     /// for asynchronous task state. Other voice providers return a local
     /// unsupported fault.
     pub async fn refresh_context(&self) -> Result<(), ReactionPortFault> {
+        self.request_context_refresh(None).await
+    }
+
+    /// Queue fresh Component context and one response after its remote ACKs.
+    ///
+    /// This explicitly opts into generation on Qwen Smart Turn v2, retaining
+    /// the current reaction and socket. Active speech finishes first. A user
+    /// turn or automatic response that wins the context-installation race
+    /// takes priority and skips this optional generation. Native tool feedback
+    /// and this intent share a single `response.create` when both are ready.
+    /// Success means queued; raw media delivery observations report the result.
+    pub async fn refresh_context_and_respond(&self) -> Result<(), ReactionPortFault> {
+        self.refresh_context_and_respond_with_instruction(
+            "这是一次由服务端主动触发的回复。请依据刚更新的上下文完成本次答复；本指令仅对这一次回复有效。若有新的用户请求，优先回应用户。"
+        ).await
+    }
+
+    /// Request one reply with a trusted instruction scoped to that delivery.
+    /// The system-role item is acknowledged after the Frame context, removed
+    /// when its response ends, and dropped if a user turn wins insertion.
+    /// Empty or over-64-KiB instructions are refused locally. Do not pass
+    /// external user text as this server-authored control instruction.
+    pub async fn refresh_context_and_respond_with_instruction(
+        &self,
+        instruction: impl Into<String>,
+    ) -> Result<(), ReactionPortFault> {
+        self.request_context_refresh(Some(instruction.into())).await
+    }
+
+    async fn request_context_refresh(
+        &self,
+        instruction: Option<String>,
+    ) -> Result<(), ReactionPortFault> {
         // This input type is shared by providers with different session
         // protocols. Reject only the unsupported optional refresh, rather than
         // turning it into speech or disturbing their microphone stream.
@@ -156,7 +189,22 @@ impl QwenRealtimeVoiceInput {
                 ReactionPortFaultReason::RequestPreparation,
             ));
         }
-        self.send(Input::RefreshContext).await
+        // The application owns this optional cue. Refuse only an unusable new
+        // instruction before it can occupy the bounded microphone/control queue.
+        if instruction
+            .as_ref()
+            .is_some_and(|text| text.trim().is_empty() || text.len() > MAX_SPOKEN_TEXT_BYTES)
+        {
+            return Err(ReactionPortFault::retryable(
+                ReactionPortFaultCode::Rejected,
+                ReactionPortFaultReason::RequestPreparation,
+            ));
+        }
+        self.send(match instruction {
+            Some(instruction) => Input::RefreshContextAndRespond(instruction),
+            None => Input::RefreshContext,
+        })
+        .await
     }
 
     /// Stream 16 kHz mono signed little-endian PCM16, including silence.

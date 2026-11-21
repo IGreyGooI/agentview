@@ -10,6 +10,7 @@ pub(crate) mod voice_application;
 use std::{
     collections::VecDeque,
     num::{NonZeroU128, NonZeroU64},
+    sync::atomic::{AtomicU64, Ordering},
     task::Poll,
 };
 
@@ -43,6 +44,7 @@ use super::ModelSpec;
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+static NEXT_CONTEXT_RESPONSE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Mode {
@@ -213,6 +215,43 @@ struct Session {
     media: Option<Media>,
     frame: Option<FrameRevision>,
     pending_events: VecDeque<(Value, Option<FrameRevision>)>,
+    context_setup: bool,
+}
+
+impl Session {
+    fn user_turn_owns_context_response(&self) -> bool {
+        self.pending_events.iter().any(|(event, _)| {
+            event["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("response."))
+        }) || self
+            .media
+            .as_ref()
+            .is_some_and(|media| !media.context_response_available())
+    }
+
+    fn observe_context_response(&self, revision: FrameRevision, requested: bool, reason: &str) {
+        if let Some(media) = &self.media {
+            let mut event = serde_json::json!({
+                "type": if requested { "agentview.context_response_requested" } else { "agentview.context_response_skipped" },
+                "provider_session_id": self.id,
+                "frame_revision": format!("{revision:?}"),
+            });
+            event[if requested { "source" } else { "reason" }] = Value::String(reason.to_owned());
+            media.publish_context_refresh_event(event);
+        }
+    }
+
+    fn observe_context_refresh_rejected(&self, reason: &str, ack: &str) {
+        if let Some(media) = &self.media {
+            media.publish_context_refresh_event(serde_json::json!({
+                "type": "agentview.context_refresh_rejected",
+                "provider_session_id": self.id,
+                "reason": reason,
+                "ack": ack,
+            }));
+        }
+    }
 }
 
 struct Retained {
@@ -279,6 +318,7 @@ impl ReactionPort for QwenRealtimeProvider {
                     media: None,
                     frame: None,
                     pending_events: VecDeque::new(),
+                    context_setup: false,
                 },
                 created,
             ))
@@ -449,9 +489,13 @@ async fn start_response(
     if let (Some(media), Some(created)) = (&mut session.media, created) {
         media.observe(&created)?;
     }
-    if let Some(media) = &mut session.media {
-        media.begin_context_frame();
-    }
+    let (deferred_context, context_instruction) = session
+        .media
+        .as_mut()
+        .map(Media::begin_context_frame)
+        .unwrap_or_default();
+    let context_response = context_instruction.is_some();
+    session.context_setup = optional_context || deferred_context;
     transport::send(&mut session.socket, commands.update).await?;
     let updated = match next_ack(
         &mut bytes,
@@ -464,6 +508,10 @@ async fn start_response(
     {
         Some(updated) => updated,
         None => {
+            session.context_setup = false;
+            if context_response {
+                session.observe_context_response(revision, false, "context_rejected");
+            }
             let rejected_frame = session.frame;
             return Ok(StartedResponse {
                 session,
@@ -471,6 +519,7 @@ async fn start_response(
                 transient: Vec::new(),
                 started: true,
                 rejected_frame,
+                response_requested: false,
             });
         }
     };
@@ -495,18 +544,24 @@ async fn start_response(
     // unconfirmed configuration instead of stopping accepted voice.
     if updated["session"]["id"] != session.id || !expected_modalities || !expected_detection {
         if optional_context {
+            session.observe_context_refresh_rejected("configuration_ack", "session.updated");
             tracing::warn!(
                 event = "qwen_context_refresh_rejected",
                 reason = "configuration_ack",
                 "optional context update ignored; voice continues"
             );
             let rejected_frame = session.frame;
+            session.context_setup = false;
+            if context_response {
+                session.observe_context_response(revision, false, "context_rejected");
+            }
             return Ok(StartedResponse {
                 session,
                 bytes,
                 transient: Vec::new(),
                 started: true,
                 rejected_frame,
+                response_requested: false,
             });
         }
         return Err(transport::protocol_fault());
@@ -529,6 +584,7 @@ async fn start_response(
                     transient: Vec::new(),
                     started: false,
                     rejected_frame: None,
+                    response_requested: false,
                 });
             }
             media.begin_turn();
@@ -547,27 +603,107 @@ async fn start_response(
     // The whole context Frame owns callbacks only after all its item ACKs.
     // Until then previously forwarded PCM may still start an old-Frame reply.
     session.frame = Some(revision);
-    if optional_context {
+    session.context_setup = false;
+    if optional_context || deferred_context {
         // This writer owns each command/ACK boundary. Do not claim the task
         // snapshot reached the model if even one optional item was refused;
         // report incomplete delivery without interrupting the audio owner.
         if rejected_items == 0 {
-            tracing::info!(event = "qwen_context_refresh_applied", provider_session_id = %session.id, frame_revision = ?revision,
-                "context Frame acknowledged without requesting generation");
+            tracing::info!(event = "qwen_context_refresh_applied", provider_session_id = %session.id, frame_revision = ?revision, deferred_context,
+                "requested context Frame acknowledged");
+            if let Some(media) = &session.media {
+                media.publish_context_refresh_event(serde_json::json!({
+                    "type": "agentview.context_refresh_applied",
+                    "provider_session_id": session.id,
+                    // FrameRevision is deliberately opaque; retain its debug
+                    // token solely for internal observation correlation.
+                    "frame_revision": format!("{revision:?}"),
+                }));
+            }
         } else {
             tracing::warn!(
                 event = "qwen_context_refresh_incomplete",
                 rejected_items,
                 "optional context items refused; voice continues"
             );
+            if let Some(media) = &session.media {
+                media.publish_context_refresh_event(serde_json::json!({
+                    "type": "agentview.context_refresh_incomplete",
+                    "provider_session_id": session.id,
+                    "frame_revision": format!("{revision:?}"),
+                    "rejected_items": rejected_items,
+                }));
+            }
         }
     }
-    if mode != Mode::SmartTurnV2 || tool_feedback {
-        transport::send(
-            &mut session.socket,
-            r#"{"type":"response.create"}"#.to_owned(),
-        )
-        .await?;
+    let ordinary_generation = mode != Mode::SmartTurnV2 || tool_feedback;
+    // The server can accept user audio forwarded on the former Frame while
+    // this context awaits its ACKs. A buffered automatic response or a live
+    // utterance owns that turn; drop only this optional generation intent.
+    let mut user_turn_won = context_response && session.user_turn_owns_context_response();
+    let mut context_cue = None;
+    let mut cue_rejected = false;
+    if let Some(instruction) = context_instruction.filter(|_| !user_turn_won && rejected_items == 0)
+    {
+        let cue = serde_json::json!({"type":"conversation.item.create", "item": {
+            "type":"message", "role":"system",
+            "content":[{"type":"input_text", "text":instruction}],
+        }})
+        .to_string();
+        context_cue = create_item(&mut session, &mut bytes, cue, true).await?;
+        cue_rejected = context_cue.is_none();
+        user_turn_won = session.user_turn_owns_context_response();
+        if let Some(id) = &context_cue {
+            if user_turn_won {
+                // The cue belongs only to this optional reply. If real speech
+                // wins its insertion race, retire it now instead of leaving a
+                // standing instruction in later user or scheduled turns.
+                delete_optional_context_item(&mut session, &mut bytes, id).await?;
+                context_cue = None;
+            } else {
+                transient.push(id.clone());
+            }
+        }
+    }
+    let optional_generation =
+        context_response && rejected_items == 0 && !cue_rejected && !user_turn_won;
+    let response_requested = !user_turn_won && (ordinary_generation || optional_generation);
+    if response_requested {
+        let event = if optional_generation {
+            let event_id = format!(
+                "context_response_{}",
+                NEXT_CONTEXT_RESPONSE.fetch_add(1, Ordering::Relaxed)
+            );
+            if let Some(media) = &mut session.media {
+                media.expect_context_response(
+                    event_id.clone(),
+                    session.id.clone(),
+                    revision,
+                    context_cue,
+                );
+            }
+            serde_json::json!({"type":"response.create", "event_id":event_id}).to_string()
+        } else {
+            r#"{"type":"response.create"}"#.to_owned()
+        };
+        transport::send(&mut session.socket, event).await?;
+    }
+    if context_response {
+        session.observe_context_response(
+            revision,
+            response_requested && !cue_rejected,
+            if user_turn_won {
+                "user_turn"
+            } else if rejected_items > 0 {
+                "context_incomplete"
+            } else if cue_rejected {
+                "instruction_rejected"
+            } else if ordinary_generation {
+                "tool_continuation"
+            } else {
+                "explicit_context"
+            },
+        );
     }
     Ok(StartedResponse {
         session,
@@ -575,7 +711,25 @@ async fn start_response(
         transient,
         started: true,
         rejected_frame: None,
+        response_requested,
     })
+}
+
+async fn delete_optional_context_item(
+    session: &mut Session,
+    bytes: &mut ResponseBytes,
+    id: &str,
+) -> Result<(), Fault> {
+    transport::send(
+        &mut session.socket,
+        serde_json::json!({
+            "type":"conversation.item.delete", "item_id":id,
+        })
+        .to_string(),
+    )
+    .await?;
+    let _ = next_ack(bytes, session, "conversation.item.deleted", None, true).await?;
+    Ok(())
 }
 
 struct StartedResponse {
@@ -584,6 +738,7 @@ struct StartedResponse {
     transient: Vec<String>,
     started: bool,
     rejected_frame: Option<FrameRevision>,
+    response_requested: bool,
 }
 
 async fn create_item(
@@ -615,6 +770,7 @@ async fn create_item(
                 reason = "item_ack",
                 "optional context item ACK unusable; voice continues"
             );
+            session.observe_context_refresh_rejected("item_ack", "conversation.item.created");
             Ok(None)
         }
         None => Err(transport::protocol_fault()),
@@ -641,6 +797,7 @@ async fn next_ack(
                 .as_ref()
                 .is_none_or(|media| !media.owns_control_error(&event))
         {
+            session.observe_context_refresh_rejected("invalid_request", expected);
             if let Some(media) = &session.media {
                 media.observe_context_rejection(event);
             }
@@ -674,7 +831,11 @@ async fn next_ack(
                 }
                 return Ok(Some(event));
             }
-            Some(kind) if optional && session.media.is_some() && kind.starts_with("response.") => {
+            Some(kind)
+                if (optional || session.context_setup)
+                    && session.media.is_some()
+                    && kind.starts_with("response.") =>
+            {
                 // Audio forwarded on the previous Frame can start generation
                 // while an update or item ACK is in flight. Preserve all model
                 // events and the last acknowledged Frame for response.created;
@@ -764,10 +925,12 @@ impl InFlight<'_> {
                 transient,
                 started,
                 rejected_frame,
+                response_requested,
             } = pending.await?;
             self.session = Some(session);
             self.response_bytes = bytes;
             self.transient = transient;
+            self.expect_immediate_response |= response_requested;
             if let Some(revision) = rejected_frame {
                 self.revision = revision;
                 self.facts
@@ -815,6 +978,21 @@ impl InFlight<'_> {
                     None,
                 )
             };
+            if event["type"] == "agentview.context_response_rejected" {
+                if event["cancel_wait"] == true {
+                    self.expect_immediate_response = false;
+                    if let Some(id) = event["cue_item_id"].as_str() {
+                        delete_optional_context_item(
+                            self.session.as_mut().expect("live session"),
+                            &mut self.response_bytes,
+                            id,
+                        )
+                        .await?;
+                        self.transient.retain(|item| item != id);
+                    }
+                }
+                continue;
+            }
             if event["type"] == "agentview.context_refresh" {
                 self.cleanup_context(true).await?;
                 // Cleanup ACKs can race an automatic response too. Finish that

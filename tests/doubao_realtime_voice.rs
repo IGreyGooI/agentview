@@ -387,6 +387,7 @@ async fn batched_native_results_continue_the_current_response_before_the_next_fr
     let operation = async {
         assert!(input.refresh_context().await.is_err(),
             "Qwen context controls must be rejected locally on Seeduplex without changing voice input");
+        assert!(input.refresh_context_and_respond().await.is_err());
         input.append_pcm16(&[11, 0, 12, 0]).await.unwrap();
         let mut rounds = Vec::new();
         for expected_pcm in [vec![1, 0, 2, 0], vec![3, 0, 4, 0]] {

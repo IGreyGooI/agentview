@@ -12,7 +12,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, OwnedSemaphorePermit};
 use tokio::time::Instant;
 
 use crate::component::execution::{
-    ReactionPortFault as Fault, ReactionPortFaultCode as Code, ReactionPortFaultReason as Reason,
+    FrameRevision, ReactionPortFault as Fault, ReactionPortFaultCode as Code,
+    ReactionPortFaultReason as Reason,
 };
 
 use super::{
@@ -37,11 +38,20 @@ struct Notice {
     requested: bool,
 }
 
+#[derive(Clone)]
+struct ContextResponseRequest {
+    event_id: String,
+    provider_session_id: String,
+    revision: FrameRevision,
+    cue_item: Option<String>,
+}
+
 pub(crate) enum Input {
     Append(String),
     SetMuted(bool),
     Speak(SpokenText),
     RefreshContext,
+    RefreshContextAndRespond(String),
     Commit,
     Clear,
     Interrupt(Interrupt),
@@ -137,7 +147,9 @@ impl MediaEventsSender {
     }
 }
 
-/// An independent subscription to complete Qwen server events.
+/// An independent subscription to complete Qwen server events and local
+/// `agentview.context_*` delivery observations. Local observations carry
+/// only correlation/status metadata and are never sent to the model.
 pub struct QwenRealtimeServerEvents(broadcast::Receiver<Arc<Value>>);
 
 impl QwenRealtimeServerEvents {
@@ -203,6 +215,9 @@ pub(super) struct Media {
     input_speech: bool,
     awaiting_speech_response: bool,
     context_refresh_pending: bool,
+    context_response_pending: Option<String>,
+    context_generation_waiting: Option<String>,
+    context_generations: VecDeque<ContextResponseRequest>,
     finished: bool,
 }
 
@@ -235,6 +250,9 @@ impl Media {
                 input_speech: false,
                 awaiting_speech_response: false,
                 context_refresh_pending: false,
+                context_response_pending: None,
+                context_generation_waiting: None,
+                context_generations: VecDeque::new(),
                 finished: false,
             },
             sender,
@@ -246,11 +264,62 @@ impl Media {
         self.active_response.subscribe()
     }
 
-    pub(super) fn begin_context_frame(&mut self) {
+    pub(super) fn begin_context_frame(&mut self) -> (bool, Option<String>) {
         // Only refreshes already consumed by this socket owner are covered by
         // the Frame about to be installed. New requests remain in the input
         // queue, so an ACK cannot erase a later Signal update.
-        self.context_refresh_pending = false;
+        (
+            std::mem::take(&mut self.context_refresh_pending),
+            std::mem::take(&mut self.context_response_pending),
+        )
+    }
+
+    pub(super) fn context_response_available(&self) -> bool {
+        !self.decoder.is_responding()
+            && !self.input_speech
+            && !self.awaiting_speech_response
+            && !self.awaiting_commit
+            && !self.spoken_pending
+            && !self.waiting_for_interruption
+            && !self.finished
+            && self.context_generation_waiting.is_none()
+    }
+
+    pub(super) fn expect_context_response(
+        &mut self,
+        event_id: String,
+        provider_session_id: String,
+        revision: FrameRevision,
+        cue_item: Option<String>,
+    ) {
+        self.context_generation_waiting = Some(event_id.clone());
+        if self.context_generations.len() == ABANDONED_NOTICES {
+            self.context_generations.pop_front();
+        }
+        self.context_generations.push_back(ContextResponseRequest {
+            event_id,
+            provider_session_id,
+            revision,
+            cue_item,
+        });
+    }
+
+    fn context_response_rejection(&self, event: &Value) -> Option<(ContextResponseRequest, bool)> {
+        if event["type"] != "error" || event["error"]["type"] != "invalid_request_error" {
+            return None;
+        }
+        let explicit = event["error"]["event_id"].as_str();
+        let request = self.context_generations.iter().find(|request| {
+            explicit == Some(request.event_id.as_str())
+                || (explicit.is_none()
+                    && event["error"]["param"] == "response.create"
+                    && self.context_generation_waiting.as_deref()
+                        == Some(request.event_id.as_str()))
+        })?;
+        Some((
+            request.clone(),
+            self.context_generation_waiting.as_deref() == Some(request.event_id.as_str()),
+        ))
     }
 
     pub(super) fn observe_context_rejection(&self, event: Value) {
@@ -259,8 +328,17 @@ impl Media {
         self.events.publish_server_event(Arc::new(event));
     }
 
+    pub(super) fn publish_context_refresh_event(&self, event: Value) {
+        // Local delivery observations share the raw media stream so the owning
+        // application can record ACK outcomes even when SDK tracing is filtered.
+        // The context writer supplies only IDs, counters and fixed status text.
+        self.events.publish_server_event(Arc::new(event));
+    }
+
     pub(super) fn owns_control_error(&self, event: &Value) -> bool {
-        self.rejected_notice(event).is_some() || self.is_cancel_rejection(event)
+        self.rejected_notice(event).is_some()
+            || self.is_cancel_rejection(event)
+            || self.context_response_rejection(event).is_some()
     }
 
     pub(super) fn observe(&mut self, event: &Value) -> Result<(), Fault> {
@@ -333,6 +411,7 @@ impl Media {
                 }
             }
             Some("response.done") => {
+                self.context_generation_waiting = None;
                 self.spoken_pending = false;
                 self.notice = None;
             }
@@ -574,6 +653,10 @@ impl Media {
                     Some(Input::SetMuted(_)) => {},
                     Some(Input::Speak(spoken)) => self.spoken.push_back(spoken),
                     Some(Input::RefreshContext) => self.context_refresh_pending = true,
+                    Some(Input::RefreshContextAndRespond(instruction)) => {
+                        self.context_refresh_pending = true;
+                        self.context_response_pending = Some(instruction);
+                    }
                     Some(Input::Commit) if responding => self.commit_pending = true,
                     Some(Input::Commit) => self.commit(socket).await?,
                     Some(Input::Clear) => {
@@ -616,6 +699,26 @@ impl Media {
     }
 
     pub(super) fn admit(&mut self, event: Value, bytes: usize) -> Result<(Value, usize), Fault> {
+        // This optional response can lose a race after all context ACKs but
+        // before the server handles response.create. Only its owned rejection
+        // retires the cue and wait; late errors cannot cancel a newer response.
+        if let Some((request, current)) = self.context_response_rejection(&event) {
+            self.events.publish_server_event(Arc::new(event));
+            self.publish_context_refresh_event(json!({
+                "type":"agentview.context_response_skipped",
+                "provider_session_id":request.provider_session_id,
+                "frame_revision":format!("{:?}", request.revision),
+                "reason":"provider_rejected",
+            }));
+            if current {
+                self.context_generation_waiting = None;
+            }
+            return Ok((
+                json!({"type":"agentview.context_response_rejected", "cancel_wait":current,
+                "cue_item_id":if current { request.cue_item } else { None }}),
+                0,
+            ));
+        }
         // Optional notification requests are the only client item/create-response
         // commands outstanding in this media phase. Match an explicit request
         // reference, or its create parameter while waiting for this exact ACK;
