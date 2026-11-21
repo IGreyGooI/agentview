@@ -291,6 +291,8 @@ async fn next_context_response_outcome(events: &mut QwenRealtimeServerEvents) ->
 enum ContextReplyCase {
     Complete,
     UserWins,
+    UserWinsCleanupRefused,
+    UserWinsCleanupRefusedTwice,
     ProviderRejects,
 }
 
@@ -303,6 +305,12 @@ async fn explicit_context_reply_waits_for_its_scoped_cue_ack_and_preserves_futur
 async fn user_speech_and_provider_refusal_skip_only_the_optional_context_reply() {
     exercise_context_reply(ContextReplyCase::UserWins).await;
     exercise_context_reply(ContextReplyCase::ProviderRejects).await;
+}
+
+#[tokio::test]
+async fn proactive_cleanup_keeps_a_refused_cue_owned_until_the_existing_response_end() {
+    exercise_context_reply(ContextReplyCase::UserWinsCleanupRefused).await;
+    exercise_context_reply(ContextReplyCase::UserWinsCleanupRefusedTwice).await;
 }
 
 async fn exercise_context_reply(case: ContextReplyCase) {
@@ -328,7 +336,7 @@ async fn exercise_context_reply(case: ContextReplyCase) {
         receive_repeated_instruction(&mut socket).await;
         let cue = receive(&mut socket).await;
         assert_eq!(cue["type"], "conversation.item.create");
-        assert_eq!(cue["item"]["role"], "system");
+        assert_eq!(cue["item"]["role"], "user");
         assert_eq!(cue["item"]["content"][0]["type"], "input_text");
         cue_seen_tx.send(()).unwrap();
         assert!(
@@ -337,7 +345,12 @@ async fn exercise_context_reply(case: ContextReplyCase) {
                 .is_err(),
             "generation must wait for the cue's own ACK"
         );
-        if matches!(case, ContextReplyCase::UserWins) {
+        if matches!(
+            case,
+            ContextReplyCase::UserWins
+                | ContextReplyCase::UserWinsCleanupRefused
+                | ContextReplyCase::UserWinsCleanupRefusedTwice
+        ) {
             send_input(&mut socket, "new-user-race").await;
             send_audio_reply(
                 &mut socket,
@@ -360,7 +373,9 @@ async fn exercise_context_reply(case: ContextReplyCase) {
 
         let mut removed = Vec::new();
         match case {
-            ContextReplyCase::UserWins => {}
+            ContextReplyCase::UserWins
+            | ContextReplyCase::UserWinsCleanupRefused
+            | ContextReplyCase::UserWinsCleanupRefusedTwice => {}
             ContextReplyCase::Complete | ContextReplyCase::ProviderRejects => {
                 let generate = receive(&mut socket).await;
                 assert_eq!(generate["type"], "response.create");
@@ -393,10 +408,30 @@ async fn exercise_context_reply(case: ContextReplyCase) {
             }
         }
         if !matches!(case, ContextReplyCase::ProviderRejects) {
+            let mut refused_cue_deletes = 0;
+            let refusals = if matches!(case, ContextReplyCase::UserWinsCleanupRefusedTwice) {
+                2
+            } else {
+                1
+            };
             let next = loop {
                 let event = receive(&mut socket).await;
                 match event["type"].as_str().unwrap() {
                     "conversation.item.delete" => {
+                        if matches!(
+                            case,
+                            ContextReplyCase::UserWinsCleanupRefused
+                                | ContextReplyCase::UserWinsCleanupRefusedTwice
+                        ) && event["item_id"] == "context-cue-once"
+                            && refused_cue_deletes < refusals
+                        {
+                            refused_cue_deletes += 1;
+                            send(&mut socket, json!({"type":"error", "error":{
+                                "type":"invalid_request_error", "code":"invalid_state",
+                                "param":"conversation.item.delete", "message":"Cue cleanup refused once"
+                            }})).await;
+                            continue;
+                        }
                         removed.push(event["item_id"].as_str().unwrap().to_owned());
                         send(
                             &mut socket,
@@ -418,7 +453,11 @@ async fn exercise_context_reply(case: ContextReplyCase) {
                 .iter()
                 .filter(|id| id.as_str() == "context-cue-once")
                 .count(),
-            1
+            if matches!(case, ContextReplyCase::UserWinsCleanupRefusedTwice) {
+                0
+            } else {
+                1
+            }
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(50), socket.next())
@@ -485,7 +524,12 @@ async fn exercise_context_reply(case: ContextReplyCase) {
         let outcome = next_context_response_outcome(&mut raw).await;
         assert_eq!(outcome["provider_session_id"], SESSION);
         assert_eq!(outcome.as_object().unwrap().len(), 4);
-        if matches!(case, ContextReplyCase::UserWins) {
+        if matches!(
+            case,
+            ContextReplyCase::UserWins
+                | ContextReplyCase::UserWinsCleanupRefused
+                | ContextReplyCase::UserWinsCleanupRefusedTwice
+        ) {
             assert_eq!(outcome["type"], "agentview.context_response_skipped");
             assert_eq!(outcome["reason"], "user_turn");
         } else {
@@ -605,6 +649,10 @@ async fn await_session_close(socket: &mut WebSocketStream<TcpStream>) {
                     "session.update" => acknowledge_update(socket, &event).await,
                     "conversation.item.create" => acknowledge_item(socket, &event).await,
                     "conversation.item.delete" => {
+                        assert_ne!(
+                            event["item_id"], "context-cue-once",
+                            "a second refused cue cleanup must not create later retry work"
+                        );
                         send(
                             socket,
                             json!({"type":"conversation.item.deleted", "item_id":event["item_id"]}),
@@ -748,6 +796,145 @@ async fn send_tool_reply(socket: &mut WebSocketStream<TcpStream>) {
     ] {
         send(socket, event).await;
     }
+}
+
+#[tokio::test]
+async fn proactive_cleanup_buffers_barged_in_native_calls_with_the_original_frame() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (initialized_tx, initialized_rx) = oneshot::channel();
+    let (cleanup_tx, cleanup_rx) = oneshot::channel();
+    let (state_changed_tx, state_changed_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        receive_repeated_instruction(&mut socket).await;
+        initialized_tx.send(()).unwrap();
+        let refresh = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &refresh).await;
+        receive_repeated_instruction(&mut socket).await;
+        let cue = receive(&mut socket).await;
+        assert_eq!(cue["item"]["role"], "user");
+        let mut cue_item = cue["item"].clone();
+        cue_item["id"] = json!("cue-proactive-interrupted");
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.created", "item":cue_item}),
+        )
+        .await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        send(
+            &mut socket,
+            json!({"type":"response.created", "response":{
+                "id":"proactive-interrupted", "status":"in_progress", "output":[]
+            }}),
+        )
+        .await;
+        assert_eq!(receive_audio(&mut socket).await, [31, 0, 32, 0]);
+        send(&mut socket, json!({"type":"input_audio_buffer.speech_started", "item_id":"barge-input", "audio_start_ms":100})).await;
+        send(
+            &mut socket,
+            json!({"type":"response.done", "response":{
+                "id":"proactive-interrupted", "status":"cancelled", "output":[],
+                "status_details":{"type":"cancelled", "reason":"turn_detected"}
+            }}),
+        )
+        .await;
+        let first_delete = receive(&mut socket).await;
+        assert_eq!(first_delete["type"], "conversation.item.delete");
+        cleanup_tx.send(()).unwrap();
+        state_changed_rx.await.unwrap();
+        // The already forwarded microphone input can finish an automatic reply
+        // while the preceding reply's context delete is still awaiting ACK.
+        // Its native call belongs to generation 1, even after a render sees 2.
+        send_committed_input(&mut socket, "barge-input", 200).await;
+        send_tool_reply(&mut socket).await;
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.deleted", "item_id":first_delete["item_id"]}),
+        )
+        .await;
+        let next = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &next).await;
+        receive_repeated_instruction(&mut socket).await;
+
+        let continuation = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &continuation).await;
+        let result = receive(&mut socket).await;
+        assert_eq!(result["item"]["type"], "function_call_output");
+        assert_eq!(result["item"]["call_id"], "call_status");
+        let output: Value =
+            serde_json::from_str(result["item"]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            output,
+            json!({"generation":1}),
+            "a barged-in call must not execute the newer Frame's closure"
+        );
+        acknowledge_item(&mut socket, &result).await;
+        receive_repeated_instruction(&mut socket).await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        send_audio_reply(
+            &mut socket,
+            "barge-answer",
+            "barge-answer-item",
+            "已回应用户请求。",
+            &[5, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let provider = QwenRealtimeProvider::new(
+        &endpoint,
+        CREDENTIAL,
+        ModelSpec::new(MODEL, 262_144).unwrap(),
+    )
+    .unwrap();
+    let probe = RefreshProbe::default();
+    let root_probe = probe.clone();
+    let (mut app, input, mut events) = QwenRealtimeVoiceApplication::mount(
+        move || refreshable_assistant(root_probe.clone()),
+        provider,
+    )
+    .unwrap();
+    let operation = async {
+        initialized_rx.await.unwrap();
+        let state = probe.state.lock().unwrap().clone().unwrap();
+        state.set(1).unwrap();
+        input.refresh_context_and_respond().await.unwrap();
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseStarted { response_id } if response_id == "proactive-interrupted")
+            {
+                break;
+            }
+        }
+        input.append_pcm16(&[31, 0, 32, 0]).await.unwrap();
+        cleanup_rx.await.unwrap();
+        state.set(2).unwrap();
+        state_changed_tx.send(()).unwrap();
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseEnded { response_id, .. } if response_id == "barge-answer")
+            {
+                break;
+            }
+        }
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    server.await.unwrap();
+    let calls = probe.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, 1);
+    assert_eq!(
+        calls[0].1.frame_revision(),
+        probe.completions.lock().unwrap()[0].frame_revision()
+    );
 }
 
 #[tokio::test]

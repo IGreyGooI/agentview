@@ -301,7 +301,7 @@ ephemeral developer projection，在后续授权的 Frame 中重新声明当前�
 
 需要主动回复时显式调用 `refresh_context_and_respond()`，或用
 `refresh_context_and_respond_with_instruction(trusted_text)` 提供本次回复的可信简短指令。
-这保留既有 Frame 事实：全部上下文 ACK 后，再以 system/input_text 写入一次临时控制指令，等待其
+全部上下文 ACK 后，以服务端生成的 user/input_text 写入一次临时控制指令，等待其
 自身 ACK 后发送一次 `response.create`；与已需执行的 native tool 续轮合并，不额外重复生成。
 临时指令在该回复结束后删除；用户在插入阶段抢先开始一轮时，删除本次指令并跳过可选生成。
 相关客户端拒绝只丢弃这次可选控制，不关闭既有语音。后续普通 Frame 不携带该一次性指令。

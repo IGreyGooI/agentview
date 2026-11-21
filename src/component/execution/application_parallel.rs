@@ -1529,6 +1529,20 @@ impl<P: ReactionPort + 'static> Shared<P> {
             && matches!(result, Err(fault) if fault.kind() == ApplicationFaultKind::RecoveryRequired)
         {
             lane.completion_bindings = Some(bindings);
+            return result;
+        }
+        if matches!(
+            &result,
+            Ok(FrameOutcome::Reaction(ReactionOutcome::Completed))
+        ) && lane.port.supports_context_refresh()
+            && !lane.streaming.pending()
+        {
+            // Cleanup can have buffered a new reply generated under the Frame
+            // that just settled. Preserve its native/text routes until the port
+            // identifies the next response; never substitute newer callbacks.
+            if let Some(revision) = bindings.retain_session_handlers() {
+                lane.context_bindings = Some((revision, bindings));
+            }
         }
         result
     }

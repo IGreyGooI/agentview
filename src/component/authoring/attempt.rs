@@ -7,8 +7,8 @@ use crate::{
     component::{
         execution::{
             CommandOutcome, DecisionDeclaration, DecisionDeclarationError, DecisionQuestion,
-            DriverDemandHandle, FrameRequirements, ProjectionProvenance, ProviderOutputKey,
-            RenderedProjection, RenderedProjectionNode,
+            DriverDemandHandle, FrameRequirements, FrameRevision, ProjectionProvenance,
+            ProviderOutputKey, RenderedProjection, RenderedProjectionNode,
         },
         provenance::EventScope,
         signal::{
@@ -444,6 +444,26 @@ impl<Root> RenderBindings<Root>
 where
     Root: Send + Sync + 'static,
 {
+    pub(crate) fn retain_session_handlers(&mut self) -> Option<FrameRevision> {
+        // A native voice session may already have started another automatic
+        // response on this Frame while its context cleanup awaits ACK. Keep
+        // the same reusable event/tool handlers for that response. Stateful XML
+        // parsers cannot be reopened, and consumed FnOnce completion hooks must
+        // never run a second time for the same delivered Frame.
+        if !self.finished
+            || self.faulted
+            || !self.streaming_routes.is_empty()
+            || !self.streaming_contracts.is_empty()
+            || self.xml_callbacks.is_some()
+        {
+            return None;
+        }
+        let revision = self.event_scope.frame_revision()?;
+        self.finished = false;
+        self.reaction_completions.clear();
+        Some(revision)
+    }
+
     pub(crate) fn discard_callbacks(&mut self) {
         // A session response explicitly belongs to an unavailable old Frame.
         // New render callbacks must not execute its commands. Audio still

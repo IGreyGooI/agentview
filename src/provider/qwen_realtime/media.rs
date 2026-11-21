@@ -304,6 +304,12 @@ impl Media {
         });
     }
 
+    pub(super) fn owns_context_cue(&self, item_id: &str) -> bool {
+        self.context_generations
+            .iter()
+            .any(|request| request.cue_item.as_deref() == Some(item_id))
+    }
+
     fn context_response_rejection(&self, event: &Value) -> Option<(ContextResponseRequest, bool)> {
         if event["type"] != "error" || event["error"]["type"] != "invalid_request_error" {
             return None;

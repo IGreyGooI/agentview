@@ -165,6 +165,10 @@ pub(crate) struct EventScope {
 }
 
 impl EventScope {
+    pub(crate) const fn frame_revision(&self) -> Option<FrameRevision> {
+        self.frame_revision
+    }
+
     pub(crate) const fn application_id(&self) -> ApplicationId {
         self.application_id
     }

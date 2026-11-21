@@ -45,6 +45,7 @@ use super::ModelSpec;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 static NEXT_CONTEXT_RESPONSE: AtomicU64 = AtomicU64::new(1);
+const MAX_PENDING_CONTEXT_CUES: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Mode {
@@ -216,9 +217,36 @@ struct Session {
     frame: Option<FrameRevision>,
     pending_events: VecDeque<(Value, Option<FrameRevision>)>,
     context_setup: bool,
+    pending_context_cues: Vec<String>,
 }
 
 impl Session {
+    fn retain_context_cue(&mut self, item_id: String) {
+        // The same optional cue may reach a normal response boundary after an
+        // earlier delete was refused. Keep ownership until its matching ACK;
+        // repeated observations must not enqueue duplicate cleanup commands.
+        if !self.pending_context_cues.contains(&item_id) {
+            // Rejected cues can accumulate when more TaskCompleted controls
+            // arrive before any real response ends. Bound only this bookkeeping:
+            // evict its oldest observation, never a new generation or user input.
+            if self.pending_context_cues.len() == MAX_PENDING_CONTEXT_CUES {
+                self.pending_context_cues.remove(0);
+                self.observe_context_refresh_rejected(
+                    "cue_cleanup_tracking_evicted",
+                    "conversation.item.deleted",
+                );
+            }
+            self.pending_context_cues.push(item_id);
+        }
+    }
+
+    fn observe_context_delete(&mut self, event: &Value) {
+        if event["type"] == "conversation.item.deleted" {
+            self.pending_context_cues
+                .retain(|id| Some(id.as_str()) != event["item_id"].as_str());
+        }
+    }
+
     fn user_turn_owns_context_response(&self) -> bool {
         self.pending_events.iter().any(|(event, _)| {
             event["type"]
@@ -319,6 +347,7 @@ impl ReactionPort for QwenRealtimeProvider {
                     frame: None,
                     pending_events: VecDeque::new(),
                     context_setup: false,
+                    pending_context_cues: Vec::new(),
                 },
                 created,
             ))
@@ -646,7 +675,7 @@ async fn start_response(
     if let Some(instruction) = context_instruction.filter(|_| !user_turn_won && rejected_items == 0)
     {
         let cue = serde_json::json!({"type":"conversation.item.create", "item": {
-            "type":"message", "role":"system",
+            "type":"message", "role":"user",
             "content":[{"type":"input_text", "text":instruction}],
         }})
         .to_string();
@@ -728,7 +757,12 @@ async fn delete_optional_context_item(
         .to_string(),
     )
     .await?;
-    let _ = next_ack(bytes, session, "conversation.item.deleted", None, true).await?;
+    let ack = next_ack(bytes, session, "conversation.item.deleted", None, true).await?;
+    if !ack.is_some_and(|ack| ack["item_id"] == id) {
+        session.retain_context_cue(id.to_owned());
+        session
+            .observe_context_refresh_rejected("cue_cleanup_pending", "conversation.item.deleted");
+    }
     Ok(())
 }
 
@@ -813,6 +847,7 @@ async fn next_ack(
             None => (event, count),
         };
         let event = bytes.admit(event, count)?;
+        session.observe_context_delete(&event);
         match event["type"].as_str() {
             Some("conversation.item.created")
                 if event["item"]["content"].as_array().is_some_and(|parts| {
@@ -978,6 +1013,10 @@ impl InFlight<'_> {
                     None,
                 )
             };
+            self.session
+                .as_mut()
+                .expect("live session")
+                .observe_context_delete(&event);
             if event["type"] == "agentview.context_response_rejected" {
                 if event["cancel_wait"] == true {
                     self.expect_immediate_response = false;
@@ -1038,7 +1077,31 @@ impl InFlight<'_> {
         if let Some(media) = &mut session.media {
             self.transient.extend(media.take_spoken_items());
         }
-        for id in std::mem::take(&mut self.transient) {
+        // A failed optional delete stays owned until the next ordinary reply
+        // ends. A silent context refresh is not a retry/recovery boundary.
+        let pending_cues = if optional {
+            Vec::new()
+        } else {
+            std::mem::take(&mut session.pending_context_cues)
+        };
+        let mut items = std::mem::take(&mut self.transient);
+        for id in &pending_cues {
+            if !items.contains(id) {
+                items.push(id.clone());
+            }
+        }
+        let context_cleanup = !pending_cues.is_empty()
+            || items.iter().any(|id| {
+                session
+                    .media
+                    .as_ref()
+                    .is_some_and(|media| media.owns_context_cue(id))
+            });
+        // An already forwarded user utterance may start its next automatic
+        // response while proactive context/cue deletes await ACK. Buffer those
+        // facts with this exact Frame; never terminate media or silently route
+        // their native calls through the following render's callbacks.
+        for id in items {
             transport::send(
                 &mut session.socket,
                 serde_json::json!({
@@ -1052,11 +1115,29 @@ impl InFlight<'_> {
                 session,
                 "conversation.item.deleted",
                 None,
-                optional,
+                optional || context_cleanup,
             )
             .await?;
-            if ack.is_some_and(|ack| ack["item_id"] != id) {
-                return Err(transport::protocol_fault());
+            if !ack.as_ref().is_some_and(|ack| ack["item_id"] == id) {
+                if context_cleanup {
+                    if !pending_cues.contains(&id)
+                        && session
+                            .media
+                            .as_ref()
+                            .is_some_and(|media| media.owns_context_cue(&id))
+                    {
+                        session.retain_context_cue(id);
+                    }
+                    // A cue already held from an earlier refusal has reached
+                    // its one ordinary cleanup boundary. If still unconfirmed,
+                    // report and release bookkeeping rather than retrying it.
+                    session.observe_context_refresh_rejected(
+                        "cue_cleanup_unconfirmed",
+                        "conversation.item.deleted",
+                    );
+                } else if ack.is_some() {
+                    return Err(transport::protocol_fault());
+                }
             }
         }
         Ok(())

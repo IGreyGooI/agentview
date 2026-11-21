@@ -165,10 +165,11 @@ impl QwenRealtimeVoiceInput {
     }
 
     /// Request one reply with a trusted instruction scoped to that delivery.
-    /// The system-role item is acknowledged after the Frame context, removed
-    /// when its response ends, and dropped if a user turn wins insertion.
-    /// Empty or over-64-KiB instructions are refused locally. Do not pass
-    /// external user text as this server-authored control instruction.
+    /// Qwen receives a service-authored text item after the Frame context,
+    /// then acknowledges it before generation. The provider retires the item
+    /// when its response ends or if a user turn wins insertion.
+    /// Empty or over-64-KiB instructions are refused locally. Mark any
+    /// externally sourced content as quoted data within the authored cue.
     pub async fn refresh_context_and_respond_with_instruction(
         &self,
         instruction: impl Into<String>,
