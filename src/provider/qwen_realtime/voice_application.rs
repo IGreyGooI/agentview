@@ -77,12 +77,14 @@ pub(crate) fn mount_voice<P: ReactionPort + 'static>(
     provider_input: QwenRealtimeMediaInput,
     active_response: watch::Receiver<Option<String>>,
 ) -> Result<(Application<P>, QwenRealtimeVoiceInput), ApplicationFault> {
+    let context_refresh_supported = provider.supports_context_refresh();
     let (sender, receiver) = mpsc::channel(8);
     let receiver = Arc::new(Mutex::new(Some(receiver)));
     let input = QwenRealtimeVoiceInput {
         sender,
         active_response,
         pending_speech: Arc::new(Semaphore::new(PENDING_SPEECH_CAPACITY)),
+        context_refresh_supported,
     };
     let component_input = input.clone();
     let app = Application::mount(
@@ -129,9 +131,34 @@ pub struct QwenRealtimeVoiceInput {
     sender: mpsc::Sender<Input>,
     active_response: watch::Receiver<Option<String>>,
     pending_speech: Arc<Semaphore>,
+    context_refresh_supported: bool,
 }
 
 impl QwenRealtimeVoiceInput {
+    /// Queue a context-only Frame refresh after changing Component Signals.
+    ///
+    /// Qwen Smart Turn v2 re-renders the mounted tree and submits its current
+    /// context through the normal Frame handoff in the same running reaction.
+    /// This does not request speech or call `response.create`. A response or
+    /// user utterance already underway retains its submitted callbacks; its
+    /// normal next Frame carries the update. Success means queued, not remotely
+    /// acknowledged. Optional client refusals are observed and omitted without
+    /// cancelling speech. Repeated ephemeral developer snapshots are suitable
+    /// for asynchronous task state. Other voice providers return a local
+    /// unsupported fault.
+    pub async fn refresh_context(&self) -> Result<(), ReactionPortFault> {
+        // This input type is shared by providers with different session
+        // protocols. Reject only the unsupported optional refresh, rather than
+        // turning it into speech or disturbing their microphone stream.
+        if !self.context_refresh_supported {
+            return Err(ReactionPortFault::retryable(
+                ReactionPortFaultCode::Rejected,
+                ReactionPortFaultReason::RequestPreparation,
+            ));
+        }
+        self.send(Input::RefreshContext).await
+    }
+
     /// Stream 16 kHz mono signed little-endian PCM16, including silence.
     pub async fn append_pcm16(&self, pcm16: &[u8]) -> Result<(), ReactionPortFault> {
         self.send(Input::Append(encode_pcm16(pcm16)?)).await

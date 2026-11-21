@@ -20,7 +20,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use super::{
@@ -38,8 +38,8 @@ use crate::component::{
         driver_demand::DriverDemand,
         frame::FrameSession,
         streaming::{StreamingSupervisor, StreamingToolRecoveryStatus},
-        CommandInput, ForkableReactionPort, Frame, FrameObservation, ProviderEvent,
-        ProviderFactStream, ReactionPort, ReactionPortFault, ReactionPortFaultCode,
+        CommandInput, ForkableReactionPort, Frame, FrameObservation, FrameRevision, ProviderEvent,
+        ProviderFact, ProviderFactStream, ReactionPort, ReactionPortFault, ReactionPortFaultCode,
         ReactionPortFaultReason, RenderedProjection, ResettableReactionPort, SubmitFault,
         TargetDeclaration,
     },
@@ -260,6 +260,11 @@ fn not_ready() -> ApplicationFault {
 struct PortSlot<P>(Option<P>);
 #[async_trait]
 impl<P: ReactionPort> ReactionPort for PortSlot<P> {
+    fn supports_context_refresh(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(ReactionPort::supports_context_refresh)
+    }
     fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
         self.0.as_mut().ok_or_else(port_busy)?.declare()
     }
@@ -322,6 +327,12 @@ enum LanePort<P> {
 }
 #[async_trait]
 impl<P: ReactionPort> ReactionPort for LanePort<P> {
+    fn supports_context_refresh(&self) -> bool {
+        match self {
+            Self::Main(port) => port.supports_context_refresh(),
+            Self::Temporary(port) => port.supports_context_refresh(),
+        }
+    }
     fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
         match self {
             Self::Main(p) => p.declare(),
@@ -362,6 +373,12 @@ struct Lane<P> {
     streaming: StreamingSupervisor,
     completion_bindings: Option<RenderBindings<ProviderEvent>>,
     feedback_pending: bool,
+    context_bindings: Option<(FrameRevision, RenderBindings<ProviderEvent>)>,
+}
+
+enum FrameOutcome {
+    Reaction(ReactionOutcome),
+    ContextRefresh(FrameRevision),
 }
 struct Temporary {
     port: Box<dyn ReactionPort>,
@@ -1118,6 +1135,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
                 streaming: temporary.streaming,
                 completion_bindings: None,
                 feedback_pending: false,
+                context_bindings: None,
             }),
         };
         admission.tasks.push(runtime.spawn(Self::drive(owned)));
@@ -1143,7 +1161,9 @@ impl<P: ReactionPort + 'static> Shared<P> {
                 .catch_unwind()
                 .await;
             completion = match operation {
-                Ok(result) => Completion::Result(result),
+                Ok(Ok(FrameOutcome::ContextRefresh(_))) => continue,
+                Ok(Ok(FrameOutcome::Reaction(outcome))) => Completion::Result(Ok(outcome)),
+                Ok(Err(fault)) => Completion::Result(Err(fault)),
                 Err(payload) => {
                     self.fail(payload);
                     Completion::Panic(self.panic.clone())
@@ -1389,7 +1409,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
         state: &ReactionState,
         lane: &mut Option<Lane<P>>,
         cancellation: &ReactionCancellationControl,
-    ) -> Result<ReactionOutcome, ApplicationFault> {
+    ) -> Result<FrameOutcome, ApplicationFault> {
         // Admission owns identity already. Preparation remains one serialized
         // mutation of the mounted runtime, independently of all network streams.
         let prepare = async {
@@ -1449,6 +1469,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
                     streaming: StreamingSupervisor::default(),
                     completion_bindings: None,
                     feedback_pending: false,
+                    context_bindings: None,
                 });
             }
             let receipt = (state.kind == ReactionKind::Main)
@@ -1467,12 +1488,14 @@ impl<P: ReactionPort + 'static> Shared<P> {
         };
         let prepared = tokio::select! {
             biased;
-            _ = state.cancelled() => return Ok(ReactionOutcome::Interrupted),
+            _ = state.cancelled() => return Ok(FrameOutcome::Reaction(ReactionOutcome::Interrupted)),
             task = self.monitor.wait() => { let _ = task; cancellation.suppress(); self.check()?; return Err(owner_closed()); }
             prepared = prepare => prepared?,
         };
         let (projection, mut bindings, receipt, projection_revision) = match prepared {
-            ControlFlow::Break(reason) => return Ok(ReactionOutcome::Exited(reason)),
+            ControlFlow::Break(reason) => {
+                return Ok(FrameOutcome::Reaction(ReactionOutcome::Exited(reason)))
+            }
             ControlFlow::Continue(prepared) => prepared,
         };
         let lane = lane.as_mut().expect("prepared request owns a lane");
@@ -1488,11 +1511,18 @@ impl<P: ReactionPort + 'static> Shared<P> {
             tokio::pin!(submission);
             tokio::select! {
                 biased;
-                _ = state.cancelled() => Ok(ReactionOutcome::Interrupted),
+                _ = state.cancelled() => Ok(FrameOutcome::Reaction(ReactionOutcome::Interrupted)),
                 task = self.monitor.wait() => { let _ = task; cancellation.suppress(); self.check()?; Err(owner_closed()) }
                 result = &mut submission => result,
             }
         };
+        if let Ok(FrameOutcome::ContextRefresh(revision)) = &result {
+            // No model output or completion was delivered for this Frame. Keep
+            // its exact callbacks until the following setup has crossed the
+            // remote response race, rather than rebinding old native calls.
+            lane.context_bindings = Some((*revision, bindings));
+            return result;
+        }
         if lane.streaming.normal_eof
             && lane.streaming.pending()
             && !lane.streaming.clear()
@@ -1511,11 +1541,11 @@ impl<P: ReactionPort + 'static> Shared<P> {
         bindings: &mut RenderBindings<ProviderEvent>,
         cancellation: &ReactionCancellationControl,
         receipt: Option<crate::component::execution::command::CommandFeedbackReceipt>,
-    ) -> Result<ReactionOutcome, ApplicationFault> {
+    ) -> Result<FrameOutcome, ApplicationFault> {
         let (projection, projection_revision) = prepared_projection;
         for attempt in 0..2 {
             if let Err(reason) = self.exit.try_begin_submission() {
-                return Ok(ReactionOutcome::Exited(reason));
+                return Ok(FrameOutcome::Reaction(ReactionOutcome::Exited(reason)));
             }
             let declaration = lane.port.declare().map_err(|fault| {
                 ApplicationFault::from_port(ApplicationFaultStage::Declaration, fault)
@@ -1556,7 +1586,10 @@ impl<P: ReactionPort + 'static> Shared<P> {
                     tracing::warn!("frame observer panicked; continuing submission");
                 }
             }
-            let facts =
+            let context_frames = lane.port.supports_context_refresh();
+            let mut context_checkpoint = (context_frames && lane.context_bindings.is_some())
+                .then(|| lane.session.context_checkpoint());
+            let mut facts =
                 match submit_prepared_frame(&mut lane.port, &mut lane.session, prepared).await {
                     Ok(facts) => facts,
                     Err(SubmitFault::ContinuityChanged) if attempt == 0 => continue,
@@ -1565,8 +1598,98 @@ impl<P: ReactionPort + 'static> Shared<P> {
             if let Some(receipt) = &receipt {
                 receipt.commit();
             }
+            let mut output_revision = revision;
+            if context_frames {
+                loop {
+                    match facts.next().await.transpose().map_err(|fault| {
+                        ApplicationFault::from_port(ApplicationFaultStage::FactStream, fault)
+                    })? {
+                        Some(ProviderFact::ContextRefreshRequested) => {
+                            // The port owns whether a response has started. Its
+                            // control is legal only as a finite output-free stream;
+                            // drain EOF so retained continuity is published before
+                            // preparing the next Frame. No completion hooks run.
+                            match facts.next().await {
+                                None => return Ok(FrameOutcome::ContextRefresh(output_revision)),
+                                Some(Err(fault)) => {
+                                    return Err(ApplicationFault::from_port(
+                                        ApplicationFaultStage::FactStream,
+                                        fault,
+                                    ))
+                                }
+                                Some(Ok(_)) => {
+                                    return Err(ApplicationFault::terminal(
+                                        ApplicationFaultStage::FactStream,
+                                        ApplicationFaultCode::Internal,
+                                        ApplicationFaultReason::FactProjectionInvariant,
+                                    ))
+                                }
+                            }
+                        }
+                        Some(ProviderFact::ResponseFrame {
+                            revision: response_revision,
+                        }) => {
+                            if response_revision != output_revision {
+                                // Already forwarded PCM can start an automatic reply
+                                // while the next context update awaits ACK. Dispatch
+                                // that reply using its prior submitted callbacks;
+                                // if the provider names an unavailable revision,
+                                // skip only its callback actions and keep audio
+                                // alive rather than using newer side effects.
+                                if let Some((previous_revision, mut previous)) =
+                                    lane.context_bindings.take()
+                                {
+                                    if previous_revision == response_revision {
+                                        std::mem::swap(bindings, &mut previous);
+                                        output_revision = response_revision;
+                                    } else {
+                                        bindings.discard_callbacks();
+                                        tracing::warn!(
+                                            "session response Frame attribution unavailable"
+                                        );
+                                    }
+                                } else {
+                                    bindings.discard_callbacks();
+                                    tracing::warn!(
+                                        "session response Frame attribution unavailable"
+                                    );
+                                }
+                            } else {
+                                lane.context_bindings.take();
+                            }
+                        }
+                        Some(ProviderFact::ContextRefreshRejected {
+                            revision: previous_revision,
+                        }) => {
+                            if let Some(checkpoint) = context_checkpoint.take() {
+                                lane.session.reject_context_update(checkpoint);
+                            }
+                            if let Some((binding_revision, mut previous)) =
+                                lane.context_bindings.take()
+                            {
+                                if binding_revision == previous_revision {
+                                    std::mem::swap(bindings, &mut previous);
+                                    output_revision = previous_revision;
+                                } else {
+                                    bindings.discard_callbacks();
+                                    tracing::warn!("refused context Frame attribution unavailable");
+                                }
+                            } else {
+                                bindings.discard_callbacks();
+                                tracing::warn!("refused context Frame attribution unavailable");
+                            }
+                        }
+                        Some(fact) => {
+                            facts =
+                                Box::pin(futures::stream::once(async { Ok(fact) }).chain(facts));
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
             let mut scope =
-                EventScope::reaction_with_kind(self.app_id, state.id, state.kind, revision);
+                EventScope::reaction_with_kind(self.app_id, state.id, state.kind, output_revision);
             if state.kind == ReactionKind::Temporary {
                 scope = scope.with_temporary_lineage(state.lineage);
             }
@@ -1590,10 +1713,10 @@ impl<P: ReactionPort + 'static> Shared<P> {
             if lane.streaming.pending() && !lane.streaming.clear() {
                 return Err(ApplicationFault::streaming_recovery());
             }
-            return Ok(match self.exit.reason() {
+            return Ok(FrameOutcome::Reaction(match self.exit.reason() {
                 Some(reason) => ReactionOutcome::Exited(reason),
                 None => ReactionOutcome::Completed,
-            });
+            }));
         }
         unreachable!("second continuity failure returns a classified fault")
     }

@@ -1790,6 +1790,9 @@ async fn pump_provider_facts(
                         super::reaction::ProviderFact::ReactionCompleted { primary_text } => {
                             (*primary_text, None)
                         }
+                        super::reaction::ProviderFact::ContextRefreshRequested
+                        | super::reaction::ProviderFact::ContextRefreshRejected { .. }
+                        | super::reaction::ProviderFact::ResponseFrame { .. } => (None, None),
                     };
                     let (event, ticket, structured_text) = recovery
                         .admission_mut()
@@ -1805,6 +1808,29 @@ async fn pump_provider_facts(
                     };
                     let context = bindings.event_context(source);
                     match (event, ticket) {
+                        (Some(ProviderEvent::ToolCall(call)), Some(ticket))
+                            if !bindings.callbacks_available() =>
+                        {
+                            // The response named an old submitted Frame whose
+                            // callbacks are no longer retained. Decline only
+                            // that tool action; never run a newer side effect or
+                            // cancel the user's remaining response and audio.
+                            recovery
+                                .admission_mut()
+                                .stage_tool_output(
+                                    ticket,
+                                    call.output(r#"{"status":"unavailable"}"#),
+                                )
+                                .map_err(|source| {
+                                    ApplicationFault::from_tool_output(
+                                        ApplicationFaultStage::ToolOutput,
+                                        source,
+                                    )
+                                })?;
+                            tracing::warn!(
+                                "original session tool callback unavailable; action skipped"
+                            );
+                        }
                         (Some(ProviderEvent::ToolCall(call)), Some(ticket)) => {
                             let (future, record) = bindings
                                 .start_native_tool_record_with_context(context, call)

@@ -92,6 +92,7 @@ pub struct QwenRealtimeProvider {
     media: Option<Media>,
     mode: Mode,
     follow_up: bool,
+    context_frame_pending: bool,
 }
 
 impl QwenRealtimeProvider {
@@ -144,6 +145,7 @@ impl QwenRealtimeProvider {
             media: None,
             mode: Mode::Text,
             follow_up: false,
+            context_frame_pending: false,
         })
     }
 
@@ -209,6 +211,8 @@ struct Session {
     socket: Socket,
     id: String,
     media: Option<Media>,
+    frame: Option<FrameRevision>,
+    pending_events: VecDeque<(Value, Option<FrameRevision>)>,
 }
 
 struct Retained {
@@ -219,6 +223,9 @@ struct Retained {
 
 #[async_trait]
 impl ReactionPort for QwenRealtimeProvider {
+    fn supports_context_refresh(&self) -> bool {
+        self.mode == Mode::SmartTurnV2
+    }
     fn declare(&mut self) -> Result<TargetDeclaration, Fault> {
         if let Some(fault) = self.terminal {
             return Err(fault);
@@ -259,6 +266,7 @@ impl ReactionPort for QwenRealtimeProvider {
         }
         let commands = request::encode(&frame, MAX_REQUEST_BYTES, self.mode)?;
         let tool_feedback = self.follow_up || !frame.submission().staged_inputs().is_empty();
+        let optional_context = self.context_frame_pending && !tool_feedback;
         let mut response_bytes = ResponseBytes::default();
         let fresh = if matches!(frame.basis(), FrameBasis::Full) {
             let mut socket = self.connect().await?;
@@ -269,6 +277,8 @@ impl ReactionPort for QwenRealtimeProvider {
                     socket,
                     id,
                     media: None,
+                    frame: None,
+                    pending_events: VecDeque::new(),
                 },
                 created,
             ))
@@ -284,6 +294,7 @@ impl ReactionPort for QwenRealtimeProvider {
         let (mut started, first) = futures::future::poll_fn(|cx| {
             frame.check_handoff_precondition(&self.declare()?)?;
             self.follow_up = false;
+            self.context_frame_pending = false;
             let retained = self.retained.take();
             let fresh = fresh.take().map(|(mut session, created)| {
                 session.media = self.media.take();
@@ -299,6 +310,8 @@ impl ReactionPort for QwenRealtimeProvider {
                 created,
                 tool_feedback,
                 self.mode,
+                revision,
+                optional_context,
             )
             .boxed();
             let first = started.as_mut().poll(cx);
@@ -333,6 +346,8 @@ impl ReactionPort for QwenRealtimeProvider {
             facts: VecDeque::new(),
             settled: false,
             ended_without_response: false,
+            announced_frame: false,
+            context_boundary: false,
             transient: Vec::new(),
         };
         Ok(Box::pin(stream::unfold(
@@ -427,13 +442,38 @@ async fn start_response(
     created: Option<Value>,
     tool_feedback: bool,
     mode: Mode,
+    revision: FrameRevision,
+    optional_context: bool,
 ) -> Result<StartedResponse, Fault> {
     let first_frame = created.is_some();
     if let (Some(media), Some(created)) = (&mut session.media, created) {
         media.observe(&created)?;
     }
+    if let Some(media) = &mut session.media {
+        media.begin_context_frame();
+    }
     transport::send(&mut session.socket, commands.update).await?;
-    let updated = next_ack(&mut bytes, &mut session, "session.updated").await?;
+    let updated = match next_ack(
+        &mut bytes,
+        &mut session,
+        "session.updated",
+        None,
+        optional_context,
+    )
+    .await?
+    {
+        Some(updated) => updated,
+        None => {
+            let rejected_frame = session.frame;
+            return Ok(StartedResponse {
+                session,
+                bytes,
+                transient: Vec::new(),
+                started: true,
+                rejected_frame,
+            });
+        }
+    };
     let modalities = updated["session"]["modalities"].as_array();
     let audio = session.media.is_some();
     let expected_modalities = modalities.is_some_and(|modes| {
@@ -450,12 +490,35 @@ async fn start_response(
     // The provider owns the acknowledged configuration. With a mismatched
     // session or mode, sending microphone data could expose the Frame's input
     // to a different session or leave it waiting for a manual commit. Reject
-    // this provider exchange before forwarding its microphone input.
+    // initial exchange before forwarding its microphone input. During an
+    // optional refresh, retain the established session and ignore only this
+    // unconfirmed configuration instead of stopping accepted voice.
     if updated["session"]["id"] != session.id || !expected_modalities || !expected_detection {
+        if optional_context {
+            tracing::warn!(
+                event = "qwen_context_refresh_rejected",
+                reason = "configuration_ack",
+                "optional context update ignored; voice continues"
+            );
+            let rejected_frame = session.frame;
+            return Ok(StartedResponse {
+                session,
+                bytes,
+                transient: Vec::new(),
+                started: true,
+                rejected_frame,
+            });
+        }
         return Err(transport::protocol_fault());
     }
+    let mut rejected_items = 0usize;
     for item in commands.items {
-        create_item(&mut session, &mut bytes, item).await?;
+        if create_item(&mut session, &mut bytes, item, optional_context)
+            .await?
+            .is_none()
+        {
+            rejected_items += 1;
+        }
     }
     if let Some(media) = session.media.as_mut().filter(|_| mode == Mode::ManualAudio) {
         if !tool_feedback {
@@ -465,6 +528,7 @@ async fn start_response(
                     bytes,
                     transient: Vec::new(),
                     started: false,
+                    rejected_frame: None,
                 });
             }
             media.begin_turn();
@@ -472,9 +536,30 @@ async fn start_response(
     }
     let mut transient = Vec::with_capacity(commands.ephemeral.len());
     for item in commands.ephemeral {
-        let id = create_item(&mut session, &mut bytes, item).await?;
-        if session.media.is_some() {
+        let id = create_item(&mut session, &mut bytes, item, optional_context).await?;
+        if id.is_none() {
+            rejected_items += 1;
+        }
+        if let Some(id) = id.filter(|_| session.media.is_some()) {
             transient.push(id);
+        }
+    }
+    // The whole context Frame owns callbacks only after all its item ACKs.
+    // Until then previously forwarded PCM may still start an old-Frame reply.
+    session.frame = Some(revision);
+    if optional_context {
+        // This writer owns each command/ACK boundary. Do not claim the task
+        // snapshot reached the model if even one optional item was refused;
+        // report incomplete delivery without interrupting the audio owner.
+        if rejected_items == 0 {
+            tracing::info!(event = "qwen_context_refresh_applied", provider_session_id = %session.id, frame_revision = ?revision,
+                "context Frame acknowledged without requesting generation");
+        } else {
+            tracing::warn!(
+                event = "qwen_context_refresh_incomplete",
+                rejected_items,
+                "optional context items refused; voice continues"
+            );
         }
     }
     if mode != Mode::SmartTurnV2 || tool_feedback {
@@ -489,6 +574,7 @@ async fn start_response(
         bytes,
         transient,
         started: true,
+        rejected_frame: None,
     })
 }
 
@@ -497,29 +583,74 @@ struct StartedResponse {
     bytes: ResponseBytes,
     transient: Vec<String>,
     started: bool,
+    rejected_frame: Option<FrameRevision>,
 }
 
 async fn create_item(
     session: &mut Session,
     bytes: &mut ResponseBytes,
     item: String,
-) -> Result<String, Fault> {
+    optional: bool,
+) -> Result<Option<String>, Fault> {
+    let envelope: Value = serde_json::from_str(&item).map_err(|_| transport::protocol_fault())?;
     transport::send(&mut session.socket, item).await?;
-    let ack = next_ack(bytes, session, "conversation.item.created").await?;
-    ack["item"]["id"]
-        .as_str()
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(transport::protocol_fault)
+    let Some(ack) = next_ack(
+        bytes,
+        session,
+        "conversation.item.created",
+        Some(&envelope["item"]),
+        optional,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    match ack["item"]["id"].as_str().filter(|id| !id.is_empty()) {
+        Some(id) => Ok(Some(id.to_owned())),
+        None if optional => {
+            // A malformed optional ACK does not establish a removable context
+            // item. Omit only this item and keep the accepted microphone live.
+            tracing::warn!(
+                event = "qwen_context_refresh_rejected",
+                reason = "item_ack",
+                "optional context item ACK unusable; voice continues"
+            );
+            Ok(None)
+        }
+        None => Err(transport::protocol_fault()),
+    }
 }
 
 async fn next_ack(
     bytes: &mut ResponseBytes,
     session: &mut Session,
     expected: &str,
-) -> Result<Value, Fault> {
+    expected_item: Option<&Value>,
+    optional: bool,
+) -> Result<Option<Value>, Fault> {
     loop {
         let (event, count) = transport::receive(&mut session.socket).await?;
+        // An invalid optional update is refused by the provider while the
+        // WebSocket remains usable. Drop only that context command; never turn
+        // its refusal into cancellation of the already accepted voice stream.
+        if optional
+            && event["type"] == "error"
+            && event["error"]["type"] == "invalid_request_error"
+            && session
+                .media
+                .as_ref()
+                .is_none_or(|media| !media.owns_control_error(&event))
+        {
+            if let Some(media) = &session.media {
+                media.observe_context_rejection(event);
+            }
+            tracing::warn!(
+                event = "qwen_context_refresh_rejected",
+                command = expected,
+                "optional context command refused; voice continues"
+            );
+            return Ok(None);
+        }
         let (event, count) = match &mut session.media {
             Some(media) => media.admit(event, count)?,
             None => (event, count),
@@ -530,7 +661,29 @@ async fn next_ack(
                 if event["item"]["content"].as_array().is_some_and(|parts| {
                     parts.iter().any(|part| part["type"] == "input_audio")
                 }) => {}
-            Some(kind) if kind == expected => return Ok(event),
+            Some(kind) if kind == expected => {
+                // Automatic speech may create an assistant/tool item while a
+                // client context item awaits ACK. That event cannot confirm
+                // the client item; ignore it and retain the real ACK ordering.
+                if expected_item.is_some_and(|item| {
+                    ["type", "role"].iter().any(|key| {
+                        event["item"][key].is_string() && event["item"][key] != item[key]
+                    })
+                }) {
+                    continue;
+                }
+                return Ok(Some(event));
+            }
+            Some(kind) if optional && session.media.is_some() && kind.starts_with("response.") => {
+                // Audio forwarded on the previous Frame can start generation
+                // while an update or item ACK is in flight. Preserve all model
+                // events and the last acknowledged Frame for response.created;
+                // the fact stream replays them once, with their original bindings.
+                let frame = (kind == "response.created")
+                    .then_some(session.frame)
+                    .flatten();
+                session.pending_events.push_back((event, frame));
+            }
             Some("rate_limits.updated") => {}
             Some(kind) if session.media.is_some() && !kind.starts_with("response.") => {}
             _ => return Err(transport::protocol_fault()),
@@ -566,6 +719,8 @@ struct InFlight<'a> {
     facts: VecDeque<ProviderFact>,
     settled: bool,
     ended_without_response: bool,
+    announced_frame: bool,
+    context_boundary: bool,
     transient: Vec<String>,
 }
 
@@ -581,6 +736,7 @@ impl InFlight<'_> {
                 if self.discard_session {
                     self.provider.lose_continuity();
                 } else {
+                    self.provider.context_frame_pending = self.context_boundary;
                     self.provider.retained = self.session.take().map(|session| Retained {
                         session,
                         revision: self.revision,
@@ -607,10 +763,16 @@ impl InFlight<'_> {
                 bytes,
                 transient,
                 started,
+                rejected_frame,
             } = pending.await?;
             self.session = Some(session);
             self.response_bytes = bytes;
             self.transient = transient;
+            if let Some(revision) = rejected_frame {
+                self.revision = revision;
+                self.facts
+                    .push_back(ProviderFact::ContextRefreshRejected { revision });
+            }
             if !started {
                 self.ended_without_response = true;
                 return Ok(Some(ProviderFact::ReactionCompleted { primary_text: None }));
@@ -641,13 +803,35 @@ impl InFlight<'_> {
                 return Ok(None);
             }
             let session = self.session.as_mut().expect("response started");
-            let event = if let Some(media) = &mut session.media {
+            let (event, response_frame) = if let Some(event) = session.pending_events.pop_front() {
+                event
+            } else if let Some(media) = &mut session.media {
                 let responding = self.expect_immediate_response || self.decoder.has_started();
                 let (event, bytes) = media.receive(&mut session.socket, responding).await?;
-                self.response_bytes.admit(event, bytes)?
+                (self.response_bytes.admit(event, bytes)?, None)
             } else {
-                self.response_bytes.receive(&mut session.socket).await?
+                (
+                    self.response_bytes.receive(&mut session.socket).await?,
+                    None,
+                )
             };
+            if event["type"] == "agentview.context_refresh" {
+                self.cleanup_context(true).await?;
+                // Cleanup ACKs can race an automatic response too. Finish that
+                // response on this Frame instead of abandoning its callbacks.
+                if !self
+                    .session
+                    .as_ref()
+                    .expect("live session")
+                    .pending_events
+                    .is_empty()
+                {
+                    continue;
+                }
+                self.ended_without_response = true;
+                self.context_boundary = true;
+                return Ok(Some(ProviderFact::ContextRefreshRequested));
+            }
             if event["type"] == "agentview.input_finished" {
                 self.ended_without_response = true;
                 return Ok(Some(ProviderFact::ReactionCompleted { primary_text: None }));
@@ -655,32 +839,49 @@ impl InFlight<'_> {
             if event["type"].as_str().is_some_and(media_event) {
                 continue;
             }
+            if event["type"] == "response.created"
+                && self.provider.mode == Mode::SmartTurnV2
+                && !self.announced_frame
+            {
+                self.announced_frame = true;
+                self.facts.push_back(ProviderFact::ResponseFrame {
+                    revision: response_frame.unwrap_or(self.revision),
+                });
+            }
             self.facts.extend(self.decoder.on_event(event)?);
             if self.decoder.is_complete() {
-                if let Some(media) = &mut session.media {
-                    self.transient.extend(media.take_spoken_items());
-                }
-                for id in std::mem::take(&mut self.transient) {
-                    transport::send(
-                        &mut session.socket,
-                        serde_json::json!({
-                            "type": "conversation.item.delete", "item_id": id
-                        })
-                        .to_string(),
-                    )
-                    .await?;
-                    let ack = next_ack(
-                        &mut self.response_bytes,
-                        session,
-                        "conversation.item.deleted",
-                    )
-                    .await?;
-                    if ack["item_id"] != id {
-                        return Err(transport::protocol_fault());
-                    }
-                }
+                self.cleanup_context(false).await?;
             }
         }
+    }
+
+    async fn cleanup_context(&mut self, optional: bool) -> Result<(), Fault> {
+        let session = self.session.as_mut().expect("live session");
+        if let Some(media) = &mut session.media {
+            self.transient.extend(media.take_spoken_items());
+        }
+        for id in std::mem::take(&mut self.transient) {
+            transport::send(
+                &mut session.socket,
+                serde_json::json!({
+                    "type": "conversation.item.delete", "item_id": id
+                })
+                .to_string(),
+            )
+            .await?;
+            let ack = next_ack(
+                &mut self.response_bytes,
+                session,
+                "conversation.item.deleted",
+                None,
+                optional,
+            )
+            .await?;
+            if ack.is_some_and(|ack| ack["item_id"] != id) {
+                return Err(transport::protocol_fault());
+            }
+        }
+        Ok(())
     }
 }
 

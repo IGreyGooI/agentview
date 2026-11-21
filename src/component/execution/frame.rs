@@ -266,7 +266,29 @@ pub(super) struct FrameSession {
     highest_observed_epoch: TargetEpoch,
 }
 
+pub(super) struct ContextFrameCheckpoint {
+    transcript: CanonicalTranscript,
+    delivery: TargetDeliveryState,
+}
+
 impl FrameSession {
+    pub(super) fn context_checkpoint(&self) -> ContextFrameCheckpoint {
+        ContextFrameCheckpoint {
+            transcript: self.canonical_history.transcript.clone(),
+            delivery: self.target_delivery.clone(),
+        }
+    }
+
+    pub(super) fn reject_context_update(&mut self, checkpoint: ContextFrameCheckpoint) {
+        // This snapshot belongs only to an output-free context exchange, before
+        // any model facts or native lanes start. Restore its failed delivery
+        // baseline without reusing the sequence allocated for that attempt.
+        let next_sequence = self.target_delivery.next_sequence;
+        self.canonical_history.transcript = checkpoint.transcript;
+        self.target_delivery = checkpoint.delivery;
+        self.target_delivery.next_sequence = next_sequence;
+    }
+
     pub(super) fn decision(&self) -> Option<&super::DecisionDeclaration> {
         self.target_delivery
             .checkpoint

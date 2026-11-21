@@ -287,6 +287,18 @@ hook 等待期间继续仲裁定向中断、Component exit 和 task panic；丢�
 `use_reaction_completion` 在每个有限 Frame exchange 正常结算时运行，事件来源携带该 Frame 的
 revision。其状态更新先完成 post-reconcile，再进入会话 hook。
 
+Qwen Smart Turn v2 的 `QwenRealtimeVoiceInput::refresh_context()` 是显式的上下文交付控制。
+应用先更新 Component Signal，再调用它；普通 Signal 写入仍只触发本地投影刷新。
+等待输入时，port 以 `ContextRefreshRequested` 结束一个尚无模型输出的 exchange，runtime 在同一
+ReactionId、FrameSession 和 port 上重新 preparation、handoff 当前 Frame。该控制不进入 canonical
+模型输出，不调用 completion hooks，也不发送 `response.create`。已开始的语音或回答保留其正常边界。
+port 在可选上下文设置期间缓存抢先到达的响应事件，`ResponseFrame` 将其回调绑定到此前已交付的
+Frame；整份上下文的 items 确认之前不发布新 Frame 的输出归属。缺失旧回调时只返回该工具不可用，
+不执行新 Frame 的副作用。可选 update 的客户端拒绝恢复此前的交付快照；可选 context item 的拒绝
+记录观测并丢弃该项，语音继续。调用成功只表示已排队，不保证远端已接纳；完整 task snapshot 宜用
+ephemeral developer projection，在后续授权的 Frame 中重新声明当前状态。其他 voice provider
+对该可选控制返回本地不支持错误，不生成语音。
+
 `app.react(ephemeral: bool)` 在准入时选择历史分支。`ephemeral=true` 始终创建 Temporary，
 即使没有活动 Main，也不领取或推进主 port/session；每次都从最近的合法主 checkpoint 创建新 sibling。
 `ephemeral=false` 保留自动分类：没有占用主线执行位时为 Main，否则为 Temporary。

@@ -41,6 +41,7 @@ pub(crate) enum Input {
     Append(String),
     SetMuted(bool),
     Speak(SpokenText),
+    RefreshContext,
     Commit,
     Clear,
     Interrupt(Interrupt),
@@ -201,6 +202,7 @@ pub(super) struct Media {
     notice_delete_events: VecDeque<(String, String)>,
     input_speech: bool,
     awaiting_speech_response: bool,
+    context_refresh_pending: bool,
     finished: bool,
 }
 
@@ -232,6 +234,7 @@ impl Media {
                 notice_delete_events: VecDeque::new(),
                 input_speech: false,
                 awaiting_speech_response: false,
+                context_refresh_pending: false,
                 finished: false,
             },
             sender,
@@ -241,6 +244,23 @@ impl Media {
 
     pub(super) fn subscribe_active_response(&self) -> watch::Receiver<Option<String>> {
         self.active_response.subscribe()
+    }
+
+    pub(super) fn begin_context_frame(&mut self) {
+        // Only refreshes already consumed by this socket owner are covered by
+        // the Frame about to be installed. New requests remain in the input
+        // queue, so an ACK cannot erase a later Signal update.
+        self.context_refresh_pending = false;
+    }
+
+    pub(super) fn observe_context_rejection(&self, event: Value) {
+        // The context writer classified this optional request refusal before
+        // the audio decoder. Publish its diagnostic without failing playback.
+        self.events.publish_server_event(Arc::new(event));
+    }
+
+    pub(super) fn owns_control_error(&self, event: &Value) -> bool {
+        self.rejected_notice(event).is_some() || self.is_cancel_rejection(event)
     }
 
     pub(super) fn observe(&mut self, event: &Value) -> Result<(), Fault> {
@@ -473,6 +493,9 @@ impl Media {
                 && !self.awaiting_speech_response
                 && !self.awaiting_commit;
             let can_speak = idle && !self.spoken_pending;
+            if self.mode == Mode::SmartTurnV2 && can_speak && self.context_refresh_pending {
+                return Ok((json!({"type":"agentview.context_refresh"}), 0));
+            }
             let notice_ready = idle
                 && self
                     .notice
@@ -550,6 +573,7 @@ impl Media {
                     }
                     Some(Input::SetMuted(_)) => {},
                     Some(Input::Speak(spoken)) => self.spoken.push_back(spoken),
+                    Some(Input::RefreshContext) => self.context_refresh_pending = true,
                     Some(Input::Commit) if responding => self.commit_pending = true,
                     Some(Input::Commit) => self.commit(socket).await?,
                     Some(Input::Clear) => {

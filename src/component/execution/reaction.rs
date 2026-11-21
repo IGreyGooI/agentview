@@ -846,6 +846,15 @@ pub enum ProviderToolCallError {
 /// One ordered, target-neutral fact that shared history can admit directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderFact {
+    /// Session control: close this output-free exchange and prepare another
+    /// context Frame under the same Reaction. This is not model completion.
+    ContextRefreshRequested,
+    /// An optional context update was refused before changing remote context.
+    /// Restore the preceding output-free delivery snapshot and keep listening.
+    ContextRefreshRejected { revision: FrameRevision },
+    /// Session control preceding model output, selecting the already submitted
+    /// Frame whose callbacks own a response that raced a context refresh.
+    ResponseFrame { revision: FrameRevision },
     TextDelta {
         output: ProviderOutputKey,
         phase: Option<AssistantPhase>,
@@ -973,6 +982,11 @@ pub type ProviderFactStream<'a> =
 /// Structured integration boundary shared by Provider, Skill, and Plugin ports.
 #[async_trait]
 pub trait ReactionPort: Send {
+    /// Whether this session port emits context-only Frame controls. Ordinary
+    /// ports retain their existing streaming startup and completion lifecycle.
+    fn supports_context_refresh(&self) -> bool {
+        false
+    }
     /// Returns an idempotent snapshot without advancing delivery state.
     /// Model ports must declare ContextWindow::Tokens with the caller's explicit
     /// capacity. ContextWindow::NotApplicable is reserved for non-model targets.
@@ -1058,6 +1072,9 @@ pub trait ReactionPort: Send {
 
 #[async_trait]
 impl<P: ReactionPort + ?Sized> ReactionPort for Box<P> {
+    fn supports_context_refresh(&self) -> bool {
+        (**self).supports_context_refresh()
+    }
     fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
         (**self).declare()
     }

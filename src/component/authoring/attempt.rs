@@ -364,6 +364,7 @@ where
                     callback_sealed: false,
                     finished: false,
                     faulted: false,
+                    callbacks_available: true,
                     marker: std::marker::PhantomData,
                 },
                 task_starts,
@@ -415,6 +416,7 @@ pub(crate) struct RenderBindings<Root> {
     callback_sealed: bool,
     finished: bool,
     faulted: bool,
+    callbacks_available: bool,
     marker: std::marker::PhantomData<fn(Root)>,
 }
 
@@ -442,6 +444,23 @@ impl<Root> RenderBindings<Root>
 where
     Root: Send + Sync + 'static,
 {
+    pub(crate) fn discard_callbacks(&mut self) {
+        // A session response explicitly belongs to an unavailable old Frame.
+        // New render callbacks must not execute its commands. Audio still
+        // streams; native calls receive an unavailable result without effects.
+        self.callbacks_available = false;
+        self.listeners.clear();
+        self.reaction_completions.clear();
+        self.native_tools.clear();
+        self.streaming_routes.clear();
+        self.streaming_contracts.clear();
+        self.xml_callbacks = None;
+    }
+
+    pub(crate) fn callbacks_available(&self) -> bool {
+        self.callbacks_available
+    }
+
     pub(crate) fn retained_model_history(&self) -> RetainedModelHistory {
         RetainedModelHistory {
             native: self

@@ -49,6 +49,41 @@ struct VoiceProbe {
     rendered: Arc<Notify>,
 }
 
+#[derive(Clone, Default)]
+struct RefreshProbe {
+    state: Arc<Mutex<Option<Signal<u32>>>>,
+    calls: Arc<Mutex<Vec<(u32, EventContext)>>>,
+    completions: Arc<Mutex<Vec<EventContext>>>,
+}
+
+#[component]
+fn refreshable_assistant(probe: RefreshProbe) -> Component {
+    let state = use_signal(|| 0u32);
+    *probe.state.lock().unwrap() = Some(state.clone());
+    let generation = state.with(|value| *value).unwrap();
+    let completions = probe.completions.clone();
+    use_reaction_completion(move |context| async move {
+        completions.lock().unwrap().push(context);
+        Ok::<_, Infallible>(())
+    });
+    view! {
+        #[system_once]
+        "Use the current task state when answering."
+
+        #[developer(ephemeral, repeat)]
+        { format!("Current task generation: {generation}") }
+
+        NativeToolCall {
+            name: "report_status",
+            description: "Read the task state delivered by this Frame.",
+            on_call: move |context: EventContext| {
+                probe.calls.lock().unwrap().push((generation, context));
+                Ok::<_, Infallible>(json!({"generation": generation}))
+            },
+        }
+    }
+}
+
 #[component]
 fn voice_assistant(probe: VoiceProbe) -> Component {
     let external_state = use_signal(|| 0u32);
@@ -211,6 +246,23 @@ async fn receive_repeated_instruction(socket: &mut WebSocketStream<TcpStream>) -
     event["item"].clone()
 }
 
+async fn receive_context_update(socket: &mut WebSocketStream<TcpStream>) -> Value {
+    loop {
+        let event = receive(socket).await;
+        match event["type"].as_str().unwrap() {
+            "session.update" => return event,
+            "conversation.item.delete" => {
+                send(
+                    socket,
+                    json!({"type":"conversation.item.deleted", "item_id":event["item_id"]}),
+                )
+                .await;
+            }
+            other => panic!("context refresh must not generate a reply, got {other}"),
+        }
+    }
+}
+
 async fn send_input(socket: &mut WebSocketStream<TcpStream>, input_id: &str) {
     send(
         socket,
@@ -291,6 +343,13 @@ async fn await_session_close(socket: &mut WebSocketStream<TcpStream>) {
                 match event["type"].as_str().unwrap() {
                     "session.update" => acknowledge_update(socket, &event).await,
                     "conversation.item.create" => acknowledge_item(socket, &event).await,
+                    "conversation.item.delete" => {
+                        send(
+                            socket,
+                            json!({"type":"conversation.item.deleted", "item_id":event["item_id"]}),
+                        )
+                        .await
+                    }
                     other => panic!("unexpected client turn command after speech, got {other}"),
                 }
             }
@@ -428,6 +487,336 @@ async fn send_tool_reply(socket: &mut WebSocketStream<TcpStream>) {
     ] {
         send(socket, event).await;
     }
+}
+
+#[tokio::test]
+async fn explicit_context_refresh_is_silent_and_keeps_a_newer_signal_write_during_ack() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (initialized_tx, initialized_rx) = oneshot::channel();
+    let (refresh_started_tx, refresh_started_rx) = oneshot::channel();
+    let (newer_queued_tx, newer_queued_rx) = oneshot::channel();
+    let (context_ready_tx, context_ready_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        receive_repeated_instruction(&mut socket).await;
+        initialized_tx.send(()).unwrap();
+        assert_eq!(receive_audio(&mut socket).await, [11, 0, 12, 0]);
+
+        let first_refresh = receive_context_update(&mut socket).await;
+        assert!(first_refresh["session"].get("turn_detection").is_none());
+        refresh_started_tx.send(()).unwrap();
+        newer_queued_rx.await.unwrap();
+        acknowledge_update(&mut socket, &first_refresh).await;
+        receive_repeated_instruction(&mut socket).await;
+
+        let second_refresh = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &second_refresh).await;
+        receive_repeated_instruction(&mut socket).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "context-only Frames must leave Smart Turn waiting for real input"
+        );
+        context_ready_tx.send(()).unwrap();
+        assert_eq!(receive_audio(&mut socket).await, [21, 0, 22, 0]);
+        send_input(&mut socket, "input-refresh").await;
+        send_tool_reply(&mut socket).await;
+
+        let continuation = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &continuation).await;
+        let result = receive(&mut socket).await;
+        assert_eq!(result["item"]["type"], "function_call_output");
+        assert_eq!(result["item"]["call_id"], "call_status");
+        let output: Value =
+            serde_json::from_str(result["item"]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output, json!({"generation":2}));
+        acknowledge_item(&mut socket, &result).await;
+        receive_repeated_instruction(&mut socket).await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        send_audio_reply(
+            &mut socket,
+            "refresh-answer",
+            "refresh-answer-item",
+            "结果已更新。",
+            &[1, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let provider = QwenRealtimeProvider::new(
+        &endpoint,
+        CREDENTIAL,
+        ModelSpec::new(MODEL, 262_144).unwrap(),
+    )
+    .unwrap();
+    let probe = RefreshProbe::default();
+    let root_probe = probe.clone();
+    let (mut app, input, mut events) = QwenRealtimeVoiceApplication::mount(
+        move || refreshable_assistant(root_probe.clone()),
+        provider,
+    )
+    .unwrap();
+    let operation = async {
+        initialized_rx.await.unwrap();
+        let state = probe.state.lock().unwrap().clone().unwrap();
+        input.append_pcm16(&[11, 0, 12, 0]).await.unwrap();
+        state.set(1).unwrap();
+        input.refresh_context().await.unwrap();
+        refresh_started_rx.await.unwrap();
+        state.set(2).unwrap();
+        input.refresh_context().await.unwrap();
+        newer_queued_tx.send(()).unwrap();
+        context_ready_rx.await.unwrap();
+        assert!(
+            probe.completions.lock().unwrap().is_empty(),
+            "silent refresh is not a reaction completion"
+        );
+        input.append_pcm16(&[21, 0, 22, 0]).await.unwrap();
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseEnded { response_id, .. } if response_id == "refresh-answer")
+            {
+                break;
+            }
+        }
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    server.await.unwrap();
+    let calls = probe.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, 2);
+    let completions = probe.completions.lock().unwrap();
+    assert!(completions
+        .iter()
+        .all(|context| context.reaction_id() == calls[0].1.reaction_id()));
+    assert_eq!(completions[0].frame_revision(), calls[0].1.frame_revision());
+}
+
+#[tokio::test]
+async fn response_racing_a_context_update_keeps_the_prior_frames_native_bindings() {
+    exercise_context_update_race(true).await;
+    exercise_context_update_race(false).await;
+}
+
+async fn exercise_context_update_race(before_update_ack: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (initialized_tx, initialized_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        receive_repeated_instruction(&mut socket).await;
+        initialized_tx.send(()).unwrap();
+        assert_eq!(receive_audio(&mut socket).await, [11, 0, 12, 0]);
+
+        let refresh = receive_context_update(&mut socket).await;
+        // Previously forwarded audio starts a response before the update ACK.
+        // Its function call must execute the old closure, even though the new
+        // Signal value has already been rendered and handed off locally.
+        if before_update_ack {
+            send_input(&mut socket, "input-race").await;
+            send_tool_reply(&mut socket).await;
+            acknowledge_update(&mut socket, &refresh).await;
+            receive_repeated_instruction(&mut socket).await;
+        } else {
+            acknowledge_update(&mut socket, &refresh).await;
+            let context = receive(&mut socket).await;
+            assert_eq!(context["item"]["role"], "system");
+            send_input(&mut socket, "input-race").await;
+            send_tool_reply(&mut socket).await;
+            acknowledge_item(&mut socket, &context).await;
+        }
+
+        let continuation = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &continuation).await;
+        let result = receive(&mut socket).await;
+        assert_eq!(result["item"]["type"], "function_call_output");
+        assert_eq!(result["item"]["call_id"], "call_status");
+        let output: Value =
+            serde_json::from_str(result["item"]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output, json!({"generation":0}));
+        acknowledge_item(&mut socket, &result).await;
+        receive_repeated_instruction(&mut socket).await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        send_audio_reply(
+            &mut socket,
+            "race-answer",
+            "race-answer-item",
+            "已取得结果。",
+            &[1, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let provider = QwenRealtimeProvider::new(
+        &endpoint,
+        CREDENTIAL,
+        ModelSpec::new(MODEL, 262_144).unwrap(),
+    )
+    .unwrap();
+    let probe = RefreshProbe::default();
+    let root_probe = probe.clone();
+    let (mut app, input, mut events) = QwenRealtimeVoiceApplication::mount(
+        move || refreshable_assistant(root_probe.clone()),
+        provider,
+    )
+    .unwrap();
+    let operation = async {
+        initialized_rx.await.unwrap();
+        input.append_pcm16(&[11, 0, 12, 0]).await.unwrap();
+        probe
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .set(1)
+            .unwrap();
+        input.refresh_context().await.unwrap();
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseEnded { response_id, .. } if response_id == "race-answer")
+            {
+                break;
+            }
+        }
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    server.await.unwrap();
+    let calls = probe.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, 0);
+    let completions = probe.completions.lock().unwrap();
+    assert_eq!(completions[0].frame_revision(), calls[0].1.frame_revision());
+    assert_ne!(completions[1].frame_revision(), calls[0].1.frame_revision());
+    assert!(completions
+        .iter()
+        .all(|context| context.reaction_id() == calls[0].1.reaction_id()));
+}
+
+#[tokio::test]
+async fn refused_optional_context_commands_keep_voice_and_native_tool_results_alive() {
+    exercise_refused_context(true).await;
+    exercise_refused_context(false).await;
+}
+
+async fn exercise_refused_context(reject_update: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (initialized_tx, initialized_rx) = oneshot::channel();
+    let (refused_tx, refused_rx) = oneshot::channel();
+    let expected_generation = if reject_update { 0 } else { 1 };
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        receive_repeated_instruction(&mut socket).await;
+        initialized_tx.send(()).unwrap();
+        let refresh = receive_context_update(&mut socket).await;
+        let command = if reject_update {
+            "session.update"
+        } else {
+            acknowledge_update(&mut socket, &refresh).await;
+            let context = receive(&mut socket).await;
+            assert_eq!(context["item"]["role"], "system");
+            "conversation.item.create"
+        };
+        send(
+            &mut socket,
+            json!({"type":"error", "error": {
+                "type":"invalid_request_error", "code":"invalid_value", "param":command,
+                "message":"Optional context refused by test provider"
+            }}),
+        )
+        .await;
+        let unexpected = tokio::time::timeout(Duration::from_millis(50), socket.next()).await;
+        assert!(unexpected.is_err(),
+            "a refused optional context command must not generate, retry, or replace the voice session: {unexpected:?}");
+        refused_tx.send(()).unwrap();
+        assert_eq!(receive_audio(&mut socket).await, [31, 0, 32, 0]);
+        send_input(&mut socket, "input-after-refusal").await;
+        send_tool_reply(&mut socket).await;
+        let continuation = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &continuation).await;
+        let result = receive(&mut socket).await;
+        assert_eq!(result["item"]["type"], "function_call_output");
+        let output: Value =
+            serde_json::from_str(result["item"]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output, json!({"generation":expected_generation}));
+        acknowledge_item(&mut socket, &result).await;
+        receive_repeated_instruction(&mut socket).await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        send_audio_reply(
+            &mut socket,
+            "refusal-answer",
+            "refusal-answer-item",
+            "语音仍可继续。",
+            &[1, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let provider = QwenRealtimeProvider::new(
+        &endpoint,
+        CREDENTIAL,
+        ModelSpec::new(MODEL, 262_144).unwrap(),
+    )
+    .unwrap();
+    let probe = RefreshProbe::default();
+    let root_probe = probe.clone();
+    let (mut app, input, mut events) = QwenRealtimeVoiceApplication::mount(
+        move || refreshable_assistant(root_probe.clone()),
+        provider,
+    )
+    .unwrap();
+    let operation = async {
+        initialized_rx.await.unwrap();
+        probe
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .set(1)
+            .unwrap();
+        input.refresh_context().await.unwrap();
+        refused_rx.await.unwrap();
+        assert!(probe.completions.lock().unwrap().is_empty());
+        input.append_pcm16(&[31, 0, 32, 0]).await.unwrap();
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseEnded { response_id, .. } if response_id == "refusal-answer")
+            {
+                break;
+            }
+        }
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    server.await.unwrap();
+    assert_eq!(probe.calls.lock().unwrap()[0].0, expected_generation);
 }
 
 #[tokio::test]

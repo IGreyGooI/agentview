@@ -548,6 +548,11 @@ impl<'a> ReactionAdmissionGuard<'a> {
 
         let mut structured_text = None;
         let (event, tool_lane) = match fact {
+            ProviderFact::ContextRefreshRequested
+            | ProviderFact::ContextRefreshRejected { .. }
+            | ProviderFact::ResponseFrame { .. } => {
+                return Err(ReactionAdmissionFault::UnexpectedSessionControl);
+            }
             ProviderFact::TextDelta {
                 output,
                 phase,
@@ -1171,6 +1176,8 @@ fn is_commentary(phase: Option<AssistantPhase>) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(super) enum ReactionAdmissionFault {
+    #[error("session control reached canonical model-output admission")]
+    UnexpectedSessionControl,
     #[error("decision output references no active request")]
     UnknownDecisionRequest,
     #[error("decision output has an invalid response envelope")]
@@ -1264,6 +1271,7 @@ pub(super) enum ReactionAdmissionFault {
 impl ReactionAdmissionFault {
     pub(super) const fn reason(&self) -> ReactionAdmissionReason {
         match self {
+            Self::UnexpectedSessionControl => ReactionAdmissionReason::UnexpectedSessionControl,
             Self::UnknownDecisionRequest => ReactionAdmissionReason::UnknownDecisionRequest,
             Self::InvalidDecisionEnvelope => ReactionAdmissionReason::InvalidDecisionEnvelope,
             Self::DuplicateDecision => ReactionAdmissionReason::DuplicateDecision,
@@ -1310,6 +1318,7 @@ impl ReactionAdmissionFault {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReactionAdmissionReason {
+    UnexpectedSessionControl,
     UnknownDecisionRequest,
     InvalidDecisionEnvelope,
     DuplicateDecision,

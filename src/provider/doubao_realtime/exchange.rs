@@ -257,7 +257,7 @@ impl<'a> Exchange<'a> {
                     self.complete(None);
                 }
             }
-            Some(Input::Commit | Input::Clear) => {}
+            Some(Input::Commit | Input::Clear | Input::RefreshContext) => {}
         }
         Ok(())
     }
