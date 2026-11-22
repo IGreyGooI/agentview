@@ -18,6 +18,7 @@ use crate::component::execution::{
 
 use super::{
     audio::{AudioDecoder, QwenRealtimeAudioEvent, QwenRealtimeResponseStatus},
+    reference_audio::ReferenceAudioDelivery,
     transport::{self, Socket},
     Mode,
 };
@@ -218,6 +219,7 @@ pub(super) struct Media {
     context_response_pending: Option<String>,
     context_generation_waiting: Option<String>,
     context_generations: VecDeque<ContextResponseRequest>,
+    reference_audio: Option<ReferenceAudioDelivery>,
     finished: bool,
 }
 
@@ -253,6 +255,7 @@ impl Media {
                 context_response_pending: None,
                 context_generation_waiting: None,
                 context_generations: VecDeque::new(),
+                reference_audio: None,
                 finished: false,
             },
             sender,
@@ -341,10 +344,33 @@ impl Media {
         self.events.publish_server_event(Arc::new(event));
     }
 
+    pub(super) fn begin_reference_audio(&mut self, item_id: String, event_id: String) {
+        self.reference_audio = Some(ReferenceAudioDelivery::new(item_id, event_id));
+    }
+
+    pub(super) fn expire_reference_audio(&mut self) {
+        if let Some(reference) = &mut self.reference_audio {
+            reference.expire();
+            tracing::warn!(
+                event = "qwen_reference_audio_delivery",
+                status = "timeout",
+                item_id = reference.item_id
+            );
+            self.events.publish_server_event(Arc::new(json!({
+                "type":"agentview.reference_audio_delivery", "status":"timeout",
+                "item_id":reference.item_id,
+            })));
+        }
+    }
+
     pub(super) fn owns_control_error(&self, event: &Value) -> bool {
         self.rejected_notice(event).is_some()
             || self.is_cancel_rejection(event)
             || self.context_response_rejection(event).is_some()
+            || self
+                .reference_audio
+                .as_ref()
+                .is_some_and(|reference| reference.owns_error(event))
     }
 
     pub(super) fn observe(&mut self, event: &Value) -> Result<(), Fault> {
@@ -705,6 +731,23 @@ impl Media {
     }
 
     pub(super) fn admit(&mut self, event: Value, bytes: usize) -> Result<(Value, usize), Fault> {
+        if let Some(reference) = &mut self.reference_audio {
+            if let Some(status) = reference.classify(&event) {
+                let observation = json!({
+                    "type":"agentview.reference_audio_delivery", "status":status,
+                    "item_id":reference.item_id,
+                });
+                self.events.publish_server_event(Arc::new(event));
+                self.events
+                    .publish_server_event(Arc::new(observation.clone()));
+                tracing::info!(
+                    event = "qwen_reference_audio_delivery",
+                    status,
+                    item_id = reference.item_id
+                );
+                return Ok((observation, 0));
+            }
+        }
         // This optional response can lose a race after all context ACKs but
         // before the server handles response.create. Only its owned rejection
         // retires the cue and wait; late errors cannot cancel a newer response.

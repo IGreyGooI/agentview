@@ -12,8 +12,8 @@ use agentview::{
     llm_call::TextTurnEvent,
     provider::{
         qwen_realtime::{
-            QwenRealtimeAudioEvent, QwenRealtimeProvider, QwenRealtimeResponseStatus,
-            QwenRealtimeServerEvents, QwenRealtimeVoiceApplication,
+            QwenRealtimeAudioEvent, QwenRealtimeProvider, QwenRealtimeReferenceAudio,
+            QwenRealtimeResponseStatus, QwenRealtimeServerEvents, QwenRealtimeVoiceApplication,
         },
         ModelSpec,
     },
@@ -285,6 +285,181 @@ async fn next_context_response_outcome(events: &mut QwenRealtimeServerEvents) ->
             return event;
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ReferenceCase {
+    Acknowledged,
+    Rejected,
+    LateAcknowledged,
+    LateRejected,
+}
+
+#[tokio::test]
+async fn reference_audio_precedes_live_input_and_optional_failures_preserve_later_turns() {
+    for case in [
+        ReferenceCase::Acknowledged,
+        ReferenceCase::Rejected,
+        ReferenceCase::LateAcknowledged,
+        ReferenceCase::LateRejected,
+    ] {
+        exercise_reference_audio(case).await;
+    }
+}
+
+async fn exercise_reference_audio(case: ReferenceCase) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let reference_pcm16 = vec![1, 0, 2, 0];
+    let server_pcm16 = reference_pcm16.clone();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let update = receive(&mut socket).await;
+        assert_eq!(update["type"], "session.update");
+        assert_eq!(update["session"]["turn_detection"]["type"], "smart_turn_v2");
+        acknowledge_update(&mut socket, &update).await;
+        let reference = receive(&mut socket).await;
+        assert_eq!(reference["type"], "conversation.item.create");
+        assert!(reference["event_id"].is_string());
+        assert!(reference["item"]["id"].is_string());
+        assert_eq!(reference["item"]["role"], "user");
+        let content = reference["item"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_audio");
+        assert_eq!(
+            STANDARD
+                .decode(content[1]["audio"].as_str().unwrap())
+                .unwrap(),
+            server_pcm16
+        );
+        let acknowledge = json!({"type":"conversation.item.created", "item":{
+            "id":reference["item"]["id"], "type":"message", "role":"user",
+            "content":[{"type":"input_audio"}],
+        }});
+        let reject = json!({"type":"error", "error":{
+            "type":"invalid_request_error", "code":"invalid_audio",
+            "event_id":reference["event_id"], "message":"Optional reference refused",
+        }});
+        match case {
+            ReferenceCase::Acknowledged => {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), socket.next())
+                        .await
+                        .is_err()
+                );
+                send(&mut socket, acknowledge.clone()).await;
+            }
+            ReferenceCase::Rejected => send(&mut socket, reject.clone()).await,
+            ReferenceCase::LateAcknowledged | ReferenceCase::LateRejected => {}
+        }
+        let live = tokio::time::timeout(Duration::from_millis(750), receive(&mut socket))
+            .await
+            .expect("an optional reference ACK cannot stall queued microphone input");
+        assert_eq!(live["type"], "input_audio_buffer.append");
+        assert_eq!(
+            STANDARD.decode(live["audio"].as_str().unwrap()).unwrap(),
+            [11, 0, 12, 0]
+        );
+        match case {
+            ReferenceCase::LateAcknowledged => send(&mut socket, acknowledge).await,
+            ReferenceCase::LateRejected => send(&mut socket, reject).await,
+            ReferenceCase::Acknowledged | ReferenceCase::Rejected => {}
+        }
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.input_audio_transcription.completed",
+            "item_id":reference["item"]["id"], "content_index":0,
+            "transcript":"登记样本中的原话"}),
+        )
+        .await;
+        send_input(&mut socket, "reference-live-one").await;
+        send_audio_reply(
+            &mut socket,
+            "reference-reply-one",
+            "reference-output-one",
+            "收到。",
+            &[3, 0],
+            None,
+        )
+        .await;
+        let update = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &update).await;
+        let live = receive(&mut socket).await;
+        assert_eq!(live["type"], "input_audio_buffer.append");
+        assert_eq!(
+            STANDARD.decode(live["audio"].as_str().unwrap()).unwrap(),
+            [21, 0, 22, 0]
+        );
+        send_input(&mut socket, "reference-live-two").await;
+        send_audio_reply(
+            &mut socket,
+            "reference-reply-two",
+            "reference-output-two",
+            "继续。",
+            &[4, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let reference = QwenRealtimeReferenceAudio::new(reference_pcm16, "张三".into()).unwrap();
+    let provider = QwenRealtimeProvider::new(
+        &endpoint,
+        CREDENTIAL,
+        ModelSpec::new(MODEL, 262_144).unwrap(),
+    )
+    .unwrap()
+    .with_reference_audio(reference);
+    let (mut app, input, mut events) =
+        QwenRealtimeVoiceApplication::mount(|| view! {}, provider).unwrap();
+    let mut raw = events.subscribe_server_events();
+    input.append_pcm16(&[11, 0, 12, 0]).await.unwrap();
+    let operation = async {
+        let mut transcripts = Vec::new();
+        let mut ended = 0;
+        while ended < 2 {
+            match events.next_event().await.unwrap() {
+                QwenRealtimeAudioEvent::InputTranscriptDone { item_id, .. } => {
+                    transcripts.push(item_id)
+                }
+                QwenRealtimeAudioEvent::ResponseEnded { status, .. } => {
+                    assert_eq!(status, QwenRealtimeResponseStatus::Completed);
+                    ended += 1;
+                    if ended == 1 {
+                        input.append_pcm16(&[21, 0, 22, 0]).await.unwrap();
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(transcripts, ["reference-live-one", "reference-live-two"]);
+        let expected = match case {
+            ReferenceCase::Acknowledged => vec!["acknowledged", "sample_observation"],
+            ReferenceCase::Rejected => vec!["rejected", "sample_observation"],
+            ReferenceCase::LateAcknowledged => {
+                vec!["timeout", "late_acknowledged", "sample_observation"]
+            }
+            ReferenceCase::LateRejected => vec!["timeout", "rejected", "sample_observation"],
+        };
+        let mut statuses = Vec::new();
+        while statuses.len() < expected.len() {
+            let event = raw.next_event().await.unwrap();
+            if event["type"] == "agentview.reference_audio_delivery" {
+                assert_eq!(event.as_object().unwrap().len(), 3);
+                statuses.push(event["status"].as_str().unwrap().to_owned());
+            }
+        }
+        assert_eq!(statuses, expected);
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    server.await.unwrap();
 }
 
 #[derive(Clone, Copy)]
