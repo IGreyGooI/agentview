@@ -12,8 +12,8 @@ use agentview::{
     llm_call::TextTurnEvent,
     provider::{
         qwen_realtime::{
-            QwenRealtimeAudioEvent, QwenRealtimeProvider, QwenRealtimeReferenceAudio,
-            QwenRealtimeResponseStatus, QwenRealtimeServerEvents, QwenRealtimeVoiceApplication,
+            QwenRealtimeAudioEvent, QwenRealtimeProvider, QwenRealtimeResponseStatus,
+            QwenRealtimeServerEvents, QwenRealtimeVoiceApplication, QwenRealtimeVoiceprintAudioUrl,
         },
         ModelSpec,
     },
@@ -288,102 +288,78 @@ async fn next_context_response_outcome(events: &mut QwenRealtimeServerEvents) ->
 }
 
 #[derive(Clone, Copy)]
-enum ReferenceCase {
-    Acknowledged,
-    Rejected,
-    LateAcknowledged,
-    LateRejected,
+enum VoiceprintCase {
+    Completed,
+    Failed,
+    FailedBeforeReady,
 }
 
 #[tokio::test]
-async fn reference_audio_precedes_live_input_and_optional_failures_preserve_later_turns() {
-    for case in [
-        ReferenceCase::Acknowledged,
-        ReferenceCase::Rejected,
-        ReferenceCase::LateAcknowledged,
-        ReferenceCase::LateRejected,
-    ] {
-        exercise_reference_audio(case).await;
-    }
+async fn native_voiceprint_registers_only_in_initial_update_without_waiting_for_completion() {
+    exercise_native_voiceprint(VoiceprintCase::Completed).await;
 }
 
-async fn exercise_reference_audio(case: ReferenceCase) {
+#[tokio::test]
+async fn asynchronous_voiceprint_failure_preserves_microphone_and_later_turns() {
+    exercise_native_voiceprint(VoiceprintCase::Failed).await;
+    exercise_native_voiceprint(VoiceprintCase::FailedBeforeReady).await;
+}
+
+async fn exercise_native_voiceprint(case: VoiceprintCase) {
+    const AUDIO_URL: &str = "https://audio.example/speaker.wav?expires=123&signature=fixture";
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
-    let reference_pcm16 = vec![1, 0, 2, 0];
-    let server_pcm16 = reference_pcm16.clone();
     let server = tokio::spawn(async move {
         let mut socket = accept_session(&listener).await;
         let update = receive(&mut socket).await;
         assert_eq!(update["type"], "session.update");
         assert_eq!(update["session"]["turn_detection"]["type"], "smart_turn_v2");
-        acknowledge_update(&mut socket, &update).await;
-        let reference = receive(&mut socket).await;
-        assert_eq!(reference["type"], "conversation.item.create");
-        assert!(reference["event_id"].is_string());
-        assert!(reference["item"]["id"].is_string());
-        assert_eq!(reference["item"]["role"], "user");
-        let content = reference["item"]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["type"], "input_text");
-        assert_eq!(content[1]["type"], "input_audio");
         assert_eq!(
-            STANDARD
-                .decode(content[1]["audio"].as_str().unwrap())
-                .unwrap(),
-            server_pcm16
+            update["session"]["turn_detection"]["voiceprint_audio_urls"],
+            json!([AUDIO_URL])
         );
-        let acknowledge = json!({"type":"conversation.item.created", "item":{
-            "id":reference["item"]["id"], "type":"message", "role":"user",
-            "content":[{"type":"input_audio"}],
-        }});
-        let reject = json!({"type":"error", "error":{
-            "type":"invalid_request_error", "code":"invalid_audio",
-            "event_id":reference["event_id"], "message":"Optional reference refused",
-        }});
-        match case {
-            ReferenceCase::Acknowledged => {
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(20), socket.next())
-                        .await
-                        .is_err()
-                );
-                send(&mut socket, acknowledge.clone()).await;
+        send(
+            &mut socket,
+            json!({"type":"voiceprint_audio_list.in_progress", "item_id":"voiceprint-one"}),
+        )
+        .await;
+        let registered = match case {
+            VoiceprintCase::Completed => {
+                json!({"type":"voiceprint_audio_list.completed", "item_id":"voiceprint-one"})
             }
-            ReferenceCase::Rejected => send(&mut socket, reject.clone()).await,
-            ReferenceCase::LateAcknowledged | ReferenceCase::LateRejected => {}
+            VoiceprintCase::Failed | VoiceprintCase::FailedBeforeReady => json!({
+                "type":"voiceprint_audio_list.failed", "item_id":"voiceprint-one", "reason":"Audio URL download timed out",
+            }),
+        };
+        if matches!(case, VoiceprintCase::FailedBeforeReady) {
+            send(&mut socket, registered.clone()).await;
         }
+        acknowledge_update(&mut socket, &update).await;
         let live = tokio::time::timeout(Duration::from_millis(750), receive(&mut socket))
             .await
-            .expect("an optional reference ACK cannot stall queued microphone input");
+            .expect("asynchronous registration cannot stall microphone input");
         assert_eq!(live["type"], "input_audio_buffer.append");
         assert_eq!(
             STANDARD.decode(live["audio"].as_str().unwrap()).unwrap(),
             [11, 0, 12, 0]
         );
-        match case {
-            ReferenceCase::LateAcknowledged => send(&mut socket, acknowledge).await,
-            ReferenceCase::LateRejected => send(&mut socket, reject).await,
-            ReferenceCase::Acknowledged | ReferenceCase::Rejected => {}
+        if !matches!(case, VoiceprintCase::FailedBeforeReady) {
+            send(&mut socket, registered).await;
         }
-        send(
-            &mut socket,
-            json!({"type":"conversation.item.input_audio_transcription.completed",
-            "item_id":reference["item"]["id"], "content_index":0,
-            "transcript":"登记样本中的原话"}),
-        )
-        .await;
-        send_input(&mut socket, "reference-live-one").await;
+        send_input(&mut socket, "voiceprint-live-one").await;
         send_audio_reply(
             &mut socket,
-            "reference-reply-one",
-            "reference-output-one",
+            "voiceprint-reply-one",
+            "voiceprint-output-one",
             "收到。",
             &[3, 0],
             None,
         )
         .await;
         let update = receive_context_update(&mut socket).await;
+        assert!(update["session"]["turn_detection"]
+            .get("voiceprint_audio_urls")
+            .is_none());
         acknowledge_update(&mut socket, &update).await;
         let live = receive(&mut socket).await;
         assert_eq!(live["type"], "input_audio_buffer.append");
@@ -391,11 +367,11 @@ async fn exercise_reference_audio(case: ReferenceCase) {
             STANDARD.decode(live["audio"].as_str().unwrap()).unwrap(),
             [21, 0, 22, 0]
         );
-        send_input(&mut socket, "reference-live-two").await;
+        send_input(&mut socket, "voiceprint-live-two").await;
         send_audio_reply(
             &mut socket,
-            "reference-reply-two",
-            "reference-output-two",
+            "voiceprint-reply-two",
+            "voiceprint-output-two",
             "继续。",
             &[4, 0],
             None,
@@ -403,14 +379,15 @@ async fn exercise_reference_audio(case: ReferenceCase) {
         .await;
         await_session_close(&mut socket).await;
     });
-    let reference = QwenRealtimeReferenceAudio::new(reference_pcm16, "张三".into()).unwrap();
+    let reference =
+        QwenRealtimeVoiceprintAudioUrl::new(url::Url::parse(AUDIO_URL).unwrap()).unwrap();
     let provider = QwenRealtimeProvider::new(
         &endpoint,
         CREDENTIAL,
         ModelSpec::new(MODEL, 262_144).unwrap(),
     )
     .unwrap()
-    .with_reference_audio(reference);
+    .with_voiceprint_audio_url(reference);
     let (mut app, input, mut events) =
         QwenRealtimeVoiceApplication::mount(|| view! {}, provider).unwrap();
     let mut raw = events.subscribe_server_events();
@@ -433,24 +410,28 @@ async fn exercise_reference_audio(case: ReferenceCase) {
                 _ => {}
             }
         }
-        assert_eq!(transcripts, ["reference-live-one", "reference-live-two"]);
+        assert_eq!(transcripts, ["voiceprint-live-one", "voiceprint-live-two"]);
         let expected = match case {
-            ReferenceCase::Acknowledged => vec!["acknowledged", "sample_observation"],
-            ReferenceCase::Rejected => vec!["rejected", "sample_observation"],
-            ReferenceCase::LateAcknowledged => {
-                vec!["timeout", "late_acknowledged", "sample_observation"]
+            VoiceprintCase::Completed => "voiceprint_audio_list.completed",
+            VoiceprintCase::Failed | VoiceprintCase::FailedBeforeReady => {
+                "voiceprint_audio_list.failed"
             }
-            ReferenceCase::LateRejected => vec!["timeout", "rejected", "sample_observation"],
         };
-        let mut statuses = Vec::new();
-        while statuses.len() < expected.len() {
+        let mut registrations = Vec::new();
+        while registrations.len() < 2 {
             let event = raw.next_event().await.unwrap();
-            if event["type"] == "agentview.reference_audio_delivery" {
-                assert_eq!(event.as_object().unwrap().len(), 3);
-                statuses.push(event["status"].as_str().unwrap().to_owned());
+            if event["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("voiceprint_audio_list."))
+            {
+                assert_eq!(event["item_id"], "voiceprint-one");
+                registrations.push(event["type"].as_str().unwrap().to_owned());
             }
         }
-        assert_eq!(statuses, expected);
+        assert_eq!(
+            registrations,
+            ["voiceprint_audio_list.in_progress", expected]
+        );
         input.finish().await.unwrap();
     };
     let (outcome, ()) =

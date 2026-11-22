@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use super::Mode;
+use super::{Mode, QwenRealtimeVoiceprintAudioUrl};
 use crate::{
     component::execution::{
         Frame, FrameBasis, ReactionPortFault, ReactionPortFaultCode, ReactionPortFaultReason,
@@ -24,6 +24,7 @@ pub(super) fn encode(
     frame: &Frame,
     max_request_bytes: usize,
     mode: Mode,
+    voiceprint_audio_url: Option<&QwenRealtimeVoiceprintAudioUrl>,
 ) -> Result<Commands, ReactionPortFault> {
     let submission = frame.submission();
     if submission.decision().is_some() {
@@ -47,6 +48,14 @@ pub(super) fn encode(
         // The service freezes turn detection once the session processes input.
         (FrameBasis::DeltaFrom(_), _) => json!({}),
     };
+    // Qwen consumes speaker URLs only on the first update. Subsequent Frames
+    // retain the same media session, so repeating this field would misrepresent
+    // a device setting edit as a live re-registration that the service ignores.
+    if let (FrameBasis::Full, Mode::SmartTurnV2, Some(reference)) =
+        (frame.basis(), mode, voiceprint_audio_url)
+    {
+        session["turn_detection"]["voiceprint_audio_urls"] = json!([reference.as_str()]);
+    }
     let mut tools = Vec::with_capacity(submission.tools().definitions().len());
     for tool in submission.tools().definitions() {
         // Qwen's Realtime function declaration has no strict-schema option.

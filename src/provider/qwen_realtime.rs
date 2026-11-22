@@ -3,10 +3,10 @@
 mod audio;
 pub(crate) mod media;
 mod output;
-mod reference_audio;
 mod request;
 pub(crate) mod transport;
 pub(crate) mod voice_application;
+mod voiceprint;
 
 use std::{
     collections::VecDeque,
@@ -38,9 +38,9 @@ pub use audio::{
 use media::Media;
 pub use media::{QwenRealtimeMediaEvents, QwenRealtimeMediaInput, QwenRealtimeServerEvents};
 use output::Decoder;
-pub use reference_audio::QwenRealtimeReferenceAudio;
 use transport::Socket;
 pub use voice_application::{QwenRealtimeVoiceApplication, QwenRealtimeVoiceInput};
+pub use voiceprint::QwenRealtimeVoiceprintAudioUrl;
 
 use super::ModelSpec;
 
@@ -77,8 +77,8 @@ pub enum QwenRealtimeConfigError {
     TransportInitialization,
     #[error("Qwen Realtime target initialization failed")]
     TargetInitialization,
-    #[error("Qwen Realtime reference audio requires a name and bounded 16 kHz mono PCM16")]
-    InvalidReferenceAudio,
+    #[error("Qwen Realtime voiceprint audio requires an HTTP or HTTPS fetch URL")]
+    InvalidVoiceprintAudioUrl,
 }
 
 /// A Frame-native port that retains its WebSocket across compatible reactions.
@@ -100,7 +100,7 @@ pub struct QwenRealtimeProvider {
     mode: Mode,
     follow_up: bool,
     context_frame_pending: bool,
-    reference_audio: Option<QwenRealtimeReferenceAudio>,
+    voiceprint_audio_url: Option<QwenRealtimeVoiceprintAudioUrl>,
 }
 
 impl QwenRealtimeProvider {
@@ -154,20 +154,18 @@ impl QwenRealtimeProvider {
             mode: Mode::Text,
             follow_up: false,
             context_frame_pending: false,
-            reference_audio: None,
+            voiceprint_audio_url: None,
         })
     }
 
-    /// Supply one enrolled speaker sample to the initial Smart Turn conversation.
+    /// Configure one target speaker sample for native Qwen Smart Turn enhancement.
     ///
-    /// The sample is a labeled historical user audio item. It adds reference
-    /// context for speaker comparison while the provider continues receiving
-    /// every live microphone utterance. Its optional delivery is observed and
-    /// waits at most 300 ms before normal input continues. Configure this before
-    /// mounting `QwenRealtimeVoiceApplication`. Its initial Frame owns this
-    /// one-time delivery.
-    pub fn with_reference_audio(mut self, reference: QwenRealtimeReferenceAudio) -> Self {
-        self.reference_audio = Some(reference);
+    /// Qwen fetches the recording from the first session update and focuses
+    /// duplex input on that speaker. Registration runs asynchronously and its
+    /// raw server events report success/failure while microphone input continues.
+    /// Configure this before mounting `QwenRealtimeVoiceApplication`.
+    pub fn with_voiceprint_audio_url(mut self, reference: QwenRealtimeVoiceprintAudioUrl) -> Self {
+        self.voiceprint_audio_url = Some(reference);
         self
     }
 
@@ -350,7 +348,12 @@ impl ReactionPort for QwenRealtimeProvider {
         if self.mode.audio() && self.retained.is_none() && self.media.is_none() {
             return Err(Fault::terminal(Code::Unavailable, Reason::Declaration).into());
         }
-        let commands = request::encode(&frame, MAX_REQUEST_BYTES, self.mode)?;
+        let commands = request::encode(
+            &frame,
+            MAX_REQUEST_BYTES,
+            self.mode,
+            self.voiceprint_audio_url.as_ref(),
+        )?;
         let tool_feedback = self.follow_up || !frame.submission().staged_inputs().is_empty();
         let optional_context = self.context_frame_pending && !tool_feedback;
         let mut response_bytes = ResponseBytes::default();
@@ -391,15 +394,6 @@ impl ReactionPort for QwenRealtimeProvider {
             let (session, created) = fresh
                 .or_else(|| retained.map(|retained| (retained.session, None)))
                 .expect("validated Qwen session at handoff");
-            // The provider retains subsequent Frames on this same socket.
-            // Consume enrolled audio only at its new Smart Turn handoff so
-            // tool continuations and context refreshes cannot insert the sample
-            // again as another historical user utterance.
-            let reference_audio = if created.is_some() && self.mode == Mode::SmartTurnV2 {
-                self.reference_audio.take()
-            } else {
-                None
-            };
             let mut started = start_response(
                 session,
                 commands.take().expect("handoff polled once"),
@@ -409,7 +403,6 @@ impl ReactionPort for QwenRealtimeProvider {
                 self.mode,
                 revision,
                 optional_context,
-                reference_audio,
             )
             .boxed();
             let first = started.as_mut().poll(cx);
@@ -542,7 +535,6 @@ async fn start_response(
     mode: Mode,
     revision: FrameRevision,
     optional_context: bool,
-    reference_audio: Option<QwenRealtimeReferenceAudio>,
 ) -> Result<StartedResponse, Fault> {
     let first_frame = created.is_some();
     if let (Some(media), Some(created)) = (&mut session.media, created) {
@@ -658,9 +650,6 @@ async fn start_response(
         if let Some(id) = id.filter(|_| session.media.is_some()) {
             transient.push(id);
         }
-    }
-    if let Some(reference) = reference_audio {
-        reference_audio::deliver(&mut session, &mut bytes, reference).await?;
     }
     // The whole context Frame owns callbacks only after all its item ACKs.
     // Until then previously forwarded PCM may still start an old-Frame reply.
