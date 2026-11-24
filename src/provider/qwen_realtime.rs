@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use futures::{future::BoxFuture, stream, FutureExt};
 use reqwest::{header::HeaderValue, Client};
 use serde_json::Value;
+use tokio::sync::watch;
 use url::{Host, Url};
 
 use crate::{
@@ -103,6 +104,8 @@ pub struct QwenRealtimeProvider {
     follow_up: bool,
     context_frame_pending: bool,
     voiceprint_audio_url: Option<QwenRealtimeVoiceprintAudioUrl>,
+    retain_text_conversation: bool,
+    session_id: watch::Sender<Option<String>>,
 }
 
 impl QwenRealtimeProvider {
@@ -157,7 +160,27 @@ impl QwenRealtimeProvider {
             follow_up: false,
             context_frame_pending: false,
             voiceprint_audio_url: None,
+            retain_text_conversation: false,
+            session_id: watch::channel(None).0,
         })
+    }
+
+    /// Retain the text WebSocket across request-only context and native tools.
+    /// Temporary items are deleted and acknowledged after each response. A
+    /// refused or unconfirmed cleanup preserves the completed answer and lets
+    /// the next ordinary Frame use the existing full-replay behavior.
+    /// This opt-in does not change either audio mode or the default text port.
+    pub fn with_retained_text_conversation(mut self) -> Self {
+        self.retain_text_conversation = true;
+        self
+    }
+
+    /// Observe the most recent actual session.created.session.id.
+    /// The last value remains available after close or continuity loss, so an
+    /// application can correlate the request it just completed. It does not
+    /// attest that the socket is still open. A fresh connection replaces it.
+    pub fn subscribe_session_id(&self) -> watch::Receiver<Option<String>> {
+        self.session_id.subscribe()
     }
 
     /// Configure one target speaker sample for native Qwen Smart Turn enhancement.
@@ -237,6 +260,7 @@ struct Session {
     pending_events: VecDeque<(Value, Option<FrameRevision>)>,
     context_setup: bool,
     pending_context_cues: Vec<String>,
+    retain_text_conversation: bool,
 }
 
 impl Session {
@@ -332,7 +356,7 @@ impl ReactionPort for QwenRealtimeProvider {
             return Err(Fault::retryable(Code::Rejected, Reason::RequestPreparation).into());
         }
         if matches!(frame.basis(), FrameBasis::DeltaFrom(_))
-            && ((!self.mode.audio() && ephemeral)
+            && ((!self.mode.audio() && ephemeral && !self.retain_text_conversation)
                 || self
                     .retained
                     .as_ref()
@@ -363,6 +387,7 @@ impl ReactionPort for QwenRealtimeProvider {
             let mut socket = self.connect().await?;
             let created = response_bytes.receive(&mut socket).await?;
             let id = session_id(&created, "session.created", self.model.id())?.to_owned();
+            self.session_id.send_replace(Some(id.clone()));
             Some((
                 Session {
                     socket,
@@ -372,6 +397,8 @@ impl ReactionPort for QwenRealtimeProvider {
                     pending_events: VecDeque::new(),
                     context_setup: false,
                     pending_context_cues: Vec::new(),
+                    retain_text_conversation: self.mode == Mode::Text
+                        && self.retain_text_conversation,
                 },
                 created,
             ))
@@ -424,7 +451,7 @@ impl ReactionPort for QwenRealtimeProvider {
         } else {
             Decoder::default()
         };
-        let discard_session = !self.mode.audio() && ephemeral;
+        let discard_session = !self.mode.audio() && ephemeral && !self.retain_text_conversation;
         let expect_immediate_response = self.mode != Mode::SmartTurnV2 || tool_feedback;
         let in_flight = InFlight {
             provider: self,
@@ -676,7 +703,8 @@ async fn start_response(
         if id.is_none() {
             rejected_items += 1;
         }
-        if let Some(id) = id.filter(|_| session.media.is_some()) {
+        if let Some(id) = id.filter(|_| session.media.is_some() || session.retain_text_conversation)
+        {
             transient.push(id);
         }
     }
@@ -1230,7 +1258,25 @@ impl InFlight<'_> {
             }
             self.facts.extend(self.decoder.on_event(event)?);
             if self.decoder.is_complete() {
-                self.cleanup_context(false).await?;
+                let cleanup = self.cleanup_context(false).await;
+                if let Err(fault) = cleanup {
+                    // The provider owns these temporary item ACKs. An absent
+                    // delete ACK would leak this request's instructions into
+                    // later input. Keep this already generated answer, and
+                    // retire only continuity so the next normal Frame replays.
+                    if self
+                        .session
+                        .as_ref()
+                        .is_some_and(|s| s.retain_text_conversation)
+                    {
+                        self.discard_session = true;
+                        tracing::warn!(event = "qwen_text_context_cleanup_unconfirmed",
+                            provider_session_id = self.session.as_ref().map(|s| s.id.as_str()),
+                            code = ?fault.code(), reason = ?fault.reason());
+                    } else {
+                        return Err(fault);
+                    }
+                }
             }
         }
     }
@@ -1278,7 +1324,7 @@ impl InFlight<'_> {
                 session,
                 "conversation.item.deleted",
                 None,
-                optional || context_cleanup,
+                optional || context_cleanup || session.retain_text_conversation,
             )
             .await?;
             if !ack.as_ref().is_some_and(|ack| ack["item_id"] == id) {
@@ -1298,7 +1344,7 @@ impl InFlight<'_> {
                         "cue_cleanup_unconfirmed",
                         "conversation.item.deleted",
                     );
-                } else if ack.is_some() {
+                } else if session.retain_text_conversation || ack.is_some() {
                     return Err(transport::protocol_fault());
                 }
             }

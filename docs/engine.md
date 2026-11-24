@@ -1459,7 +1459,21 @@ text delta output和decision能力；Chat当前不声明native或decision。能�
 Qwen Realtime port 声明 semantic delta、native tools 和 text delta 能力。普通 Delta 沿用
 上轮 WebSocket，先校验 replay 后缀与服务端已保留的输出事实，再交付 staged inputs 和当前
 Component 变化。文本模式通过 Full 建立新连接并发送完整观察。取消、断流和 ephemeral 请求
-释放对应文本连接，下一次从新 epoch 的 Full 恢复。
+默认释放对应文本连接，下一次从新 epoch 的 Full 恢复。
+
+文字调用方可显式用 `QwenRealtimeProvider::with_retained_text_conversation()` 保留包含 ephemeral
+上下文的会话。每个 Frame 仍通过 `session.update` 交付配置与标准系统说明；新增 user item 和
+staged native tool receipt 经各自 ACK 后起答，已有 user/assistant 历史不重复发送。
+ephemeral 上下文仅在本次响应有效，SDK 记录实际创建回执的 item ID，响应终态后逐项删除并
+等待相应 ACK，再保留同一 WebSocket。该选择不改变 `Application::prepare()` 的无模型请求行为，
+也不要求普通多个输入共用 Reaction：各输入仍可分别 `react(false)`，native 工具续轮仍走原 Frame。
+删除拒绝、错误 ACK 或断流只使这个已生成回答的连接失去连续性；本次输出正常结算，下一正常
+输入沿原有新 epoch / Full replay 路径交付，不重放该条已接受输入、不增加业务重试。
+
+`subscribe_session_id()` 提供最近一次真实 `session.created.session.id` 的 watch 订阅，可在 provider
+移入 Application 前保存，按每次输入的结算记录该 ID。它在连接关闭后仍保留最后值，仅作实际使用
+会话的观测，不证明当前连接存活。新握手会以服务端返回的新 ID 更新；同一 ID 连续出现需结合
+握手计数与 item/response 关联验收。默认文本端口及两个音频模式的既有连接语义不因该 opt-in 改变。
 
 `with_audio()` 启用长会话。宿主追加 16 kHz PCM16 并通过 `commit_input()` 划分话轮。
 port 在收到提交确认并交付本轮 Frame 后请求生成。原生工具结果与 XML 操作反馈驱动同一
