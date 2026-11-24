@@ -18,8 +18,9 @@ use crate::component::execution::{
 
 use super::{
     audio::{AudioDecoder, QwenRealtimeAudioEvent, QwenRealtimeResponseStatus},
+    text::{ActiveTextTurn, TextCorrelations, TextRequest},
     transport::{self, Socket},
-    Mode,
+    Mode, QwenRealtimeTextReply,
 };
 
 const INPUT_CAPACITY: usize = 32;
@@ -50,8 +51,9 @@ pub(crate) enum Input {
     Append(String),
     SetMuted(bool),
     Speak(SpokenText),
+    UserText(TextRequest),
     RefreshContext,
-    RefreshContextAndRespond(String),
+    RefreshContextAndRespond(TextRequest),
     Commit,
     Clear,
     Interrupt(Interrupt),
@@ -79,12 +81,31 @@ pub(crate) struct Interrupt {
 
 /// Cloneable, bounded input to a mounted Qwen Realtime voice session.
 #[derive(Clone)]
-pub struct QwenRealtimeMediaInput(mpsc::Sender<Input>);
+pub struct QwenRealtimeMediaInput {
+    sender: mpsc::Sender<Input>,
+    text_correlation: watch::Sender<Option<String>>,
+    text_correlations: TextCorrelations,
+}
 
 impl QwenRealtimeMediaInput {
     pub(crate) fn channel() -> (Self, mpsc::Receiver<Input>) {
         let (sender, receiver) = mpsc::channel(INPUT_CAPACITY);
-        (Self(sender), receiver)
+        let (text_correlation, _) = watch::channel(None);
+        (
+            Self {
+                sender,
+                text_correlation,
+                text_correlations: TextCorrelations::default(),
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn text_correlations(&self) -> (watch::Receiver<Option<String>>, TextCorrelations) {
+        (
+            self.text_correlation.subscribe(),
+            self.text_correlations.clone(),
+        )
     }
 
     /// Enqueues 16 kHz mono signed little-endian PCM16.
@@ -109,7 +130,7 @@ impl QwenRealtimeMediaInput {
     }
 
     pub(crate) async fn send(&self, input: Input) -> Result<(), Fault> {
-        self.0.send(input).await.map_err(|_| closed())
+        self.sender.send(input).await.map_err(|_| closed())
     }
 }
 
@@ -215,7 +236,16 @@ pub(super) struct Media {
     input_speech: bool,
     awaiting_speech_response: bool,
     context_refresh_pending: bool,
-    context_response_pending: Option<String>,
+    context_response_pending: VecDeque<TextRequest>,
+    user_texts: VecDeque<TextRequest>,
+    prepared_text: Option<TextRequest>,
+    text_turn: Option<ActiveTextTurn>,
+    text_correlation: watch::Sender<Option<String>>,
+    text_correlations: TextCorrelations,
+    speech_sequence: u64,
+    text_cancelled_response: Option<String>,
+    interrupt_for_text: bool,
+    retired_text_creates: VecDeque<String>,
     context_generation_waiting: Option<String>,
     context_generations: VecDeque<ContextResponseRequest>,
     finished: bool,
@@ -250,7 +280,16 @@ impl Media {
                 input_speech: false,
                 awaiting_speech_response: false,
                 context_refresh_pending: false,
-                context_response_pending: None,
+                context_response_pending: VecDeque::new(),
+                user_texts: VecDeque::new(),
+                prepared_text: None,
+                text_turn: None,
+                text_correlation: sender.text_correlation.clone(),
+                text_correlations: sender.text_correlations.clone(),
+                speech_sequence: 0,
+                text_cancelled_response: None,
+                interrupt_for_text: false,
+                retired_text_creates: VecDeque::new(),
                 context_generation_waiting: None,
                 context_generations: VecDeque::new(),
                 finished: false,
@@ -264,14 +303,250 @@ impl Media {
         self.active_response.subscribe()
     }
 
-    pub(super) fn begin_context_frame(&mut self) -> (bool, Option<String>) {
+    pub(super) fn begin_context_frame(&mut self) -> (bool, Option<TextRequest>) {
         // Only refreshes already consumed by this socket owner are covered by
         // the Frame about to be installed. New requests remain in the input
         // queue, so an ACK cannot erase a later Signal update.
-        (
-            std::mem::take(&mut self.context_refresh_pending),
-            std::mem::take(&mut self.context_response_pending),
-        )
+        let refresh = std::mem::take(&mut self.context_refresh_pending);
+        let cue = if self.prepared_text.is_none()
+            && self.user_texts.is_empty()
+            && self.text_turn.is_none()
+            && self.context_response_available()
+        {
+            self.context_response_pending.pop_front()
+        } else {
+            None
+        };
+        self.context_refresh_pending =
+            !self.context_response_pending.is_empty() || !self.user_texts.is_empty();
+        (refresh, cue)
+    }
+
+    pub(super) fn prepare_text_frame(&mut self) {
+        // The socket reader maintains voice activity. Select a queued user only
+        // after the preceding response has ended, so its old callbacks cannot
+        // acquire the new input's owner during the next Frame preparation.
+        if self.prepared_text.is_none()
+            && !self.user_texts.is_empty()
+            && self.context_response_available()
+        {
+            if let Some(previous) = self.text_turn.take() {
+                previous.request.finish(QwenRealtimeTextReply {
+                    response_id: previous.last_response_id,
+                    text: previous.text,
+                    status: QwenRealtimeResponseStatus::Cancelled,
+                    error: None,
+                });
+            }
+            self.prepared_text = self.user_texts.pop_front();
+            self.interrupt_for_text = false;
+            self.text_correlation.send_replace(
+                self.prepared_text
+                    .as_ref()
+                    .and_then(|text| text.correlation.clone()),
+            );
+        }
+    }
+
+    pub(super) fn take_prepared_text(&mut self) -> Option<TextRequest> {
+        self.prepared_text.take()
+    }
+
+    pub(super) fn defer_text(&mut self, text: TextRequest) {
+        if text.user {
+            self.user_texts.push_front(text);
+        } else {
+            self.context_response_pending.push_front(text);
+        }
+        self.context_refresh_pending = true;
+    }
+
+    pub(super) fn begin_text_response(&mut self, request: TextRequest, event_id: String) {
+        self.text_turn = Some(ActiveTextTurn {
+            request,
+            response_id: None,
+            last_response_id: String::new(),
+            response_event_id: event_id,
+            speech_sequence: self.speech_sequence,
+            continuation: false,
+            text: String::new(),
+            terminal: None,
+        });
+    }
+
+    pub(super) fn fail_text(&self, request: TextRequest, reason: &'static str, fault: Fault) {
+        if !request.user {
+            self.publish_context_refresh_event(json!({"type":"agentview.context_response_failed",
+                "correlation": request.correlation, "reason":reason}));
+        }
+        self.text_correlation.send_replace(None);
+        request.reject(fault);
+    }
+
+    pub(super) fn retain_context_response(&mut self, request: TextRequest) {
+        // Correlated completion commands represent one queued delivery. Voice
+        // may win this Frame, but must not consume that unstarted delivery.
+        // Legacy uncorrelated optional cues retain their documented skip policy.
+        if request.correlation.is_some() {
+            self.defer_text(request);
+        }
+    }
+
+    pub(super) fn settle_text_turn(&mut self) {
+        if self
+            .text_turn
+            .as_ref()
+            .is_some_and(|turn| turn.terminal.is_some())
+        {
+            let mut turn = self.text_turn.take().expect("settled text response");
+            let reply = turn.terminal.take().expect("terminal text reply");
+            self.publish_context_refresh_event(json!({
+                "type":if turn.request.user { "agentview.text_response_completed" } else { "agentview.context_response_completed" },
+                "correlation":turn.request.correlation, "item_id":turn.request.item_id,
+                "response_id":reply.response_id, "status":response_status(reply.status),
+            }));
+            turn.request.finish(reply);
+            self.text_correlation.send_replace(None);
+        }
+    }
+
+    fn observe_text_turn(&mut self, event: &Value) {
+        let Some(mut turn) = self.text_turn.take() else {
+            return;
+        };
+        match event["type"].as_str() {
+            Some("response.created") if turn.response_id.is_none() => {
+                // Qwen's response.created does not echo the client's create ID.
+                // If VAD advanced after our create, it may describe automatic
+                // speech rather than this text. Preserve the original request
+                // and its ACKed item until that voice response ends; assigning
+                // this ambiguous response would send a voice answer to text.
+                if turn.speech_sequence != self.speech_sequence {
+                    self.defer_unbound_text(turn);
+                    return;
+                }
+                if let Some(response_id) = event["response"]["id"].as_str() {
+                    turn.response_id = Some(response_id.to_owned());
+                    turn.last_response_id = response_id.to_owned();
+                    turn.continuation = false;
+                    turn.text.clear();
+                    if let Some(correlation) = &turn.request.correlation {
+                        self.text_correlations
+                            .remember_response(response_id, correlation);
+                    }
+                    turn.request.admit(response_id);
+                    self.publish_context_refresh_event(json!({
+                        "type":if turn.request.user { "agentview.text_response_started" } else { "agentview.context_response_started" },
+                        "correlation":turn.request.correlation, "item_id":turn.request.item_id,
+                        "response_id":response_id,
+                    }));
+                }
+            }
+            Some("response.audio_transcript.done" | "response.text.done")
+                if event["response_id"].as_str() == turn.response_id.as_deref() =>
+            {
+                if let Some(text) = event["transcript"]
+                    .as_str()
+                    .or_else(|| event["text"].as_str())
+                {
+                    turn.text = text.to_owned();
+                }
+            }
+            Some("response.done")
+                if event["response"]["id"].as_str() == turn.response_id.as_deref() =>
+            {
+                let response = &event["response"];
+                // The terminal envelope also carries the provider's final
+                // content. Some sessions omit separate transcript/text-done
+                // events; keep their actual text in the acknowledged receipt.
+                if turn.text.is_empty() {
+                    turn.text = response["output"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|item| item["type"] == "message" && item["role"] == "assistant")
+                        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+                        .filter_map(|part| {
+                            part["transcript"]
+                                .as_str()
+                                .or_else(|| part["text"].as_str())
+                        })
+                        .collect();
+                }
+                let output = response["output"].as_array();
+                let tools = output
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item["type"] == "function_call");
+                let mut has_tools = false;
+                for tool in tools {
+                    has_tools = true;
+                    if let (Some(call_id), Some(correlation)) = (
+                        tool["call_id"].as_str(),
+                        turn.request.correlation.as_deref(),
+                    ) {
+                        self.text_correlations.remember(call_id, correlation);
+                    }
+                }
+                let status = match response["status"].as_str() {
+                    Some("completed") => QwenRealtimeResponseStatus::Completed,
+                    Some("cancelled") => QwenRealtimeResponseStatus::Cancelled,
+                    Some("incomplete") => QwenRealtimeResponseStatus::Incomplete,
+                    _ => QwenRealtimeResponseStatus::Failed,
+                };
+                if status == QwenRealtimeResponseStatus::Completed && has_tools {
+                    turn.continuation = true;
+                    turn.response_id = None;
+                } else {
+                    turn.terminal = Some(QwenRealtimeTextReply {
+                        response_id: turn.response_id.clone().unwrap_or_default(),
+                        text: turn.text.clone(),
+                        status,
+                        error: (status == QwenRealtimeResponseStatus::Failed).then(|| {
+                            super::output::server_error(&response["status_details"]["error"])
+                        }),
+                    });
+                }
+            }
+            _ => {}
+        }
+        self.text_turn = Some(turn);
+    }
+
+    // Voice VAD and an explicit create can advance before the create has a
+    // provable response identity. Preserve the original ACKed text, clearing
+    // only this create's ownership; the voice terminal opens the next Frame.
+    fn defer_unbound_text(&mut self, turn: ActiveTextTurn) {
+        self.publish_context_refresh_event(json!({
+            "type":"agentview.text_response_deferred",
+            "correlation":turn.request.correlation,
+            "item_id":turn.request.item_id, "reason":"user_turn",
+        }));
+        self.text_correlation.send_replace(None);
+        self.context_generation_waiting = None;
+        if turn.request.user {
+            if self.retired_text_creates.len() == ABANDONED_NOTICES {
+                self.retired_text_creates.pop_front();
+            }
+            self.retired_text_creates.push_back(turn.response_event_id);
+            self.defer_text(turn.request);
+        } else {
+            self.retain_context_response(turn.request);
+        }
+    }
+
+    pub(super) fn isolated_text_failure(&self, event: &Value) -> bool {
+        event["type"] == "response.done"
+            && self.text_turn.as_ref().is_some_and(|turn| {
+                turn.response_id.as_deref() == event["response"]["id"].as_str()
+                    && turn.terminal.as_ref().is_some_and(|reply| {
+                        matches!(
+                            reply.status,
+                            QwenRealtimeResponseStatus::Failed
+                                | QwenRealtimeResponseStatus::Incomplete
+                        )
+                    })
+            })
     }
 
     pub(super) fn context_response_available(&self) -> bool {
@@ -281,7 +556,6 @@ impl Media {
             && !self.awaiting_commit
             && !self.spoken_pending
             && !self.waiting_for_interruption
-            && !self.finished
             && self.context_generation_waiting.is_none()
     }
 
@@ -345,6 +619,38 @@ impl Media {
         self.rejected_notice(event).is_some()
             || self.is_cancel_rejection(event)
             || self.context_response_rejection(event).is_some()
+            || self.text_response_rejection(event)
+            || self.retired_text_rejection(event)
+    }
+
+    fn retired_text_rejection(&self, event: &Value) -> bool {
+        // A deferred create and the next create advance independently of late
+        // provider error delivery. Ignore only a refusal with an exact retired
+        // client event ID, so it cannot reject the newer request or voice.
+        event["type"] == "error"
+            && event["error"]["type"] == "invalid_request_error"
+            && event["error"]["event_id"].as_str().is_some_and(|id| {
+                self.retired_text_creates
+                    .iter()
+                    .any(|retired| retired == id)
+            })
+    }
+
+    fn text_response_rejection(&self, event: &Value) -> bool {
+        // The local explicit create owns one pending response. A rejection of
+        // this event must fail only that input, while unrelated transport or
+        // provider errors keep their existing failure behavior.
+        event["type"] == "error"
+            && event["error"]["type"] == "invalid_request_error"
+            && self.text_turn.as_ref().is_some_and(|turn| {
+                turn.request.user
+                    && turn.response_id.is_none()
+                    && !turn.continuation
+                    && (event["error"]["event_id"].as_str()
+                        == Some(turn.response_event_id.as_str())
+                        || (event["error"]["event_id"].is_null()
+                            && event["error"]["param"] == "response.create"))
+            })
     }
 
     pub(super) fn observe(&mut self, event: &Value) -> Result<(), Fault> {
@@ -364,6 +670,8 @@ impl Media {
         }
         match event["type"].as_str() {
             Some("input_audio_buffer.speech_started") => {
+                self.speech_sequence = self.speech_sequence.wrapping_add(1);
+                self.text_correlation.send_replace(None);
                 self.input_speech = true;
                 self.awaiting_speech_response = true;
                 // User speech can win the race with optional text insertion.
@@ -417,12 +725,14 @@ impl Media {
                 }
             }
             Some("response.done") => {
+                self.text_cancelled_response = None;
                 self.context_generation_waiting = None;
                 self.spoken_pending = false;
                 self.notice = None;
             }
             _ => {}
         }
+        self.observe_text_turn(event);
         if self.mode == Mode::SmartTurnV2 {
             match event["type"].as_str() {
                 Some("input_audio_buffer.speech_started") if self.decoder.is_responding() => {
@@ -524,7 +834,15 @@ impl Media {
     }
 
     pub(super) fn is_finished(&self) -> bool {
-        self.finished && self.spoken.is_empty()
+        // Finish closes the input producer, while the socket still owns every
+        // accepted text and completion cue. Close only after those queued
+        // deliveries settle; otherwise Finish would drop their receipts.
+        self.finished
+            && self.spoken.is_empty()
+            && self.user_texts.is_empty()
+            && self.context_response_pending.is_empty()
+            && self.prepared_text.is_none()
+            && self.text_turn.is_none()
     }
 
     pub(super) fn take_spoken_items(&mut self) -> Vec<String> {
@@ -551,6 +869,20 @@ impl Media {
         responding: bool,
     ) -> Result<(Value, usize), Fault> {
         loop {
+            // New text can reach the queue after an earlier response.create
+            // but before Qwen assigns its response ID. The socket reader keeps
+            // this intent until that response becomes cancellable. Deferring
+            // an ACKed item after a VAD race does not set this new-input intent.
+            if self.interrupt_for_text {
+                if let Some(response_id) = self.decoder.active_response().map(str::to_owned) {
+                    if self.text_cancelled_response.as_deref() != Some(response_id.as_str()) {
+                        transport::send(socket, json!({"type":"response.cancel"}).to_string())
+                            .await?;
+                        self.text_cancelled_response = Some(response_id);
+                    }
+                    self.interrupt_for_text = false;
+                }
+            }
             if let Some(item_id) = self.notice_cleanup.pop_front() {
                 // An acknowledged optional item lost the race to user speech.
                 // Remove it before forwarding more input where possible; its
@@ -578,7 +910,13 @@ impl Media {
                 && !self.awaiting_speech_response
                 && !self.awaiting_commit;
             let can_speak = idle && !self.spoken_pending;
-            if self.mode == Mode::SmartTurnV2 && can_speak && self.context_refresh_pending {
+            if can_speak && !self.user_texts.is_empty() {
+                self.prepare_text_frame();
+            }
+            if self.mode == Mode::SmartTurnV2
+                && can_speak
+                && (self.context_refresh_pending || self.prepared_text.is_some())
+            {
                 return Ok((json!({"type":"agentview.context_refresh"}), 0));
             }
             let notice_ready = idle
@@ -594,7 +932,7 @@ impl Media {
                     || Instant::now() + NOTICE_ACK_TIMEOUT,
                     |notice| notice.deadline,
                 );
-            if self.finished && !responding && !self.spoken_pending && self.spoken.is_empty() {
+            if self.is_finished() && !responding && !self.spoken_pending {
                 return Ok((json!({"type":"agentview.input_finished"}), 0));
             }
             if self.commit_pending || self.awaiting_commit || self.waiting_for_interruption {
@@ -658,10 +996,15 @@ impl Media {
                     }
                     Some(Input::SetMuted(_)) => {},
                     Some(Input::Speak(spoken)) => self.spoken.push_back(spoken),
+                    Some(Input::UserText(text)) => {
+                        self.user_texts.push_back(text);
+                        self.context_refresh_pending = true;
+                        self.interrupt_for_text = true;
+                    },
                     Some(Input::RefreshContext) => self.context_refresh_pending = true,
                     Some(Input::RefreshContextAndRespond(instruction)) => {
                         self.context_refresh_pending = true;
-                        self.context_response_pending = Some(instruction);
+                        self.context_response_pending.push_back(instruction);
                     }
                     Some(Input::Commit) if responding => self.commit_pending = true,
                     Some(Input::Commit) => self.commit(socket).await?,
@@ -705,6 +1048,29 @@ impl Media {
     }
 
     pub(super) fn admit(&mut self, event: Value, bytes: usize) -> Result<(Value, usize), Fault> {
+        if self.retired_text_rejection(&event) {
+            self.events.publish_server_event(Arc::new(event));
+            return Ok((json!({"type":"agentview.text_create_retired"}), 0));
+        }
+        if self.text_response_rejection(&event) {
+            self.events.publish_server_event(Arc::new(event.clone()));
+            if let Some(turn) = self.text_turn.take() {
+                // A VAD event after this create makes its refusal a speech
+                // race, rather than a refusal of the original text input.
+                // Keep that ACKed input queued, without inserting it again.
+                if turn.speech_sequence != self.speech_sequence {
+                    self.defer_unbound_text(turn);
+                } else {
+                    self.fail_text(
+                        turn.request,
+                        "provider_rejected",
+                        super::output::server_error(&event["error"]),
+                    );
+                }
+            }
+            self.context_generation_waiting = None;
+            return Ok((json!({"type":"agentview.text_response_rejected"}), 0));
+        }
         // This optional response can lose a race after all context ACKs but
         // before the server handles response.create. Only its owned rejection
         // retires the cue and wait; late errors cannot cancel a newer response.
@@ -718,6 +1084,13 @@ impl Media {
             }));
             if current {
                 self.context_generation_waiting = None;
+                if let Some(turn) = self.text_turn.take() {
+                    self.fail_text(
+                        turn.request,
+                        "provider_rejected",
+                        Fault::retryable(Code::Rejected, Reason::RequestPreparation),
+                    );
+                }
             }
             return Ok((
                 json!({"type":"agentview.context_response_rejected", "cancel_wait":current,
@@ -856,6 +1229,15 @@ impl Media {
         self.commit_pending = false;
         self.awaiting_commit = true;
         Ok(())
+    }
+}
+
+fn response_status(status: QwenRealtimeResponseStatus) -> &'static str {
+    match status {
+        QwenRealtimeResponseStatus::Completed => "completed",
+        QwenRealtimeResponseStatus::Cancelled => "cancelled",
+        QwenRealtimeResponseStatus::Incomplete => "incomplete",
+        QwenRealtimeResponseStatus::Failed => "failed",
     }
 }
 

@@ -260,6 +260,7 @@ impl<'a> Exchange<'a> {
             Some(
                 Input::Commit
                 | Input::Clear
+                | Input::UserText(_)
                 | Input::RefreshContext
                 | Input::RefreshContextAndRespond(_),
             ) => {}

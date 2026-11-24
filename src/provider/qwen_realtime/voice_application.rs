@@ -16,7 +16,9 @@ use crate::component::{
 use super::{
     audio::encode_pcm16,
     media::{closed, Input, Interrupt, Media, SpokenText},
+    text::{TextCorrelations, TextRequest},
     Mode, QwenRealtimeMediaEvents, QwenRealtimeMediaInput, QwenRealtimeProvider,
+    QwenRealtimeTextTurn,
 };
 
 type VoiceReceiver = Arc<Mutex<Option<mpsc::Receiver<Input>>>>;
@@ -34,7 +36,7 @@ const MAX_SPOKEN_TEXT_BYTES: usize = 64 * 1024;
 pub struct QwenRealtimeVoiceApplication(Application<QwenRealtimeProvider>);
 
 impl QwenRealtimeVoiceApplication {
-    /// Mount a voice-only Component tree and create its audio input and output handles.
+    /// Mount a realtime Component tree and create its input and output handles.
     pub fn mount(
         root: impl Fn() -> Component + Send + Sync + 'static,
         provider: QwenRealtimeProvider,
@@ -78,6 +80,7 @@ pub(crate) fn mount_voice<P: ReactionPort + 'static>(
     active_response: watch::Receiver<Option<String>>,
 ) -> Result<(Application<P>, QwenRealtimeVoiceInput), ApplicationFault> {
     let context_refresh_supported = provider.supports_context_refresh();
+    let (text_correlation, text_correlations) = provider_input.text_correlations();
     let (sender, receiver) = mpsc::channel(8);
     let receiver = Arc::new(Mutex::new(Some(receiver)));
     let input = QwenRealtimeVoiceInput {
@@ -85,6 +88,9 @@ pub(crate) fn mount_voice<P: ReactionPort + 'static>(
         active_response,
         pending_speech: Arc::new(Semaphore::new(PENDING_SPEECH_CAPACITY)),
         context_refresh_supported,
+        pending_text: Arc::new(Semaphore::new(32)),
+        text_correlation,
+        text_correlations,
     };
     let component_input = input.clone();
     let app = Application::mount(
@@ -125,16 +131,119 @@ fn voice_input(receiver: VoiceReceiver, provider: QwenRealtimeMediaInput) -> Com
     Component::realtime_audio()
 }
 
-/// The bounded microphone input for an independent voice Application.
+/// The bounded microphone, text and control input for a voice Application.
 #[derive(Clone)]
 pub struct QwenRealtimeVoiceInput {
     sender: mpsc::Sender<Input>,
     active_response: watch::Receiver<Option<String>>,
     pending_speech: Arc<Semaphore>,
     context_refresh_supported: bool,
+    pending_text: Arc<Semaphore>,
+    text_correlation: watch::Receiver<Option<String>>,
+    text_correlations: TextCorrelations,
 }
 
 impl QwenRealtimeVoiceInput {
+    /// Send an ordinary user message on the mounted Smart Turn session.
+    /// The receipt waits for the user item's ACK and its first response identity.
+    /// A newer message cancels the preceding generated response, then waits for
+    /// that response's terminal before sending this message. Dropping a waiter
+    /// never retracts a message already accepted by the input queue.
+    pub async fn submit_text(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<QwenRealtimeTextTurn, ReactionPortFault> {
+        self.submit_user_text(None, text.into()).await
+    }
+
+    /// Retain an opaque application correlation outside model-visible content.
+    pub async fn submit_text_with_correlation(
+        &self,
+        correlation: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<QwenRealtimeTextTurn, ReactionPortFault> {
+        self.submit_user_text(Some(correlation.into()), text.into())
+            .await
+    }
+
+    async fn submit_user_text(
+        &self,
+        correlation: Option<String>,
+        text: String,
+    ) -> Result<QwenRealtimeTextTurn, ReactionPortFault> {
+        let permit = self.text_permit(&text)?;
+        let (request, admission) = TextRequest::acknowledged(text, correlation, true, permit);
+        self.send(Input::UserText(request)).await?;
+        admission.await.map_err(|_| closed())?
+    }
+
+    /// Queue one trusted completion cue. Every cue retains its own FIFO slot
+    /// while speech is busy. Raw context_response_started/completed/failed events
+    /// carry this correlation and the provider's actual response identity.
+    pub async fn queue_context_response(
+        &self,
+        correlation: impl Into<String>,
+        instruction: impl Into<String>,
+    ) -> Result<(), ReactionPortFault> {
+        let instruction = instruction.into();
+        let permit = self.text_permit(&instruction)?;
+        let mut request = TextRequest::queued(instruction, permit);
+        request.correlation = Some(correlation.into());
+        self.send(Input::RefreshContextAndRespond(request)).await
+    }
+
+    /// Queue a service-authored reply and receive its acknowledged final result.
+    pub async fn respond_with_correlation(
+        &self,
+        correlation: impl Into<String>,
+        instruction: impl Into<String>,
+    ) -> Result<QwenRealtimeTextTurn, ReactionPortFault> {
+        let instruction = instruction.into();
+        let permit = self.text_permit(&instruction)?;
+        let (request, admission) =
+            TextRequest::acknowledged(instruction, Some(correlation.into()), false, permit);
+        self.send(Input::RefreshContextAndRespond(request)).await?;
+        admission.await.map_err(|_| closed())?
+    }
+
+    /// The formal text selected for the next Frame, available to preparations.
+    /// Use text_correlation_for_call for authorization of an actual tool call.
+    pub fn current_text_correlation(&self) -> Option<String> {
+        self.text_correlation.borrow().clone()
+    }
+
+    /// Look up the immutable input owner of an admitted native tool call.
+    pub fn text_correlation_for_call(&self, call_id: &str) -> Option<String> {
+        self.text_correlations.get(call_id)
+    }
+
+    /// Look up the immutable input owner of a provider response, including tools.
+    pub fn text_correlation_for_response(&self, response_id: &str) -> Option<String> {
+        self.text_correlations.response(response_id)
+    }
+
+    fn text_permit(
+        &self,
+        text: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ReactionPortFault> {
+        // The API caller owns each new text. Reject only an unusable command or
+        // excess queue entry, preserving all earlier inputs and live microphone.
+        if !self.context_refresh_supported
+            || text.trim().is_empty()
+            || text.len() > MAX_SPOKEN_TEXT_BYTES
+        {
+            return Err(ReactionPortFault::retryable(
+                ReactionPortFaultCode::Rejected,
+                ReactionPortFaultReason::RequestPreparation,
+            ));
+        }
+        self.pending_text.clone().try_acquire_owned().map_err(|_| {
+            ReactionPortFault::retryable(
+                ReactionPortFaultCode::Limit,
+                ReactionPortFaultReason::RequestPreparation,
+            )
+        })
+    }
     /// Queue a context-only Frame refresh after changing Component Signals.
     ///
     /// Qwen Smart Turn v2 re-renders the mounted tree and submits its current
@@ -202,7 +311,10 @@ impl QwenRealtimeVoiceInput {
             ));
         }
         self.send(match instruction {
-            Some(instruction) => Input::RefreshContextAndRespond(instruction),
+            Some(instruction) => {
+                let permit = self.text_permit(&instruction)?;
+                Input::RefreshContextAndRespond(TextRequest::queued(instruction, permit))
+            }
             None => Input::RefreshContext,
         })
         .await

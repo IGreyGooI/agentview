@@ -4,6 +4,7 @@ mod audio;
 pub(crate) mod media;
 mod output;
 mod request;
+mod text;
 pub(crate) mod transport;
 pub(crate) mod voice_application;
 mod voiceprint;
@@ -38,6 +39,7 @@ pub use audio::{
 use media::Media;
 pub use media::{QwenRealtimeMediaEvents, QwenRealtimeMediaInput, QwenRealtimeServerEvents};
 use output::Decoder;
+pub use text::{QwenRealtimeTextReply, QwenRealtimeTextTurn};
 use transport::Socket;
 pub use voice_application::{QwenRealtimeVoiceApplication, QwenRealtimeVoiceInput};
 pub use voiceprint::QwenRealtimeVoiceprintAudioUrl;
@@ -455,6 +457,10 @@ impl ReactionPort for QwenRealtimeProvider {
             .retained
             .as_mut()
             .ok_or_else(transport::protocol_fault)?;
+        if let Some(media) = &mut retained.session.media {
+            media.settle_text_turn();
+            media.prepare_text_frame();
+        }
         if feedback_pending
             || retained
                 .output
@@ -540,12 +546,13 @@ async fn start_response(
     if let (Some(media), Some(created)) = (&mut session.media, created) {
         media.observe(&created)?;
     }
-    let (deferred_context, context_instruction) = session
+    let (deferred_context, mut context_instruction) = session
         .media
         .as_mut()
         .map(Media::begin_context_frame)
         .unwrap_or_default();
     let context_response = context_instruction.is_some();
+    let mut user_text = session.media.as_mut().and_then(Media::take_prepared_text);
     session.context_setup = optional_context || deferred_context;
     transport::send(&mut session.socket, commands.update).await?;
     let updated = match next_ack(
@@ -560,6 +567,17 @@ async fn start_response(
         Some(updated) => updated,
         None => {
             session.context_setup = false;
+            for request in context_instruction
+                .take()
+                .into_iter()
+                .chain(user_text.take())
+            {
+                session.media.as_ref().expect("text media").fail_text(
+                    request,
+                    "context_rejected",
+                    Fault::retryable(Code::Rejected, Reason::RequestPreparation),
+                );
+            }
             if context_response {
                 session.observe_context_response(revision, false, "context_rejected");
             }
@@ -603,6 +621,17 @@ async fn start_response(
             );
             let rejected_frame = session.frame;
             session.context_setup = false;
+            for request in context_instruction
+                .take()
+                .into_iter()
+                .chain(user_text.take())
+            {
+                session.media.as_ref().expect("text media").fail_text(
+                    request,
+                    "context_rejected",
+                    Fault::retryable(Code::Rejected, Reason::RequestPreparation),
+                );
+            }
             if context_response {
                 session.observe_context_response(revision, false, "context_rejected");
             }
@@ -694,32 +723,125 @@ async fn start_response(
     let mut user_turn_won = context_response && session.user_turn_owns_context_response();
     let mut context_cue = None;
     let mut cue_rejected = false;
-    if let Some(instruction) = context_instruction.filter(|_| !user_turn_won && rejected_items == 0)
-    {
-        let cue = serde_json::json!({"type":"conversation.item.create", "item": {
-            "type":"message", "role":"user",
-            "content":[{"type":"input_text", "text":instruction}],
-        }})
-        .to_string();
-        context_cue = create_item(&mut session, &mut bytes, cue, true).await?;
-        cue_rejected = context_cue.is_none();
-        user_turn_won = session.user_turn_owns_context_response();
-        if let Some(id) = &context_cue {
-            if user_turn_won {
-                // The cue belongs only to this optional reply. If real speech
-                // wins its insertion race, retire it now instead of leaving a
-                // standing instruction in later user or scheduled turns.
-                delete_optional_context_item(&mut session, &mut bytes, id).await?;
-                context_cue = None;
+    let mut text_generation = false;
+    if let Some(mut request) = user_text.take() {
+        if session.user_turn_owns_context_response() {
+            user_turn_won = true;
+            session
+                .media
+                .as_mut()
+                .expect("text media")
+                .defer_text(request);
+        } else {
+            let item_id = match request.item_id.clone() {
+                Some(id) => Some(id),
+                None => {
+                    let id = format!(
+                        "msg_agentview_text_{}",
+                        NEXT_CONTEXT_RESPONSE.fetch_add(1, Ordering::Relaxed)
+                    );
+                    let item = serde_json::json!({"type":"conversation.item.create", "item":{
+                        "id":id, "type":"message", "role":"user",
+                        "content":[{"type":"input_text", "text":request.text}],
+                    }})
+                    .to_string();
+                    create_item(&mut session, &mut bytes, item, true).await?
+                }
+            };
+            if let Some(item_id) = item_id {
+                request.item_id = Some(item_id.clone());
+                if session.user_turn_owns_context_response() {
+                    user_turn_won = true;
+                    // Audio accepted before this ACK owns the next automatic
+                    // turn. Keep this exact acknowledged text item queued;
+                    // sending it again would duplicate the user's input.
+                    session
+                        .media
+                        .as_mut()
+                        .expect("text media")
+                        .defer_text(request);
+                } else {
+                    let event_id = format!(
+                        "respond_{item_id}_{}",
+                        NEXT_CONTEXT_RESPONSE.fetch_add(1, Ordering::Relaxed)
+                    );
+                    session
+                        .media
+                        .as_mut()
+                        .expect("text media")
+                        .begin_text_response(request, event_id.clone());
+                    transport::send(
+                        &mut session.socket,
+                        serde_json::json!({
+                            "type":"response.create", "event_id":event_id,
+                        })
+                        .to_string(),
+                    )
+                    .await?;
+                    text_generation = true;
+                }
             } else {
-                transient.push(id.clone());
+                session.media.as_ref().expect("text media").fail_text(
+                    request,
+                    "item_rejected",
+                    Fault::retryable(Code::Rejected, Reason::RequestPreparation),
+                );
+            }
+        }
+    }
+    if let Some(mut instruction) = context_instruction.take() {
+        if user_turn_won {
+            session
+                .media
+                .as_mut()
+                .expect("context media")
+                .retain_context_response(instruction);
+        } else if rejected_items > 0 {
+            session.media.as_ref().expect("context media").fail_text(
+                instruction,
+                "context_incomplete",
+                Fault::retryable(Code::Rejected, Reason::RequestPreparation),
+            );
+        } else {
+            let cue = serde_json::json!({"type":"conversation.item.create", "item": {
+                "type":"message", "role":"user",
+                "content":[{"type":"input_text", "text":instruction.text}],
+            }})
+            .to_string();
+            context_cue = create_item(&mut session, &mut bytes, cue, true).await?;
+            cue_rejected = context_cue.is_none();
+            user_turn_won = session.user_turn_owns_context_response();
+            if let Some(id) = &context_cue {
+                if user_turn_won {
+                    // The cue belongs only to this optional reply. If real speech
+                    // wins its insertion race, retire it now instead of leaving a
+                    // standing instruction in later user or scheduled turns.
+                    delete_optional_context_item(&mut session, &mut bytes, id).await?;
+                    context_cue = None;
+                    session
+                        .media
+                        .as_mut()
+                        .expect("context media")
+                        .retain_context_response(instruction);
+                } else {
+                    transient.push(id.clone());
+                    instruction.item_id = Some(id.clone());
+                    context_instruction = Some(instruction);
+                }
+            } else {
+                session.media.as_ref().expect("context media").fail_text(
+                    instruction,
+                    "instruction_rejected",
+                    Fault::retryable(Code::Rejected, Reason::RequestPreparation),
+                );
             }
         }
     }
     let optional_generation =
         context_response && rejected_items == 0 && !cue_rejected && !user_turn_won;
-    let response_requested = !user_turn_won && (ordinary_generation || optional_generation);
-    if response_requested {
+    let response_requested =
+        text_generation || (!user_turn_won && (ordinary_generation || optional_generation));
+    if response_requested && !text_generation {
         let event = if optional_generation {
             let event_id = format!(
                 "context_response_{}",
@@ -732,6 +854,9 @@ async fn start_response(
                     revision,
                     context_cue,
                 );
+                if let Some(instruction) = context_instruction.take() {
+                    media.begin_text_response(instruction, event_id.clone());
+                }
             }
             serde_json::json!({"type":"response.create", "event_id":event_id}).to_string()
         } else {
@@ -880,9 +1005,9 @@ async fn next_ack(
                 // client context item awaits ACK. That event cannot confirm
                 // the client item; ignore it and retain the real ACK ordering.
                 if expected_item.is_some_and(|item| {
-                    ["type", "role"].iter().any(|key| {
-                        event["item"][key].is_string() && event["item"][key] != item[key]
-                    })
+                    ["type", "role", "id"]
+                        .iter()
+                        .any(|key| item[key].is_string() && event["item"][key] != item[key])
                 }) {
                     continue;
                 }
@@ -1039,6 +1164,10 @@ impl InFlight<'_> {
                 .as_mut()
                 .expect("live session")
                 .observe_context_delete(&event);
+            if event["type"] == "agentview.text_response_rejected" {
+                self.expect_immediate_response = false;
+                continue;
+            }
             if event["type"] == "agentview.context_response_rejected" {
                 if event["cancel_wait"] == true {
                     self.expect_immediate_response = false;
@@ -1086,6 +1215,18 @@ impl InFlight<'_> {
                 self.facts.push_back(ProviderFact::ResponseFrame {
                     revision: response_frame.unwrap_or(self.revision),
                 });
+            }
+            let mut event = event;
+            // A failed explicit text/cue is scoped to that one queued turn.
+            // Media has already published its real terminal and receipt. Close
+            // only this Frame's fact stream as interrupted so voice continues.
+            if self
+                .session
+                .as_ref()
+                .and_then(|session| session.media.as_ref())
+                .is_some_and(|media| media.isolated_text_failure(&event))
+            {
+                event["response"]["status"] = Value::String("cancelled".into());
             }
             self.facts.extend(self.decoder.on_event(event)?);
             if self.decoder.is_complete() {

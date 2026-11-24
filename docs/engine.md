@@ -309,6 +309,28 @@ raw media 订阅中的 `agentview.context_refresh_applied/incomplete/rejected` �
 `agentview.context_response_requested/skipped` 是本地交付观测，独立于 tracing filter，
 只含 provider session、opaque Frame revision、固定原因和计数，不携带上下文、任务结果或指令正文。
 
+同一 Qwen 语音 Application 通过 `submit_text(text)` 或
+`submit_text_with_correlation(correlation, text)` 接纳正式文字。它经既有 Component 的有界入口，
+在同一 Reaction、WebSocket 和正常 Frame 边界发送 `role=user`、原样 `input_text`；相同文字的
+两次提交仍是两个独立输入。正式文字优先于尚未开始的完成通知；已有回答先收到 `response.cancel`，
+待该回答的终态后再交付新文字。若用户语音抢先，已确认的文字项继续保留，等待语音终态后起答，
+不重复插入 user item；没有可确证归属的自动语音回答不会绑定到文字回执。
+
+`submit_text*` 与 `respond_with_correlation(correlation, trusted_instruction)` 等待实际 item ACK
+和首个 `response.created`，返回带真实 `item_id`、`response_id` 的 `QwenRealtimeTextTurn`。
+其 `completed().await` 等待 native tool 续轮以及 Frame 回调结算，再返回最终 response ID、
+原始回答文字、completed/cancelled/failed/incomplete 状态与 provider fault。丢弃 waiter 不撤回
+已排队输入。`queue_context_response(correlation, trusted_instruction)` 仅等待排队；可信完成通知
+逐条 FIFO 保留，语音竞争只推迟未开始的通知。单条客户端拒绝或失败终态只结算该条，语音继续。
+文字与完成通知共用最多32条待结算请求，每条最多64 KiB；超过限额只拒绝新请求。
+
+correlation 只存于 SDK 本地。raw 订阅中的 `agentview.text_response_started/completed`、
+`agentview.context_response_started/completed/failed` 携带该值和真实 response ID；未起答失败可能
+没有 response ID。`text_correlation_for_call(call_id)` 在 native tool dispatch 前冻结归属，
+`text_correlation_for_response(response_id)` 在响应开始时冻结归属，两类查询各保留最近128项。
+`current_text_correlation()` 仅供下一 Frame preparation 选择文字上下文，不代替具体 tool call
+归属。普通 Signal 写入依然只刷新本地投影，不新增生成请求。
+
 `app.react(ephemeral: bool)` 在准入时选择历史分支。`ephemeral=true` 始终创建 Temporary，
 即使没有活动 Main，也不领取或推进主 port/session；每次都从最近的合法主 checkpoint 创建新 sibling。
 `ephemeral=false` 保留自动分类：没有占用主线执行位时为 Main，否则为 Temporary。
