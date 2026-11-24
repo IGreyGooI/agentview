@@ -138,6 +138,143 @@ async fn formal_text_reuses_voice_socket_and_keeps_equal_inputs_and_exact_conten
 }
 
 #[tokio::test]
+async fn formal_text_cancels_while_microphone_forwarding_and_its_queue_are_blocked() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let server =
+        tokio::spawn(async move {
+            let mut socket = accept_session(&listener).await;
+            let update = receive(&mut socket).await;
+            acknowledge_update(&mut socket, &update).await;
+            send_input(&mut socket, "old_input").await;
+            send(
+                &mut socket,
+                json!({"type":"response.created", "response":{
+                    "id":"blocked_old", "status":"in_progress", "output":[],
+                }}),
+            )
+            .await;
+            // Smart Turn pauses microphone forwarding during interruption. That
+            // pause must leave an independent way for formal text to cancel it.
+            send(
+                &mut socket,
+                json!({"type":"input_audio_buffer.speech_started",
+            "item_id":"pending_barge", "audio_start_ms":200}),
+            )
+            .await;
+            assert_eq!(
+                receive(&mut socket).await,
+                json!({"type":"response.cancel"})
+            );
+            send(
+                &mut socket,
+                json!({"type":"response.done", "response":{
+                    "id":"blocked_old", "status":"cancelled", "output":[],
+                    "status_details":{"type":"cancelled", "reason":"client_cancelled"},
+                }}),
+            )
+            .await;
+            send(
+                &mut socket,
+                json!({"type":"input_audio_buffer.speech_stopped",
+            "item_id":"pending_barge", "audio_end_ms":300, "reason":"turn_invalid"}),
+            )
+            .await;
+            let user = receive_user_text(&mut socket).await;
+            assert_eq!(user["item"]["content"][0]["text"], "打断后回答");
+            acknowledge_item(&mut socket, &user).await;
+            assert_eq!(receive(&mut socket).await["type"], "response.create");
+            send(
+                &mut socket,
+                json!({"type":"response.created", "response":{
+                    "id":"after_block", "status":"in_progress", "output":[],
+                }}),
+            )
+            .await;
+            send(&mut socket, json!({"type":"response.done", "response":{
+            "id":"after_block", "status":"completed", "output":[{
+                "id":"after_block_item", "type":"message", "status":"completed", "role":"assistant",
+                "content":[{"type":"audio", "transcript":"已打断。"}],
+            }],
+        }})).await;
+            loop {
+                match socket.next().await.unwrap().unwrap() {
+                    Message::Text(raw) => {
+                        let event: Value = serde_json::from_str(raw.as_str()).unwrap();
+                        match event["type"].as_str().unwrap() {
+                            "session.update" => acknowledge_update(&mut socket, &event).await,
+                            "input_audio_buffer.append" => {}
+                            "conversation.item.delete" => send(
+                                &mut socket,
+                                json!({
+                                    "type":"conversation.item.deleted", "item_id":event["item_id"],
+                                }),
+                            )
+                            .await,
+                            other => panic!("unexpected close command {other}"),
+                        }
+                    }
+                    Message::Close(_) => {
+                        let _ = socket.close(None).await;
+                        break;
+                    }
+                    other => panic!("unexpected close frame {other:?}"),
+                }
+            }
+        });
+    let (mut application, input, events) =
+        QwenRealtimeVoiceApplication::mount(|| view! {}, text_voice_provider(&endpoint)).unwrap();
+    let mut raw = events.subscribe_server_events();
+    let operation = async {
+        loop {
+            let event = raw.next_event().await.unwrap();
+            if event["type"] == "input_audio_buffer.speech_started"
+                && event["item_id"] == "pending_barge"
+            {
+                break;
+            }
+        }
+        let (saturated, saturation) = oneshot::channel();
+        let microphone = input.clone();
+        let flood = tokio::spawn(async move {
+            for _ in 0..41 {
+                microphone.append_pcm16(&[1, 0]).await.unwrap();
+            }
+            saturated.send(()).unwrap();
+            // The next append cannot enter the full Component/provider queues.
+            microphone.append_pcm16(&[1, 0]).await.unwrap();
+        });
+        saturation.await.unwrap();
+        let turn = input
+            .submit_text_with_correlation("urgent", "打断后回答")
+            .await
+            .unwrap();
+        let mut cancel_observed = false;
+        while let Some(event) = raw.next_event().await.ok() {
+            if event["type"] == "agentview.text_response_cancel_sent" {
+                assert_eq!(event["response_id"], "blocked_old");
+                cancel_observed = true;
+                break;
+            }
+        }
+        assert!(cancel_observed);
+        flood.abort();
+        let result = turn.completed().await.unwrap();
+        assert_eq!(result.text, "已打断。");
+        assert_eq!(result.response_id, "after_block");
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(application.run(), operation)
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    application.shutdown().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn newer_text_cancels_a_prior_text_whose_response_identity_arrives_later() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
@@ -152,8 +289,8 @@ async fn newer_text_cancels_a_prior_text_whose_response_identity_arrives_later()
         acknowledge_item(&mut socket, &first).await;
         assert_eq!(receive(&mut socket).await["type"], "response.create");
         first_sent.send(()).unwrap();
-        // This marker follows the newer text through the same Component input
-        // queue, proving the new text was read before the old response started.
+        // The operation sends this marker after observing the socket owner's
+        // local text-queue event, before this response has its identity.
         assert_eq!(receive_audio(&mut socket).await, vec![1, 0]);
         send(
             &mut socket,
@@ -193,8 +330,9 @@ async fn newer_text_cancels_a_prior_text_whose_response_identity_arrives_later()
         .await;
         await_session_close(&mut socket).await;
     });
-    let (mut application, input, _events) =
+    let (mut application, input, events) =
         QwenRealtimeVoiceApplication::mount(|| view! {}, text_voice_provider(&endpoint)).unwrap();
+    let mut raw = events.subscribe_server_events();
     let operation = async {
         ready.await.unwrap();
         let first = async {
@@ -211,6 +349,14 @@ async fn newer_text_cancels_a_prior_text_whose_response_identity_arrives_later()
             let submission = input.submit_text_with_correlation("second", "后来的文字");
             tokio::pin!(submission);
             assert!(futures::poll!(&mut submission).is_pending());
+            loop {
+                let event = raw.next_event().await.unwrap();
+                if event["type"] == "agentview.text_input_queued"
+                    && event["correlation"] == "second"
+                {
+                    break;
+                }
+            }
             input.append_pcm16(&[1, 0]).await.unwrap();
             let reply = submission.await.unwrap().completed().await.unwrap();
             assert_eq!(reply.response_id, "second_text");

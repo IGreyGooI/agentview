@@ -22,6 +22,12 @@ use super::{
 };
 
 type VoiceReceiver = Arc<Mutex<Option<mpsc::Receiver<Input>>>>;
+type ControlReceiver = Arc<Mutex<Option<mpsc::Receiver<VoiceControl>>>>;
+
+struct VoiceControl {
+    input: Option<Input>,
+    forwarded: oneshot::Sender<Result<(), ReactionPortFault>>,
+}
 const PENDING_SPEECH_CAPACITY: usize = 8;
 const MAX_SPOKEN_TEXT_BYTES: usize = 64 * 1024;
 
@@ -83,8 +89,11 @@ pub(crate) fn mount_voice<P: ReactionPort + 'static>(
     let (text_correlation, text_correlations) = provider_input.text_correlations();
     let (sender, receiver) = mpsc::channel(8);
     let receiver = Arc::new(Mutex::new(Some(receiver)));
+    let (controls, control_receiver) = mpsc::channel(32);
+    let control_receiver = Arc::new(Mutex::new(Some(control_receiver)));
     let input = QwenRealtimeVoiceInput {
         sender,
+        controls,
         active_response,
         pending_speech: Arc::new(Semaphore::new(PENDING_SPEECH_CAPACITY)),
         context_refresh_supported,
@@ -96,7 +105,11 @@ pub(crate) fn mount_voice<P: ReactionPort + 'static>(
     let app = Application::mount(
         move || {
             Component::fragment([
-                voice_input(receiver.clone(), provider_input.clone()),
+                voice_input(
+                    receiver.clone(),
+                    control_receiver.clone(),
+                    provider_input.clone(),
+                ),
                 root(component_input.clone()),
             ])
         },
@@ -118,15 +131,44 @@ pub(crate) async fn drive_voice<P: ReactionPort + 'static>(
 }
 
 #[component]
-fn voice_input(receiver: VoiceReceiver, provider: QwenRealtimeMediaInput) -> Component {
+fn voice_input(
+    receiver: VoiceReceiver,
+    controls: ControlReceiver,
+    provider: QwenRealtimeMediaInput,
+) -> Component {
     use_future(move || async move {
         let receiver = receiver.lock().expect("voice input receiver mutex").take();
         let Some(mut receiver) = receiver else { return };
-        while let Some(command) = receiver.recv().await {
-            if provider.send(command).await.is_err() {
-                break;
+        let controls = controls
+            .lock()
+            .expect("voice control receiver mutex")
+            .take();
+        let Some(mut controls) = controls else { return };
+        let microphone = provider.clone();
+        // A paused microphone queue can be full while the provider waits for
+        // an old turn's terminal. Keep this Component's text/control pump live
+        // independently, so that text can send the cancellation ending the wait.
+        tokio::join!(
+            async move {
+                while let Some(command) = receiver.recv().await {
+                    if microphone.send(command).await.is_err() {
+                        break;
+                    }
+                }
+            },
+            async move {
+                while let Some(command) = controls.recv().await {
+                    let result = match command.input {
+                        Some(input) => provider.send(input).await,
+                        None => Ok(()),
+                    };
+                    let _ = command.forwarded.send(result);
+                    if result.is_err() {
+                        break;
+                    }
+                }
             }
-        }
+        );
     });
     Component::realtime_audio()
 }
@@ -135,6 +177,7 @@ fn voice_input(receiver: VoiceReceiver, provider: QwenRealtimeMediaInput) -> Com
 #[derive(Clone)]
 pub struct QwenRealtimeVoiceInput {
     sender: mpsc::Sender<Input>,
+    controls: mpsc::Sender<VoiceControl>,
     active_response: watch::Receiver<Option<String>>,
     pending_speech: Arc<Semaphore>,
     context_refresh_supported: bool,
@@ -396,6 +439,27 @@ impl QwenRealtimeVoiceInput {
     }
 
     async fn send(&self, input: Input) -> Result<(), ReactionPortFault> {
+        if matches!(
+            input,
+            Input::UserText(_) | Input::RefreshContextAndRespond(_)
+        ) {
+            return self.send_control(Some(input)).await;
+        }
+        // Finish stays behind all prior microphone packets. First fence the
+        // independent control pump, so no accepted text can arrive after the
+        // provider decides that its finished input has no pending deliveries.
+        if matches!(input, Input::Finish) {
+            self.send_control(None).await?;
+        }
         self.sender.send(input).await.map_err(|_| closed())
+    }
+
+    async fn send_control(&self, input: Option<Input>) -> Result<(), ReactionPortFault> {
+        let (forwarded, receipt) = oneshot::channel();
+        self.controls
+            .send(VoiceControl { input, forwarded })
+            .await
+            .map_err(|_| closed())?;
+        receipt.await.map_err(|_| closed())?
     }
 }

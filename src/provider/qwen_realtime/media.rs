@@ -60,6 +60,11 @@ pub(crate) enum Input {
     Finish,
 }
 
+enum TextControl {
+    User(TextRequest),
+    Context(TextRequest),
+}
+
 pub(crate) struct SpokenText {
     pub(crate) text: String,
     _permit: OwnedSemaphorePermit,
@@ -83,6 +88,7 @@ pub(crate) struct Interrupt {
 #[derive(Clone)]
 pub struct QwenRealtimeMediaInput {
     sender: mpsc::Sender<Input>,
+    controls: Option<mpsc::Sender<TextControl>>,
     text_correlation: watch::Sender<Option<String>>,
     text_correlations: TextCorrelations,
 }
@@ -94,6 +100,7 @@ impl QwenRealtimeMediaInput {
         (
             Self {
                 sender,
+                controls: None,
                 text_correlation,
                 text_correlations: TextCorrelations::default(),
             },
@@ -130,6 +137,21 @@ impl QwenRealtimeMediaInput {
     }
 
     pub(crate) async fn send(&self, input: Input) -> Result<(), Fault> {
+        let input = match (input, &self.controls) {
+            (Input::UserText(text), Some(controls)) => {
+                return controls
+                    .send(TextControl::User(text))
+                    .await
+                    .map_err(|_| closed());
+            }
+            (Input::RefreshContextAndRespond(text), Some(controls)) => {
+                return controls
+                    .send(TextControl::Context(text))
+                    .await
+                    .map_err(|_| closed());
+            }
+            (input, _) => input,
+        };
         self.sender.send(input).await.map_err(|_| closed())
     }
 }
@@ -216,6 +238,8 @@ pub(crate) fn closed() -> Fault {
 pub(super) struct Media {
     mode: Mode,
     input: mpsc::Receiver<Input>,
+    controls: mpsc::Receiver<TextControl>,
+    controls_closed: bool,
     events: MediaEventsSender,
     decoder: AudioDecoder,
     pending_asr: HashSet<String>,
@@ -253,13 +277,17 @@ pub(super) struct Media {
 
 impl Media {
     pub(super) fn new(mode: Mode) -> (Self, QwenRealtimeMediaInput, QwenRealtimeMediaEvents) {
-        let (sender, input) = QwenRealtimeMediaInput::channel();
+        let (mut sender, input) = QwenRealtimeMediaInput::channel();
+        let (controls, control_input) = mpsc::channel(INPUT_CAPACITY);
+        sender.controls = Some(controls);
         let (events, media_events) = MediaEventsSender::new();
         let (active_response, _) = watch::channel(None);
         (
             Self {
                 mode,
                 input,
+                controls: control_input,
+                controls_closed: false,
                 events,
                 decoder: AudioDecoder::default(),
                 pending_asr: HashSet::new(),
@@ -311,6 +339,7 @@ impl Media {
         let cue = if self.prepared_text.is_none()
             && self.user_texts.is_empty()
             && self.text_turn.is_none()
+            && self.controls.is_empty()
             && self.context_response_available()
         {
             self.context_response_pending.pop_front()
@@ -843,6 +872,7 @@ impl Media {
             && self.context_response_pending.is_empty()
             && self.prepared_text.is_none()
             && self.text_turn.is_none()
+            && self.controls.is_empty()
     }
 
     pub(super) fn take_spoken_items(&mut self) -> Vec<String> {
@@ -878,6 +908,9 @@ impl Media {
                     if self.text_cancelled_response.as_deref() != Some(response_id.as_str()) {
                         transport::send(socket, json!({"type":"response.cancel"}).to_string())
                             .await?;
+                        self.publish_context_refresh_event(json!({
+                            "type":"agentview.text_response_cancel_sent", "response_id":response_id,
+                        }));
                         self.text_cancelled_response = Some(response_id);
                     }
                     self.interrupt_for_text = false;
@@ -935,17 +968,23 @@ impl Media {
             if self.is_finished() && !responding && !self.spoken_pending {
                 return Ok((json!({"type":"agentview.input_finished"}), 0));
             }
-            if self.commit_pending || self.awaiting_commit || self.waiting_for_interruption {
-                return self
-                    .read(
-                        socket,
-                        responding || self.awaiting_commit || self.spoken_pending,
-                    )
-                    .await;
-            }
+            let hold_microphone =
+                self.commit_pending || self.awaiting_commit || self.waiting_for_interruption;
             tokio::select! {
                 biased;
-                result = receive(socket, responding || self.spoken_pending) => {
+                // Microphone forwarding may be paused behind an old response,
+                // and the server may continuously have audio ready. This
+                // separate bounded control lane remains readable in both cases;
+                // accepting text can cancel the response that owns that wait.
+                control = self.controls.recv(), if !self.controls_closed => match control {
+                    Some(TextControl::User(text)) => self.queue_user_text(text),
+                    Some(TextControl::Context(text)) => {
+                        self.context_refresh_pending = true;
+                        self.context_response_pending.push_back(text);
+                    }
+                    None => self.controls_closed = true,
+                },
+                result = receive(socket, responding || self.awaiting_commit || self.spoken_pending) => {
                     let (event, bytes) = result?;
                     return self.admit(event, bytes);
                 }
@@ -981,7 +1020,7 @@ impl Media {
                         deadline:Instant::now() + NOTICE_ACK_TIMEOUT, created:false, requested:false });
                     self.spoken_pending = true;
                 }
-                input = self.input.recv(), if !self.finished => match input {
+                input = self.input.recv(), if !self.finished && !hold_microphone => match input {
                     Some(Input::Append(audio)) => {
                         // Bound the open utterance independently of the ingress queue.
                         if self.mode == Mode::ManualAudio {
@@ -997,9 +1036,7 @@ impl Media {
                     Some(Input::SetMuted(_)) => {},
                     Some(Input::Speak(spoken)) => self.spoken.push_back(spoken),
                     Some(Input::UserText(text)) => {
-                        self.user_texts.push_back(text);
-                        self.context_refresh_pending = true;
-                        self.interrupt_for_text = true;
+                        self.queue_user_text(text);
                     },
                     Some(Input::RefreshContext) => self.context_refresh_pending = true,
                     Some(Input::RefreshContextAndRespond(instruction)) => {
@@ -1042,9 +1079,13 @@ impl Media {
         }
     }
 
-    async fn read(&mut self, socket: &mut Socket, bounded: bool) -> Result<(Value, usize), Fault> {
-        let (event, bytes) = receive(socket, bounded).await?;
-        self.admit(event, bytes)
+    fn queue_user_text(&mut self, text: TextRequest) {
+        self.publish_context_refresh_event(json!({
+            "type":"agentview.text_input_queued", "correlation":text.correlation,
+        }));
+        self.user_texts.push_back(text);
+        self.context_refresh_pending = true;
+        self.interrupt_for_text = true;
     }
 
     pub(super) fn admit(&mut self, event: Value, bytes: usize) -> Result<(Value, usize), Fault> {

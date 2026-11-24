@@ -315,6 +315,12 @@ raw media 订阅中的 `agentview.context_refresh_applied/incomplete/rejected` �
 两次提交仍是两个独立输入。正式文字优先于尚未开始的完成通知；已有回答先收到 `response.cancel`，
 待该回答的终态后再交付新文字。若用户语音抢先，已确认的文字项继续保留，等待语音终态后起答，
 不重复插入 user item；没有可确证归属的自动语音回答不会绑定到文字回执。
+Component 的 `use_future` 分别推进有界麦克风入口与有界文字控制入口；暂停麦克风交付或连续
+收到 provider 音频不能挡住文字取消控制。两条入口仍由同一 socket owner 串行交付，麦克风
+原有的响应终态边界保持不变。Finish 先等待文字控制转交，再沿麦克风队列正常结束输入。
+只有 socket 的 `response.cancel` 写入成功后，raw 订阅才发布
+`agentview.text_response_cancel_sent` 并携带被取消的旧 `response_id`；这证明命令已发送，
+最终是否取消仍取同一 response 的真实终态，不以本地停止播放代替 provider 取消。
 
 `submit_text*` 与 `respond_with_correlation(correlation, trusted_instruction)` 等待实际 item ACK
 和首个 `response.created`，返回带真实 `item_id`、`response_id` 的 `QwenRealtimeTextTurn`。
