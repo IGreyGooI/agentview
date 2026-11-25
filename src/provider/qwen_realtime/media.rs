@@ -19,8 +19,7 @@ use crate::component::execution::{
 use super::{
     audio::{AudioDecoder, QwenRealtimeAudioEvent, QwenRealtimeResponseStatus},
     text::{ActiveTextTurn, ContextReplacementOrigin, TextCorrelations, TextRequest},
-    transport::{self, Socket},
-    Mode, QwenRealtimeTextReply,
+    transport, Mode, QwenRealtimeTextReply, Socket,
 };
 
 const INPUT_CAPACITY: usize = 32;
@@ -1542,13 +1541,14 @@ mod notice_tests {
                 "the retired target must never send a cancellation for the ready newer response"
             );
         });
-        let mut socket = transport::connect(
+        let socket = transport::connect(
             &reqwest::Client::new(),
             &endpoint,
             reqwest::header::HeaderValue::from_static("fixture"),
         )
         .await
         .unwrap();
+        let mut socket = Socket::new(socket, None);
         let (mut media, input, mut events) = Media::new(Mode::SmartTurnV2);
         media
             .admit(

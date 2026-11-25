@@ -15,7 +15,10 @@ use agentview::{
     llm_call::TextTurnEvent,
     pom::ResolvedDocument,
     provider::{
-        qwen_realtime::{QwenRealtimeAudioEvent, QwenRealtimeProvider, QwenRealtimeResponseStatus},
+        qwen_realtime::{
+            QwenRealtimeAudioEvent, QwenRealtimeProvider, QwenRealtimeResponseStatus,
+            QwenRealtimeWireDirection,
+        },
         ModelSpec,
     },
     transcript::{AssistantTextStatus, CanonicalInputItem},
@@ -560,12 +563,22 @@ fn audio_reply(response_id: &str, item_id: &str, text: &str, pcm16: &[u8]) -> Ve
 #[tokio::test]
 async fn native_weather_lookup_delivers_its_result_and_updated_view_before_the_next_response() {
     let (endpoint, server) = spawn_server(vec![tool_reply(), text_reply()]).await;
+    let wire = Arc::new(Mutex::new(Vec::new()));
+    let observed_wire = Arc::clone(&wire);
     let provider = QwenRealtimeProvider::new(
         &endpoint,
         TEST_API_KEY,
         ModelSpec::new(MODEL, 32_768).unwrap(),
     )
-    .unwrap();
+    .unwrap()
+    .with_wire_observer(move |event| {
+        observed_wire.lock().unwrap().push((
+            event.connection_id,
+            event.sequence,
+            event.direction,
+            serde_json::from_str::<Value>(event.raw).unwrap(),
+        ));
+    });
     let probe = InteractionProbe::default();
     let root_probe = probe.clone();
     let observed = Arc::new(Mutex::new(Vec::<ObservedFrame>::new()));
@@ -685,6 +698,36 @@ async fn native_weather_lookup_delivers_its_result_and_updated_view_before_the_n
         1
     );
     assert_eq!(*probe.calls.lock().unwrap(), ["杭州"]);
+
+    let messages = wire.lock().unwrap();
+    assert!(messages.iter().all(|message| message.0 == messages[0].0));
+    assert!(messages
+        .iter()
+        .enumerate()
+        .all(|(index, message)| message.1 == index as u64 + 1));
+    let output_index = messages
+        .iter()
+        .position(|message| {
+            message.2 == QwenRealtimeWireDirection::Send
+                && message.3["item"]["type"] == "function_call_output"
+                && message.3["item"]["call_id"] == "call_lookup"
+        })
+        .expect("the actual tool receipt must be visible on the same connection");
+    let continuation_index = messages
+        .iter()
+        .rposition(|message| {
+            message.2 == QwenRealtimeWireDirection::Send && message.3["type"] == "response.create"
+        })
+        .unwrap();
+    assert!(output_index < continuation_index);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.2 == QwenRealtimeWireDirection::Send
+                && message.3["type"] == "response.create")
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -717,12 +760,22 @@ async fn interrupted_response_reconnects_and_replays_the_partial_text_as_interru
         let _ = next_socket.close(None).await;
         vec![first, second]
     });
+    let wire = Arc::new(Mutex::new(Vec::new()));
+    let observed_wire = Arc::clone(&wire);
     let provider = QwenRealtimeProvider::new(
         &endpoint,
         TEST_API_KEY,
         ModelSpec::new(MODEL, 32_768).unwrap(),
     )
-    .unwrap();
+    .unwrap()
+    .with_wire_observer(move |event| {
+        observed_wire.lock().unwrap().push((
+            event.connection_id,
+            event.sequence,
+            event.direction,
+            serde_json::from_str::<Value>(event.raw).unwrap(),
+        ));
+    });
     let probe = InteractionProbe::default();
     let root_probe = probe.clone();
     let observed = Arc::new(Mutex::new(Vec::<ObservedFrame>::new()));
@@ -813,6 +866,25 @@ async fn interrupted_response_reconnects_and_replays_the_partial_text_as_interru
             .count(),
         1
     );
+    let messages = wire.lock().unwrap();
+    let connections: Vec<_> = messages
+        .iter()
+        .filter(|message| {
+            message.2 == QwenRealtimeWireDirection::Receive
+                && message.3["type"] == "session.created"
+        })
+        .collect();
+    assert_eq!(connections.len(), 2);
+    assert_ne!(connections[0].0, connections[1].0);
+    assert_eq!(connections[0].1, 1);
+    assert_eq!(connections[1].1, 1);
+    for connection in connections {
+        assert!(messages
+            .iter()
+            .filter(|message| message.0 == connection.0)
+            .enumerate()
+            .all(|(index, message)| message.1 == index as u64 + 1));
+    }
 }
 
 #[tokio::test]
@@ -1417,12 +1489,20 @@ async fn voice_ephemeral_context_follows_audio_and_is_deleted_before_the_next_re
         ));
         (exchanges, deleted_ids)
     });
+    let wire = Arc::new(Mutex::new(Vec::new()));
+    let observed_wire = Arc::clone(&wire);
     let provider = QwenRealtimeProvider::new(
         &endpoint,
         TEST_API_KEY,
         ModelSpec::new(MODEL, 32_768).unwrap(),
     )
-    .unwrap();
+    .unwrap()
+    .with_wire_observer(move |event| {
+        observed_wire.lock().unwrap().push((
+            event.direction,
+            serde_json::from_str::<Value>(event.raw).unwrap(),
+        ));
+    });
     let (provider, input, mut events) = provider.with_audio();
     let observed = Arc::new(Mutex::new(Vec::<EphemeralVoiceFrame>::new()));
     let observed_frames = observed.clone();
@@ -1496,4 +1576,27 @@ async fn voice_ephemeral_context_follows_audio_and_is_deleted_before_the_next_re
             .chain(&frame.projection)
             .all(|item| !frame.ephemeral.contains(item)));
     }
+    let messages = wire.lock().unwrap();
+    let outbound: Vec<_> = messages
+        .iter()
+        .filter(|message| message.0 == QwenRealtimeWireDirection::Send)
+        .map(|message| &message.1)
+        .collect();
+    let chunks: Vec<_> = outbound
+        .iter()
+        .filter(|message| message["type"] == "input_audio_buffer.append")
+        .map(|message| STANDARD.decode(message["audio"].as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(chunks, [vec![11, 0], vec![21, 0]]);
+    assert_eq!(
+        outbound
+            .iter()
+            .filter(|message| message["type"] == "conversation.item.delete")
+            .count(),
+        deleted_ids.len()
+    );
+    assert!(messages.iter().all(|message| !message.1["type"]
+        .as_str()
+        .unwrap()
+        .starts_with("agentview.")));
 }

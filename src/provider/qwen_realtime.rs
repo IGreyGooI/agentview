@@ -8,11 +8,15 @@ mod text;
 pub(crate) mod transport;
 pub(crate) mod voice_application;
 mod voiceprint;
+mod wire_observation;
 
 use std::{
     collections::VecDeque,
     num::{NonZeroU128, NonZeroU64},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     task::Poll,
 };
 
@@ -41,9 +45,10 @@ use media::Media;
 pub use media::{QwenRealtimeMediaEvents, QwenRealtimeMediaInput, QwenRealtimeServerEvents};
 use output::Decoder;
 pub use text::{QwenRealtimeTextReply, QwenRealtimeTextTurn};
-use transport::Socket;
 pub use voice_application::{QwenRealtimeVoiceApplication, QwenRealtimeVoiceInput};
 pub use voiceprint::QwenRealtimeVoiceprintAudioUrl;
+use wire_observation::{ObservedSocket as Socket, WireObserver};
+pub use wire_observation::{QwenRealtimeWireDirection, QwenRealtimeWireEvent};
 
 use super::ModelSpec;
 
@@ -106,6 +111,7 @@ pub struct QwenRealtimeProvider {
     voiceprint_audio_urls: Vec<QwenRealtimeVoiceprintAudioUrl>,
     retain_text_conversation: bool,
     session_id: watch::Sender<Option<String>>,
+    wire_observer: Option<Arc<WireObserver>>,
 }
 
 impl QwenRealtimeProvider {
@@ -162,6 +168,7 @@ impl QwenRealtimeProvider {
             voiceprint_audio_urls: Vec::new(),
             retain_text_conversation: false,
             session_id: watch::channel(None).0,
+            wire_observer: None,
         })
     }
 
@@ -181,6 +188,25 @@ impl QwenRealtimeProvider {
     /// attest that the socket is still open. A fresh connection replaces it.
     pub fn subscribe_session_id(&self) -> watch::Receiver<Option<String>> {
         self.session_id.subscribe()
+    }
+
+    /// Observe original JSON text on each subsequently opened WebSocket.
+    ///
+    /// Text, tool and audio modes use the same hook. Each message is observed
+    /// once at the socket, with its connection ID and a sequence shared by both
+    /// directions. Incoming text is observed before JSON parsing or protocol
+    /// admission. Local Application events use their existing subscriptions.
+    ///
+    /// The callback borrows the original text and must remain bounded and
+    /// nonblocking. Copy it into an application-owned queue for file I/O.
+    /// Its panic is contained so observations cannot interrupt the conversation.
+    /// Capturing is disabled by default and copies no message text when disabled.
+    pub fn with_wire_observer(
+        mut self,
+        observer: impl for<'a> Fn(QwenRealtimeWireEvent<'a>) + Send + Sync + 'static,
+    ) -> Self {
+        self.wire_observer = Some(Arc::new(observer));
+        self
     }
 
     /// Configure one target speaker sample for native Qwen Smart Turn enhancement.
@@ -217,7 +243,12 @@ impl QwenRealtimeProvider {
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
         let authorization = self.authorization.clone();
-        async move { transport::connect(&client, &endpoint, authorization).await }.boxed()
+        let observer = self.wire_observer.clone();
+        async move {
+            let socket = transport::connect(&client, &endpoint, authorization).await?;
+            Ok(Socket::new(socket, observer))
+        }
+        .boxed()
     }
 
     fn lose_continuity(&mut self) {
