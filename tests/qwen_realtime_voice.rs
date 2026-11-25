@@ -1512,6 +1512,7 @@ async fn asynchronous_voiceprint_failure_preserves_microphone_and_later_turns() 
 
 async fn exercise_native_voiceprint(case: VoiceprintCase) {
     const AUDIO_URL: &str = "https://audio.example/speaker.wav?expires=123&signature=fixture";
+    const OTHER_AUDIO_URL: &str = "https://audio.example/other-speaker.wav";
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -1521,7 +1522,7 @@ async fn exercise_native_voiceprint(case: VoiceprintCase) {
         assert_eq!(update["session"]["turn_detection"]["type"], "smart_turn_v2");
         assert_eq!(
             update["session"]["turn_detection"]["voiceprint_audio_urls"],
-            json!([AUDIO_URL])
+            json!([AUDIO_URL, OTHER_AUDIO_URL])
         );
         send(
             &mut socket,
@@ -1586,13 +1587,15 @@ async fn exercise_native_voiceprint(case: VoiceprintCase) {
     });
     let reference =
         QwenRealtimeVoiceprintAudioUrl::new(url::Url::parse(AUDIO_URL).unwrap()).unwrap();
+    let other_reference =
+        QwenRealtimeVoiceprintAudioUrl::new(url::Url::parse(OTHER_AUDIO_URL).unwrap()).unwrap();
     let provider = QwenRealtimeProvider::new(
         &endpoint,
         CREDENTIAL,
         ModelSpec::new(MODEL, 262_144).unwrap(),
     )
     .unwrap()
-    .with_voiceprint_audio_url(reference);
+    .with_voiceprint_audio_urls([reference, other_reference]);
     let (mut app, input, mut events) =
         QwenRealtimeVoiceApplication::mount(|| view! {}, provider).unwrap();
     let mut raw = events.subscribe_server_events();

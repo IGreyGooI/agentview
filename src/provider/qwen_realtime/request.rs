@@ -24,7 +24,7 @@ pub(super) fn encode(
     frame: &Frame,
     max_request_bytes: usize,
     mode: Mode,
-    voiceprint_audio_url: Option<&QwenRealtimeVoiceprintAudioUrl>,
+    voiceprint_audio_urls: &[QwenRealtimeVoiceprintAudioUrl],
 ) -> Result<Commands, ReactionPortFault> {
     let submission = frame.submission();
     if submission.decision().is_some() {
@@ -51,10 +51,14 @@ pub(super) fn encode(
     // Qwen consumes speaker URLs only on the first update. Subsequent Frames
     // retain the same media session, so repeating this field would misrepresent
     // a device setting edit as a live re-registration that the service ignores.
-    if let (FrameBasis::Full, Mode::SmartTurnV2, Some(reference)) =
-        (frame.basis(), mode, voiceprint_audio_url)
+    if matches!((frame.basis(), mode), (FrameBasis::Full, Mode::SmartTurnV2))
+        && !voiceprint_audio_urls.is_empty()
     {
-        session["turn_detection"]["voiceprint_audio_urls"] = json!([reference.as_str()]);
+        let urls: Vec<&str> = voiceprint_audio_urls
+            .iter()
+            .map(QwenRealtimeVoiceprintAudioUrl::as_str)
+            .collect();
+        session["turn_detection"]["voiceprint_audio_urls"] = json!(urls);
     }
     let mut tools = Vec::with_capacity(submission.tools().definitions().len());
     for tool in submission.tools().definitions() {

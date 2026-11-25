@@ -103,7 +103,7 @@ pub struct QwenRealtimeProvider {
     mode: Mode,
     follow_up: bool,
     context_frame_pending: bool,
-    voiceprint_audio_url: Option<QwenRealtimeVoiceprintAudioUrl>,
+    voiceprint_audio_urls: Vec<QwenRealtimeVoiceprintAudioUrl>,
     retain_text_conversation: bool,
     session_id: watch::Sender<Option<String>>,
 }
@@ -159,7 +159,7 @@ impl QwenRealtimeProvider {
             mode: Mode::Text,
             follow_up: false,
             context_frame_pending: false,
-            voiceprint_audio_url: None,
+            voiceprint_audio_urls: Vec::new(),
             retain_text_conversation: false,
             session_id: watch::channel(None).0,
         })
@@ -189,8 +189,18 @@ impl QwenRealtimeProvider {
     /// duplex input on that speaker. Registration runs asynchronously and its
     /// raw server events report success/failure while microphone input continues.
     /// Configure this before mounting `QwenRealtimeVoiceApplication`.
-    pub fn with_voiceprint_audio_url(mut self, reference: QwenRealtimeVoiceprintAudioUrl) -> Self {
-        self.voiceprint_audio_url = Some(reference);
+    pub fn with_voiceprint_audio_url(self, reference: QwenRealtimeVoiceprintAudioUrl) -> Self {
+        self.with_voiceprint_audio_urls([reference])
+    }
+
+    /// Configure samples in order for the first Smart Turn session update.
+    /// Qwen accepts five URLs. It fetches those samples while microphone input
+    /// continues, and an empty list leaves speaker enhancement unconfigured.
+    pub fn with_voiceprint_audio_urls(
+        mut self,
+        references: impl IntoIterator<Item = QwenRealtimeVoiceprintAudioUrl>,
+    ) -> Self {
+        self.voiceprint_audio_urls = references.into_iter().take(5).collect();
         self
     }
 
@@ -378,7 +388,7 @@ impl ReactionPort for QwenRealtimeProvider {
             &frame,
             MAX_REQUEST_BYTES,
             self.mode,
-            self.voiceprint_audio_url.as_ref(),
+            &self.voiceprint_audio_urls,
         )?;
         let tool_feedback = self.follow_up || !frame.submission().staged_inputs().is_empty();
         let optional_context = self.context_frame_pending && !tool_feedback;
