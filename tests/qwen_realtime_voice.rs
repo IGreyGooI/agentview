@@ -1242,6 +1242,169 @@ async fn text_native_tool_continuation_retains_correlation_and_waits_for_settlem
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn user_native_tool_continuation_precedes_a_queued_background_context_reply() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        receive_repeated_instruction(&mut socket).await;
+        assert_eq!(receive_audio(&mut socket).await, [11, 0, 12, 0]);
+        send_input(&mut socket, "user-tool-input").await;
+        send(
+            &mut socket,
+            json!({"type":"response.created", "response":{
+                "id":"response_status", "status":"in_progress", "output":[],
+            }}),
+        )
+        .await;
+
+        // The control pump forwards the background request before this PCM
+        // marker. Keep the user's automatic response active until both have
+        // reached the same socket owner, then complete its native tool call.
+        assert_eq!(receive_audio(&mut socket).await, [21, 0, 22, 0]);
+        finish_tool_reply(&mut socket).await;
+        let mut receipt_delivered = false;
+        loop {
+            let event = receive(&mut socket).await;
+            match event["type"].as_str().unwrap() {
+                "session.update" => acknowledge_update(&mut socket, &event).await,
+                "conversation.item.delete" => {
+                    send(
+                        &mut socket,
+                        json!({"type":"conversation.item.deleted", "item_id":event["item_id"]}),
+                    )
+                    .await;
+                }
+                "conversation.item.create" => {
+                    assert_ne!(
+                        event["item"]["role"], "user",
+                        "a queued background cue must not enter the user's native tool continuation"
+                    );
+                    if event["item"]["type"] == "function_call_output" {
+                        assert_eq!(event["item"]["call_id"], "call_status");
+                        let output: Value =
+                            serde_json::from_str(event["item"]["output"].as_str().unwrap())
+                                .unwrap();
+                        assert_eq!(output, json!({"generation":0}));
+                        receipt_delivered = true;
+                    }
+                    acknowledge_item(&mut socket, &event).await;
+                }
+                "response.create" => {
+                    assert!(receipt_delivered);
+                    assert!(
+                        event.get("event_id").is_none(),
+                        "the first generation after the tool receipt belongs to the user"
+                    );
+                    break;
+                }
+                other => panic!("unexpected user tool continuation command {other}"),
+            }
+        }
+        send_audio_reply(
+            &mut socket,
+            "user-tool-answer",
+            "user-tool-answer-item",
+            "用户工具结果已返回。",
+            &[1, 0],
+            None,
+        )
+        .await;
+
+        let cue = receive_user_text(&mut socket).await;
+        let mut cue_item = cue["item"].clone();
+        cue_item["id"] = json!("background-after-user-tool");
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.created", "item":cue_item}),
+        )
+        .await;
+        let generate = receive(&mut socket).await;
+        assert_eq!(generate["type"], "response.create");
+        assert!(generate["event_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("context_response_"));
+        send_audio_reply(
+            &mut socket,
+            "background-after-user-answer",
+            "background-after-user-answer-item",
+            "后台任务结果已返回。",
+            &[2, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let probe = RefreshProbe::default();
+    let root_probe = probe.clone();
+    let (mut app, input, mut events) = QwenRealtimeVoiceApplication::mount(
+        move || refreshable_assistant(root_probe.clone()),
+        text_voice_provider(&endpoint),
+    )
+    .unwrap();
+    let operation = async {
+        input.append_pcm16(&[11, 0, 12, 0]).await.unwrap();
+        loop {
+            if matches!(events.next_event().await.unwrap(),
+                QwenRealtimeAudioEvent::ResponseStarted { response_id } if response_id == "response_status")
+            {
+                break;
+            }
+        }
+        input
+            .queue_context_response("background-task-result", "播报后台任务完成结果。")
+            .await
+            .unwrap();
+        input.append_pcm16(&[21, 0, 22, 0]).await.unwrap();
+        let mut responses = Vec::new();
+        loop {
+            if let QwenRealtimeAudioEvent::ResponseEnded {
+                response_id,
+                status,
+                ..
+            } = events.next_event().await.unwrap()
+            {
+                assert_eq!(status, QwenRealtimeResponseStatus::Completed);
+                let finished = response_id == "background-after-user-answer";
+                responses.push(response_id);
+                if finished {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            responses,
+            [
+                "response_status",
+                "user-tool-answer",
+                "background-after-user-answer"
+            ]
+        );
+        assert_eq!(input.text_correlation_for_call("call_status"), None);
+        assert_eq!(
+            input.text_correlation_for_response("user-tool-answer"),
+            None
+        );
+        assert_eq!(
+            input.text_correlation_for_response("background-after-user-answer"),
+            Some("background-task-result".into())
+        );
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    server.await.unwrap();
+    assert_eq!(probe.calls.lock().unwrap().len(), 1);
+}
+
 #[derive(Clone, Default)]
 struct VoiceProbe {
     text_frames: Arc<Mutex<Vec<(String, FrameRevision)>>>,
@@ -1658,6 +1821,309 @@ enum ContextReplyCase {
     UserWinsCleanupRefused,
     UserWinsCleanupRefusedTwice,
     ProviderRejects,
+}
+
+#[derive(Clone, Copy)]
+enum ReadySpeechBoundary {
+    BeforeCue,
+    CueAck,
+}
+
+#[tokio::test]
+async fn ready_user_speech_before_context_cue_prevents_optional_generation() {
+    exercise_ready_speech_during_context_reply(ReadySpeechBoundary::BeforeCue).await;
+}
+
+#[tokio::test]
+async fn ready_user_speech_after_context_cue_ack_prevents_optional_generation() {
+    exercise_ready_speech_during_context_reply(ReadySpeechBoundary::CueAck).await;
+}
+
+async fn exercise_ready_speech_during_context_reply(boundary: ReadySpeechBoundary) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (initialized_tx, initialized_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        receive_repeated_instruction(&mut socket).await;
+        assert_eq!(receive_audio(&mut socket).await, [11, 0, 12, 0]);
+        initialized_tx.send(()).unwrap();
+
+        let refresh = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &refresh).await;
+        let repeated = receive(&mut socket).await;
+        assert_eq!(repeated["type"], "conversation.item.create");
+        assert_eq!(repeated["item"]["role"], "system");
+        let ack = match boundary {
+            ReadySpeechBoundary::BeforeCue => {
+                let mut item = repeated["item"].clone();
+                item["id"] = json!("context-before-ready-speech");
+                json!({"type":"conversation.item.created", "item":item})
+            }
+            ReadySpeechBoundary::CueAck => {
+                acknowledge_item(&mut socket, &repeated).await;
+                let cue = receive(&mut socket).await;
+                assert_eq!(cue["type"], "conversation.item.create");
+                assert_eq!(cue["item"]["role"], "user");
+                let mut item = cue["item"].clone();
+                item["id"] = json!("cue-before-ready-speech");
+                json!({"type":"conversation.item.created", "item":item})
+            }
+        };
+
+        // Forwarded PCM can already be committed remotely while the client is
+        // waiting for a context ACK. Put that ACK and the real user turn in one
+        // flush so the user events are ready before optional generation checks.
+        for event in [
+            ack,
+            json!({"type":"input_audio_buffer.speech_started",
+                "item_id":"ready-user-input", "audio_start_ms":0}),
+            json!({"type":"input_audio_buffer.speech_stopped",
+                "item_id":"ready-user-input", "audio_end_ms":100}),
+            json!({"type":"input_audio_buffer.committed", "item_id":"ready-user-input"}),
+            json!({"type":"conversation.item.created", "item":{
+                "id":"ready-user-input", "type":"message", "role":"user", "status":"completed",
+                "content":[{"type":"input_audio"}],
+            }}),
+            json!({"type":"conversation.item.input_audio_transcription.completed",
+                "item_id":"ready-user-input", "content_index":0, "transcript":"先处理我的请求。"}),
+            json!({"type":"response.created", "response":{
+                "id":"ready-user-response", "status":"in_progress", "output":[],
+            }}),
+        ] {
+            socket
+                .feed(Message::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        socket.flush().await.unwrap();
+
+        if matches!(boundary, ReadySpeechBoundary::CueAck) {
+            let delete = receive(&mut socket).await;
+            assert_eq!(
+                delete["type"], "conversation.item.delete",
+                "ready user speech must retire the cue before any optional response.create"
+            );
+            assert_eq!(delete["item_id"], "cue-before-ready-speech");
+            send(
+                &mut socket,
+                json!({"type":"conversation.item.deleted", "item_id":delete["item_id"]}),
+            )
+            .await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "ready user speech must prevent optional cue insertion and response.create"
+        );
+        send(
+            &mut socket,
+            json!({"type":"response.done", "response":{
+                "id":"ready-user-response", "status":"completed", "output":[],
+            }}),
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let probe = RefreshProbe::default();
+    let root_probe = probe.clone();
+    let (mut app, input, mut events) = QwenRealtimeVoiceApplication::mount(
+        move || refreshable_assistant(root_probe.clone()),
+        text_voice_provider(&endpoint),
+    )
+    .unwrap();
+    let mut raw = events.subscribe_server_events();
+    let operation = async {
+        input.append_pcm16(&[11, 0, 12, 0]).await.unwrap();
+        initialized_rx.await.unwrap();
+        probe
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .set(1)
+            .unwrap();
+        input
+            .refresh_context_and_respond_with_instruction("简短播报后台任务结果。")
+            .await
+            .unwrap();
+        let outcome = next_context_response_outcome(&mut raw).await;
+        assert_eq!(outcome["type"], "agentview.context_response_skipped");
+        assert_eq!(outcome["reason"], "user_turn");
+        let mut responses = Vec::new();
+        loop {
+            match events.next_event().await.unwrap() {
+                QwenRealtimeAudioEvent::ResponseStarted { response_id } => {
+                    responses.push(response_id);
+                }
+                QwenRealtimeAudioEvent::ResponseEnded {
+                    response_id,
+                    status,
+                    ..
+                } if response_id == "ready-user-response" => {
+                    assert_eq!(status, QwenRealtimeResponseStatus::Completed);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(responses, ["ready-user-response"]);
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn optional_create_refusal_after_user_response_starts_preserves_voice() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (initialized_tx, initialized_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        assert_eq!(receive_audio(&mut socket).await, [11, 0, 12, 0]);
+        initialized_tx.send(()).unwrap();
+
+        let refresh = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &refresh).await;
+        let cue = receive(&mut socket).await;
+        assert_eq!(cue["type"], "conversation.item.create");
+        assert_eq!(cue["item"]["role"], "user");
+        let mut cue_item = cue["item"].clone();
+        cue_item["id"] = json!("refused-create-cue");
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.created", "item":cue_item}),
+        )
+        .await;
+        let generate = receive(&mut socket).await;
+        assert_eq!(generate["type"], "response.create");
+        assert!(generate["event_id"].as_str().is_some());
+
+        // The optional create is already on the wire when Qwen commits the
+        // previously forwarded speech. Its parameter-only refusal must stay
+        // owned by that create after the user's automatic response has opened.
+        send_input(&mut socket, "speech-before-create-refusal").await;
+        send(
+            &mut socket,
+            json!({"type":"response.created", "response":{
+                "id":"voice-during-create-refusal", "status":"in_progress", "output":[],
+            }}),
+        )
+        .await;
+        send(
+            &mut socket,
+            json!({"type":"error", "error":{
+                "type":"invalid_request_error", "code":"invalid_state",
+                "param":"response.create", "message":"Conversation already has an active response",
+            }}),
+        )
+        .await;
+        let delete = receive(&mut socket).await;
+        assert_eq!(delete["type"], "conversation.item.delete");
+        assert_eq!(delete["item_id"], "refused-create-cue");
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.deleted", "item_id":delete["item_id"]}),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "an optional create refusal must not cancel or replace the user's active response"
+        );
+        send(
+            &mut socket,
+            json!({"type":"response.done", "response":{
+                "id":"voice-during-create-refusal", "status":"completed", "output":[],
+            }}),
+        )
+        .await;
+
+        let next = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &next).await;
+        assert_eq!(receive_audio(&mut socket).await, [21, 0, 22, 0]);
+        send_input(&mut socket, "speech-after-create-refusal").await;
+        send_audio_reply(
+            &mut socket,
+            "voice-after-create-refusal",
+            "voice-after-create-refusal-item",
+            "继续回答用户。",
+            &[3, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let (mut app, input, mut events) =
+        QwenRealtimeVoiceApplication::mount(|| view! {}, text_voice_provider(&endpoint)).unwrap();
+    let mut raw = events.subscribe_server_events();
+    let operation = async {
+        input.append_pcm16(&[11, 0, 12, 0]).await.unwrap();
+        initialized_rx.await.unwrap();
+        input
+            .refresh_context_and_respond_with_instruction("播报一次后台任务结果。")
+            .await
+            .unwrap();
+        assert_eq!(
+            next_context_response_outcome(&mut raw).await["type"],
+            "agentview.context_response_requested"
+        );
+        let skipped = next_context_response_outcome(&mut raw).await;
+        assert_eq!(skipped["type"], "agentview.context_response_skipped");
+        assert_eq!(skipped["reason"], "provider_rejected");
+        let mut completed = Vec::new();
+        let mut audio_received = false;
+        loop {
+            match events.next_event().await.unwrap() {
+                QwenRealtimeAudioEvent::AudioDelta {
+                    response_id, pcm16, ..
+                } if response_id == "voice-after-create-refusal" => {
+                    assert_eq!(pcm16, [3, 0]);
+                    audio_received = true;
+                }
+                QwenRealtimeAudioEvent::ResponseEnded {
+                    response_id,
+                    status,
+                    error,
+                } => {
+                    assert_eq!(status, QwenRealtimeResponseStatus::Completed);
+                    assert!(error.is_none());
+                    completed.push(response_id);
+                    if completed.len() == 2 {
+                        break;
+                    }
+                    input.append_pcm16(&[21, 0, 22, 0]).await.unwrap();
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            completed,
+            ["voice-during-create-refusal", "voice-after-create-refusal"]
+        );
+        assert!(audio_received);
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(DEADLINE, async { tokio::join!(app.run(), operation) })
+            .await
+            .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    app.shutdown().await.unwrap();
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -2125,6 +2591,18 @@ async fn send_audio_reply(
 }
 
 async fn send_tool_reply(socket: &mut WebSocketStream<TcpStream>) {
+    send(
+        socket,
+        json!({
+            "type": "response.created",
+            "response": {"id": "response_status", "status": "in_progress", "output": []},
+        }),
+    )
+    .await;
+    finish_tool_reply(socket).await;
+}
+
+async fn finish_tool_reply(socket: &mut WebSocketStream<TcpStream>) {
     let item = json!({
         "id": "item_status", "object": "realtime.item", "type": "function_call",
         "status": "completed", "call_id": "call_status", "name": "report_status", "arguments": "{}",
@@ -2133,10 +2611,6 @@ async fn send_tool_reply(socket: &mut WebSocketStream<TcpStream>) {
     added["status"] = json!("in_progress");
     added["arguments"] = json!("");
     for event in [
-        json!({
-            "type": "response.created",
-            "response": {"id": "response_status", "status": "in_progress", "output": []},
-        }),
         json!({
             "type": "response.output_item.added", "response_id": "response_status",
             "output_index": 0, "item": added,

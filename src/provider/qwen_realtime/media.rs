@@ -359,13 +359,32 @@ impl Media {
         self.active_response.subscribe()
     }
 
-    pub(super) fn begin_context_frame(&mut self) -> (bool, Option<TextRequest>) {
+    pub(super) fn begin_context_frame(
+        &mut self,
+        tool_feedback: bool,
+    ) -> (bool, Option<TextRequest>) {
         // Only refreshes already consumed by this socket owner are covered by
         // the Frame about to be installed. New requests remain in the input
         // queue, so an ACK cannot erase a later Signal update.
         let refresh = std::mem::take(&mut self.context_refresh_pending);
-        let cue = if self.prepared_text.is_none()
-            && self.user_texts.is_empty()
+        // A provider response with tool calls ends before the user's turn has
+        // finished. Leave the cue queued while that turn still owns the next
+        // generation, so its tool output and the cue cannot share a reply.
+        // A replacement only owns the cancelled reply's slot. If tool feedback
+        // already owns that slot, discard just the replacement instead of
+        // replaying it after another response has run.
+        if tool_feedback {
+            if let Some(origin) = self
+                .context_response_pending
+                .front()
+                .and_then(|request| request.replacement.as_ref())
+            {
+                self.observe_replacement_skipped(&origin.response_id, "tool_continuation");
+                self.context_response_pending.pop_front();
+            }
+        }
+        let cue = if !tool_feedback
+            && !self.has_pending_user_text()
             && self.text_turn.is_none()
             && self.controls.is_empty()
             && self.context_response_available()
@@ -407,6 +426,15 @@ impl Media {
 
     pub(super) fn take_prepared_text(&mut self) -> Option<TextRequest> {
         self.prepared_text.take()
+    }
+
+    pub(super) fn has_pending_user_text(&self) -> bool {
+        // The application can accept a user input while the socket owner awaits
+        // a context ACK. Give that input the next reply even before the owner
+        // receives it, so it does not have to cancel a freshly started cue.
+        !self.user_texts.is_empty()
+            || self.prepared_text.is_some()
+            || self.received_text_sequence != self.text_correlations.accepted_text_sequence()
     }
 
     pub(super) fn defer_text(&mut self, text: TextRequest) {
@@ -667,14 +695,18 @@ impl Media {
             "item_id":turn.request.item_id, "reason":"user_turn",
         }));
         self.text_correlation.send_replace(None);
-        self.context_generation_waiting = None;
         if turn.request.user {
+            self.context_generation_waiting = None;
             if self.retired_text_creates.len() == ABANDONED_NOTICES {
                 self.retired_text_creates.pop_front();
             }
             self.retired_text_creates.push_back(turn.response_event_id);
             self.defer_text(turn.request);
         } else {
+            // Qwen can open the user's automatic response before rejecting our
+            // optional create. Keep ownership of that possible refusal until
+            // the response ends, including errors that name only response.create.
+            // The refusal then cleans up the cue without failing user speech.
             self.retain_context_response(turn.request);
         }
     }
@@ -1123,12 +1155,9 @@ impl Media {
             if can_speak && !self.user_texts.is_empty() {
                 self.prepare_text_frame();
             }
-            if self.mode == Mode::SmartTurnV2
+            let refresh_ready = self.mode == Mode::SmartTurnV2
                 && can_speak
-                && (self.context_refresh_pending || self.prepared_text.is_some())
-            {
-                return Ok((json!({"type":"agentview.context_refresh"}), 0));
-            }
+                && (self.context_refresh_pending || self.prepared_text.is_some());
             let notice_ready = idle
                 && self
                     .notice
@@ -1177,6 +1206,12 @@ impl Media {
                     if let Some(request) = self.replacement_requests.pop_front() {
                         self.replace_context_response(socket, request).await?;
                     }
+                }
+                // The provider may already have detected forwarded voice while
+                // our cached state is idle. Consume ready socket events first
+                // so that input keeps the turn and this refresh stays queued.
+                () = std::future::ready(()), if refresh_ready => {
+                    return Ok((json!({"type":"agentview.context_refresh"}), 0));
                 }
                 () = tokio::time::sleep_until(notice_deadline), if self.notice.as_ref().is_some_and(|notice| !notice.created) => {
                     // The provider did not accept this optional text in time.

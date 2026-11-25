@@ -342,6 +342,54 @@ impl Session {
             .is_some_and(|media| !media.context_response_available())
     }
 
+    fn buffer_response_event(&mut self, event: Value) {
+        let frame = (event["type"] == "response.created")
+            .then_some(self.frame)
+            .flatten();
+        self.pending_events.push_back((event, frame));
+    }
+
+    fn admit_context_event(
+        &mut self,
+        bytes: &mut ResponseBytes,
+        event: Value,
+        count: usize,
+    ) -> Result<Value, Fault> {
+        let (event, count) = match &mut self.media {
+            Some(media) => media.admit(event, count)?,
+            None => (event, count),
+        };
+        let event = bytes.admit(event, count)?;
+        self.observe_context_delete(&event);
+        Ok(event)
+    }
+
+    fn poll_context_response_boundary(&mut self, bytes: &mut ResponseBytes) -> Result<bool, Fault> {
+        // PCM sent before the Frame may already have opened a turn at Qwen.
+        // Consume ready VAD/response events before writing an optional cue or
+        // its create command. Once voice owns the turn, keep its facts bound
+        // to this Frame and defer the cue. Pending I/O does not delay voice.
+        while !self.user_turn_owns_context_response()
+            && !self
+                .media
+                .as_ref()
+                .is_some_and(Media::has_pending_user_text)
+        {
+            let Some(event) = transport::receive_unbounded(&mut self.socket).now_or_never() else {
+                return Ok(false);
+            };
+            let (event, count) = event?;
+            let event = self.admit_context_event(bytes, event, count)?;
+            if event["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("response."))
+            {
+                self.buffer_response_event(event);
+            }
+        }
+        Ok(true)
+    }
+
     fn observe_context_response(&self, revision: FrameRevision, requested: bool, reason: &str) {
         if let Some(media) = &self.media {
             let mut event = serde_json::json!({
@@ -617,7 +665,7 @@ async fn start_response(
     let (deferred_context, mut context_instruction) = session
         .media
         .as_mut()
-        .map(Media::begin_context_frame)
+        .map(|media| media.begin_context_frame(tool_feedback))
         .unwrap_or_default();
     let context_response = context_instruction.is_some();
     let mut user_text = session.media.as_mut().and_then(Media::take_prepared_text);
@@ -862,10 +910,11 @@ async fn start_response(
         // Voice/text admission advances independently while this Frame awaits
         // context ACKs. A replacement belongs to its captured old response and
         // user turn, so discard only its generation when newer input won here.
-        user_turn_won |= session
-            .media
-            .as_ref()
-            .is_some_and(|media| media.replacement_is_superseded(&instruction));
+        user_turn_won |= session.poll_context_response_boundary(&mut bytes)?
+            || session
+                .media
+                .as_ref()
+                .is_some_and(|media| media.replacement_is_superseded(&instruction));
         if user_turn_won {
             session
                 .media
@@ -886,7 +935,7 @@ async fn start_response(
             .to_string();
             context_cue = create_item(&mut session, &mut bytes, cue, true).await?;
             cue_rejected = context_cue.is_none();
-            user_turn_won = session.user_turn_owns_context_response()
+            user_turn_won = session.poll_context_response_boundary(&mut bytes)?
                 || session
                     .media
                     .as_ref()
@@ -1069,12 +1118,7 @@ async fn next_ack(
             );
             return Ok(None);
         }
-        let (event, count) = match &mut session.media {
-            Some(media) => media.admit(event, count)?,
-            None => (event, count),
-        };
-        let event = bytes.admit(event, count)?;
-        session.observe_context_delete(&event);
+        let event = session.admit_context_event(bytes, event, count)?;
         match event["type"].as_str() {
             Some("conversation.item.created")
                 if event["item"]["content"].as_array().is_some_and(|parts| {
@@ -1102,10 +1146,7 @@ async fn next_ack(
                 // while an update or item ACK is in flight. Preserve all model
                 // events and the last acknowledged Frame for response.created;
                 // the fact stream replays them once, with their original bindings.
-                let frame = (kind == "response.created")
-                    .then_some(session.frame)
-                    .flatten();
-                session.pending_events.push_back((event, frame));
+                session.buffer_response_event(event);
             }
             Some("rate_limits.updated") => {}
             Some(kind) if session.media.is_some() && !kind.starts_with("response.") => {}
