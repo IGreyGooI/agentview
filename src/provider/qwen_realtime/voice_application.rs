@@ -1,5 +1,5 @@
 use std::{
-    future::IntoFuture,
+    future::{Future, IntoFuture},
     sync::{Arc, Mutex},
 };
 
@@ -12,6 +12,7 @@ use crate::component::{
     },
     prelude::{component, Component},
 };
+use crate::transcript::CanonicalInputItem;
 
 use super::{
     audio::encode_pcm16,
@@ -66,6 +67,18 @@ impl QwenRealtimeVoiceApplication {
             .with_text_delta_output(false);
         let (app, input) = mount_voice(root, provider, provider_input, active_response)?;
         Ok((Self(app), input, events))
+    }
+
+    /// Set request-only prompts loaded at each normal Frame boundary.
+    ///
+    /// Captured-state updates do not schedule a render or context refresh.
+    /// See [`Application::set_frame_ephemeral_loader`].
+    pub fn set_frame_ephemeral_loader<F, Fut>(&mut self, loader: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Vec<CanonicalInputItem>> + Send + 'static,
+    {
+        self.0.set_frame_ephemeral_loader(loader);
     }
 
     /// Drive one voice session until its input finishes or its Component exits.

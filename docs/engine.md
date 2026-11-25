@@ -954,6 +954,13 @@ ephemeral prompts，它们不在 `projection().items()` 中；port 在上述各 
 - diff candidate、commit receipt或mutable history capability；
 - Provider response id、wire history或private compaction artifact。
 
+`Application::set_frame_ephemeral_loader` 可在普通 Frame 组装时异步读取应用拥有的当前上下文。
+loader 在 Component preparation 后、Frame 计量前运行，返回的 user/developer canonical prompts
+只追加到本次 projection 副本的 ephemeral section。注册 loader 或更新其外部存储均不产生 Signal
+写入、dirty、reconcile 或新 Frame，显式 `prepare()` 和 `current_projection()` 也不调用它。
+同一 retained session 的 control-only context refresh 继续携带上次加载的 items，下一个普通 Frame
+才重新读取；continuity retry 复用同一次加载。其他 item 类型仅记录观测并忽略。
+
 private、non-cloneable `PreparedFrame` 同时保留 public Frame、generation-exact bindings、complete checkpoint
 和commit candidate。prepare不推进任何 state；successful handoff后的同步 commit一次性推进 canonical
 outbound segment、revision、complete diff baseline和exact staged ToolOutput receipt。

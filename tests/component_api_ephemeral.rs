@@ -8,7 +8,7 @@ use std::{
     num::{NonZeroU128, NonZeroU64},
     ops::ControlFlow,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -383,6 +383,151 @@ async fn ephemeral_subtrees_are_stably_collected_after_ordinary_inputs_on_full_a
     assert_ephemeral_not_retained(&frames);
 
     application.shutdown().await.expect("shutdown application");
+}
+
+#[tokio::test]
+async fn frame_loader_reads_latest_external_state_without_dirtying_the_component_tree() {
+    let (port, capture, _) = CapturingPort::new();
+    let renders = Arc::new(AtomicUsize::new(0));
+    let render_count = renders.clone();
+    let mut application = Application::mount(
+        move || {
+            render_count.fetch_add(1, Ordering::SeqCst);
+            view! {
+                #[developer(ephemeral, repeat)]
+                authored_context { "component context" }
+                current_state { "mounted" }
+            }
+        },
+        port,
+    )
+    .unwrap();
+    let history = Arc::new(Mutex::new(vec![CanonicalInputItem::instruction(
+        InstructionAuthority::Developer,
+        text_element("history", "first record"),
+    )]));
+    let loads = Arc::new(AtomicUsize::new(0));
+    let source = history.clone();
+    let load_count = loads.clone();
+    application.set_frame_ephemeral_loader(move || {
+        let source = source.clone();
+        let load_count = load_count.clone();
+        async move {
+            load_count.fetch_add(1, Ordering::SeqCst);
+            source.lock().unwrap().clone()
+        }
+    });
+    assert!(application.prepare().await.unwrap().is_continue());
+    let before = application.current_projection();
+    let projection = before.projection().clone();
+    let revision = before.revision();
+    assert!(!before.is_dirty());
+    assert_eq!(loads.load(Ordering::SeqCst), 0);
+    assert!(capture.frames().is_empty());
+    drop(before);
+
+    react(&mut application).await;
+    let first = capture.frames().remove(0);
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+    assert_eq!(first.ephemeral.len(), 2);
+    assert_eq!(first.ephemeral[1..], *history.lock().unwrap());
+    let after_reaction_renders = renders.load(Ordering::SeqCst);
+    let after_reaction_revision = application.current_projection().revision();
+    let updated = vec![CanonicalInputItem::message(
+        ConversationRole::User,
+        text_element("history", "second record from the other application"),
+    )];
+    *history.lock().unwrap() = updated.clone();
+    tokio::task::yield_now().await;
+    assert_eq!(renders.load(Ordering::SeqCst), after_reaction_renders);
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+    assert_eq!(capture.frames().len(), 1);
+    let current = application.current_projection();
+    assert!(!current.is_dirty());
+    assert_eq!(current.revision(), after_reaction_revision);
+    assert!(current.revision() >= revision);
+    assert_eq!(current.projection(), &projection);
+    drop(current);
+
+    react(&mut application).await;
+    let frames = capture.frames();
+    assert_eq!(loads.load(Ordering::SeqCst), 2);
+    assert_eq!(frames[1].ephemeral[0], first.ephemeral[0]);
+    assert_eq!(frames[1].ephemeral[1..], updated);
+    assert_ephemeral_not_retained(&frames);
+    assert_eq!(application.current_projection().projection(), &projection);
+    application.shutdown().await.unwrap();
+}
+
+struct ControlRefreshPort {
+    inner: CapturingPort,
+    history: Arc<Mutex<Vec<CanonicalInputItem>>>,
+    next_history: Vec<CanonicalInputItem>,
+}
+
+#[async_trait]
+impl ReactionPort for ControlRefreshPort {
+    fn declare(&mut self) -> Result<TargetDeclaration, ReactionPortFault> {
+        self.inner.declare()
+    }
+
+    fn supports_context_refresh(&self) -> bool {
+        true
+    }
+
+    async fn submit<'a>(&'a mut self, frame: Frame) -> Result<ProviderFactStream<'a>, SubmitFault> {
+        drop(self.inner.submit(frame).await?);
+        let fact = if self.inner.capture.frames().len() == 1 {
+            *self.history.lock().unwrap() = self.next_history.clone();
+            ProviderFact::ContextRefreshRequested
+        } else {
+            ProviderFact::ReactionCompleted { primary_text: None }
+        };
+        Ok(Box::pin(futures::stream::once(async { Ok(fact) })))
+    }
+
+    async fn next_session_frame(&mut self, _feedback: bool) -> Result<bool, ReactionPortFault> {
+        Ok(self.inner.capture.frames().len() < 3)
+    }
+}
+
+#[tokio::test]
+async fn retained_control_frames_preserve_loaded_items_until_the_next_normal_frame() {
+    let (inner, capture, _) = CapturingPort::new();
+    let original = vec![CanonicalInputItem::instruction(
+        InstructionAuthority::Developer,
+        text_element("history", "already loaded"),
+    )];
+    let latest = vec![CanonicalInputItem::instruction(
+        InstructionAuthority::Developer,
+        text_element("history", "arrived during the retained session"),
+    )];
+    let history = Arc::new(Mutex::new(original.clone()));
+    let mut application = Application::mount(
+        || view! { current_state { "mounted" } },
+        ControlRefreshPort {
+            inner,
+            history: history.clone(),
+            next_history: latest.clone(),
+        },
+    )
+    .unwrap();
+    let loads = Arc::new(AtomicUsize::new(0));
+    let observed = loads.clone();
+    application.set_frame_ephemeral_loader(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+        let items = history.lock().unwrap().clone();
+        async move { items }
+    });
+    assert!(application.react(false).unwrap().await.unwrap().is_continue());
+    let frames = capture.frames();
+    assert_eq!(loads.load(Ordering::SeqCst), 2);
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[0].ephemeral, original);
+    assert_eq!(frames[1].ephemeral, original);
+    assert_eq!(frames[2].ephemeral, latest);
+    assert_ephemeral_not_retained(&frames);
+    application.shutdown().await.unwrap();
 }
 
 #[derive(Clone, AgentView)]

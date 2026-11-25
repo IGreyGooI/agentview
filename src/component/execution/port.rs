@@ -85,6 +85,42 @@ impl RenderedProjection {
         &self.nodes
     }
 
+    pub(crate) fn with_frame_ephemeral(mut self, mut items: Vec<CanonicalInputItem>) -> Self {
+        let supplied = items.len();
+        // Application loaders own these optional prompts. Only the established
+        // user/developer ephemeral kinds can enter this section. Drop a loader's
+        // unsupported item so it cannot inject System authority or tool facts,
+        // while the existing Component input continues through its normal Frame.
+        items.retain(|item| {
+            matches!(
+                item,
+                CanonicalInputItem::Instruction {
+                    authority: InstructionAuthority::Developer,
+                    ..
+                } | CanonicalInputItem::Message {
+                    role: ConversationRole::User,
+                    ..
+                }
+            )
+        });
+        if items.len() != supplied {
+            tracing::warn!(
+                event = "frame_ephemeral_items_dropped",
+                count = supplied - items.len()
+            );
+        }
+        if !items.is_empty() {
+            let mut identity = "@agentview/frame_ephemeral".to_owned();
+            while self.nodes.iter().any(|node| node.identity == identity) {
+                identity.push('_');
+            }
+            let indexes = (0..items.len()).collect();
+            self.nodes
+                .push(RenderedProjectionNode::new(identity, items).with_ephemeral_items(indexes));
+        }
+        self
+    }
+
     #[allow(dead_code)] // Retained for name-only compatibility fixtures.
     pub(crate) fn with_native_tool_names(
         nodes: Vec<RenderedProjectionNode>,
@@ -2173,8 +2209,9 @@ mod projection_validation_tests {
     };
 
     use super::{
-        RenderedProjection, RenderedProjectionDiffMarker, RenderedProjectionError,
-        RenderedProjectionFragment, RenderedProjectionItemTemplate, RenderedProjectionNode,
+        ProjectionExecutionScope, ProjectionProvenance, RenderedProjection,
+        RenderedProjectionDiffMarker, RenderedProjectionError, RenderedProjectionFragment,
+        RenderedProjectionItemTemplate, RenderedProjectionNode,
     };
 
     fn item() -> CanonicalInputItem {
@@ -2190,6 +2227,34 @@ mod projection_validation_tests {
             authored: Document::new(BlockChildren::new()),
             complete: ResolvedDocument::new(BlockChildren::new()),
         }
+    }
+
+    #[test]
+    fn frame_ephemeral_append_preserves_existing_projection_metadata() {
+        let mut provenance = ProjectionProvenance::default();
+        provenance.parents.insert("existing".to_owned(), None);
+        let original = RenderedProjection::with_native_tools(
+            vec![RenderedProjectionNode::new(
+                "@agentview/frame_ephemeral",
+                vec![item()],
+            )],
+            vec![super::ToolDefinition::legacy_name_only("existing_tool").unwrap()],
+        )
+        .unwrap()
+        .with_execution_scope(ProjectionExecutionScope {
+            host_instance: 9,
+            mount_generation: 3,
+        })
+        .with_requirements(super::FrameRequirements::new(false, true, false))
+        .with_xml_actions(true)
+        .with_provenance(provenance);
+        let mut augmented = original.clone().with_frame_ephemeral(vec![item()]);
+        let node = augmented.nodes.pop().unwrap();
+        assert_ne!(node.identity(), original.nodes()[0].identity());
+        assert_eq!(node.items(), &[item()]);
+        assert!(node.is_ephemeral_item(0));
+        assert!(node.repeats_item(0));
+        assert_eq!(augmented, original);
     }
 
     #[test]

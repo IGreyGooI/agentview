@@ -20,7 +20,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{FutureExt, StreamExt};
+use futures::{future::BoxFuture, FutureExt, StreamExt};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use super::{
@@ -47,6 +47,7 @@ use crate::component::{
     task::TaskPanicMonitor,
     ApplicationId, ReactionId, ReactionKind,
 };
+use crate::transcript::CanonicalInputItem;
 
 /// The runtime result of one reaction. Business success remains application data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +83,7 @@ impl PartialEq<ControlFlow<ExitReason>> for ReactionOutcome {
 
 type PanicPayload = Box<dyn Any + Send + 'static>;
 type FrameObserver = dyn for<'a> Fn(FrameObservation<'a>) + Send + Sync;
+type FrameEphemeralLoader = dyn Fn() -> BoxFuture<'static, Vec<CanonicalInputItem>> + Send + Sync;
 #[derive(Default)]
 struct PanicState(Mutex<Option<PanicPayload>>, std::sync::atomic::AtomicBool);
 impl PanicState {
@@ -374,6 +376,7 @@ struct Lane<P> {
     completion_bindings: Option<RenderBindings<ProviderEvent>>,
     feedback_pending: bool,
     context_bindings: Option<(FrameRevision, RenderBindings<ProviderEvent>)>,
+    frame_ephemeral: Vec<CanonicalInputItem>,
 }
 
 enum FrameOutcome {
@@ -415,6 +418,7 @@ struct Shared<P: ReactionPort + 'static> {
     admission: Mutex<Admission<P>>,
     snapshot: Mutex<Snapshot>,
     frame_observer: Mutex<Option<Arc<FrameObserver>>>,
+    frame_ephemeral_loader: Mutex<Option<Arc<FrameEphemeralLoader>>>,
     app_id: ApplicationId,
     exit: ApplicationExitControl,
     demand: Arc<DriverDemand>,
@@ -542,6 +546,7 @@ impl<P: ReactionPort + 'static> Application<P> {
             core: AsyncMutex::new(Some(core)),
             snapshot: Mutex::new(snapshot),
             frame_observer: Mutex::new(None),
+            frame_ephemeral_loader: Mutex::new(None),
             settled: Notify::new(),
             admission: Mutex::new(Admission {
                 closed: false,
@@ -584,6 +589,27 @@ impl<P: ReactionPort + 'static> Application<P> {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(observer));
         self
+    }
+
+    /// Load request-only user or developer prompts at normal Frame assembly.
+    ///
+    /// The loader runs after Component preparation and before Frame metering.
+    /// Setting it and updating its captured state do not dirty the Component
+    /// tree or request a reaction. Explicit `prepare()` and projection reads
+    /// do not call it. Retained-session control refreshes reuse the last loaded
+    /// items until the next normal Frame. Continuity retries use that same
+    /// snapshot. Independent forked Applications configure their own loader.
+    /// Unsupported item kinds are observed and omitted from this optional input.
+    pub fn set_frame_ephemeral_loader<F, Fut>(&mut self, loader: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Vec<CanonicalInputItem>> + Send + 'static,
+    {
+        *self
+            .shared
+            .frame_ephemeral_loader
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(move || loader().boxed()));
     }
     pub fn exit_handle(&self) -> ApplicationExitHandle {
         self.shared.exit.handle()
@@ -1136,6 +1162,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
                 completion_bindings: None,
                 feedback_pending: false,
                 context_bindings: None,
+                frame_ephemeral: Vec::new(),
             }),
         };
         admission.tasks.push(runtime.spawn(Self::drive(owned)));
@@ -1156,12 +1183,24 @@ impl<P: ReactionPort + 'static> Shared<P> {
     async fn drive_owned(&self, state: &Arc<ReactionState>, lane: &mut Option<Lane<P>>) {
         let cancellation = ReactionCancellationControl::new(self.monitor.clone());
         let mut completion;
+        let mut load_frame_ephemeral = true;
         loop {
-            let operation = AssertUnwindSafe(self.drive_inner(state, lane, &cancellation))
-                .catch_unwind()
-                .await;
+            let operation = AssertUnwindSafe(self.drive_inner(
+                state,
+                lane,
+                &cancellation,
+                load_frame_ephemeral,
+            ))
+            .catch_unwind()
+            .await;
             completion = match operation {
-                Ok(Ok(FrameOutcome::ContextRefresh(_))) => continue,
+                Ok(Ok(FrameOutcome::ContextRefresh(_))) => {
+                    // The retained port requested a control-only replacement.
+                    // Keep its already loaded ephemeral context so replacement
+                    // cannot erase it or turn a history read into fresh input.
+                    load_frame_ephemeral = false;
+                    continue;
+                }
                 Ok(Ok(FrameOutcome::Reaction(outcome))) => Completion::Result(Ok(outcome)),
                 Ok(Err(fault)) => Completion::Result(Err(fault)),
                 Err(payload) => {
@@ -1213,7 +1252,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
             .catch_unwind()
             .await;
             match continuation {
-                Ok(Ok(ControlFlow::Continue(()))) => {}
+                Ok(Ok(ControlFlow::Continue(()))) => load_frame_ephemeral = true,
                 Ok(Ok(ControlFlow::Break(outcome))) => {
                     completion = Completion::Result(Ok(outcome));
                     break;
@@ -1409,6 +1448,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
         state: &ReactionState,
         lane: &mut Option<Lane<P>>,
         cancellation: &ReactionCancellationControl,
+        load_frame_ephemeral: bool,
     ) -> Result<FrameOutcome, ApplicationFault> {
         // Admission owns identity already. Preparation remains one serialized
         // mutation of the mounted runtime, independently of all network streams.
@@ -1470,6 +1510,7 @@ impl<P: ReactionPort + 'static> Shared<P> {
                     completion_bindings: None,
                     feedback_pending: false,
                     context_bindings: None,
+                    frame_ephemeral: Vec::new(),
                 });
             }
             let receipt = (state.kind == ReactionKind::Main)
@@ -1500,14 +1541,34 @@ impl<P: ReactionPort + 'static> Shared<P> {
         };
         let lane = lane.as_mut().expect("prepared request owns a lane");
         let result = {
-            let submission = self.submit(
-                state,
-                lane,
-                (&projection, projection_revision),
-                &mut bindings,
-                cancellation,
-                receipt,
-            );
+            let submission = async {
+                if load_frame_ephemeral {
+                    let loader = self
+                        .frame_ephemeral_loader
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    if let Some(loader) = loader {
+                        lane.frame_ephemeral = tokio::select! {
+                            biased;
+                            reason = self.exit.wait() => {
+                                return Ok(FrameOutcome::Reaction(ReactionOutcome::Exited(reason)));
+                            }
+                            items = loader() => items,
+                        };
+                    }
+                }
+                let projection = projection.with_frame_ephemeral(lane.frame_ephemeral.clone());
+                self.submit(
+                    state,
+                    lane,
+                    (&projection, projection_revision),
+                    &mut bindings,
+                    cancellation,
+                    receipt,
+                )
+                .await
+            };
             tokio::pin!(submission);
             tokio::select! {
                 biased;

@@ -1,7 +1,10 @@
+use std::future::Future;
+
 use crate::component::{
     execution::{Application, ApplicationFault, ReactionOutcome},
     prelude::Component,
 };
+use crate::transcript::CanonicalInputItem;
 
 use crate::provider::qwen_realtime::{
     voice_application::{drive_voice, mount_voice},
@@ -33,6 +36,18 @@ impl DoubaoRealtimeVoiceApplication {
         let (provider, provider_input, events, active_response) = provider.with_audio();
         let (app, input) = mount_voice(root, provider, provider_input, active_response)?;
         Ok((Self(app), input, events))
+    }
+
+    /// Set request-only prompts loaded at each normal Frame boundary.
+    ///
+    /// Captured-state updates do not schedule a render or context refresh.
+    /// See [`Application::set_frame_ephemeral_loader`].
+    pub fn set_frame_ephemeral_loader<F, Fut>(&mut self, loader: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Vec<CanonicalInputItem>> + Send + 'static,
+    {
+        self.0.set_frame_ephemeral_loader(loader);
     }
 
     /// Drive the voice session while Component state updates refresh its projection.
