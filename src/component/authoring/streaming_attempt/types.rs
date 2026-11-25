@@ -317,6 +317,7 @@ pub struct XmlElementDraft<Form> {
     pub(super) name: &'static str,
     pub(super) attributes: Vec<XmlAttributeDeclaration>,
     pub(super) cardinality: XmlCardinality,
+    pub(super) self_closing_when_attribute: Option<(&'static str, &'static str)>,
     pub(super) marker: PhantomData<fn() -> Form>,
 }
 
@@ -326,6 +327,7 @@ pub struct XmlElementContract<Head, Value> {
     pub(super) form: XmlElementFormKind,
     pub(super) attributes: Vec<XmlAttributeDeclaration>,
     pub(super) cardinality: XmlCardinality,
+    pub(super) self_closing_when_attribute: Option<(&'static str, &'static str)>,
     pub(super) decode_open: DecodeOpen<Head>,
     pub(super) decode_complete: DecodeComplete<Head, Value>,
 }
@@ -341,6 +343,7 @@ impl XmlToolElement {
             name,
             attributes: Vec::new(),
             cardinality: XmlCardinality::any(),
+            self_closing_when_attribute: None,
             marker: PhantomData,
         }
     }
@@ -350,8 +353,24 @@ impl XmlToolElement {
             name,
             attributes: Vec::new(),
             cardinality: XmlCardinality::any(),
+            self_closing_when_attribute: None,
             marker: PhantomData,
         }
+    }
+}
+
+impl XmlElementDraft<TextContent> {
+    /// Also accept a self-closing occurrence when this XML attribute equals
+    /// `value`. Comparison uses the entity-decoded attribute without trimming.
+    /// Attribute declarations and decoding still apply, and completion retains
+    /// [`XmlElementForm::SelfClosing`] with empty text.
+    pub fn allow_self_closing_when_attribute(
+        mut self,
+        attribute: &'static str,
+        value: &'static str,
+    ) -> Self {
+        self.self_closing_when_attribute = Some((attribute, value));
+        self
     }
 }
 
@@ -437,6 +456,7 @@ impl<Form: 'static> XmlElementDraft<Form> {
             form: XmlElementFormKind::of::<Form>(),
             attributes: self.attributes,
             cardinality: self.cardinality,
+            self_closing_when_attribute: self.self_closing_when_attribute,
             decode_open: Box::new(decode_open),
             decode_complete: Box::new(decode_complete),
         }
