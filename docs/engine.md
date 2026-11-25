@@ -287,6 +287,11 @@ hook 等待期间继续仲裁定向中断、Component exit 和 task panic；丢�
 `use_reaction_completion` 在每个有限 Frame exchange 正常结算时运行，事件来源携带该 Frame 的
 revision。其状态更新先完成 post-reconcile，再进入会话 hook。
 
+`use_frame_refresh()` 为 Component 提供绑定挂载的显式交付句柄。异步业务事件先写 Signal，再按事件意图调用
+`request()` 静默交付，`request_and_respond(correlation, instruction)` 交付后回复，或
+`interrupt_and_respond(response_id, instruction)` 取消指定回复后交付并回复。当前 Qwen Smart Turn v2
+提供此能力。调用成功表示请求已入本地队列，实际交付由 provider 事件报告。旧挂载的句柄在请求入口失效。
+
 Qwen Smart Turn v2 的 `QwenRealtimeVoiceInput::refresh_context()` 是显式的上下文交付控制。
 应用先更新 Component Signal，再调用它；普通 Signal 写入仍只触发本地投影刷新。
 等待输入时，port 以 `ContextRefreshRequested` 结束一个尚无模型输出的 exchange，runtime 在同一
@@ -305,6 +310,10 @@ ephemeral developer projection，在后续授权的 Frame 中重新声明当前�
 自身 ACK 后发送一次 `response.create`；与已需执行的 native tool 续轮合并，不额外重复生成。
 临时指令在该回复结束后删除；用户在插入阶段抢先开始一轮时，删除本次指令并跳过可选生成。
 相关客户端拒绝只丢弃这次可选控制，不关闭既有语音。后续普通 Frame 不携带该一次性指令。
+`interrupt_and_respond` 由 socket reader 确认目标回复仍在生成，取消完成后将新上下文交给正常 Frame 流程。
+旧回复已结束、取消被拒绝或用户输入取得会话时，丢弃这次替换。Qwen 的 `response.cancel` 无 response ID 参数，
+SDK 先处理已到达的服务端事件，并以当前可见的回复 ID 校验目标。服务端仍可能在校验和处理取消之间推进。
+
 raw media 订阅中的 `agentview.context_refresh_applied/incomplete/rejected` 与
 `agentview.context_response_requested/skipped` 是本地交付观测，独立于 tracing filter，
 只含 provider session、opaque Frame revision、固定原因和计数，不携带上下文、任务结果或指令正文。

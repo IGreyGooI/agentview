@@ -702,6 +702,460 @@ async fn formal_text_cancels_old_response_and_precedes_fifo_completions_with_iso
 }
 
 #[tokio::test]
+async fn context_replacement_targets_one_response_and_waits_for_terminal_and_fresh_frame_acks() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (release_old, old_released) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        receive_repeated_instruction(&mut socket).await;
+        send_input(&mut socket, "replacement-old-input").await;
+        send(
+            &mut socket,
+            json!({"type":"response.created", "response":{
+                "id":"replacement-old", "status":"in_progress", "output":[],
+            }}),
+        )
+        .await;
+
+        let cancel = receive(&mut socket).await;
+        assert_eq!(cancel["type"], "response.cancel");
+        assert!(cancel["event_id"].is_string());
+        old_released.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(30), socket.next()).await.is_err(),
+            "stale and duplicate commands must not cancel twice or install context before the terminal");
+        send(
+            &mut socket,
+            json!({"type":"response.done", "response":{
+                "id":"replacement-old", "status":"cancelled", "output":[],
+            }}),
+        )
+        .await;
+
+        let refresh = receive_context_update(&mut socket).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), socket.next())
+                .await
+                .is_err()
+        );
+        acknowledge_update(&mut socket, &refresh).await;
+        receive_repeated_instruction(&mut socket).await;
+        let cue = receive(&mut socket).await;
+        assert_eq!(cue["type"], "conversation.item.create");
+        assert_eq!(cue["item"]["role"], "user");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), socket.next())
+                .await
+                .is_err(),
+            "replacement generation must wait for its cue acknowledgement"
+        );
+        let mut item = cue["item"].clone();
+        item["id"] = json!("replacement-cue");
+        send(
+            &mut socket,
+            json!({"type":"conversation.item.created", "item":item}),
+        )
+        .await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        send_tool_reply(&mut socket).await;
+
+        let continuation = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &continuation).await;
+        let tool = receive(&mut socket).await;
+        assert_eq!(tool["item"]["type"], "function_call_output");
+        let output: Value = serde_json::from_str(tool["item"]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output, json!({"generation":1}));
+        acknowledge_item(&mut socket, &tool).await;
+        receive_repeated_instruction(&mut socket).await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        send_audio_reply(
+            &mut socket,
+            "replacement-final",
+            "replacement-answer",
+            "已采用最新结果。",
+            &[1, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let probe = RefreshProbe::default();
+    let root_probe = probe.clone();
+    let (mut application, input, mut events) = QwenRealtimeVoiceApplication::mount(
+        move || refreshable_assistant(root_probe.clone()),
+        text_voice_provider(&endpoint),
+    )
+    .unwrap();
+    let mut raw = events.subscribe_server_events();
+    let operation = async {
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseStarted { response_id } if response_id == "replacement-old")
+            {
+                break;
+            }
+        }
+        input
+            .replace_context_response("retired-response".into(), "使用更新后的状态回答。".into())
+            .await
+            .unwrap();
+        let stale = next_context_replacement_event(&mut raw).await;
+        assert_eq!(stale["type"], "agentview.context_replacement_skipped");
+        assert_eq!(stale["reason"], "stale_response");
+        probe
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .set(1)
+            .unwrap();
+        input
+            .replace_context_response("replacement-old".into(), "使用更新后的状态回答。".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            next_context_replacement_event(&mut raw).await["type"],
+            "agentview.context_replacement_cancel_sent"
+        );
+        input
+            .replace_context_response("replacement-old".into(), "重复请求。".into())
+            .await
+            .unwrap();
+        let duplicate = next_context_replacement_event(&mut raw).await;
+        assert_eq!(duplicate["reason"], "cancellation_pending");
+        release_old.send(()).unwrap();
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseEnded { response_id, .. } if response_id == "replacement-final")
+            {
+                break;
+            }
+        }
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(application.run(), operation)
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    application.shutdown().await.unwrap();
+    server.await.unwrap();
+    assert_eq!(probe.calls.lock().unwrap()[0].0, 1);
+}
+
+#[tokio::test]
+async fn rejected_context_replacement_keeps_a_new_formal_text_cancellation_pending() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (text_queued, queued_text) = oneshot::channel();
+    let server =
+        tokio::spawn(async move {
+            let mut socket = accept_session(&listener).await;
+            let initial = receive(&mut socket).await;
+            acknowledge_update(&mut socket, &initial).await;
+            send_input(&mut socket, "replacement-rejected-input").await;
+            send(
+                &mut socket,
+                json!({"type":"response.created", "response":{
+                    "id":"replacement-rejected", "status":"in_progress", "output":[],
+                }}),
+            )
+            .await;
+            let cancel = receive(&mut socket).await;
+            assert_eq!(cancel["type"], "response.cancel");
+            queued_text.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), socket.next())
+                    .await
+                    .is_err(),
+                "the queued user input shares the replacement's outstanding cancellation"
+            );
+            send(&mut socket, json!({"type":"error", "error":{
+            "type":"invalid_request_error", "code":"invalid_state", "param":"response.cancel",
+            "event_id":cancel["event_id"], "message":"Replacement cancellation refused",
+        }})).await;
+            assert_eq!(
+                receive(&mut socket).await,
+                json!({"type":"response.cancel"})
+            );
+            send(
+                &mut socket,
+                json!({"type":"response.done", "response":{
+                    "id":"replacement-rejected", "status":"cancelled", "output":[],
+                }}),
+            )
+            .await;
+            let user = receive_user_text(&mut socket).await;
+            assert_eq!(user["item"]["content"][0]["text"], "优先回答这个新问题");
+            acknowledge_item(&mut socket, &user).await;
+            assert_eq!(receive(&mut socket).await["type"], "response.create");
+            send_audio_reply(
+                &mut socket,
+                "replacement-user",
+                "replacement-user-item",
+                "回答新的问题。",
+                &[1, 0],
+                None,
+            )
+            .await;
+            await_session_close(&mut socket).await;
+        });
+    let (mut application, input, mut events) =
+        QwenRealtimeVoiceApplication::mount(|| view! {}, text_voice_provider(&endpoint)).unwrap();
+    let mut raw = events.subscribe_server_events();
+    let operation = async {
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseStarted { response_id } if response_id == "replacement-rejected")
+            {
+                break;
+            }
+        }
+        input
+            .replace_context_response("replacement-rejected".into(), "替换当前回答。".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            next_context_replacement_event(&mut raw).await["type"],
+            "agentview.context_replacement_cancel_sent"
+        );
+        let submission = input.submit_text("优先回答这个新问题");
+        tokio::pin!(submission);
+        assert!(futures::poll!(&mut submission).is_pending());
+        loop {
+            if raw.next_event().await.unwrap()["type"] == "agentview.text_input_queued" {
+                break;
+            }
+        }
+        text_queued.send(()).unwrap();
+        let skipped = next_context_replacement_event(&mut raw).await;
+        assert_eq!(skipped["reason"], "cancel_rejected");
+        let reply = submission.await.unwrap().completed().await.unwrap();
+        assert_eq!(reply.response_id, "replacement-user");
+        assert_eq!(reply.status, QwenRealtimeResponseStatus::Completed);
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(application.run(), operation)
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    application.shutdown().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn context_replacement_yields_to_voice_before_terminal_and_during_cue_ack() {
+    exercise_replacement_voice_race(false).await;
+    exercise_replacement_voice_race(true).await;
+}
+
+#[tokio::test]
+async fn context_replacement_yields_to_formal_text_accepted_while_cue_ack_is_pending() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (cue_seen, cue_ready) = oneshot::channel();
+    let (release_ack, acknowledge_cue) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        send_input(&mut socket, "replacement-queued-text-input").await;
+        send(
+            &mut socket,
+            json!({"type":"response.created", "response":{
+                "id":"replacement-queued-text", "status":"in_progress", "output":[],
+            }}),
+        )
+        .await;
+        assert_eq!(receive(&mut socket).await["type"], "response.cancel");
+        send(
+            &mut socket,
+            json!({"type":"response.done", "response":{
+                "id":"replacement-queued-text", "status":"cancelled", "output":[],
+            }}),
+        )
+        .await;
+        let refresh = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &refresh).await;
+        let mut cue = receive(&mut socket).await;
+        assert_eq!(cue["type"], "conversation.item.create");
+        assert_eq!(cue["item"]["role"], "user");
+        cue["item"]["id"] = json!("replacement-queued-text-cue");
+        cue_seen.send(()).unwrap();
+        acknowledge_cue.await.unwrap();
+        acknowledge_item(&mut socket, &cue).await;
+
+        let user = receive_user_text(&mut socket).await;
+        assert_eq!(user["item"]["content"][0]["text"], "刚接纳的新问题");
+        acknowledge_item(&mut socket, &user).await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        send_audio_reply(
+            &mut socket,
+            "queued-text-answer",
+            "queued-text-item",
+            "回答新问题。",
+            &[1, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let (mut application, input, mut events) =
+        QwenRealtimeVoiceApplication::mount(|| view! {}, text_voice_provider(&endpoint)).unwrap();
+    let mut raw = events.subscribe_server_events();
+    let operation = async {
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseStarted { response_id } if response_id == "replacement-queued-text")
+            {
+                break;
+            }
+        }
+        input
+            .replace_context_response("replacement-queued-text".into(), "替换当前回答。".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            next_context_replacement_event(&mut raw).await["type"],
+            "agentview.context_replacement_cancel_sent"
+        );
+        cue_ready.await.unwrap();
+        let submission = input.submit_text("刚接纳的新问题");
+        tokio::pin!(submission);
+        assert!(futures::poll!(&mut submission).is_pending());
+        // No socket polling can admit this text while the cue ACK is withheld.
+        // Its accepted sequence must still suppress replacement generation.
+        release_ack.send(()).unwrap();
+        let skipped = next_context_replacement_event(&mut raw).await;
+        assert_eq!(skipped["reason"], "user_turn");
+        let reply = submission.await.unwrap().completed().await.unwrap();
+        assert_eq!(reply.response_id, "queued-text-answer");
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(application.run(), operation)
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    application.shutdown().await.unwrap();
+    server.await.unwrap();
+}
+
+async fn exercise_replacement_voice_race(during_cue_ack: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        send_input(&mut socket, "replacement-voice-old-input").await;
+        send(
+            &mut socket,
+            json!({"type":"response.created", "response":{
+                "id":"replacement-voice-old", "status":"in_progress", "output":[],
+            }}),
+        )
+        .await;
+        assert_eq!(receive(&mut socket).await["type"], "response.cancel");
+        if !during_cue_ack {
+            send(&mut socket, json!({"type":"input_audio_buffer.speech_started", "item_id":"replacement-voice-input", "audio_start_ms":0})).await;
+        }
+        send(
+            &mut socket,
+            json!({"type":"response.done", "response":{
+                "id":"replacement-voice-old", "status":"cancelled", "output":[],
+            }}),
+        )
+        .await;
+        let refresh = receive_context_update(&mut socket).await;
+        acknowledge_update(&mut socket, &refresh).await;
+        let cue = if during_cue_ack {
+            let mut cue = receive(&mut socket).await;
+            assert_eq!(cue["type"], "conversation.item.create");
+            assert_eq!(cue["item"]["role"], "user");
+            cue["item"]["id"] = json!("replacement-voice-cue");
+            send(&mut socket, json!({"type":"input_audio_buffer.speech_started", "item_id":"replacement-voice-input", "audio_start_ms":0})).await;
+            Some(cue)
+        } else {
+            None
+        };
+        send_committed_input(&mut socket, "replacement-voice-input", 100).await;
+        send_audio_reply(
+            &mut socket,
+            "replacement-voice-user",
+            "replacement-voice-user-item",
+            "先回答用户。",
+            &[1, 0],
+            None,
+        )
+        .await;
+        if let Some(cue) = cue {
+            acknowledge_item(&mut socket, &cue).await;
+            let delete = receive(&mut socket).await;
+            assert_eq!(delete["type"], "conversation.item.delete");
+            assert_eq!(delete["item_id"], "replacement-voice-cue");
+            send(
+                &mut socket,
+                json!({"type":"conversation.item.deleted", "item_id":delete["item_id"]}),
+            )
+            .await;
+        }
+        await_session_close(&mut socket).await;
+    });
+    let (mut application, input, mut events) =
+        QwenRealtimeVoiceApplication::mount(|| view! {}, text_voice_provider(&endpoint)).unwrap();
+    let mut raw = events.subscribe_server_events();
+    let operation = async {
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseStarted { response_id } if response_id == "replacement-voice-old")
+            {
+                break;
+            }
+        }
+        input
+            .replace_context_response("replacement-voice-old".into(), "根据新状态重答。".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            next_context_replacement_event(&mut raw).await["type"],
+            "agentview.context_replacement_cancel_sent"
+        );
+        let skipped = next_context_replacement_event(&mut raw).await;
+        assert_eq!(skipped["reason"], "user_turn");
+        loop {
+            if matches!(events.next_event().await.unwrap(), QwenRealtimeAudioEvent::ResponseEnded { response_id, .. } if response_id == "replacement-voice-user")
+            {
+                break;
+            }
+        }
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(application.run(), operation)
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    application.shutdown().await.unwrap();
+    server.await.unwrap();
+}
+
+async fn next_context_replacement_event(events: &mut QwenRealtimeServerEvents) -> Arc<Value> {
+    loop {
+        let event = events.next_event().await.unwrap();
+        if event["type"]
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("agentview.context_replacement_"))
+        {
+            return event;
+        }
+    }
+}
+
+#[tokio::test]
 async fn text_native_tool_continuation_retains_correlation_and_waits_for_settlement() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());

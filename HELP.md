@@ -56,6 +56,7 @@ demonstrate interactivity. Error handling is one part of this experience; see
 | Start an independent child on another port with explicit business state and empty model history | `app.fork_to(root, target).await`, or `fork_to_with_commands(root, target, input)` with a new inbox |
 | Branch the current model history into an independent application | `app.fork(root).await`, or `fork_with_commands(root, input)` with a new inbox; requires `ForkableReactionPort` |
 | Wait for required business inputs | `use_preparation` inside the owning Component |
+| Explicitly refresh the current Realtime session after a Signal write | `use_frame_refresh()` in the Component and call its handle from async work |
 | End normal application work | `use_application_exit`, then owner calls `shutdown()` |
 | Start and control a model turn | `let reaction = app.react(false)?; reaction.interrupt()?; reaction.await` |
 | Receive ordinary provider output | `use_provider_event_handler` |

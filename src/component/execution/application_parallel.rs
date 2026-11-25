@@ -32,7 +32,8 @@ use super::{
 use crate::component::{
     authoring::{
         application_exit::ApplicationExitControl, streaming_attempt::StreamingToolAbortCause,
-        ApplicationExitHandle, Component, ExitReason, InternalEventInput, RenderBindings,
+        ApplicationExitHandle, Component, ExitReason, FrameRefreshDispatcher, InternalEventInput,
+        RenderBindings,
     },
     execution::{
         driver_demand::DriverDemand,
@@ -520,6 +521,15 @@ impl<P: ReactionPort + 'static> Application<P> {
     ) -> Result<Self, ApplicationFault> {
         CoreApplication::mount(root, PortSlot(Some(port))).map(Self::from_core)
     }
+    pub(crate) fn mount_with_frame_refresh(
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        port: P,
+        dispatcher: FrameRefreshDispatcher,
+    ) -> Result<Self, ApplicationFault> {
+        CoreApplication::mount_with_frame_refresh(root, PortSlot(Some(port)), dispatcher)
+            .map(Self::from_core)
+    }
+
     pub fn mount_with_commands(
         root: impl Fn() -> Component + Send + Sync + 'static,
         port: P,

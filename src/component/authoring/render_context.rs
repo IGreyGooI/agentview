@@ -15,8 +15,8 @@ use super::{
     event_input::{EventInputOrigin, EventSelector},
     event_listener::EventListenerDeclaration,
     preparation::{CommandWaitDeclaration, PreparationDeclaration, PreparationSet},
-    ApplicationExitHandle, Coroutine, CoroutineInbox, ReactionCompletionDeclaration,
-    ReactionRequest, Signal,
+    ApplicationExitHandle, Coroutine, CoroutineInbox, FrameRefresh, FrameRefreshDispatcher,
+    ReactionCompletionDeclaration, ReactionRequest, Signal,
 };
 
 /// Runtime hook authority passed only to repeatable Component renderers.
@@ -29,6 +29,7 @@ pub struct HookRenderContext<'render> {
     preparations: &'render mut PreparationSet,
     task_starts: &'render mut Vec<MountTaskStart>,
     driver_demand: Option<&'render DriverDemandHandle>,
+    frame_refresh: Option<&'render FrameRefreshDispatcher>,
     tasks: Option<&'render MountTaskHandle>,
     application_exit: Option<&'render ApplicationExitControl>,
     attempt_local_allowed: bool,
@@ -48,6 +49,7 @@ impl<'render> HookRenderContext<'render> {
         preparations: &'render mut PreparationSet,
         task_starts: &'render mut Vec<MountTaskStart>,
         driver_demand: Option<&'render DriverDemandHandle>,
+        frame_refresh: Option<&'render FrameRefreshDispatcher>,
         tasks: Option<&'render MountTaskHandle>,
         application_exit: Option<&'render ApplicationExitControl>,
     ) -> Self {
@@ -59,6 +61,7 @@ impl<'render> HookRenderContext<'render> {
             preparations,
             task_starts,
             driver_demand,
+            frame_refresh,
             tasks,
             application_exit,
             attempt_local_allowed: true,
@@ -78,6 +81,7 @@ impl<'render> HookRenderContext<'render> {
         preparations: &'render mut PreparationSet,
         task_starts: &'render mut Vec<MountTaskStart>,
         driver_demand: Option<&'render DriverDemandHandle>,
+        frame_refresh: Option<&'render FrameRefreshDispatcher>,
         tasks: Option<&'render MountTaskHandle>,
         application_exit: Option<&'render ApplicationExitControl>,
     ) -> Self {
@@ -89,6 +93,7 @@ impl<'render> HookRenderContext<'render> {
             preparations,
             task_starts,
             driver_demand,
+            frame_refresh,
             tasks,
             application_exit,
             attempt_local_allowed: false,
@@ -155,6 +160,12 @@ impl<'render> HookRenderContext<'render> {
     #[doc(hidden)]
     pub fn use_application_id_at(&mut self, site: u32) -> ApplicationId {
         self.try_use_application_id_at(site)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    #[doc(hidden)]
+    pub fn use_frame_refresh_at(&mut self, site: u32) -> FrameRefresh {
+        self.try_use_frame_refresh_at(site)
             .unwrap_or_else(|fault| panic!("{fault}"))
     }
 
@@ -374,6 +385,20 @@ impl<'render> HookRenderContext<'render> {
                 .use_marker_at(site, HookKind::ApplicationId)
                 .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
             Ok(context.event_origin.application_id())
+        })
+    }
+
+    pub(crate) fn try_use_frame_refresh_at(
+        &mut self,
+        site: u32,
+    ) -> Result<FrameRefresh, ComponentDefinitionError> {
+        self.definition_hook(move |context| {
+            context.definition_hook_allowed("Frame refresh")?;
+            let mount = context
+                .signals
+                .use_marker_at(site, HookKind::FrameRefresh)
+                .map_err(|fault| ComponentDefinitionError::new(fault.to_string()))?;
+            Ok(FrameRefresh::new(mount, context.frame_refresh.cloned()))
         })
     }
 

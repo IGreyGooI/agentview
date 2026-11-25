@@ -5,8 +5,8 @@ use super::authoring::Signal;
 use super::{
     authoring::{
         application_exit::ApplicationExitControl, Component, ComponentAttemptFault,
-        ComponentRenderStage, InternalEventInput as EventInput, MountTaskStart, PreparationSet,
-        RenderBindings, RetainedModelHistory,
+        ComponentRenderStage, FrameRefreshDispatcher, InternalEventInput as EventInput,
+        MountTaskStart, PreparationSet, RenderBindings, RetainedModelHistory,
     },
     execution::{DriverDemandHandle, ProjectionExecutionScope, ProviderEvent, RenderedProjection},
     signal::{MountIdentity, SignalMountTransition, SignalRenderError, SignalRuntime, SignalWake},
@@ -55,6 +55,7 @@ pub struct ComponentHost<Props> {
     root: ComponentRoot<Props>,
     props: Props,
     signals: SignalRuntime,
+    frame_refresh: Option<FrameRefreshDispatcher>,
     driver_demand: Option<DriverDemandHandle>,
     tasks: Option<MountTaskHandle>,
     application_exit: Option<ApplicationExitControl>,
@@ -137,6 +138,7 @@ impl<Props> ComponentHost<Props> {
             root,
             props,
             signals: SignalRuntime::new(),
+            frame_refresh: None,
             driver_demand,
             tasks,
             application_exit,
@@ -150,6 +152,13 @@ impl<Props> ComponentHost<Props> {
             current_projection_prepared: false,
             current_has_command_wait: false,
         }
+    }
+
+    pub(crate) fn set_frame_refresh_dispatcher(
+        &mut self,
+        dispatcher: Option<FrameRefreshDispatcher>,
+    ) {
+        self.frame_refresh = dispatcher;
     }
 
     pub fn id(&self) -> ComponentHostId {
@@ -336,6 +345,7 @@ where
                 origin,
                 &self.signals,
                 self.driver_demand.as_ref(),
+                self.frame_refresh.as_ref(),
                 self.tasks.as_ref(),
                 self.application_exit.as_ref(),
                 &self.command_prefix,

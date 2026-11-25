@@ -818,6 +818,13 @@ async fn start_response(
         }
     }
     if let Some(mut instruction) = context_instruction.take() {
+        // Voice/text admission advances independently while this Frame awaits
+        // context ACKs. A replacement belongs to its captured old response and
+        // user turn, so discard only its generation when newer input won here.
+        user_turn_won |= session
+            .media
+            .as_ref()
+            .is_some_and(|media| media.replacement_is_superseded(&instruction));
         if user_turn_won {
             session
                 .media
@@ -838,7 +845,11 @@ async fn start_response(
             .to_string();
             context_cue = create_item(&mut session, &mut bytes, cue, true).await?;
             cue_rejected = context_cue.is_none();
-            user_turn_won = session.user_turn_owns_context_response();
+            user_turn_won = session.user_turn_owns_context_response()
+                || session
+                    .media
+                    .as_ref()
+                    .is_some_and(|media| media.replacement_is_superseded(&instruction));
             if let Some(id) = &context_cue {
                 if user_turn_won {
                     // The cue belongs only to this optional reply. If real speech

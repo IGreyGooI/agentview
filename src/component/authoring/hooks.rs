@@ -6,7 +6,7 @@ use crate::component::{ApplicationId, EventContext};
 
 use super::{
     render_context::HookRenderContext, ApplicationExitHandle, ComponentDefinitionError, Coroutine,
-    CoroutineInbox, ProviderEventSelector, ReactionRequest, Signal,
+    CoroutineInbox, FrameRefresh, ProviderEventSelector, ReactionRequest, Signal,
 };
 
 /// Render-scoped access to an instance's native state and lifecycle hooks.
@@ -109,6 +109,14 @@ impl<'hook, 'render> ComponentHooks<'hook, 'render> {
         site: u32,
     ) -> Result<ApplicationId, ComponentDefinitionError> {
         self.context.try_use_application_id_at(site)
+    }
+
+    /// Retain a mount-scoped handle for explicit provider context delivery.
+    pub fn use_frame_refresh_at(
+        &mut self,
+        site: u32,
+    ) -> Result<FrameRefresh, ComponentDefinitionError> {
+        self.context.try_use_frame_refresh_at(site)
     }
 
     /// Return a mount-scoped request for a later explicitly driven turn.

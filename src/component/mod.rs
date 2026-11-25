@@ -21,15 +21,15 @@ pub use signal::SignalAccessError;
 pub mod prelude {
     pub use super::authoring::streaming_attempt::*;
     pub use super::authoring::{
-        spawn, use_application_exit, use_application_id, use_coroutine, use_future,
-        use_preparation, use_provider_event_handler, use_reaction_completion, use_reaction_request,
-        use_signal, use_wait_for_command, Action, ApplicationExitError, ApplicationExitHandle,
-        Choice, CliCommand, Command, CommandArgument, CommandDefinition, Component,
-        ComponentDefinition, ComponentDefinitionError, ComponentHooks, Coroutine,
-        CoroutineInbox, CoroutineSendError, Decision, DecisionQuestionSpec, ExitReason, NativeTool,
-        NativeToolCall, Noul, ProviderEventSelector, ReactionRequest, ReactionRequestError, Score,
-        Signal, SpawnError, StreamingXml, StreamingXmlTag, ToolError, XmlContractDiagnostic,
-        XmlStreamingToolCall,
+        spawn, use_application_exit, use_application_id, use_coroutine, use_frame_refresh,
+        use_future, use_preparation, use_provider_event_handler, use_reaction_completion,
+        use_reaction_request, use_signal, use_wait_for_command, Action, ApplicationExitError,
+        ApplicationExitHandle, Choice, CliCommand, Command, CommandArgument, CommandDefinition,
+        Component, ComponentDefinition, ComponentDefinitionError, ComponentHooks, Coroutine,
+        CoroutineInbox, CoroutineSendError, Decision, DecisionQuestionSpec, ExitReason,
+        FrameRefresh, FrameRefreshError, NativeTool, NativeToolCall, Noul, ProviderEventSelector,
+        ReactionRequest, ReactionRequestError, Score, Signal, SpawnError, StreamingXml,
+        StreamingXmlTag, ToolError, XmlContractDiagnostic, XmlStreamingToolCall,
     };
     #[cfg(feature = "legacy-provider-port")]
     #[allow(

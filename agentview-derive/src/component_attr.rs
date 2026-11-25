@@ -220,6 +220,9 @@ impl VisitMut for HookCallRewriter {
             ComponentHookCall::ReactionCompletion => syn::parse_quote! {
                 __agentview_hooks.use_reaction_completion_at(#site, #arguments)
             },
+            ComponentHookCall::FrameRefresh => syn::parse_quote! {
+                __agentview_hooks.use_frame_refresh_at(#site)
+            },
             ComponentHookCall::ReactionRequest => syn::parse_quote! {
                 __agentview_hooks.use_reaction_request_at(#site)
             },
@@ -253,6 +256,7 @@ enum ComponentHookCall {
     ProviderEventHandler,
     ReactionCompletion,
     ReactionRequest,
+    FrameRefresh,
     ApplicationExit,
     ApplicationId,
     Future,
@@ -280,6 +284,7 @@ fn component_hook_call(path: &syn::Path, argument_count: usize) -> Option<Compon
         ("use_wait_for_command", 0) => Some(ComponentHookCall::CommandWait),
         ("use_provider_event_handler", 2) => Some(ComponentHookCall::ProviderEventHandler),
         ("use_reaction_completion", 1) => Some(ComponentHookCall::ReactionCompletion),
+        ("use_frame_refresh", 0) => Some(ComponentHookCall::FrameRefresh),
         ("use_reaction_request", 0) => Some(ComponentHookCall::ReactionRequest),
         ("use_application_exit", 0) => Some(ComponentHookCall::ApplicationExit),
         ("use_application_id", 0) => Some(ComponentHookCall::ApplicationId),

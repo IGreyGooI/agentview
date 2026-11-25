@@ -16,6 +16,7 @@ mod declaration;
 mod definition;
 mod event_input;
 mod event_listener;
+mod frame_refresh;
 mod handler;
 mod hooks;
 pub(crate) mod native_tool;
@@ -56,8 +57,10 @@ pub(crate) use event_listener::EventListener as InternalEventListener;
 #[cfg(feature = "legacy-provider-port")]
 #[deprecated(note = "use `use_provider_event_handler` for provider event routing")]
 pub type EventListener = event_listener::EventListener;
-pub use native_tool::{NativeToolCall, NativeToolCallProps};
+pub use frame_refresh::{use_frame_refresh, FrameRefresh, FrameRefreshError};
+pub(crate) use frame_refresh::{FrameRefreshDispatcher, FrameRefreshRequest};
 pub use hooks::ComponentHooks;
+pub use native_tool::{NativeToolCall, NativeToolCallProps};
 pub use provider_event_handler::{use_provider_event_handler, ProviderEventSelector};
 pub use reaction_completion::use_reaction_completion;
 pub(crate) use reaction_completion::ReactionCompletionDeclaration;

@@ -18,7 +18,7 @@ use crate::component::execution::{
 
 use super::{
     audio::{AudioDecoder, QwenRealtimeAudioEvent, QwenRealtimeResponseStatus},
-    text::{ActiveTextTurn, TextCorrelations, TextRequest},
+    text::{ActiveTextTurn, ContextReplacementOrigin, TextCorrelations, TextRequest},
     transport::{self, Socket},
     Mode, QwenRealtimeTextReply,
 };
@@ -29,6 +29,7 @@ const MAX_PENDING_TRANSCRIPTIONS: usize = 128;
 const TRANSCRIPTION_DRAIN: Duration = Duration::from_secs(15);
 const NOTICE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const ABANDONED_NOTICES: usize = 16;
+const REPLACEMENT_CANCEL_PREFIX: &str = "context_replace_cancel_";
 
 struct Notice {
     item_id: String,
@@ -54,6 +55,7 @@ pub(crate) enum Input {
     UserText(TextRequest),
     RefreshContext,
     RefreshContextAndRespond(TextRequest),
+    ReplaceContextResponse(ReplaceContextResponse),
     Commit,
     Clear,
     Interrupt(Interrupt),
@@ -63,6 +65,21 @@ pub(crate) enum Input {
 enum TextControl {
     User(TextRequest),
     Context(TextRequest),
+    Replace(ReplaceContextResponse),
+}
+
+pub(crate) struct ReplaceContextResponse {
+    pub(crate) response_id: String,
+    pub(crate) instruction: TextRequest,
+    pub(crate) text_sequence: u64,
+}
+
+struct PendingContextReplacement {
+    response_id: String,
+    cancel_event_id: String,
+    instruction: TextRequest,
+    speech_sequence: u64,
+    text_sequence: u64,
 }
 
 pub(crate) struct SpokenText {
@@ -147,6 +164,12 @@ impl QwenRealtimeMediaInput {
             (Input::RefreshContextAndRespond(text), Some(controls)) => {
                 return controls
                     .send(TextControl::Context(text))
+                    .await
+                    .map_err(|_| closed());
+            }
+            (Input::ReplaceContextResponse(request), Some(controls)) => {
+                return controls
+                    .send(TextControl::Replace(request))
                     .await
                     .map_err(|_| closed());
             }
@@ -249,6 +272,8 @@ pub(super) struct Media {
     committed_turn: bool,
     waiting_for_interruption: bool,
     interrupt: Option<Interrupt>,
+    context_replacement: Option<PendingContextReplacement>,
+    replacement_requests: VecDeque<ReplaceContextResponse>,
     active_response: watch::Sender<Option<String>>,
     spoken: VecDeque<SpokenText>,
     spoken_items: Vec<String>,
@@ -266,6 +291,7 @@ pub(super) struct Media {
     text_turn: Option<ActiveTextTurn>,
     text_correlation: watch::Sender<Option<String>>,
     text_correlations: TextCorrelations,
+    received_text_sequence: u64,
     speech_sequence: u64,
     text_cancelled_response: Option<String>,
     interrupt_for_text: bool,
@@ -297,6 +323,8 @@ impl Media {
                 committed_turn: false,
                 waiting_for_interruption: false,
                 interrupt: None,
+                context_replacement: None,
+                replacement_requests: VecDeque::new(),
                 active_response,
                 spoken: VecDeque::new(),
                 spoken_items: Vec::new(),
@@ -314,6 +342,7 @@ impl Media {
                 text_turn: None,
                 text_correlation: sender.text_correlation.clone(),
                 text_correlations: sender.text_correlations.clone(),
+                received_text_sequence: 0,
                 speech_sequence: 0,
                 text_cancelled_response: None,
                 interrupt_for_text: false,
@@ -413,12 +442,99 @@ impl Media {
     }
 
     pub(super) fn retain_context_response(&mut self, request: TextRequest) {
+        // Replacement cues belong to the interrupted response and the user turn
+        // observed at admission. Once another turn owns this Frame, discard only
+        // that cue instead of replaying the old replacement after the user reply.
+        if let Some(origin) = &request.replacement {
+            self.observe_replacement_skipped(&origin.response_id, "user_turn");
+            return;
+        }
         // Correlated completion commands represent one queued delivery. Voice
         // may win this Frame, but must not consume that unstarted delivery.
         // Legacy uncorrelated optional cues retain their documented skip policy.
         if request.correlation.is_some() {
             self.defer_text(request);
         }
+    }
+
+    pub(super) fn replacement_is_superseded(&self, request: &TextRequest) -> bool {
+        // The socket reader counts voice turns, while the Component control queue
+        // counts accepted text before that text reaches this reader. Both advance
+        // independently of Frame ACKs. An old replacement yields even if a voice
+        // turn already ended or new text still waits in either queue. Only its
+        // optional generation is discarded; current input continues.
+        request.replacement.as_ref().is_some_and(|origin| {
+            origin.speech_sequence != self.speech_sequence
+                || origin.text_sequence != self.text_correlations.accepted_text_sequence()
+                || !self.user_texts.is_empty()
+                || self.prepared_text.is_some()
+        })
+    }
+
+    fn observe_replacement_skipped(&self, response_id: &str, reason: &str) {
+        self.publish_context_refresh_event(json!({
+            "type":"agentview.context_replacement_skipped",
+            "response_id":response_id, "reason":reason,
+        }));
+    }
+
+    async fn replace_context_response(
+        &mut self,
+        socket: &mut Socket,
+        request: ReplaceContextResponse,
+    ) -> Result<(), Fault> {
+        // The application captured a response ID before this control reached the
+        // socket owner. A response may end, or voice/text may take the next turn,
+        // across that handoff. Reject only this optional request so an old cue
+        // cannot cancel the newer response or replace the user's pending reply.
+        // Accepted/received text counts also expose formal input that still waits
+        // in either control queue before this socket owner can receive it.
+        let rejection = if self.decoder.active_response() != Some(request.response_id.as_str()) {
+            Some("stale_response")
+        } else if self.input_speech
+            || self.awaiting_speech_response
+            || self.awaiting_commit
+            || !self.user_texts.is_empty()
+            || self.prepared_text.is_some()
+            || self.interrupt_for_text
+            || request.text_sequence != self.text_correlations.accepted_text_sequence()
+            || self.received_text_sequence != self.text_correlations.accepted_text_sequence()
+        {
+            Some("user_turn")
+        } else if self.interrupt.is_some()
+            || self.context_replacement.is_some()
+            || self.text_cancelled_response.is_some()
+        {
+            Some("cancellation_pending")
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            self.observe_replacement_skipped(&request.response_id, reason);
+            return Ok(());
+        }
+        static NEXT_REPLACEMENT_CANCEL: AtomicU64 = AtomicU64::new(1);
+        let cancel_event_id = format!(
+            "{REPLACEMENT_CANCEL_PREFIX}{}",
+            NEXT_REPLACEMENT_CANCEL.fetch_add(1, Ordering::Relaxed)
+        );
+        transport::send(
+            socket,
+            json!({"type":"response.cancel", "event_id":cancel_event_id}).to_string(),
+        )
+        .await?;
+        self.publish_context_refresh_event(json!({
+            "type":"agentview.context_replacement_cancel_sent",
+            "response_id":request.response_id, "event_id":cancel_event_id,
+        }));
+        self.context_replacement = Some(PendingContextReplacement {
+            response_id: request.response_id,
+            cancel_event_id,
+            instruction: request.instruction,
+            speech_sequence: self.speech_sequence,
+            text_sequence: request.text_sequence,
+        });
+        Ok(())
     }
 
     pub(super) fn settle_text_turn(&mut self) {
@@ -690,10 +806,24 @@ impl Media {
             // Qwen may reject cancel while the old response is completing or
             // when automatic generation cannot be cancelled by a client. Only
             // this control request failed. Keep processing audio and the reply.
-            if let Some(request) = self.interrupt.take() {
-                let _ = request
-                    .result
-                    .send(Err(super::output::server_error(&event["error"])));
+            let reference = event["error"]["event_id"]
+                .as_str()
+                .or_else(|| event["error"]["request_event_id"].as_str());
+            // Replacement cancellation has its own request ID. A delayed refusal
+            // of an earlier cancellation must not discard a later replacement or
+            // settle an independent explicit interrupt. If Qwen omits a reference,
+            // discard the pending optional cue while the current reply continues.
+            let rejected_replacement = self.context_replacement.take_if(|pending| {
+                reference.is_none() || reference == Some(pending.cancel_event_id.as_str())
+            });
+            if let Some(pending) = rejected_replacement {
+                self.observe_replacement_skipped(&pending.response_id, "cancel_rejected");
+            } else if !reference.is_some_and(|id| id.starts_with(REPLACEMENT_CANCEL_PREFIX)) {
+                if let Some(request) = self.interrupt.take() {
+                    let _ = request
+                        .result
+                        .send(Err(super::output::server_error(&event["error"])));
+                }
             }
             return Ok(());
         }
@@ -812,6 +942,43 @@ impl Media {
                     ..
                 } => {
                     self.active_response.send_replace(None);
+                    // This pending cue is owned by the response the socket reader
+                    // cancelled. Wait for its actual terminal, then arm generation
+                    // only for a confirmed cancellation with no intervening user
+                    // turn. A normal completion/refusal discards just this cue.
+                    if let Some(mut pending) = self
+                        .context_replacement
+                        .take_if(|pending| pending.response_id == *response_id)
+                    {
+                        if *status == QwenRealtimeResponseStatus::Cancelled
+                            && pending.speech_sequence == self.speech_sequence
+                            && pending.text_sequence
+                                == self.text_correlations.accepted_text_sequence()
+                            && !self.input_speech
+                            && !self.awaiting_speech_response
+                            && !self.awaiting_commit
+                            && self.user_texts.is_empty()
+                            && self.prepared_text.is_none()
+                        {
+                            pending.instruction.replacement = Some(ContextReplacementOrigin {
+                                response_id: pending.response_id,
+                                speech_sequence: pending.speech_sequence,
+                                text_sequence: pending.text_sequence,
+                            });
+                            self.context_refresh_pending = true;
+                            self.context_response_pending
+                                .push_front(pending.instruction);
+                        } else {
+                            self.observe_replacement_skipped(
+                                &pending.response_id,
+                                if *status == QwenRealtimeResponseStatus::Cancelled {
+                                    "user_turn"
+                                } else {
+                                    "response_not_cancelled"
+                                },
+                            );
+                        }
+                    }
                     if self
                         .interrupt
                         .as_ref()
@@ -872,6 +1039,8 @@ impl Media {
             && self.context_response_pending.is_empty()
             && self.prepared_text.is_none()
             && self.text_turn.is_none()
+            && self.context_replacement.is_none()
+            && self.replacement_requests.is_empty()
             && self.controls.is_empty()
     }
 
@@ -905,15 +1074,24 @@ impl Media {
             // an ACKed item after a VAD race does not set this new-input intent.
             if self.interrupt_for_text {
                 if let Some(response_id) = self.decoder.active_response().map(str::to_owned) {
-                    if self.text_cancelled_response.as_deref() != Some(response_id.as_str()) {
-                        transport::send(socket, json!({"type":"response.cancel"}).to_string())
-                            .await?;
-                        self.publish_context_refresh_event(json!({
-                            "type":"agentview.text_response_cancel_sent", "response_id":response_id,
-                        }));
-                        self.text_cancelled_response = Some(response_id);
+                    // A replacement may already have sent cancellation for this
+                    // response. Formal text still supersedes its queued cue, but
+                    // shares the pending terminal instead of sending a duplicate.
+                    let replacement_pending = self
+                        .context_replacement
+                        .as_ref()
+                        .is_some_and(|pending| pending.response_id == response_id);
+                    if !replacement_pending {
+                        if self.text_cancelled_response.as_deref() != Some(response_id.as_str()) {
+                            transport::send(socket, json!({"type":"response.cancel"}).to_string())
+                                .await?;
+                            self.publish_context_refresh_event(json!({
+                                "type":"agentview.text_response_cancel_sent", "response_id":response_id,
+                            }));
+                            self.text_cancelled_response = Some(response_id);
+                        }
+                        self.interrupt_for_text = false;
                     }
-                    self.interrupt_for_text = false;
                 }
             }
             if let Some(item_id) = self.notice_cleanup.pop_front() {
@@ -982,11 +1160,24 @@ impl Media {
                         self.context_refresh_pending = true;
                         self.context_response_pending.push_back(text);
                     }
+                    Some(TextControl::Replace(request)) => {
+                        self.replacement_requests.push_back(request);
+                    }
                     None => self.controls_closed = true,
                 },
                 result = receive(socket, responding || self.awaiting_commit || self.spoken_pending) => {
                     let (event, bytes) = result?;
                     return self.admit(event, bytes);
+                }
+                // A replacement's target came from a previously consumed event.
+                // Poll ready socket events before admitting it, so an already
+                // arrived old terminal/new response can retire that target first.
+                // Formal text keeps the control branch above and cannot be
+                // starved by a continuous stream of ready response audio.
+                () = std::future::ready(()), if !self.replacement_requests.is_empty() => {
+                    if let Some(request) = self.replacement_requests.pop_front() {
+                        self.replace_context_response(socket, request).await?;
+                    }
                 }
                 () = tokio::time::sleep_until(notice_deadline), if self.notice.as_ref().is_some_and(|notice| !notice.created) => {
                     // The provider did not accept this optional text in time.
@@ -1043,6 +1234,9 @@ impl Media {
                         self.context_refresh_pending = true;
                         self.context_response_pending.push_back(instruction);
                     }
+                    Some(Input::ReplaceContextResponse(request)) => {
+                        self.replacement_requests.push_back(request);
+                    }
                     Some(Input::Commit) if responding => self.commit_pending = true,
                     Some(Input::Commit) => self.commit(socket).await?,
                     Some(Input::Clear) => {
@@ -1055,7 +1249,13 @@ impl Media {
                         // Drop only that stale control so it never cancels the new reply.
                         if self.decoder.active_response() != Some(request.response_id.as_str()) {
                             let _ = request.result.send(Ok(false));
-                        } else if self.interrupt.is_some() {
+                        // A replacement or formal-text cancellation already owns
+                        // this exact response's terminal. Refuse only the duplicate
+                        // interrupt so it cannot acquire that control's result.
+                        } else if self.interrupt.is_some()
+                            || self.context_replacement.is_some()
+                            || self.text_cancelled_response.is_some()
+                        {
                             let _ = request.result.send(Err(Fault::retryable(Code::Unavailable, Reason::UpstreamRejected)));
                         } else {
                             transport::send(socket, json!({"type": "response.cancel"}).to_string()).await?;
@@ -1080,6 +1280,7 @@ impl Media {
     }
 
     fn queue_user_text(&mut self, text: TextRequest) {
+        self.received_text_sequence = self.received_text_sequence.wrapping_add(1);
         self.publish_context_refresh_event(json!({
             "type":"agentview.text_input_queued", "correlation":text.correlation,
         }));
@@ -1255,9 +1456,17 @@ impl Media {
     }
 
     fn is_cancel_rejection(&self, event: &Value) -> bool {
+        // Qwen reports optional cancellation failures by parameter or by the
+        // replacement's echoed request ID. Consume those observations so a late
+        // cancel refusal cannot close the live voice stream; other errors retain
+        // the provider's existing fault handling.
         self.mode == Mode::SmartTurnV2
             && event["type"] == "error"
-            && event["error"]["param"] == "response.cancel"
+            && (event["error"]["param"] == "response.cancel"
+                || event["error"]["event_id"]
+                    .as_str()
+                    .or_else(|| event["error"]["request_event_id"].as_str())
+                    .is_some_and(|id| id.starts_with(REPLACEMENT_CANCEL_PREFIX)))
     }
 
     async fn commit(&mut self, socket: &mut Socket) -> Result<(), Fault> {
@@ -1293,6 +1502,96 @@ async fn receive(socket: &mut Socket, bounded: bool) -> Result<(Value, usize), F
 #[cfg(test)]
 mod notice_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replacement_consumes_ready_terminal_and_new_response_before_matching_its_target() {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::Semaphore;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = url::Url::parse(&format!(
+            "http://{}/realtime",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let (ready, ready_events) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for event in [
+                json!({"type":"response.done", "response":{
+                    "id":"ready-old", "status":"completed", "output":[],
+                }}),
+                json!({"type":"response.created", "response":{
+                    "id":"ready-new", "status":"in_progress", "output":[],
+                }}),
+            ] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        event.to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            ready.send(()).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err(),
+                "the retired target must never send a cancellation for the ready newer response"
+            );
+        });
+        let mut socket = transport::connect(
+            &reqwest::Client::new(),
+            &endpoint,
+            reqwest::header::HeaderValue::from_static("fixture"),
+        )
+        .await
+        .unwrap();
+        let (mut media, input, mut events) = Media::new(Mode::SmartTurnV2);
+        media
+            .admit(
+                json!({"type":"response.created", "response":{
+                    "id":"ready-old", "status":"in_progress", "output":[],
+                }}),
+                0,
+            )
+            .unwrap();
+        let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        input
+            .send(Input::ReplaceContextResponse(ReplaceContextResponse {
+                response_id: "ready-old".into(),
+                instruction: TextRequest::queued("使用新状态回答。".into(), permit),
+                text_sequence: 0,
+            }))
+            .await
+            .unwrap();
+        ready_events.await.unwrap();
+        assert_eq!(
+            media.receive(&mut socket, true).await.unwrap().0["type"],
+            "response.done"
+        );
+        assert_eq!(
+            media.receive(&mut socket, true).await.unwrap().0["response"]["id"],
+            "ready-new"
+        );
+        {
+            let receive = media.receive(&mut socket, true);
+            tokio::pin!(receive);
+            assert!(futures::poll!(&mut receive).is_pending());
+        }
+        loop {
+            let event = events.raw.try_recv().unwrap();
+            if event["type"] == "agentview.context_replacement_skipped" {
+                assert_eq!(event["reason"], "stale_response");
+                break;
+            }
+            assert_ne!(event["type"], "agentview.context_replacement_cancel_sent");
+        }
+        assert_eq!(media.decoder.active_response(), Some("ready-new"));
+        server.await.unwrap();
+    }
 
     fn notice(id: &str) -> Notice {
         Notice {

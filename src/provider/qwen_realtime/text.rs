@@ -37,12 +37,25 @@ pub struct QwenRealtimeTextReply {
 struct Correlations {
     calls: VecDeque<(String, String)>,
     responses: VecDeque<(String, String)>,
+    accepted_text_sequence: u64,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct TextCorrelations(Arc<Mutex<Correlations>>);
 
 impl TextCorrelations {
+    pub(crate) fn accept_text(&self) {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        guard.accepted_text_sequence = guard.accepted_text_sequence.wrapping_add(1);
+    }
+
+    pub(crate) fn accepted_text_sequence(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .accepted_text_sequence
+    }
+
     pub(crate) fn get(&self, call_id: &str) -> Option<String> {
         self.0
             .lock()
@@ -84,11 +97,18 @@ impl TextCorrelations {
     }
 }
 
+pub(crate) struct ContextReplacementOrigin {
+    pub(crate) response_id: String,
+    pub(crate) speech_sequence: u64,
+    pub(crate) text_sequence: u64,
+}
+
 pub(crate) struct TextRequest {
     pub(crate) text: String,
     pub(crate) correlation: Option<String>,
     pub(crate) user: bool,
     pub(crate) item_id: Option<String>,
+    pub(crate) replacement: Option<ContextReplacementOrigin>,
     admitted: Option<oneshot::Sender<Result<QwenRealtimeTextTurn, ReactionPortFault>>>,
     completed: Option<oneshot::Sender<Result<QwenRealtimeTextReply, ReactionPortFault>>>,
     completion: Option<oneshot::Receiver<Result<QwenRealtimeTextReply, ReactionPortFault>>>,
@@ -102,6 +122,7 @@ impl TextRequest {
             correlation: None,
             user: false,
             item_id: None,
+            replacement: None,
             admitted: None,
             completed: None,
             completion: None,
@@ -126,6 +147,7 @@ impl TextRequest {
                 correlation,
                 user,
                 item_id: None,
+                replacement: None,
                 admitted: Some(admitted),
                 completed: Some(completed),
                 completion: Some(completion),

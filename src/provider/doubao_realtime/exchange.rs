@@ -262,7 +262,8 @@ impl<'a> Exchange<'a> {
                 | Input::Clear
                 | Input::UserText(_)
                 | Input::RefreshContext
-                | Input::RefreshContextAndRespond(_),
+                | Input::RefreshContextAndRespond(_)
+                | Input::ReplaceContextResponse(_),
             ) => {}
         }
         Ok(())

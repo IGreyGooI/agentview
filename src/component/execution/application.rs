@@ -39,8 +39,8 @@ use crate::component::{
         native_tool::NativeToolRecord,
         streaming_attempt::{StreamingToolAbortCause, StreamingToolDriverFault},
         ApplicationExitHandle, Component, ComponentAttemptFault, ExitReason,
-        InternalEventInput as EventInput, MountTaskStart, PreparationFault, PreparationRun,
-        RenderBindings, SpawnError,
+        FrameRefreshDispatcher, InternalEventInput as EventInput, MountTaskStart, PreparationFault,
+        PreparationRun, RenderBindings, SpawnError,
     },
     host::CommittedRenderTransition,
     host::ComponentHost,
@@ -414,7 +414,7 @@ impl<P: ReactionPort> Application<P> {
         root: impl Fn() -> Component + Send + Sync + 'static,
         port: P,
     ) -> Result<Self, ApplicationFault> {
-        Self::mount_with_event_root(move |_events| root(), port, None)
+        Self::mount_with_event_root(move |_events| root(), port, None, None)
     }
 
     /// Mount with an application-owned command inbox. Components declare when
@@ -425,7 +425,7 @@ impl<P: ReactionPort> Application<P> {
         port: P,
         input: CommandInput,
     ) -> Result<Self, ApplicationFault> {
-        Self::mount_with_event_root(move |_events| root(), port, Some(input))
+        Self::mount_with_event_root(move |_events| root(), port, Some(input), None)
     }
 
     /// Temporary bridge for integrations that still receive provider events
@@ -434,13 +434,22 @@ impl<P: ReactionPort> Application<P> {
         root: impl Fn(EventInput<ProviderEvent>) -> Component + Send + Sync + 'static,
         port: P,
     ) -> Result<Self, ApplicationFault> {
-        Self::mount_with_event_root(root, port, None)
+        Self::mount_with_event_root(root, port, None, None)
+    }
+
+    pub(super) fn mount_with_frame_refresh(
+        root: impl Fn() -> Component + Send + Sync + 'static,
+        port: P,
+        dispatcher: FrameRefreshDispatcher,
+    ) -> Result<Self, ApplicationFault> {
+        Self::mount_with_event_root(move |_events| root(), port, None, Some(dispatcher))
     }
 
     fn mount_with_event_root(
         root: impl Fn(EventInput<ProviderEvent>) -> Component + Send + Sync + 'static,
         mut port: P,
         command_input: Option<CommandInput>,
+        frame_refresh: Option<FrameRefreshDispatcher>,
     ) -> Result<Self, ApplicationFault> {
         let declaration = port.declare().map_err(|source| {
             ApplicationFault::from_port(ApplicationFaultStage::Declaration, source)
@@ -457,6 +466,9 @@ impl<P: ReactionPort> Application<P> {
         })?;
         let mut application =
             Self::unmounted(Arc::new(root), port, command_input, declaration, session);
+        application
+            .components
+            .set_frame_refresh_dispatcher(frame_refresh);
         application.bootstrap(|_, _| Ok(()))?;
         Ok(application)
     }

@@ -6,6 +6,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
 use crate::component::{
+    authoring::{FrameRefreshDispatcher, FrameRefreshRequest},
     execution::{
         Application, ApplicationFault, ReactionOutcome, ReactionPort, ReactionPortFault,
         ReactionPortFaultCode, ReactionPortFaultReason,
@@ -16,7 +17,7 @@ use crate::transcript::CanonicalInputItem;
 
 use super::{
     audio::encode_pcm16,
-    media::{closed, Input, Interrupt, Media, SpokenText},
+    media::{closed, Input, Interrupt, Media, ReplaceContextResponse, SpokenText},
     text::{TextCorrelations, TextRequest},
     Mode, QwenRealtimeMediaEvents, QwenRealtimeMediaInput, QwenRealtimeProvider,
     QwenRealtimeTextTurn,
@@ -115,19 +116,26 @@ pub(crate) fn mount_voice<P: ReactionPort + 'static>(
         text_correlations,
     };
     let component_input = input.clone();
-    let app = Application::mount(
-        move || {
-            Component::fragment([
-                voice_input(
-                    receiver.clone(),
-                    control_receiver.clone(),
-                    provider_input.clone(),
-                ),
-                root(component_input.clone()),
-            ])
-        },
-        provider,
-    )?;
+    let root = move || {
+        Component::fragment([
+            voice_input(
+                receiver.clone(),
+                control_receiver.clone(),
+                provider_input.clone(),
+            ),
+            root(component_input.clone()),
+        ])
+    };
+    let app = if context_refresh_supported {
+        let refresh_input = input.clone();
+        let dispatcher =
+            FrameRefreshDispatcher::new(input.active_response.clone(), move |request| {
+                refresh_input.enqueue_frame_refresh(request)
+            });
+        Application::mount_with_frame_refresh(root, provider, dispatcher)?
+    } else {
+        Application::mount(root, provider)?
+    };
     Ok((app, input))
 }
 
@@ -241,11 +249,19 @@ impl QwenRealtimeVoiceInput {
         correlation: impl Into<String>,
         instruction: impl Into<String>,
     ) -> Result<(), ReactionPortFault> {
-        let instruction = instruction.into();
+        self.send(self.context_response_input(correlation.into(), instruction.into())?)
+            .await
+    }
+
+    fn context_response_input(
+        &self,
+        correlation: String,
+        instruction: String,
+    ) -> Result<Input, ReactionPortFault> {
         let permit = self.text_permit(&instruction)?;
         let mut request = TextRequest::queued(instruction, permit);
-        request.correlation = Some(correlation.into());
-        self.send(Input::RefreshContextAndRespond(request)).await
+        request.correlation = Some(correlation);
+        Ok(Input::RefreshContextAndRespond(request))
     }
 
     /// Queue a service-authored reply and receive its acknowledged final result.
@@ -340,6 +356,40 @@ impl QwenRealtimeVoiceInput {
         instruction: impl Into<String>,
     ) -> Result<(), ReactionPortFault> {
         self.request_context_refresh(Some(instruction.into())).await
+    }
+
+    /// Cancel this exact active response, then refresh context and request one reply.
+    ///
+    /// Admission is serialized by the session's socket reader. An ended target,
+    /// another pending cancellation, or a user turn rejects only this optional
+    /// command through delivery observations. Success means queued. Generation
+    /// waits for that response's cancelled terminal and the new Frame and cue
+    /// ACKs. A rejected cancellation or intervening user input discards this reply
+    /// intent. Enqueueing does not wait for the socket reader or response terminal.
+    ///
+    /// Qwen's cancellation event has no response-ID selector. Ready server events
+    /// are consumed before matching the target, but a later server-side response
+    /// transition can still race the cancellation in transit.
+    pub async fn replace_context_response(
+        &self,
+        response_id: String,
+        instruction: String,
+    ) -> Result<(), ReactionPortFault> {
+        self.send(self.replacement_input(response_id, instruction)?)
+            .await
+    }
+
+    fn replacement_input(
+        &self,
+        response_id: String,
+        instruction: String,
+    ) -> Result<Input, ReactionPortFault> {
+        let permit = self.text_permit(&instruction)?;
+        Ok(Input::ReplaceContextResponse(ReplaceContextResponse {
+            response_id,
+            instruction: TextRequest::queued(instruction, permit),
+            text_sequence: self.text_correlations.accepted_text_sequence(),
+        }))
     }
 
     async fn request_context_refresh(
@@ -451,10 +501,41 @@ impl QwenRealtimeVoiceInput {
         receiver.await.map_err(|_| closed())?
     }
 
+    fn enqueue_frame_refresh(&self, request: FrameRefreshRequest) -> Result<(), ReactionPortFault> {
+        // Tool callbacks can run while the Frame's media owner waits for them.
+        // Use immediate bounded admission so a full queue cannot block the
+        // callback. Refuse only this optional request if the queue cannot take it.
+        let input = match request {
+            FrameRefreshRequest::Silent => {
+                return self
+                    .sender
+                    .try_send(Input::RefreshContext)
+                    .map_err(frame_refresh_queue_fault);
+            }
+            FrameRefreshRequest::Respond {
+                correlation,
+                instruction,
+            } => self.context_response_input(correlation, instruction)?,
+            FrameRefreshRequest::Replace {
+                response_id,
+                instruction,
+            } => self.replacement_input(response_id, instruction)?,
+        };
+        let (forwarded, _) = oneshot::channel();
+        self.controls
+            .try_send(VoiceControl {
+                input: Some(input),
+                forwarded,
+            })
+            .map_err(frame_refresh_queue_fault)
+    }
+
     async fn send(&self, input: Input) -> Result<(), ReactionPortFault> {
         if matches!(
             input,
-            Input::UserText(_) | Input::RefreshContextAndRespond(_)
+            Input::UserText(_)
+                | Input::RefreshContextAndRespond(_)
+                | Input::ReplaceContextResponse(_)
         ) {
             return self.send_control(Some(input)).await;
         }
@@ -469,10 +550,25 @@ impl QwenRealtimeVoiceInput {
 
     async fn send_control(&self, input: Option<Input>) -> Result<(), ReactionPortFault> {
         let (forwarded, receipt) = oneshot::channel();
-        self.controls
-            .send(VoiceControl { input, forwarded })
-            .await
-            .map_err(|_| closed())?;
+        let permit = self.controls.reserve().await.map_err(|_| closed())?;
+        // The Component control queue accepts formal text before the socket
+        // reader can consume it. Advance this shared sequence at that handoff,
+        // so a replacement waiting on context/cue ACKs yields to the new input
+        // even while its command is still in either bounded control queue.
+        if matches!(input, Some(Input::UserText(_))) {
+            self.text_correlations.accept_text();
+        }
+        permit.send(VoiceControl { input, forwarded });
         receipt.await.map_err(|_| closed())?
+    }
+}
+
+fn frame_refresh_queue_fault<T>(error: mpsc::error::TrySendError<T>) -> ReactionPortFault {
+    match error {
+        mpsc::error::TrySendError::Full(_) => ReactionPortFault::retryable(
+            ReactionPortFaultCode::Limit,
+            ReactionPortFaultReason::RequestPreparation,
+        ),
+        mpsc::error::TrySendError::Closed(_) => closed(),
     }
 }
