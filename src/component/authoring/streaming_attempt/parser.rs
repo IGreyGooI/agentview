@@ -32,6 +32,7 @@ pub(crate) enum ElementForm {
 pub(crate) struct ElementSpec {
     pub(crate) name: &'static str,
     pub(crate) form: ElementForm,
+    pub(crate) self_closing_when_attribute: Option<(&'static str, &'static str)>,
 }
 
 /// How a contract treats an element it did not declare at fragment top level.
@@ -592,7 +593,21 @@ impl Parser {
         let spec = self.contract.elements[spec_index];
         let occurrence = self.allocate_occurrence()?;
 
-        if (spec.form == ElementForm::SelfClosing) != parsed.empty {
+        // Models may omit an empty body. The declaration owns which named
+        // operation may use that shorthand; checking its attribute prevents
+        // dispatch of other operations that require explicit text. A mismatch
+        // remains a diagnostic for this occurrence, allowing later actions.
+        // Normal schema attribute validation still runs after the Open event.
+        let allowed_self_closing = parsed.empty
+            && spec
+                .self_closing_when_attribute
+                .is_some_and(|(attribute, expected)| {
+                    parsed
+                        .attributes
+                        .iter()
+                        .any(|(name, value)| name == attribute && value == expected)
+                });
+        if (spec.form == ElementForm::SelfClosing) != parsed.empty && !allowed_self_closing {
             events.push(invalid_for_element(
                 Some(occurrence),
                 Some(parsed.name.as_str()),
@@ -1178,6 +1193,7 @@ mod tests {
         Contract::strict(vec![ElementSpec {
             name: "say",
             form: ElementForm::Text,
+            self_closing_when_attribute: None,
         }])
     }
 
@@ -1185,6 +1201,7 @@ mod tests {
         Contract::strict(vec![ElementSpec {
             name: "pick",
             form: ElementForm::SelfClosing,
+            self_closing_when_attribute: None,
         }])
     }
 
