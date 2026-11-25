@@ -178,6 +178,7 @@ where
 {
     fn name(&self) -> &'static str;
     fn form(&self) -> ElementForm;
+    fn self_closing_when_attribute(&self) -> Option<(&'static str, &'static str)>;
     fn cardinality(&self) -> XmlCardinality;
     fn validate_declaration(
         &self,
@@ -289,6 +290,10 @@ where
             XmlElementFormKind::SelfClosing => ElementForm::SelfClosing,
             XmlElementFormKind::Text => ElementForm::Text,
         }
+    }
+
+    fn self_closing_when_attribute(&self) -> Option<(&'static str, &'static str)> {
+        self.contract.self_closing_when_attribute
     }
 
     fn cardinality(&self) -> XmlCardinality {
@@ -614,6 +619,7 @@ where
             .map(|element| ElementSpec {
                 name: element.name(),
                 form: element.form(),
+                self_closing_when_attribute: element.self_closing_when_attribute(),
             })
             .collect();
         let mut parser_contract = ParserContract::strict(parser_elements);
@@ -1808,6 +1814,134 @@ mod tests {
         assert_eq!(*observed.lock().unwrap(), vec!["hello & goodbye"]);
         assert!(contract.completed());
         assert!(contract.accepted());
+    }
+
+    #[tokio::test]
+    async fn self_closing_attribute_match_preserves_form_and_attribute_validation() {
+        let cases = [
+            (
+                r#"<tool name="cube-device-status"/>"#,
+                Some(("cube-device-status", "", XmlElementForm::SelfClosing)),
+                None,
+            ),
+            (
+                r#"<tool name="cube-device-&#x73;tatus"/>"#,
+                Some(("cube-device-status", "", XmlElementForm::SelfClosing)),
+                None,
+            ),
+            (
+                r#"<tool name="another-tool">{}</tool>"#,
+                Some(("another-tool", "{}", XmlElementForm::ExplicitClose)),
+                None,
+            ),
+            (
+                r#"<tool name="another-tool"/>"#,
+                None,
+                Some("wrong_element_form"),
+            ),
+            (
+                r#"<tool name="cube-device-status " />"#,
+                None,
+                Some("wrong_element_form"),
+            ),
+            (
+                r#"<tool name="cube-device-status" extra="invalid"/>"#,
+                None,
+                Some("unknown_attribute"),
+            ),
+            (
+                r#"<tool name="cube-device-status" name="cube-device-status"/>"#,
+                None,
+                Some("duplicate_attribute"),
+            ),
+            (
+                r#"<tool name="cube-device-status" count="invalid"/>"#,
+                None,
+                Some("decode"),
+            ),
+        ];
+        for (xml, expected, expected_diagnostic) in cases {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let completed = Arc::clone(&observed);
+            let diagnostics = Arc::new(Mutex::new(Vec::new()));
+            let finished = Arc::clone(&diagnostics);
+            let element = XmlToolElement::text("tool")
+                .required_attribute::<String>("name", "cube-device-status")
+                .optional_attribute::<u32>("count", "1")
+                .allow_self_closing_when_attribute("name", "cube-device-status")
+                .decode(
+                    |mut attrs| attrs.take_required::<String>("name"),
+                    |_, text| Ok(text.to_owned()),
+                );
+            let handlers: XmlElementHandlers<(), TestChannels, String, String> =
+                XmlElementHandlers::new();
+            let mut contract: ContractMachine<TestChannels, (), NoLiveRuntime, NoPublisher> =
+                ContractMachine::new(
+                    StreamingToolAttemptStart::new(
+                        StreamingToolAttemptId::new(1),
+                        "self-closing-attribute",
+                        "v1",
+                        crate::component::provenance::EventScope::application(
+                            crate::component::ApplicationId::fresh(),
+                        ),
+                    ),
+                    XmlEnvelope::strict_fragment(),
+                    false,
+                    Vec::new(),
+                    (),
+                    vec![erase_element(
+                        element,
+                        handlers.on_complete(move |_, complete| {
+                            completed.lock().unwrap().push((
+                                complete.head.as_ref().clone(),
+                                complete.value,
+                                complete.form,
+                            ));
+                            StreamingToolUpdate::none()
+                        }),
+                    )],
+                    Box::new(move |_, summary| {
+                        finished
+                            .lock()
+                            .unwrap()
+                            .extend(summary.diagnostics.iter().map(
+                                |record| match &record.diagnostic {
+                                    StreamingToolDiagnostic::Contract(violation) => {
+                                        violation.detail_code()
+                                    }
+                                    StreamingToolDiagnostic::Decode(_) => "decode",
+                                    StreamingToolDiagnostic::Domain(_) => "domain",
+                                },
+                            ));
+                        StreamingToolDecision::Accept(StreamingToolUpdate::none())
+                    }),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            for byte in xml.as_bytes().chunks(1) {
+                contract
+                    .push(std::str::from_utf8(byte).unwrap())
+                    .await
+                    .unwrap();
+            }
+            contract.seal(xml).await.unwrap();
+            contract.finish().await.unwrap();
+            assert_eq!(
+                *observed.lock().unwrap(),
+                expected
+                    .map(|(name, text, form)| (name.to_owned(), text.to_owned(), form))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{xml}"
+            );
+            assert_eq!(
+                *diagnostics.lock().unwrap(),
+                expected_diagnostic.into_iter().collect::<Vec<_>>(),
+                "{xml}"
+            );
+        }
     }
 
     #[tokio::test]

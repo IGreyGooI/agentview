@@ -523,6 +523,7 @@ enum Dispatch {
 trait ErasedCallback: Send {
     fn name(&self) -> &'static str;
     fn form(&self) -> ElementForm;
+    fn self_closing_when_attribute(&self) -> Option<(&'static str, &'static str)>;
     fn cardinality(&self) -> XmlCardinality;
     fn validate(&self) -> Result<(), StreamingToolDeclarationFault>;
     fn prompt(&self) -> Result<XmlNode, StreamingToolDeclarationFault>;
@@ -620,6 +621,9 @@ impl<Head: Send + Sync + 'static, Value: Send + 'static> ErasedCallback
     }
     fn form(&self) -> ElementForm {
         self.inner.form()
+    }
+    fn self_closing_when_attribute(&self) -> Option<(&'static str, &'static str)> {
+        self.inner.self_closing_when_attribute()
     }
     fn cardinality(&self) -> XmlCardinality {
         self.inner.cardinality()
@@ -788,6 +792,7 @@ impl XmlCallbackRuntime {
             .map(|declaration| ElementSpec {
                 name: declaration.name(),
                 form: declaration.element.form(),
+                self_closing_when_attribute: declaration.element.self_closing_when_attribute(),
             })
             .collect();
         let mut contract = Contract::strict(specs);
