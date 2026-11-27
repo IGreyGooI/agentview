@@ -18,7 +18,7 @@ use crate::transcript::CanonicalInputItem;
 use super::{
     audio::encode_pcm16,
     media::{closed, Input, Interrupt, Media, ReplaceContextResponse, SpokenText},
-    text::{TextCorrelations, TextRequest},
+    text::{TextCorrelations, TextRequest, MAX_TEXT_BYTES},
     Mode, QwenRealtimeMediaEvents, QwenRealtimeMediaInput, QwenRealtimeProvider,
     QwenRealtimeTextTurn,
 };
@@ -31,7 +31,7 @@ struct VoiceControl {
     forwarded: oneshot::Sender<Result<(), ReactionPortFault>>,
 }
 const PENDING_SPEECH_CAPACITY: usize = 8;
-const MAX_SPOKEN_TEXT_BYTES: usize = 64 * 1024;
+const MAX_SPOKEN_TEXT_BYTES: usize = MAX_TEXT_BYTES;
 
 /// A dedicated voice Application for Qwen Realtime with Smart Turn v2.
 ///
@@ -278,6 +278,35 @@ impl QwenRealtimeVoiceInput {
         admission.await.map_err(|_| closed())?
     }
 
+    /// Queue a service reply that may share one response with adjacent opted-in
+    /// requests already waiting at the same idle Frame boundary. Single cues
+    /// keep their original text. For two or more cues, the shared renderer gets
+    /// their texts in source order, within the existing 64-KiB text budget.
+    /// Every caller receives the same actual response and its final result,
+    /// including native tool continuations. Later arrivals wait for another
+    /// response. This method waits for bounded input capacity without cancelling
+    /// the running reply or microphone.
+    pub async fn respond_with_mergeable_correlation(
+        &self,
+        correlation: impl Into<String>,
+        instruction: impl Into<String>,
+        render_batch: fn(&[&str]) -> String,
+    ) -> Result<QwenRealtimeTextTurn, ReactionPortFault> {
+        let instruction = instruction.into();
+        self.validate_text(&instruction)?;
+        let permit = self
+            .pending_text
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| closed())?;
+        let (mut request, admission) =
+            TextRequest::acknowledged(instruction, Some(correlation.into()), false, permit);
+        request.merge_renderer = Some(render_batch);
+        self.send(Input::RefreshContextAndRespond(request)).await?;
+        admission.await.map_err(|_| closed())?
+    }
+
     /// The formal text selected for the next Frame, available to preparations.
     /// Use text_correlation_for_call for authorization of an actual tool call.
     pub fn current_text_correlation(&self) -> Option<String> {
@@ -294,12 +323,35 @@ impl QwenRealtimeVoiceInput {
         self.text_correlations.response(response_id)
     }
 
+    /// All originating service correlations for one admitted native tool call.
+    /// A merged reply has multiple origins, so its singular lookup returns None.
+    pub fn text_correlations_for_call(&self, call_id: &str) -> Vec<String> {
+        self.text_correlations.for_call(call_id)
+    }
+
+    /// All originating service correlations for a provider response in source order.
+    pub fn text_correlations_for_response(&self, response_id: &str) -> Vec<String> {
+        self.text_correlations.for_response(response_id)
+    }
+
     fn text_permit(
         &self,
         text: &str,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, ReactionPortFault> {
-        // The API caller owns each new text. Reject only an unusable command or
-        // excess queue entry, preserving all earlier inputs and live microphone.
+        self.validate_text(text)?;
+        self.pending_text.clone().try_acquire_owned().map_err(|_| {
+            ReactionPortFault::retryable(
+                ReactionPortFaultCode::Limit,
+                ReactionPortFaultReason::RequestPreparation,
+            )
+        })
+    }
+
+    fn validate_text(&self, text: &str) -> Result<(), ReactionPortFault> {
+        // The API caller owns each instruction before bounded admission. Empty
+        // or oversized text cannot form a valid cue, and unsupported providers
+        // cannot refresh Qwen context. Refuse just this new request, preserving
+        // accepted text and the live microphone.
         if !self.context_refresh_supported
             || text.trim().is_empty()
             || text.len() > MAX_SPOKEN_TEXT_BYTES
@@ -309,12 +361,7 @@ impl QwenRealtimeVoiceInput {
                 ReactionPortFaultReason::RequestPreparation,
             ));
         }
-        self.pending_text.clone().try_acquire_owned().map_err(|_| {
-            ReactionPortFault::retryable(
-                ReactionPortFaultCode::Limit,
-                ReactionPortFaultReason::RequestPreparation,
-            )
-        })
+        Ok(())
     }
     /// Queue a context-only Frame refresh after changing Component Signals.
     ///

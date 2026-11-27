@@ -602,6 +602,138 @@ async fn rejected_or_failed_text_turns_keep_the_socket_and_return_the_actual_ter
 }
 
 #[tokio::test]
+async fn mergeable_replies_share_one_turn_after_voice_and_keep_later_notices_queued() {
+    fn render_batch(instructions: &[&str]) -> String {
+        serde_json::to_string(instructions).unwrap()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let (queued_together, together_queued) = oneshot::channel();
+    let (queued_later, later_queued) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let update = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &update).await;
+        send_input(&mut socket, "user-before-notices").await;
+        // Hold the active user reply until both service calls have entered the
+        // queue. The helper rejects any command before this reply's terminal,
+        // including cancellation or an early notification response.create.
+        send_audio_reply(
+            &mut socket,
+            "user-voice-reply",
+            "user-voice-item",
+            "先回答用户。",
+            &[1, 0],
+            Some(together_queued),
+        )
+        .await;
+
+        let combined = receive_user_text(&mut socket).await;
+        assert_eq!(
+            combined["item"]["content"],
+            json!([{"type":"input_text", "text":render_batch(&["通知 A", "通知 B"])}])
+        );
+        acknowledge_item(&mut socket, &combined).await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        // C is admitted after this batch already has its provider response ID.
+        // It stays queued throughout the shared A/B reply and starts afterward.
+        send_audio_reply(
+            &mut socket,
+            "combined-notice-reply",
+            "combined-notice-item",
+            "一起处理两条通知。",
+            &[2, 0],
+            Some(later_queued),
+        )
+        .await;
+
+        let later = receive_user_text(&mut socket).await;
+        assert_eq!(
+            later["item"]["content"],
+            json!([{"type":"input_text", "text":"通知 C"}])
+        );
+        acknowledge_item(&mut socket, &later).await;
+        assert_eq!(receive(&mut socket).await["type"], "response.create");
+        send_audio_reply(
+            &mut socket,
+            "later-notice-reply",
+            "later-notice-item",
+            "再处理后来的通知。",
+            &[3, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let (mut application, input, mut events) =
+        QwenRealtimeVoiceApplication::mount(|| view! {}, text_voice_provider(&endpoint)).unwrap();
+    let operation = async {
+        loop {
+            if matches!(events.next_event().await.unwrap(),
+                QwenRealtimeAudioEvent::ResponseStarted { response_id }
+                    if response_id == "user-voice-reply")
+            {
+                break;
+            }
+        }
+        let first = input.respond_with_mergeable_correlation("source-a", "通知 A", render_batch);
+        tokio::pin!(first);
+        assert!(futures::poll!(&mut first).is_pending());
+        let second = input.respond_with_mergeable_correlation("source-b", "通知 B", render_batch);
+        tokio::pin!(second);
+        assert!(futures::poll!(&mut second).is_pending());
+        queued_together.send(()).unwrap();
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.response_id, "combined-notice-reply");
+        assert_eq!(second.response_id, first.response_id);
+        assert_eq!(
+            input.text_correlations_for_response(&first.response_id),
+            ["source-a", "source-b"]
+        );
+        assert_eq!(
+            input.text_correlation_for_response(&first.response_id),
+            None
+        );
+
+        let later = input.respond_with_mergeable_correlation("source-c", "通知 C", render_batch);
+        tokio::pin!(later);
+        assert!(futures::poll!(&mut later).is_pending());
+        queued_later.send(()).unwrap();
+        let (first, second, later) = tokio::join!(first.completed(), second.completed(), later);
+        for result in [first.unwrap(), second.unwrap()] {
+            assert_eq!(result.response_id, "combined-notice-reply");
+            assert_eq!(result.status, QwenRealtimeResponseStatus::Completed);
+            assert_eq!(result.text, "一起处理两条通知。");
+        }
+        let later = later.unwrap();
+        assert_eq!(later.response_id, "later-notice-reply");
+        assert_eq!(
+            input.text_correlations_for_response(&later.response_id),
+            ["source-c"]
+        );
+        assert_eq!(
+            input.text_correlation_for_response(&later.response_id),
+            Some("source-c".into())
+        );
+        let later = later.completed().await.unwrap();
+        assert_eq!(later.status, QwenRealtimeResponseStatus::Completed);
+        assert_eq!(later.text, "再处理后来的通知。");
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(application.run(), operation)
+    })
+    .await
+    .expect("queued notifications should settle through their shared provider turn");
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    application.shutdown().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn queued_context_reply_follows_smart_turn_commit_without_speech_stopped() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());

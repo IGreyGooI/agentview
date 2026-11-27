@@ -18,7 +18,9 @@ use crate::component::execution::{
 
 use super::{
     audio::{AudioDecoder, QwenRealtimeAudioEvent, QwenRealtimeResponseStatus},
-    text::{ActiveTextTurn, ContextReplacementOrigin, TextCorrelations, TextRequest},
+    text::{
+        ActiveTextTurn, ContextReplacementOrigin, TextCorrelations, TextRequest, MAX_TEXT_BYTES,
+    },
     transport, Mode, QwenRealtimeTextReply, Socket,
 };
 
@@ -391,13 +393,56 @@ impl Media {
             && self.controls.is_empty()
             && self.context_response_available()
         {
-            self.context_response_pending.pop_front()
+            self.take_context_request()
         } else {
             None
         };
         self.context_refresh_pending =
             !self.context_response_pending.is_empty() || !self.user_texts.is_empty();
         (refresh, cue)
+    }
+
+    fn take_context_request(&mut self) -> Option<TextRequest> {
+        let mut first = self.context_response_pending.pop_front()?;
+        let Some(render_batch) = first.merge_renderer.take() else {
+            return Some(first);
+        };
+        let mut members = vec![first];
+        let mut rendered = None;
+        while let Some(next) = self.context_response_pending.front() {
+            // Each application renderer defines one compatible batch. The
+            // socket owner freezes only adjacent opted-in requests already
+            // pending at this idle boundary. A different/default request keeps
+            // its FIFO position, and later arrivals retain their own response.
+            if !next
+                .merge_renderer
+                .is_some_and(|renderer| std::ptr::fn_addr_eq(renderer, render_batch))
+            {
+                break;
+            }
+            let texts: Vec<&str> = members
+                .iter()
+                .map(|request| request.text.as_str())
+                .chain(std::iter::once(next.text.as_str()))
+                .collect();
+            let candidate = render_batch(&texts);
+            // A combined cue shares the original text budget. Keep an excess
+            // or unusable rendering out of this batch so those original cues
+            // remain queued intact instead of being rejected or truncated.
+            if candidate.trim().is_empty() || candidate.len() > MAX_TEXT_BYTES {
+                break;
+            }
+            members.push(
+                self.context_response_pending
+                    .pop_front()
+                    .expect("pending batch member"),
+            );
+            rendered = Some(candidate);
+        }
+        Some(match rendered {
+            Some(text) => TextRequest::merged(text, members),
+            None => members.pop().expect("original context request"),
+        })
     }
 
     pub(super) fn prepare_text_frame(&mut self) {
@@ -463,8 +508,11 @@ impl Media {
 
     pub(super) fn fail_text(&self, request: TextRequest, reason: &'static str, fault: Fault) {
         if !request.user {
-            self.publish_context_refresh_event(json!({"type":"agentview.context_response_failed",
-                "correlation": request.correlation, "reason":reason}));
+            self.publish_text_request_event(
+                &request,
+                json!({"type":"agentview.context_response_failed",
+                "reason":reason}),
+            );
         }
         self.text_correlation.send_replace(None);
         request.reject(fault);
@@ -481,7 +529,7 @@ impl Media {
         // Correlated completion commands represent one queued delivery. Voice
         // may win this Frame, but must not consume that unstarted delivery.
         // Legacy uncorrelated optional cues retain their documented skip policy.
-        if request.correlation.is_some() {
+        if request.sources().any(|source| source.correlation.is_some()) {
             self.defer_text(request);
         }
     }
@@ -574,9 +622,9 @@ impl Media {
         {
             let mut turn = self.text_turn.take().expect("settled text response");
             let reply = turn.terminal.take().expect("terminal text reply");
-            self.publish_context_refresh_event(json!({
+            self.publish_text_request_event(&turn.request, json!({
                 "type":if turn.request.user { "agentview.text_response_completed" } else { "agentview.context_response_completed" },
-                "correlation":turn.request.correlation, "item_id":turn.request.item_id,
+                "item_id":turn.request.item_id,
                 "response_id":reply.response_id, "status":response_status(reply.status),
             }));
             turn.request.finish(reply);
@@ -604,14 +652,18 @@ impl Media {
                     turn.last_response_id = response_id.to_owned();
                     turn.continuation = false;
                     turn.text.clear();
-                    if let Some(correlation) = &turn.request.correlation {
+                    let correlations = turn.request.correlations();
+                    // The acknowledged request owns the whole origin set.
+                    // Bind it to this actual provider response, keeping a
+                    // merged event's tools away from a borrowed first origin.
+                    if !correlations.is_empty() {
                         self.text_correlations
-                            .remember_response(response_id, correlation);
+                            .remember_response(response_id, &correlations);
                     }
                     turn.request.admit(response_id);
-                    self.publish_context_refresh_event(json!({
+                    self.publish_text_request_event(&turn.request, json!({
                         "type":if turn.request.user { "agentview.text_response_started" } else { "agentview.context_response_started" },
-                        "correlation":turn.request.correlation, "item_id":turn.request.item_id,
+                        "item_id":turn.request.item_id,
                         "response_id":response_id,
                     }));
                 }
@@ -653,13 +705,11 @@ impl Media {
                     .flatten()
                     .filter(|item| item["type"] == "function_call");
                 let mut has_tools = false;
+                let correlations = turn.request.correlations();
                 for tool in tools {
                     has_tools = true;
-                    if let (Some(call_id), Some(correlation)) = (
-                        tool["call_id"].as_str(),
-                        turn.request.correlation.as_deref(),
-                    ) {
-                        self.text_correlations.remember(call_id, correlation);
+                    if let Some(call_id) = tool["call_id"].as_str() {
+                        self.text_correlations.remember(call_id, &correlations);
                     }
                 }
                 let status = match response["status"].as_str() {
@@ -691,11 +741,13 @@ impl Media {
     // provable response identity. Preserve the original ACKed text, clearing
     // only this create's ownership; the voice terminal opens the next Frame.
     fn defer_unbound_text(&mut self, turn: ActiveTextTurn) {
-        self.publish_context_refresh_event(json!({
-            "type":"agentview.text_response_deferred",
-            "correlation":turn.request.correlation,
-            "item_id":turn.request.item_id, "reason":"user_turn",
-        }));
+        self.publish_text_request_event(
+            &turn.request,
+            json!({
+                "type":"agentview.text_response_deferred",
+                "item_id":turn.request.item_id, "reason":"user_turn",
+            }),
+        );
         self.text_correlation.send_replace(None);
         if turn.request.user {
             self.context_generation_waiting = None;
@@ -791,6 +843,14 @@ impl Media {
         // application can record ACK outcomes even when SDK tracing is filtered.
         // The context writer supplies only IDs, counters and fixed status text.
         self.events.publish_server_event(Arc::new(event));
+    }
+
+    fn publish_text_request_event(&self, request: &TextRequest, event: Value) {
+        for source in request.sources() {
+            let mut observed = event.clone();
+            observed["correlation"] = json!(source.correlation);
+            self.publish_context_refresh_event(observed);
+        }
     }
 
     pub(super) fn owns_control_error(&self, event: &Value) -> bool {
