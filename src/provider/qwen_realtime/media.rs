@@ -282,6 +282,7 @@ pub(super) struct Media {
     notice_cleanup: VecDeque<String>,
     notice_delete_events: VecDeque<(String, String)>,
     input_speech: bool,
+    input_speech_item_id: Option<String>,
     awaiting_speech_response: bool,
     context_refresh_pending: bool,
     context_response_pending: VecDeque<TextRequest>,
@@ -333,6 +334,7 @@ impl Media {
                 notice_cleanup: VecDeque::new(),
                 notice_delete_events: VecDeque::new(),
                 input_speech: false,
+                input_speech_item_id: None,
                 awaiting_speech_response: false,
                 context_refresh_pending: false,
                 context_response_pending: VecDeque::new(),
@@ -863,6 +865,7 @@ impl Media {
                 self.speech_sequence = self.speech_sequence.wrapping_add(1);
                 self.text_correlation.send_replace(None);
                 self.input_speech = true;
+                self.input_speech_item_id = event["item_id"].as_str().map(str::to_owned);
                 self.awaiting_speech_response = true;
                 // User speech can win the race with optional text insertion.
                 // Do not request a second response inside that user's turn.
@@ -872,6 +875,7 @@ impl Media {
             }
             Some("input_audio_buffer.speech_stopped") => {
                 self.input_speech = false;
+                self.input_speech_item_id = None;
                 if event["reason"] == "turn_invalid" {
                     self.awaiting_speech_response = false;
                 }
@@ -941,6 +945,14 @@ impl Media {
             match &event {
                 QwenRealtimeAudioEvent::InputCommitted { item_id } => {
                     if self.mode == Mode::SmartTurnV2 {
+                        // Qwen can commit an utterance without sending speech_stopped.
+                        // Release its speech gate so queued interactions can run after
+                        // the automatic reply. A commit for an earlier item leaves
+                        // newer microphone speech in control of the next turn.
+                        if self.input_speech_item_id.as_deref() == Some(item_id.as_str()) {
+                            self.input_speech = false;
+                            self.input_speech_item_id = None;
+                        }
                         // The server owns utterance commitment. Bound optional
                         // transcript drain state without rejecting a server turn.
                         if self.pending_asr.len() < MAX_PENDING_TRANSCRIPTIONS {
@@ -1693,6 +1705,27 @@ mod notice_tests {
             .unwrap();
         assert!(!media.input_speech);
         assert!(!media.awaiting_speech_response);
+    }
+
+    #[test]
+    fn commit_for_an_older_item_keeps_newer_speech_in_progress() {
+        let (mut media, _input, _events) = Media::new(Mode::SmartTurnV2);
+        for item_id in ["first", "second"] {
+            media
+                .admit(
+                    json!({"type":"input_audio_buffer.speech_started", "item_id":item_id}),
+                    10,
+                )
+                .unwrap();
+        }
+        media
+            .admit(
+                json!({"type":"input_audio_buffer.committed", "item_id":"first"}),
+                10,
+            )
+            .unwrap();
+        assert!(media.input_speech);
+        assert!(!media.context_response_available());
     }
 
     #[test]

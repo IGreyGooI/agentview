@@ -602,6 +602,114 @@ async fn rejected_or_failed_text_turns_keep_the_socket_and_return_the_actual_ter
 }
 
 #[tokio::test]
+async fn queued_context_reply_follows_smart_turn_commit_without_speech_stopped() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut socket = accept_session(&listener).await;
+        let initial = receive(&mut socket).await;
+        acknowledge_update(&mut socket, &initial).await;
+        assert_eq!(receive_audio(&mut socket).await, [11, 0, 12, 0]);
+
+        // Qwen Smart Turn can commit this same speech item and begin its
+        // automatic reply without ever emitting speech_stopped, as observed
+        // on the device reminder path. Its completed reply must release the
+        // queued notification instead of retaining the old speech gate.
+        for event in [
+            json!({"type":"input_audio_buffer.speech_started",
+                "item_id":"smart-turn-user-input", "audio_start_ms":0}),
+            json!({"type":"input_audio_buffer.committed", "item_id":"smart-turn-user-input"}),
+            json!({"type":"conversation.item.created", "item":{
+                "id":"smart-turn-user-input", "type":"message", "role":"user", "status":"completed",
+                "content":[{"type":"input_audio"}],
+            }}),
+            json!({"type":"conversation.item.input_audio_transcription.completed",
+                "item_id":"smart-turn-user-input", "content_index":0, "transcript":"请回答。"}),
+            json!({"type":"response.created", "response":{
+                "id":"smart-turn-user-response", "status":"in_progress", "output":[],
+            }}),
+        ] {
+            send(&mut socket, event).await;
+        }
+
+        // This PCM marker follows admission of the correlated notification,
+        // so the existing user response is still active when the queue arrives.
+        assert_eq!(receive_audio(&mut socket).await, [21, 0, 22, 0]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.next())
+                .await
+                .is_err(),
+            "the queued notification must wait for the automatic user reply"
+        );
+        send(
+            &mut socket,
+            json!({"type":"response.done", "response":{
+                "id":"smart-turn-user-response", "status":"completed", "output":[],
+            }}),
+        )
+        .await;
+
+        let cue = receive_user_text(&mut socket).await;
+        assert_eq!(cue["item"]["content"][0]["text"], "提醒用户做饭。");
+        acknowledge_item(&mut socket, &cue).await;
+        let generate = receive(&mut socket).await;
+        assert_eq!(generate["type"], "response.create");
+        assert!(generate["event_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("context_response_"));
+        send_audio_reply(
+            &mut socket,
+            "smart-turn-reminder-response",
+            "smart-turn-reminder-item",
+            "该做饭了。",
+            &[3, 0, 4, 0],
+            None,
+        )
+        .await;
+        await_session_close(&mut socket).await;
+    });
+    let (mut application, input, mut events) =
+        QwenRealtimeVoiceApplication::mount(|| view! {}, text_voice_provider(&endpoint)).unwrap();
+    let mut raw = events.subscribe_server_events();
+    let operation = async {
+        input.append_pcm16(&[11, 0, 12, 0]).await.unwrap();
+        loop {
+            if matches!(events.next_event().await.unwrap(),
+                QwenRealtimeAudioEvent::ResponseStarted { response_id }
+                    if response_id == "smart-turn-user-response")
+            {
+                break;
+            }
+        }
+        input
+            .queue_context_response("due-reminder", "提醒用户做饭。")
+            .await
+            .unwrap();
+        input.append_pcm16(&[21, 0, 22, 0]).await.unwrap();
+        loop {
+            let event = raw.next_event().await.unwrap();
+            if event["type"] == "agentview.context_response_completed"
+                && event["correlation"] == "due-reminder"
+            {
+                assert_eq!(event["response_id"], "smart-turn-reminder-response");
+                assert_eq!(event["status"], "completed");
+                break;
+            }
+        }
+        input.finish().await.unwrap();
+    };
+    let (outcome, ()) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(application.run(), operation)
+    })
+    .await
+    .expect("a committed Smart Turn must release the queued reminder");
+    assert_eq!(outcome.unwrap(), ReactionOutcome::Completed);
+    application.shutdown().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn formal_text_cancels_old_response_and_precedes_fifo_completions_with_isolated_rejection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}/api-ws/v1/realtime", listener.local_addr().unwrap());
